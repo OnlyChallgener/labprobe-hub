@@ -1,4 +1,4 @@
-# LabProbe Hub v0.2.0
+# LabProbe Hub v0.3.0
 
 LabProbe Hub 是 LabProbe / 极客网探的家庭网络状态中转服务。
 
@@ -40,7 +40,7 @@ Actions -> Docker Image -> Run workflow
 
 ```text
 你的DockerHub用户名/labprobe-hub:latest
-你的DockerHub用户名/labprobe-hub:0.2.0
+你的DockerHub用户名/labprobe-hub:0.3.0
 ```
 
 ## 绿联 NAS 部署

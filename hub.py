@@ -11,7 +11,7 @@ import requests
 import dns.resolver
 from flask import Flask, request, jsonify
 
-APP_VERSION = "0.2.0"
+APP_VERSION = "0.3.0"
 PORT = int(os.environ.get("PORT", "58443"))
 CONFIG_PATH = Path(os.environ.get("CONFIG_PATH", "/app/config/config.yaml"))
 DATA_DIR = Path(os.environ.get("DATA_DIR", "/app/data"))
@@ -216,13 +216,28 @@ def build_watched_devices(online_devices: List[Dict[str, Any]]) -> List[Dict[str
 
 
 def get_exit_ip(ipv6: bool = False) -> Optional[str]:
-    cfg_url = cfg_get("exit_ip.ipv6_url" if ipv6 else "exit_ip.ipv4_url", "https://api64.ipify.org")
-    cmd = ["curl", "-6" if ipv6 else "-4", "-s", "--max-time", "5", cfg_url]
-    try:
-        out = subprocess.check_output(cmd, text=True).strip()
-        return out or None
-    except Exception:
-        return None
+    # 多源检测 NAS 出口地址。Hub 跑在 NAS 上，所以这里得到的是 NAS 的出口 IPv4 / IPv6。
+    cfg_url = cfg_get("exit_ip.ipv6_url" if ipv6 else "exit_ip.ipv4_url", None)
+    urls = []
+    if cfg_url:
+        urls.append(cfg_url)
+    if ipv6:
+        urls += ["https://api6.ipify.org", "https://ipv6.icanhazip.com", "https://6.ipw.cn"]
+    else:
+        urls += ["https://api.ipify.org", "https://ipv4.icanhazip.com", "https://4.ipw.cn"]
+    seen = set()
+    for url in urls:
+        if not url or url in seen:
+            continue
+        seen.add(url)
+        cmd = ["curl", "-6" if ipv6 else "-4", "-s", "--max-time", "6", url]
+        try:
+            out = subprocess.check_output(cmd, text=True).strip()
+            if out and len(out) < 80 and not out.lower().startswith("error"):
+                return out
+        except Exception:
+            pass
+    return None
 
 
 def resolve_records(domain: str, record_type: str) -> List[str]:
@@ -238,8 +253,9 @@ def refresh_ddns_and_exit(state: Dict[str, Any]) -> Dict[str, Any]:
     nas_ipv6 = get_exit_ip(True)
     state.setdefault("nas", {})
     state["nas"].update({"exitIpv4": nas_ipv4, "exitIpv6": nas_ipv6, "updatedAt": now_str()})
+    # 路由器 IPv6 暂不采集，避免用 NAS 地址误填。
     state.setdefault("router", {})
-    state["router"].setdefault("exitIpv4", nas_ipv4)
+    state["router"].setdefault("exitIpv4", None)
     state["router"].setdefault("exitIpv6", None)
 
     ddns_cfg = cfg_get("ddns", []) or []
@@ -293,6 +309,9 @@ def hook_lucky():
     event_type = payload.get("type", "lucky_webhook")
     address = payload.get("address") or payload.get("ipAddr") or payload.get("value")
     name = payload.get("name", "Lucky")
+    # 只收到 URL token 的空 webhook 属于测试粘贴错误，不记录事件，避免泄露 token。
+    if event_type == "lucky_webhook" and not address and set(payload.keys()).issubset({"token"}):
+        return jsonify({"ok": True, "ignored": True, "reason": "empty webhook", "time": now_str()})
     state = load_json(STATE_FILE, {})
     state["updatedAt"] = now_str()
     if "stun" in event_type or "wireguard" in event_type:
@@ -309,7 +328,9 @@ def hook_lucky():
         if address and address != old:
             add_event({"type": event_type, "title": "DDNS 地址变化", "name": domain, "oldValue": old, "newValue": address})
     else:
-        add_event({"type": event_type, "title": "Lucky Webhook", "name": name, "newValue": address or json.dumps(payload, ensure_ascii=False)})
+        safe_payload = {k: v for k, v in payload.items() if k.lower() not in ["token", "password", "secret"]}
+        if address or safe_payload:
+            add_event({"type": event_type, "title": "Lucky Webhook", "name": name, "newValue": address or json.dumps(safe_payload, ensure_ascii=False)})
     save_json(STATE_FILE, state)
     return jsonify({"ok": True, "received": payload, "time": now_str()})
 
