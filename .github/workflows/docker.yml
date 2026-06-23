@@ -30,9 +30,9 @@ jobs:
         uses: docker/build-push-action@v6
         with:
           context: .
+          file: ./Dockerfile
           push: true
           platforms: linux/amd64,linux/arm64
           tags: |
-            tags: |
-              ${{ secrets.DOCKERHUB_USERNAME }}/labprobe-hub:latest
-              ${{ secrets.DOCKERHUB_USERNAME }}/labprobe-hub:0.2.0
+            ${{ secrets.DOCKERHUB_USERNAME }}/labprobe-hub:latest
+            ${{ secrets.DOCKERHUB_USERNAME }}/labprobe-hub:0.2.0
