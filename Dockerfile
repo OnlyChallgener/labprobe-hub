@@ -1,9 +1,10 @@
 FROM python:3.12-slim
 
-ENV PYTHONUNBUFFERED=1 \
+ENV PYTHONDONTWRITEBYTECODE=1 \
+    PYTHONUNBUFFERED=1 \
+    PORT=58443 \
     DATA_DIR=/app/data \
-    CONFIG_PATH=/app/config.yaml \
-    PORT=58443
+    CONFIG_PATH=/app/config/config.yaml
 
 WORKDIR /app
 
@@ -15,7 +16,6 @@ COPY requirements.txt /app/requirements.txt
 RUN pip install --no-cache-dir -r /app/requirements.txt
 
 COPY hub.py /app/hub.py
-COPY config.example.yaml /app/config.example.yaml
 
 EXPOSE 58443
 

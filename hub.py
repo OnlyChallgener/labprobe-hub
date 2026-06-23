@@ -1,94 +1,36 @@
-import json
 import os
-import re
+import json
+import socket
 import subprocess
-import threading
-import time
-from copy import deepcopy
-from datetime import datetime, timedelta
+from datetime import datetime, date
 from pathlib import Path
 from typing import Any, Dict, List, Optional, Tuple
 
-import dns.resolver
-import requests
 import yaml
-from flask import Flask, jsonify, request
+import requests
+import dns.resolver
+from flask import Flask, request, jsonify
 
-APP_NAME = "LabProbe Hub"
-VERSION = "0.1.0"
-
-DEFAULT_CONFIG = {
-    "home": {"name": "Home Network"},
-    "server": {"app_token": "change-app-token", "hook_token": "change-hook-token"},
-    "ddns": [],
-    "router": {"enabled": False},
-    "watched_devices": [],
-    "polling": {"enabled": False, "interval_seconds": 60},
-    "exit_ip": {
-        "ipv4_url": "https://api64.ipify.org",
-        "ipv6_url": "https://api64.ipify.org",
-    },
-}
-
+APP_VERSION = "0.2.0"
 PORT = int(os.environ.get("PORT", "58443"))
-CONFIG_PATH = Path(os.environ.get("CONFIG_PATH", "/app/config.yaml"))
+CONFIG_PATH = Path(os.environ.get("CONFIG_PATH", "/app/config/config.yaml"))
 DATA_DIR = Path(os.environ.get("DATA_DIR", "/app/data"))
 DATA_DIR.mkdir(parents=True, exist_ok=True)
 
-STATE_FILE = DATA_DIR / "state.json"
 EVENTS_FILE = DATA_DIR / "events.json"
-LAST_DEVICES_FILE = DATA_DIR / "last_devices.json"
+STATE_FILE = DATA_DIR / "state.json"
+DEVICES_FILE = DATA_DIR / "devices.json"
+DAILY_FILE = DATA_DIR / "daily.json"
 
 app = Flask(__name__)
-state_lock = threading.Lock()
 
 
 def now_str() -> str:
     return datetime.now().strftime("%Y-%m-%d %H:%M:%S")
 
 
-def parse_dt(s: str) -> Optional[datetime]:
-    if not s:
-        return None
-    for fmt in ("%Y-%m-%d %H:%M:%S", "%Y-%m-%dT%H:%M:%S", "%Y-%m-%d"):
-        try:
-            return datetime.strptime(s[:19], fmt)
-        except Exception:
-            pass
-    return None
-
-
-def deep_merge(a: Dict[str, Any], b: Dict[str, Any]) -> Dict[str, Any]:
-    out = deepcopy(a)
-    for k, v in b.items():
-        if isinstance(v, dict) and isinstance(out.get(k), dict):
-            out[k] = deep_merge(out[k], v)
-        else:
-            out[k] = v
-    return out
-
-
-def load_config() -> Dict[str, Any]:
-    cfg = deepcopy(DEFAULT_CONFIG)
-    if CONFIG_PATH.exists():
-        try:
-            loaded = yaml.safe_load(CONFIG_PATH.read_text(encoding="utf-8")) or {}
-            if isinstance(loaded, dict):
-                cfg = deep_merge(cfg, loaded)
-        except Exception as e:
-            print(f"[WARN] config load failed: {e}", flush=True)
-
-    # 环境变量优先级最高，方便 Docker 部署。
-    app_token = os.environ.get("APP_TOKEN")
-    hook_token = os.environ.get("HOOK_TOKEN")
-    if app_token:
-        cfg.setdefault("server", {})["app_token"] = app_token
-    if hook_token:
-        cfg.setdefault("server", {})["hook_token"] = hook_token
-    return cfg
-
-
-CONFIG = load_config()
+def today_str() -> str:
+    return date.today().isoformat()
 
 
 def load_json(path: Path, default: Any) -> Any:
@@ -101,490 +43,365 @@ def load_json(path: Path, default: Any) -> Any:
 
 
 def save_json(path: Path, data: Any) -> None:
-    tmp = path.with_suffix(path.suffix + ".tmp")
-    tmp.write_text(json.dumps(data, ensure_ascii=False, indent=2), encoding="utf-8")
-    tmp.replace(path)
+    path.parent.mkdir(parents=True, exist_ok=True)
+    path.write_text(json.dumps(data, ensure_ascii=False, indent=2), encoding="utf-8")
 
 
-def normalize_mac(mac: Optional[str]) -> str:
-    if not mac:
-        return ""
-    return re.sub(r"[^0-9A-Fa-f]", "", str(mac)).lower()
+def load_config() -> Dict[str, Any]:
+    cfg: Dict[str, Any] = {}
+    if CONFIG_PATH.exists():
+        try:
+            cfg = yaml.safe_load(CONFIG_PATH.read_text(encoding="utf-8")) or {}
+        except Exception as e:
+            print(f"[LabProbe] config load failed: {e}", flush=True)
+            cfg = {}
+    return cfg
 
 
-def path_get(obj: Any, path: Optional[str], default: Any = None) -> Any:
-    if not path:
-        return obj
-    cur = obj
-    for part in str(path).split("."):
-        if part == "":
-            continue
-        if isinstance(cur, dict):
-            cur = cur.get(part, default)
-        elif isinstance(cur, list):
-            try:
-                cur = cur[int(part)]
-            except Exception:
-                return default
-        else:
+def cfg_get(path: str, default: Any = None) -> Any:
+    cfg = load_config()
+    cur: Any = cfg
+    for part in path.split("."):
+        if not isinstance(cur, dict) or part not in cur:
             return default
+        cur = cur[part]
     return cur
 
 
-def first_field(item: Dict[str, Any], fields: List[str], default: Any = None) -> Any:
-    for f in fields or []:
-        val = path_get(item, f, None)
-        if val not in (None, ""):
-            return val
-    return default
+def get_app_token() -> str:
+    return os.environ.get("APP_TOKEN") or cfg_get("server.app_token", "change-app-token")
+
+
+def get_hook_token() -> str:
+    return os.environ.get("HOOK_TOKEN") or cfg_get("server.hook_token", "change-hook-token")
 
 
 def check_app_token() -> bool:
     token = request.headers.get("Authorization", "").replace("Bearer ", "").strip()
-    if not token:
-        token = request.args.get("token", "").strip()
-    return token == str(CONFIG.get("server", {}).get("app_token", ""))
+    return token and token == get_app_token()
 
 
-def require_auth():
-    if not check_app_token():
-        return jsonify({"ok": False, "error": "unauthorized"}), 401
-    return None
-
-
-def get_exit_ip(ipv6: bool = False) -> Optional[str]:
-    cfg = CONFIG.get("exit_ip", {}) or {}
-    url = cfg.get("ipv6_url" if ipv6 else "ipv4_url") or "https://api64.ipify.org"
-    family_flag = "-6" if ipv6 else "-4"
-    try:
-        out = subprocess.check_output(
-            ["curl", family_flag, "-s", "--max-time", "5", url],
-            text=True,
-            stderr=subprocess.DEVNULL,
-        ).strip()
-        if out and "<" not in out and len(out) < 128:
-            return out
-    except Exception:
-        pass
-    return None
-
-
-def dns_lookup(domain: str, record_type: str) -> Dict[str, Any]:
-    resolver = dns.resolver.Resolver()
-    resolver.lifetime = 5
-    resolver.timeout = 3
-    started = time.time()
-    try:
-        ans = resolver.resolve(domain, record_type)
-        values = [r.to_text().strip('"') for r in ans]
-        return {
-            "type": record_type,
-            "ok": True,
-            "values": values,
-            "ttl": ans.rrset.ttl if ans.rrset else None,
-            "latencyMs": int((time.time() - started) * 1000),
-        }
-    except Exception as e:
-        return {
-            "type": record_type,
-            "ok": False,
-            "values": [],
-            "ttl": None,
-            "latencyMs": int((time.time() - started) * 1000),
-            "error": str(e),
-        }
+def check_hook_token() -> bool:
+    return request.args.get("token", "") == get_hook_token()
 
 
 def add_event(event: Dict[str, Any]) -> Dict[str, Any]:
-    with state_lock:
-        events = load_json(EVENTS_FILE, [])
-        next_id = int(events[-1].get("id", 0)) + 1 if events else 1
-        event.setdefault("level", "normal")
-        event["id"] = next_id
-        event["createdAt"] = event.get("createdAt") or now_str()
-        events.append(event)
-        events = events[-1000:]
-        save_json(EVENTS_FILE, events)
+    events: List[Dict[str, Any]] = load_json(EVENTS_FILE, [])
+    next_id = int(events[-1].get("id", 0)) + 1 if events else 1
+    event["id"] = next_id
+    event.setdefault("createdAt", now_str())
+    event.setdefault("level", "normal")
+    events.append(event)
+    events = events[-1000:]
+    save_json(EVENTS_FILE, events)
     return event
 
 
-def load_state() -> Dict[str, Any]:
-    state = load_json(STATE_FILE, {})
-    if not isinstance(state, dict):
-        state = {}
-    state.setdefault("agent", {})
-    state["agent"].update({"name": APP_NAME, "version": VERSION})
-    state.setdefault("home", {"name": CONFIG.get("home", {}).get("name", "Home Network")})
-    return state
+def norm_mac(mac: Optional[str]) -> str:
+    if not mac:
+        return ""
+    m = str(mac).lower().replace("-", ":").replace(".", "").strip()
+    if ":" not in m and len(m) == 12:
+        m = ":".join([m[i:i+2] for i in range(0, 12, 2)])
+    return m
 
 
-def save_state(state: Dict[str, Any]) -> None:
-    state["updatedAt"] = now_str()
-    save_json(STATE_FILE, state)
+def prefer_name(item: Dict[str, Any]) -> str:
+    for key in ["devUserDefine", "devRecommend", "hostName", "name", "manufacture", "mac"]:
+        v = item.get(key)
+        if v not in [None, ""]:
+            return str(v)
+    return "未知设备"
 
 
-def extract_router_devices(raw: Any) -> List[Dict[str, Any]]:
-    router_cfg = CONFIG.get("router", {}) or {}
-    schema = router_cfg.get("schema", {}) or {}
-    items = path_get(raw, schema.get("items_path"), raw)
-    if isinstance(items, dict):
-        # 尝试找第一个数组字段
-        for v in items.values():
-            if isinstance(v, list):
-                items = v
-                break
-    if not isinstance(items, list):
-        return []
+def to_int(v: Any, default: int = 0) -> int:
+    try:
+        return int(str(v))
+    except Exception:
+        return default
 
-    online_values = schema.get("online_values", [True, 1, "1", "online", "ONLINE", "connected"])
-    normalized = []
-    for item in items:
+
+def human_bytes(v: Any) -> str:
+    n = to_int(v, 0)
+    units = ["B", "KB", "MB", "GB", "TB"]
+    size = float(n)
+    for unit in units:
+        if size < 1024 or unit == units[-1]:
+            return f"{size:.0f}{unit}" if unit == "B" else f"{size:.1f}{unit}"
+        size /= 1024
+    return str(n)
+
+
+def parse_ruijie_devices(payload: Any) -> Tuple[List[Dict[str, Any]], int]:
+    if isinstance(payload, str):
+        payload = json.loads(payload)
+    raw_list = payload.get("list", []) if isinstance(payload, dict) else []
+    devices: List[Dict[str, Any]] = []
+    for item in raw_list:
         if not isinstance(item, dict):
             continue
-        mac = first_field(item, schema.get("mac_fields", []), "")
-        online_raw = first_field(item, schema.get("online_fields", []), True)
-        online = online_raw in online_values
-        normalized.append(
-            {
-                "name": first_field(item, schema.get("name_fields", []), "未知设备"),
-                "mac": mac,
-                "macNormalized": normalize_mac(mac),
-                "ip": first_field(item, schema.get("ip_fields", []), None),
-                "ipv6": first_field(item, schema.get("ipv6_fields", []), None),
-                "online": bool(online),
-                "raw": item,
-            }
-        )
-    return normalized
+        mac = norm_mac(item.get("mac"))
+        if not mac:
+            continue
+        devices.append({
+            "name": prefer_name(item),
+            "mac": mac,
+            "online": True,
+            "ip": item.get("userIp"),
+            "connectType": item.get("connectType"),
+            "ssid": item.get("ssid"),
+            "band": item.get("band"),
+            "rssi": item.get("rssi"),
+            "rxrate": item.get("rxrate"),
+            "channel": item.get("channel"),
+            "onlinetime": item.get("onlinetime"),
+            "activeTimeSec": to_int(item.get("activeTime"), 0),
+            "hostName": item.get("hostName"),
+            "manufacture": item.get("manufacture"),
+            "osType": item.get("osType"),
+            "devType": item.get("devType"),
+            "devRecommend": item.get("devRecommend"),
+            "deviceAliasName": item.get("deviceAliasName"),
+            "upBytes": to_int(item.get("up"), 0),
+            "downBytes": to_int(item.get("down"), 0),
+            "dailyUpBytes": to_int(item.get("dailyUp"), 0),
+            "dailyDownBytes": to_int(item.get("dailyDown"), 0),
+            "trafficText": f"↑{human_bytes(item.get('up'))} ↓{human_bytes(item.get('down'))}",
+            "raw": item,
+        })
+    total = to_int(payload.get("total"), len(devices)) if isinstance(payload, dict) else len(devices)
+    return devices, total
 
 
-def fetch_router_devices() -> Tuple[List[Dict[str, Any]], Optional[str]]:
-    router_cfg = CONFIG.get("router", {}) or {}
-    if not router_cfg.get("enabled"):
-        return [], None
-    url = router_cfg.get("api_url")
-    if not url:
-        return [], "router.api_url is empty"
-
-    method = str(router_cfg.get("method", "GET")).upper()
-    headers = router_cfg.get("headers") or {}
-    timeout = int(router_cfg.get("timeout_seconds", 5))
-
-    try:
-        if method == "POST":
-            resp = requests.post(url, headers=headers, timeout=timeout, json=router_cfg.get("body"))
-        else:
-            resp = requests.get(url, headers=headers, timeout=timeout)
-        resp.raise_for_status()
-        raw = resp.json()
-        return extract_router_devices(raw), None
-    except Exception as e:
-        return [], str(e)
-
-
-def refresh_watched_devices(state: Dict[str, Any]) -> Dict[str, Any]:
-    watched = CONFIG.get("watched_devices") or []
-    router_devices, err = fetch_router_devices()
-    router_map = {d.get("macNormalized"): d for d in router_devices if d.get("macNormalized")}
-
-    previous = load_json(LAST_DEVICES_FILE, {})
-    current_map = {}
+def build_watched_devices(online_devices: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
+    watched = cfg_get("watched_devices", []) or []
+    by_mac = {norm_mac(d.get("mac")): d for d in online_devices}
     result = []
-
-    for wd in watched:
-        mac_norm = normalize_mac(wd.get("mac"))
-        matched = router_map.get(mac_norm)
-        old = previous.get(mac_norm, {})
-        online = bool(matched and matched.get("online"))
-
-        item = {
-            "name": wd.get("name") or (matched or {}).get("name") or "未命名设备",
-            "mac": wd.get("mac"),
-            "online": online,
-            "ip": (matched or {}).get("ip") or old.get("ip"),
-            "ipv6": (matched or {}).get("ipv6") or old.get("ipv6"),
-            "lastChangedAt": old.get("lastChangedAt"),
-            "lastSeenAt": old.get("lastSeenAt"),
-        }
-
+    previous = load_json(DEVICES_FILE, {}).get("watched", [])
+    previous_by_mac = {norm_mac(d.get("mac")): d for d in previous}
+    for w in watched:
+        wmac = norm_mac(w.get("mac"))
+        old = previous_by_mac.get(wmac, {})
+        match = by_mac.get(wmac)
+        if match:
+            dev = dict(match)
+            dev.update({
+                "name": w.get("name") or match.get("name"),
+                "online": True,
+                "lastChangedAt": old.get("lastChangedAt") or now_str(),
+            })
+        else:
+            dev = {
+                "name": w.get("name") or old.get("name") or wmac,
+                "mac": wmac,
+                "online": False,
+                "ip": None,
+                "lastIp": old.get("ip") or old.get("lastIp"),
+                "lastChangedAt": old.get("lastChangedAt") or now_str(),
+            }
+        # If status changed, update lastChangedAt and create event.
         old_online = old.get("online")
-        if old_online is not None and bool(old_online) != online:
-            item["lastChangedAt"] = now_str()
-            add_event(
-                {
-                    "type": "device_online" if online else "device_offline",
-                    "title": f"{item['name']} {'上线' if online else '离线'}",
-                    "name": item["name"],
-                    "newValue": "online" if online else "offline",
-                    "ip": item.get("ip"),
-                }
-            )
-        elif not item.get("lastChangedAt"):
-            item["lastChangedAt"] = now_str()
-
-        if online:
-            item["lastSeenAt"] = now_str()
-
-        current_map[mac_norm] = item
-        result.append(item)
-
-    state["devices"] = result
-    state.setdefault("router", {})["deviceApiError"] = err
-    state["router"]["onlineDeviceCount"] = len([d for d in router_devices if d.get("online")])
-    save_json(LAST_DEVICES_FILE, current_map)
-    return state
+        if old_online is not None and old_online != dev.get("online"):
+            dev["lastChangedAt"] = now_str()
+            add_event({
+                "type": "device_online" if dev.get("online") else "device_offline",
+                "title": f"{dev.get('name')} {'上线' if dev.get('online') else '离线'}",
+                "name": dev.get("name"),
+                "mac": wmac,
+                "oldValue": "online" if old_online else "offline",
+                "newValue": "online" if dev.get("online") else "offline",
+            })
+        result.append(dev)
+    return result
 
 
-def refresh_exit_and_ddns(state: Dict[str, Any]) -> Dict[str, Any]:
+def get_exit_ip(ipv6: bool = False) -> Optional[str]:
+    cfg_url = cfg_get("exit_ip.ipv6_url" if ipv6 else "exit_ip.ipv4_url", "https://api64.ipify.org")
+    cmd = ["curl", "-6" if ipv6 else "-4", "-s", "--max-time", "5", cfg_url]
+    try:
+        out = subprocess.check_output(cmd, text=True).strip()
+        return out or None
+    except Exception:
+        return None
+
+
+def resolve_records(domain: str, record_type: str) -> List[str]:
+    try:
+        answers = dns.resolver.resolve(domain, record_type, lifetime=4)
+        return [str(a).rstrip(".") for a in answers]
+    except Exception:
+        return []
+
+
+def refresh_ddns_and_exit(state: Dict[str, Any]) -> Dict[str, Any]:
     nas_ipv4 = get_exit_ip(False)
     nas_ipv6 = get_exit_ip(True)
-
     state.setdefault("nas", {})
-    state["nas"].update({"exitIpv4": nas_ipv4, "exitIpv6": nas_ipv6, "checkedAt": now_str()})
-
+    state["nas"].update({"exitIpv4": nas_ipv4, "exitIpv6": nas_ipv6, "updatedAt": now_str()})
     state.setdefault("router", {})
-    # 如果暂时没接路由器 WAN API，路由器 IPv4 一般与 NAS 出口 IPv4 相同。
     state["router"].setdefault("exitIpv4", nas_ipv4)
     state["router"].setdefault("exitIpv6", None)
 
-    ddns_results = []
-    for item in CONFIG.get("ddns") or []:
+    ddns_cfg = cfg_get("ddns", []) or []
+    ddns_list = []
+    for item in ddns_cfg:
         domain = item.get("domain")
         if not domain:
             continue
-        record_types = item.get("record_types") or ["A", "AAAA"]
-        records = {rt: dns_lookup(domain, rt) for rt in record_types}
-
-        expect_key = item.get("expect")
-        expected = None
-        if expect_key == "nas_ipv4":
-            expected = state.get("nas", {}).get("exitIpv4")
-        elif expect_key == "nas_ipv6":
-            expected = state.get("nas", {}).get("exitIpv6")
-        elif expect_key == "router_ipv4":
-            expected = state.get("router", {}).get("exitIpv4")
-        elif expect_key == "router_ipv6":
-            expected = state.get("router", {}).get("exitIpv6")
-        elif expect_key == "stun":
-            expected = state.get("stun", {}).get("publicAddress")
-        elif expect_key == "wireguard":
-            expected = state.get("wireguard", {}).get("publicAddress")
-
-        all_values = []
-        for r in records.values():
-            all_values.extend(r.get("values") or [])
-        matched = bool(expected and expected in all_values)
-
-        ddns_results.append(
-            {
-                "name": item.get("name") or domain,
-                "domain": domain,
-                "expect": expect_key,
-                "expected": expected,
-                "matched": matched,
-                "records": records,
-                "checkedAt": now_str(),
-            }
-        )
-
-    state["ddnsChecks"] = ddns_results
-    return state
-
-
-def refresh_all() -> Dict[str, Any]:
-    with state_lock:
-        state = load_state()
-        state = refresh_exit_and_ddns(state)
-        state = refresh_watched_devices(state)
-        save_state(state)
-    return state
-
-
-def update_state_from_hook(payload: Dict[str, Any]) -> Dict[str, Any]:
-    event_type = payload.get("type") or payload.get("event") or "lucky_webhook"
-    address = payload.get("address") or payload.get("ipAddr") or payload.get("value") or payload.get("ip")
-    name = payload.get("name") or payload.get("domain") or "Lucky"
-
-    with state_lock:
-        state = load_state()
-
-        if event_type in {"stun_changed", "wireguard_changed", "wireguard_endpoint_changed"}:
-            old_value = state.get("stun", {}).get("publicAddress")
-            state["stun"] = {
-                "publicAddress": address,
-                "updatedAt": now_str(),
-                "source": "Lucky Webhook",
-            }
-            state["wireguard"] = {
-                "publicAddress": address,
-                "updatedAt": now_str(),
-                "source": "Lucky Webhook",
-            }
-            if address and address != old_value:
-                add_event(
-                    {
-                        "type": event_type,
-                        "title": "STUN / WireGuard 地址变化",
-                        "name": name,
-                        "oldValue": old_value,
-                        "newValue": address,
-                    }
-                )
-
-        elif event_type in {"ddns_changed", "ddns_update"}:
-            domain = payload.get("domain") or name or "net86.dynv6.net"
-            old_value = state.get("ddns", {}).get(domain, {}).get("address")
-            state.setdefault("ddns", {})[domain] = {
-                "domain": domain,
-                "address": address,
-                "updatedAt": now_str(),
-                "source": "Lucky Webhook",
-            }
-            if address and address != old_value:
-                add_event(
-                    {
-                        "type": event_type,
-                        "title": "DDNS 地址变化",
-                        "name": domain,
-                        "oldValue": old_value,
-                        "newValue": address,
-                    }
-                )
-        else:
-            add_event(
-                {
-                    "type": event_type,
-                    "title": "Lucky Webhook",
-                    "name": name,
-                    "newValue": address or json.dumps(payload, ensure_ascii=False),
-                }
-            )
-
-        save_state(state)
+        a = resolve_records(domain, "A") if "A" in (item.get("record_types") or ["A", "AAAA"]) else []
+        aaaa = resolve_records(domain, "AAAA") if "AAAA" in (item.get("record_types") or ["A", "AAAA"]) else []
+        expect = item.get("expect")
+        expected_value = None
+        if expect == "nas_ipv6":
+            expected_value = nas_ipv6
+        elif expect == "nas_ipv4":
+            expected_value = nas_ipv4
+        elif expect == "router_ipv6":
+            expected_value = state.get("router", {}).get("exitIpv6")
+        elif expect == "router_ipv4":
+            expected_value = state.get("router", {}).get("exitIpv4")
+        matched = None
+        if expected_value:
+            matched = expected_value in a or expected_value in aaaa
+        ddns_list.append({
+            "name": item.get("name") or domain,
+            "domain": domain,
+            "a": a,
+            "aaaa": aaaa,
+            "expect": expect,
+            "expectedValue": expected_value,
+            "matched": matched,
+            "updatedAt": now_str(),
+        })
+    state["ddnsResolved"] = ddns_list
     return state
 
 
 @app.route("/health", methods=["GET"])
 def health():
-    return jsonify({"ok": True, "name": APP_NAME, "version": VERSION, "time": now_str()})
+    return jsonify({"ok": True, "name": "LabProbe Hub", "version": APP_VERSION, "time": now_str()})
 
 
-@app.route("/hook/lucky", methods=["GET", "POST"])
+@app.route("/hook/lucky", methods=["POST", "GET"])
 def hook_lucky():
-    hook_token = str(CONFIG.get("server", {}).get("hook_token", ""))
-    token = request.args.get("token") or request.headers.get("X-Hook-Token") or ""
-    if token != hook_token:
+    if not check_hook_token():
         return jsonify({"ok": False, "error": "bad hook token"}), 401
-
     if request.is_json:
         payload = request.get_json(silent=True) or {}
     else:
-        payload = dict(request.form)
-        if not payload:
-            payload = dict(request.args)
-            payload.pop("token", None)
+        payload = dict(request.form) or dict(request.args)
+    event_type = payload.get("type", "lucky_webhook")
+    address = payload.get("address") or payload.get("ipAddr") or payload.get("value")
+    name = payload.get("name", "Lucky")
+    state = load_json(STATE_FILE, {})
+    state["updatedAt"] = now_str()
+    if "stun" in event_type or "wireguard" in event_type:
+        old = state.get("stun", {}).get("publicAddress")
+        state["stun"] = {"publicAddress": address, "source": "Lucky Webhook", "updatedAt": now_str()}
+        state["wireguard"] = {"publicAddress": address, "source": "Lucky Webhook", "updatedAt": now_str()}
+        if address and address != old:
+            add_event({"type": event_type, "title": "STUN / WireGuard 地址变化", "name": name, "oldValue": old, "newValue": address})
+    elif "ddns" in event_type:
+        domain = payload.get("domain") or name
+        state.setdefault("ddns", {})
+        old = state.get("ddns", {}).get(domain, {}).get("address")
+        state["ddns"][domain] = {"domain": domain, "address": address, "source": "Lucky Webhook", "updatedAt": now_str()}
+        if address and address != old:
+            add_event({"type": event_type, "title": "DDNS 地址变化", "name": domain, "oldValue": old, "newValue": address})
+    else:
+        add_event({"type": event_type, "title": "Lucky Webhook", "name": name, "newValue": address or json.dumps(payload, ensure_ascii=False)})
+    save_json(STATE_FILE, state)
+    return jsonify({"ok": True, "received": payload, "time": now_str()})
 
-    state = update_state_from_hook(payload)
-    return jsonify({"ok": True, "received": payload, "data": state, "time": now_str()})
+
+@app.route("/hook/ruijie/devices", methods=["POST"])
+def hook_ruijie_devices():
+    if not check_hook_token():
+        return jsonify({"ok": False, "error": "bad hook token"}), 401
+    raw = request.get_data(as_text=True)
+    try:
+        payload = json.loads(raw)
+        online, total = parse_ruijie_devices(payload)
+    except Exception as e:
+        return jsonify({"ok": False, "error": f"parse failed: {e}"}), 400
+
+    watched = build_watched_devices(online)
+    devices_state = {
+        "source": "ruijie_push",
+        "updatedAt": now_str(),
+        "onlineDeviceCount": len(online),
+        "total": total,
+        "online": online,
+        "watched": watched,
+    }
+    save_json(DEVICES_FILE, devices_state)
+
+    state = load_json(STATE_FILE, {})
+    state.setdefault("router", {})
+    state["router"].update({
+        "name": cfg_get("router.name", "Ruijie"),
+        "mode": "push",
+        "onlineDeviceCount": len(online),
+        "total": total,
+        "devicesUpdatedAt": now_str(),
+    })
+    state["devices"] = watched
+    state["updatedAt"] = now_str()
+    save_json(STATE_FILE, state)
+
+    return jsonify({"ok": True, "message": "ruijie devices saved", "onlineDeviceCount": len(online), "watchedCount": len(watched), "time": now_str()})
 
 
 @app.route("/api/status", methods=["GET"])
 def api_status():
-    auth = require_auth()
-    if auth:
-        return auth
-    state = refresh_all()
-    return jsonify({"ok": True, "data": state})
-
-
-@app.route("/api/refresh", methods=["POST", "GET"])
-def api_refresh():
-    auth = require_auth()
-    if auth:
-        return auth
-    state = refresh_all()
+    if not check_app_token():
+        return jsonify({"ok": False, "error": "unauthorized"}), 401
+    state = load_json(STATE_FILE, {})
+    state = refresh_ddns_and_exit(state)
+    state["hub"] = {"name": "LabProbe Hub", "version": APP_VERSION, "updatedAt": now_str()}
+    state["updatedAt"] = now_str()
+    save_json(STATE_FILE, state)
     return jsonify({"ok": True, "data": state})
 
 
 @app.route("/api/devices", methods=["GET"])
 def api_devices():
-    auth = require_auth()
-    if auth:
-        return auth
-    with state_lock:
-        state = load_state()
-        state = refresh_watched_devices(state)
-        save_state(state)
-    return jsonify({"ok": True, "devices": state.get("devices", [])})
+    if not check_app_token():
+        return jsonify({"ok": False, "error": "unauthorized"}), 401
+    devices = load_json(DEVICES_FILE, {"online": [], "watched": [], "updatedAt": None})
+    view = request.args.get("view", "watched")
+    return jsonify({"ok": True, "updatedAt": devices.get("updatedAt"), "devices": devices.get(view if view in ["online", "watched"] else "watched", []), "onlineDeviceCount": devices.get("onlineDeviceCount", 0)})
 
 
 @app.route("/api/events", methods=["GET"])
 def api_events():
-    auth = require_auth()
-    if auth:
-        return auth
+    if not check_app_token():
+        return jsonify({"ok": False, "error": "unauthorized"}), 401
     after = int(request.args.get("after", "0"))
-    limit = min(int(request.args.get("limit", "100")), 500)
     events = load_json(EVENTS_FILE, [])
-    result = [e for e in events if int(e.get("id", 0)) > after]
-    return jsonify({"ok": True, "events": result[-limit:]})
+    return jsonify({"ok": True, "events": [e for e in events if int(e.get("id", 0)) > after]})
 
 
 @app.route("/api/daily/latest", methods=["GET"])
-def api_daily_latest():
-    auth = require_auth()
-    if auth:
-        return auth
+def api_daily():
+    if not check_app_token():
+        return jsonify({"ok": False, "error": "unauthorized"}), 401
     events = load_json(EVENTS_FILE, [])
-    since = datetime.now() - timedelta(days=1)
-    recent = []
-    for e in events:
-        dt = parse_dt(e.get("createdAt", ""))
-        if dt and dt >= since:
-            recent.append(e)
-
+    today = today_str()
+    today_events = [e for e in events if str(e.get("createdAt", "")).startswith(today)]
     summary = {
-        "date": datetime.now().strftime("%Y-%m-%d"),
-        "totalEvents": len(recent),
-        "terminalChanges": len([e for e in recent if "device" in e.get("type", "")]),
-        "stunChanges": len([e for e in recent if "stun" in e.get("type", "")]),
-        "ddnsChanges": len([e for e in recent if "ddns" in e.get("type", "")]),
-        "text": f"近24小时共有 {len(recent)} 条事件，终端变化 {len([e for e in recent if 'device' in e.get('type', '')])} 次，STUN变化 {len([e for e in recent if 'stun' in e.get('type', '')])} 次，DDNS变化 {len([e for e in recent if 'ddns' in e.get('type', '')])} 次。",
+        "date": today,
+        "eventCount": len(today_events),
+        "terminalChanges": len([e for e in today_events if str(e.get("type", "")).startswith("device_")]),
+        "stunChanges": len([e for e in today_events if "stun" in str(e.get("type", ""))]),
+        "ddnsChanges": len([e for e in today_events if "ddns" in str(e.get("type", ""))]),
+        "text": f"今日事件 {len(today_events)} 条，终端变化 {len([e for e in today_events if str(e.get('type','')).startswith('device_')])} 次。",
     }
+    save_json(DAILY_FILE, summary)
     return jsonify({"ok": True, "daily": summary})
 
 
-@app.route("/api/config/redacted", methods=["GET"])
-def api_config_redacted():
-    auth = require_auth()
-    if auth:
-        return auth
-    cfg = deepcopy(CONFIG)
-    if "server" in cfg:
-        cfg["server"]["app_token"] = "***"
-        cfg["server"]["hook_token"] = "***"
-    if "router" in cfg and "headers" in cfg["router"]:
-        cfg["router"]["headers"] = {k: "***" for k in cfg["router"].get("headers", {})}
-    return jsonify({"ok": True, "config": cfg})
-
-
-def polling_worker():
-    while True:
-        polling = CONFIG.get("polling", {}) or {}
-        interval = max(30, int(polling.get("interval_seconds", 60)))
-        try:
-            if polling.get("enabled"):
-                print("[INFO] polling refresh", flush=True)
-                refresh_all()
-        except Exception as e:
-            print(f"[WARN] polling failed: {e}", flush=True)
-        time.sleep(interval)
-
-
 if __name__ == "__main__":
-    print(f"[INFO] {APP_NAME} v{VERSION} starting on :{PORT}", flush=True)
-    print(f"[INFO] config path: {CONFIG_PATH}", flush=True)
-    print(f"[INFO] data dir: {DATA_DIR}", flush=True)
-    t = threading.Thread(target=polling_worker, daemon=True)
-    t.start()
+    print(f"[LabProbe] Hub v{APP_VERSION} starting on 0.0.0.0:{PORT}", flush=True)
+    print(f"[LabProbe] config={CONFIG_PATH}, data={DATA_DIR}", flush=True)
     app.run(host="0.0.0.0", port=PORT)
