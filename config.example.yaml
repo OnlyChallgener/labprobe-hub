@@ -1,0 +1,59 @@
+# LabProbe Hub 示例配置
+# 复制为 config.yaml 后按你的环境修改。
+
+home:
+  name: "Home Network"
+
+server:
+  # 生产环境建议在 docker-compose.yml 里通过环境变量配置 APP_TOKEN / HOOK_TOKEN
+  app_token: "change-app-token"
+  hook_token: "change-hook-token"
+
+# 你的域名，可用于 DDNS 匹配检测
+ddns:
+  - name: "NAS / Lucky"
+    domain: "net86.dynv6.net"
+    # 可选值：nas_ipv4 / nas_ipv6 / router_ipv4 / router_ipv6 / stun / wireguard
+    expect: "nas_ipv6"
+    record_types: ["A", "AAAA"]
+
+# 路由器终端 API，可先留空。
+router:
+  enabled: false
+  name: "Ruijie Router"
+  api_url: "http://192.168.5.1/your-device-list-api"
+  method: "GET"
+  headers:
+    # Authorization: "Bearer your-token"
+    # Cookie: "your-cookie"
+  timeout_seconds: 5
+
+  # 下面是通用 JSON 解析配置。拿到你的锐捷 API 返回示例后再调整。
+  # items_path 指向终端列表数组。
+  # 例如返回 {"data":{"list":[...]}}，就写 data.list
+  schema:
+    items_path: "data.list"
+    mac_fields: ["mac", "macAddr", "macAddress"]
+    name_fields: ["name", "hostName", "hostname", "deviceName"]
+    ip_fields: ["ip", "ipv4", "ipAddr"]
+    ipv6_fields: ["ipv6", "ipv6Addr"]
+    online_fields: ["online", "isOnline", "status"]
+    online_values: [true, 1, "1", "online", "ONLINE", "on", "connected"]
+
+# 只关注这些终端。MAC 不区分大小写，冒号/横线都会自动归一。
+watched_devices:
+  - name: "小米 14 Pro"
+    mac: "AA:BB:CC:DD:EE:FF"
+  - name: "Mate60"
+    mac: "11:22:33:44:55:66"
+
+# 可选：Hub 后台轮询路由器 API，记录终端上下线历史。
+# 你目前只要手动刷新，可以保持 false。
+polling:
+  enabled: false
+  interval_seconds: 60
+
+# 可选：外部出口 IP 检测地址
+exit_ip:
+  ipv4_url: "https://api64.ipify.org"
+  ipv6_url: "https://api64.ipify.org"
