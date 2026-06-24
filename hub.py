@@ -2,6 +2,8 @@ import os
 import json
 import socket
 import subprocess
+import ipaddress
+import re
 from datetime import datetime, date
 from pathlib import Path
 from typing import Any, Dict, List, Optional, Tuple
@@ -11,7 +13,7 @@ import requests
 import dns.resolver
 from flask import Flask, request, jsonify
 
-APP_VERSION = "0.3.0"
+APP_VERSION = "0.5.0"
 PORT = int(os.environ.get("PORT", "58443"))
 CONFIG_PATH = Path(os.environ.get("CONFIG_PATH", "/app/config/config.yaml"))
 DATA_DIR = Path(os.environ.get("DATA_DIR", "/app/data"))
@@ -132,6 +134,56 @@ def human_bytes(v: Any) -> str:
     return str(n)
 
 
+
+def human_duration(seconds: Any) -> str:
+    sec = to_int(seconds, 0)
+    if sec <= 0:
+        return ""
+    h = sec // 3600
+    m = (sec % 3600) // 60
+    if h > 0:
+        return f"{h}时{m}分"
+    return f"{m}分"
+
+
+def is_public_ipv6(addr: str) -> bool:
+    try:
+        ip = ipaddress.ip_address(addr.split("/")[0].strip())
+        return ip.version == 6 and ip.is_global and not ip.is_link_local and not ip.is_multicast and not ip.is_loopback
+    except Exception:
+        return False
+
+
+def extract_public_ipv6(text: str) -> Optional[str]:
+    # 优先从 `inet6 xxxx/64 scope global` 中提取，过滤 fe80/fd/fc/ff 等非公网地址。
+    candidates: List[Tuple[int, str]] = []
+    for line in text.splitlines():
+        if "inet6" not in line:
+            continue
+        m = re.search(r"inet6\s+([0-9a-fA-F:]+)(?:/\d+)?", line)
+        if not m:
+            continue
+        addr = m.group(1)
+        if not is_public_ipv6(addr):
+            continue
+        score = 0
+        low = line.lower()
+        if "scope global" in low:
+            score += 10
+        if "temporary" in low:
+            score -= 3
+        if "deprecated" in low:
+            score -= 5
+        candidates.append((score, addr))
+    if candidates:
+        candidates.sort(key=lambda x: x[0], reverse=True)
+        return candidates[0][1]
+    # 兜底：从任意文本里找公网 v6。
+    for token in re.findall(r"[0-9a-fA-F:]{3,}", text):
+        if ":" in token and is_public_ipv6(token):
+            return token
+    return None
+
 def parse_ruijie_devices(payload: Any) -> Tuple[List[Dict[str, Any]], int]:
     if isinstance(payload, str):
         payload = json.loads(payload)
@@ -155,7 +207,10 @@ def parse_ruijie_devices(payload: Any) -> Tuple[List[Dict[str, Any]], int]:
             "rxrate": item.get("rxrate"),
             "channel": item.get("channel"),
             "onlinetime": item.get("onlinetime"),
+            "onlineSince": item.get("onlinetime"),
             "activeTimeSec": to_int(item.get("activeTime"), 0),
+            "onlineDurationText": human_duration(item.get("activeTime")),
+            "lastSeenAt": now_str(),
             "hostName": item.get("hostName"),
             "manufacture": item.get("manufacture"),
             "osType": item.get("osType"),
@@ -176,41 +231,67 @@ def parse_ruijie_devices(payload: Any) -> Tuple[List[Dict[str, Any]], int]:
 def build_watched_devices(online_devices: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
     watched = cfg_get("watched_devices", []) or []
     by_mac = {norm_mac(d.get("mac")): d for d in online_devices}
-    result = []
-    previous = load_json(DEVICES_FILE, {}).get("watched", [])
+    result: List[Dict[str, Any]] = []
+    previous_state = load_json(DEVICES_FILE, {})
+    previous = previous_state.get("watched", [])
     previous_by_mac = {norm_mac(d.get("mac")): d for d in previous}
+    now = now_str()
+
     for w in watched:
         wmac = norm_mac(w.get("mac"))
         old = previous_by_mac.get(wmac, {})
         match = by_mac.get(wmac)
+        old_online = old.get("online")
+
         if match:
             dev = dict(match)
             dev.update({
                 "name": w.get("name") or match.get("name"),
                 "online": True,
-                "lastChangedAt": old.get("lastChangedAt") or now_str(),
+                "lastSeenAt": now,
+                "offlineAt": None,
+                "onlineSince": match.get("onlineSince") or old.get("onlineSince") or now,
+                "onlineDurationText": match.get("onlineDurationText") or human_duration(match.get("activeTimeSec")),
+                "lastChangedAt": old.get("lastChangedAt") or now,
             })
+            if old_online is not None and old_online is False:
+                dev["lastChangedAt"] = now
+                add_event({
+                    "type": "device_online",
+                    "title": f"{dev.get('name')} 上线",
+                    "name": dev.get("name"),
+                    "mac": wmac,
+                    "oldValue": "offline",
+                    "newValue": "online",
+                })
         else:
+            was_online = bool(old.get("online")) if old_online is not None else False
+            offline_at = now if was_online else old.get("offlineAt")
             dev = {
                 "name": w.get("name") or old.get("name") or wmac,
                 "mac": wmac,
                 "online": False,
                 "ip": None,
                 "lastIp": old.get("ip") or old.get("lastIp"),
-                "lastChangedAt": old.get("lastChangedAt") or now_str(),
+                "ssid": old.get("ssid"),
+                "band": old.get("band"),
+                "rssi": old.get("rssi"),
+                "rxrate": old.get("rxrate"),
+                "onlineSince": old.get("onlineSince"),
+                "onlineDurationText": old.get("onlineDurationText"),
+                "lastSeenAt": old.get("lastSeenAt"),
+                "offlineAt": offline_at,
+                "lastChangedAt": now if was_online else old.get("lastChangedAt") or now,
             }
-        # If status changed, update lastChangedAt and create event.
-        old_online = old.get("online")
-        if old_online is not None and old_online != dev.get("online"):
-            dev["lastChangedAt"] = now_str()
-            add_event({
-                "type": "device_online" if dev.get("online") else "device_offline",
-                "title": f"{dev.get('name')} {'上线' if dev.get('online') else '离线'}",
-                "name": dev.get("name"),
-                "mac": wmac,
-                "oldValue": "online" if old_online else "offline",
-                "newValue": "online" if dev.get("online") else "offline",
-            })
+            if was_online:
+                add_event({
+                    "type": "device_offline",
+                    "title": f"{dev.get('name')} 离线",
+                    "name": dev.get("name"),
+                    "mac": wmac,
+                    "oldValue": "online",
+                    "newValue": "offline",
+                })
         result.append(dev)
     return result
 
@@ -253,10 +334,10 @@ def refresh_ddns_and_exit(state: Dict[str, Any]) -> Dict[str, Any]:
     nas_ipv6 = get_exit_ip(True)
     state.setdefault("nas", {})
     state["nas"].update({"exitIpv4": nas_ipv4, "exitIpv6": nas_ipv6, "updatedAt": now_str()})
-    # 路由器 IPv6 暂不采集，避免用 NAS 地址误填。
+    # 路由器 WAN IPv6 由 /hook/ruijie/router 推送；这里不再用 NAS 地址误填。
     state.setdefault("router", {})
     state["router"].setdefault("exitIpv4", None)
-    state["router"].setdefault("exitIpv6", None)
+    state["router"].setdefault("exitIpv6", state["router"].get("wanIpv6"))
 
     ddns_cfg = cfg_get("ddns", []) or []
     ddns_list = []
@@ -371,6 +452,51 @@ def hook_ruijie_devices():
     save_json(STATE_FILE, state)
 
     return jsonify({"ok": True, "message": "ruijie devices saved", "onlineDeviceCount": len(online), "watchedCount": len(watched), "time": now_str()})
+
+
+
+@app.route("/hook/ruijie/router", methods=["POST", "GET"])
+def hook_ruijie_router():
+    if not check_hook_token():
+        return jsonify({"ok": False, "error": "bad hook token"}), 401
+
+    payload: Dict[str, Any] = {}
+    raw = request.get_data(as_text=True) or ""
+    if request.is_json:
+        payload = request.get_json(silent=True) or {}
+    elif request.args:
+        payload = dict(request.args)
+
+    wan_if = payload.get("wanIf") or payload.get("interface") or "pppoe-wan"
+    wan_v6 = payload.get("routerWanIpv6") or payload.get("wanIpv6") or payload.get("ipv6")
+    if not wan_v6:
+        wan_v6 = extract_public_ipv6(raw or json.dumps(payload, ensure_ascii=False))
+
+    if wan_v6 and not is_public_ipv6(str(wan_v6)):
+        return jsonify({"ok": False, "error": "no public ipv6", "value": wan_v6}), 400
+
+    state = load_json(STATE_FILE, {})
+    state.setdefault("router", {})
+    old = state["router"].get("wanIpv6")
+    if wan_v6:
+        state["router"].update({
+            "name": cfg_get("router.name", "Ruijie"),
+            "wanIf": wan_if,
+            "wanIpv6": wan_v6,
+            "exitIpv6": wan_v6,
+            "routerUpdatedAt": now_str(),
+        })
+        state["updatedAt"] = now_str()
+        save_json(STATE_FILE, state)
+        if old and old != wan_v6:
+            add_event({
+                "type": "router_wan_ipv6_changed",
+                "title": "路由 WAN IPv6 变化",
+                "name": wan_if,
+                "oldValue": old,
+                "newValue": wan_v6,
+            })
+    return jsonify({"ok": True, "message": "router status saved", "wanIpv6": wan_v6, "wanIf": wan_if, "time": now_str()})
 
 
 @app.route("/api/status", methods=["GET"])
