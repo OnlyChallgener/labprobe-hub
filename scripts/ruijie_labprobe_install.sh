@@ -29,15 +29,16 @@ EOF
 cat > /etc/labprobe/push_router_wan6.sh <<EOF
 #!/bin/sh
 WAN_IF="$WAN_IF"
-WAN6="\$(ip -6 -o addr show dev "\$WAN_IF" scope global 2>/dev/null | awk '\$0 !~ /deprecated/ && \$0 !~ /temporary/ {print \$4}' | cut -d/ -f1 | grep -v '^fe80:' | grep -v '^fd' | grep -v '^fc' | grep -v '^ff' | head -n1)"
+OUT="\$(ip -6 -o addr show dev "\$WAN_IF" scope global 2>/dev/null)"
+WAN6="\$(printf '%s\n' "\$OUT" | awk '\$0 !~ /deprecated/ && \$0 !~ /temporary/ {print \$4}' | cut -d/ -f1 | grep -Ev '^(fe80:|fd|fc|ff|::1)' | head -n1)"
 if [ -z "\$WAN6" ]; then
-  WAN6="\$(ip -6 -o addr show dev "\$WAN_IF" scope global 2>/dev/null | awk '{print \$4}' | cut -d/ -f1 | grep -v '^fe80:' | grep -v '^fd' | grep -v '^fc' | grep -v '^ff' | head -n1)"
+  WAN6="\$(printf '%s\n' "\$OUT" | awk '{print \$4}' | cut -d/ -f1 | grep -Ev '^(fe80:|fd|fc|ff|::1)' | head -n1)"
 fi
-if [ -z "\$WAN6" ]; then
-  echo "[LabProbe] no public IPv6 found on \$WAN_IF"
-  exit 1
+if [ -n "\$WAN6" ]; then
+  curl -sS -m 8 -X POST "$HUB_BASE/hook/ruijie/router?token=$HOOK_TOKEN" -H "Content-Type:application/json" -d "{\"wanIf\":\"\$WAN_IF\",\"routerWanIpv6\":\"\$WAN6\",\"status\":\"ok\"}"
+else
+  curl -sS -m 8 -X POST "$HUB_BASE/hook/ruijie/router?token=$HOOK_TOKEN" -H "Content-Type:application/json" -d "{\"wanIf\":\"\$WAN_IF\",\"status\":\"check_failed\",\"message\":\"no public IPv6 found\"}"
 fi
-curl -sS -m 8 -X POST "$HUB_BASE/hook/ruijie/router?token=$HOOK_TOKEN&wanIf=\$WAN_IF&routerWanIpv6=\$WAN6"
 echo
 EOF
 

@@ -13,7 +13,7 @@ import requests
 import dns.resolver
 from flask import Flask, request, jsonify
 
-APP_VERSION = "0.5.0"
+APP_VERSION = "0.6.0"
 PORT = int(os.environ.get("PORT", "58443"))
 CONFIG_PATH = Path(os.environ.get("CONFIG_PATH", "/app/config/config.yaml"))
 DATA_DIR = Path(os.environ.get("DATA_DIR", "/app/data"))
@@ -23,6 +23,7 @@ EVENTS_FILE = DATA_DIR / "events.json"
 STATE_FILE = DATA_DIR / "state.json"
 DEVICES_FILE = DATA_DIR / "devices.json"
 DAILY_FILE = DATA_DIR / "daily.json"
+GEO_CACHE_FILE = DATA_DIR / "geo_cache.json"
 
 app = Flask(__name__)
 
@@ -183,6 +184,105 @@ def extract_public_ipv6(text: str) -> Optional[str]:
         if ":" in token and is_public_ipv6(token):
             return token
     return None
+
+
+
+def normalize_ip(ip: str) -> Optional[ipaddress._BaseAddress]:
+    try:
+        return ipaddress.ip_address(str(ip).split("/")[0].strip())
+    except Exception:
+        return None
+
+
+def local_geo_match(ip: str) -> Optional[Dict[str, Any]]:
+    addr = normalize_ip(ip)
+    if not addr:
+        return None
+    for item in (cfg_get("geo.local_prefixes", []) or []):
+        try:
+            net = ipaddress.ip_network(str(item.get("prefix")), strict=False)
+            if addr in net:
+                return {
+                    "localLabel": item.get("label") or item.get("name") or "本地标记",
+                    "operator": item.get("operator") or item.get("isp") or "",
+                    "location": item.get("location") or "",
+                    "source": "local_prefix",
+                    "confidence": "本地标记最高",
+                }
+        except Exception:
+            continue
+    return None
+
+
+def operator_from_text(asn: Any = None, org: str = "") -> str:
+    org_l = str(org or "").lower()
+    asn_s = str(asn or "")
+    if any(k in org_l for k in ["unicom", "联通", "china169"]) or asn_s in {"4837", "9929", "10099", "136958"}:
+        return "中国联通"
+    if any(k in org_l for k in ["telecom", "chinanet", "电信"]) or asn_s in {"4134", "4812", "58466", "4809"}:
+        return "中国电信"
+    if any(k in org_l for k in ["mobile", "cmcc", "移动"]) or asn_s in {"9808", "56040", "56046", "56048", "24400"}:
+        return "中国移动"
+    if "cernet" in org_l or "教育" in org_l:
+        return "教育网"
+    return str(org or "")
+
+
+def lookup_geo(ip: str) -> Dict[str, Any]:
+    # 三层策略：本地前缀 > Hub缓存/公网Geo > ASN/运营商兜底。城市仅作为参考。
+    cache = load_json(GEO_CACHE_FILE, {})
+    cached = cache.get(ip)
+    if cached and cached.get("cachedAt"):
+        return cached
+
+    local = local_geo_match(ip)
+    if local:
+        result = {
+            "ip": ip,
+            "localLabel": local.get("localLabel", ""),
+            "operator": local.get("operator", ""),
+            "geoText": local.get("location", ""),
+            "source": local.get("source", "local_prefix"),
+            "confidence": local.get("confidence", "本地标记最高"),
+            "note": "命中 config.yaml 的 geo.local_prefixes，优先级高于公网 Geo。",
+            "cachedAt": now_str(),
+        }
+        cache[ip] = result
+        save_json(GEO_CACHE_FILE, cache)
+        return result
+
+    geo_text = ""
+    operator = ""
+    asn = ""
+    source = "ipwho.is"
+    try:
+        r = requests.get(f"https://ipwho.is/{ip}", timeout=4)
+        data = r.json()
+        if data.get("success"):
+            conn = data.get("connection") or {}
+            asn = str(conn.get("asn") or "")
+            org = conn.get("org") or data.get("org") or ""
+            operator = operator_from_text(asn, org)
+            parts = [data.get("country"), data.get("region"), data.get("city")]
+            geo_text = " ".join([str(x) for x in parts if x])
+    except Exception:
+        pass
+
+    result = {
+        "ip": ip,
+        "localLabel": "",
+        "operator": operator,
+        "asn": asn,
+        "geoText": geo_text,
+        "source": source,
+        "confidence": "运营商较可信，城市仅供参考" if operator else "公网Geo参考",
+        "note": "家宽/IPv6 城市级 Geo 可能漂移；建议为自家前缀配置本地标记。",
+        "cachedAt": now_str(),
+    }
+    cache[ip] = result
+    cache = dict(list(cache.items())[-1000:])
+    save_json(GEO_CACHE_FILE, cache)
+    return result
 
 def parse_ruijie_devices(payload: Any) -> Tuple[List[Dict[str, Any]], int]:
     if isinstance(payload, str):
@@ -472,19 +572,19 @@ def hook_ruijie_router():
     if not wan_v6:
         wan_v6 = extract_public_ipv6(raw or json.dumps(payload, ensure_ascii=False))
 
-    if wan_v6 and not is_public_ipv6(str(wan_v6)):
-        return jsonify({"ok": False, "error": "no public ipv6", "value": wan_v6}), 400
-
     state = load_json(STATE_FILE, {})
     state.setdefault("router", {})
     old = state["router"].get("wanIpv6")
-    if wan_v6:
+    state["router"]["wanIf"] = wan_if
+    state["router"]["routerLastCheckAt"] = now_str()
+
+    if wan_v6 and is_public_ipv6(str(wan_v6)):
         state["router"].update({
             "name": cfg_get("router.name", "Ruijie"),
-            "wanIf": wan_if,
             "wanIpv6": wan_v6,
             "exitIpv6": wan_v6,
             "routerUpdatedAt": now_str(),
+            "routerStatus": "ok",
         })
         state["updatedAt"] = now_str()
         save_json(STATE_FILE, state)
@@ -496,7 +596,14 @@ def hook_ruijie_router():
                 "oldValue": old,
                 "newValue": wan_v6,
             })
-    return jsonify({"ok": True, "message": "router status saved", "wanIpv6": wan_v6, "wanIf": wan_if, "time": now_str()})
+        return jsonify({"ok": True, "message": "router status saved", "wanIpv6": wan_v6, "wanIf": wan_if, "time": now_str()})
+
+    # 空值或非公网地址不覆盖旧值，避免 APP 首页忽隐忽现。
+    state["router"]["routerStatus"] = "check_failed"
+    state["router"]["routerLastError"] = "no public IPv6 found" if not wan_v6 else f"not public IPv6: {wan_v6}"
+    state["updatedAt"] = now_str()
+    save_json(STATE_FILE, state)
+    return jsonify({"ok": True, "message": "router check failed, keep previous value", "wanIpv6": old, "wanIf": wan_if, "time": now_str(), "status": "stale"})
 
 
 @app.route("/api/status", methods=["GET"])
@@ -527,6 +634,17 @@ def api_events():
     after = int(request.args.get("after", "0"))
     events = load_json(EVENTS_FILE, [])
     return jsonify({"ok": True, "events": [e for e in events if int(e.get("id", 0)) > after]})
+
+
+
+@app.route("/api/geo", methods=["GET"])
+def api_geo():
+    if not check_app_token():
+        return jsonify({"ok": False, "error": "unauthorized"}), 401
+    ip = request.args.get("ip", "").strip()
+    if not ip:
+        return jsonify({"ok": False, "error": "missing ip"}), 400
+    return jsonify({"ok": True, "geo": lookup_geo(ip)})
 
 
 @app.route("/api/daily/latest", methods=["GET"])

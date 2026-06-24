@@ -32,3 +32,12 @@ polling:
 exit_ip:
   ipv4_url: "https://api64.ipify.org"
   ipv6_url: "https://api64.ipify.org"
+
+# Geo 识别优先级：本地前缀标记 > 运营商/ASN > 公网 Geo 参考。
+# 把你家里的 IPv6 前缀写进去后，DNS 页面会优先显示“家里 · 湖南衡阳 · 联通”，比公网 Geo 准。
+geo:
+  local_prefixes:
+    - prefix: "2408:8252:3200:9231::/64"
+      label: "家里路由前缀"
+      location: "湖南衡阳"
+      operator: "中国联通"
