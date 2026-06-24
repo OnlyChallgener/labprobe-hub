@@ -13,7 +13,7 @@ import requests
 import dns.resolver
 from flask import Flask, request, jsonify
 
-APP_VERSION = "0.6.0"
+APP_VERSION = "0.6.2"
 PORT = int(os.environ.get("PORT", "58443"))
 CONFIG_PATH = Path(os.environ.get("CONFIG_PATH", "/app/config/config.yaml"))
 DATA_DIR = Path(os.environ.get("DATA_DIR", "/app/data"))
@@ -205,7 +205,6 @@ def local_geo_match(ip: str) -> Optional[Dict[str, Any]]:
                 return {
                     "localLabel": item.get("label") or item.get("name") or "本地标记",
                     "operator": item.get("operator") or item.get("isp") or "",
-                    "location": item.get("location") or "",
                     "source": "local_prefix",
                     "confidence": "本地标记最高",
                 }
@@ -229,10 +228,13 @@ def operator_from_text(asn: Any = None, org: str = "") -> str:
 
 
 def lookup_geo(ip: str) -> Dict[str, Any]:
-    # 三层策略：本地前缀 > Hub缓存/公网Geo > ASN/运营商兜底。城市仅作为参考。
+    # v0.6.1：只返回本地标记、运营商与 ASN，不再返回城市 Geo，避免家宽/IPv6 城市漂移误导。
     cache = load_json(GEO_CACHE_FILE, {})
     cached = cache.get(ip)
     if cached and cached.get("cachedAt"):
+        # 兼容旧缓存：去掉城市字段。
+        cached.pop("geoText", None)
+        cached.pop("location", None)
         return cached
 
     local = local_geo_match(ip)
@@ -241,20 +243,19 @@ def lookup_geo(ip: str) -> Dict[str, Any]:
             "ip": ip,
             "localLabel": local.get("localLabel", ""),
             "operator": local.get("operator", ""),
-            "geoText": local.get("location", ""),
+            "asn": "",
             "source": local.get("source", "local_prefix"),
-            "confidence": local.get("confidence", "本地标记最高"),
-            "note": "命中 config.yaml 的 geo.local_prefixes，优先级高于公网 Geo。",
+            "confidence": "本地标记最高",
+            "note": "命中 config.yaml 的 geo.local_prefixes；仅显示运营商/本地标记，不显示城市 Geo。",
             "cachedAt": now_str(),
         }
         cache[ip] = result
         save_json(GEO_CACHE_FILE, cache)
         return result
 
-    geo_text = ""
     operator = ""
     asn = ""
-    source = "ipwho.is"
+    source = "ipwho.is_connection"
     try:
         r = requests.get(f"https://ipwho.is/{ip}", timeout=4)
         data = r.json()
@@ -263,8 +264,6 @@ def lookup_geo(ip: str) -> Dict[str, Any]:
             asn = str(conn.get("asn") or "")
             org = conn.get("org") or data.get("org") or ""
             operator = operator_from_text(asn, org)
-            parts = [data.get("country"), data.get("region"), data.get("city")]
-            geo_text = " ".join([str(x) for x in parts if x])
     except Exception:
         pass
 
@@ -273,10 +272,9 @@ def lookup_geo(ip: str) -> Dict[str, Any]:
         "localLabel": "",
         "operator": operator,
         "asn": asn,
-        "geoText": geo_text,
         "source": source,
-        "confidence": "运营商较可信，城市仅供参考" if operator else "公网Geo参考",
-        "note": "家宽/IPv6 城市级 Geo 可能漂移；建议为自家前缀配置本地标记。",
+        "confidence": "运营商识别" if operator else "运营商未知",
+        "note": "已移除城市 Geo，仅返回运营商/ASN，避免城市漂移误导。",
         "cachedAt": now_str(),
     }
     cache[ip] = result
@@ -363,6 +361,11 @@ def build_watched_devices(online_devices: List[Dict[str, Any]]) -> List[Dict[str
                     "mac": wmac,
                     "oldValue": "offline",
                     "newValue": "online",
+                    "ip": dev.get("ip"),
+                    "rssi": dev.get("rssi"),
+                    "band": dev.get("band"),
+                    "rxrate": dev.get("rxrate"),
+                    "onlineDurationText": "0分",
                 })
         else:
             was_online = bool(old.get("online")) if old_online is not None else False
@@ -391,6 +394,11 @@ def build_watched_devices(online_devices: List[Dict[str, Any]]) -> List[Dict[str
                     "mac": wmac,
                     "oldValue": "online",
                     "newValue": "offline",
+                    "ip": old.get("ip") or old.get("lastIp"),
+                    "rssi": old.get("rssi"),
+                    "band": old.get("band"),
+                    "rxrate": old.get("rxrate"),
+                    "onlineDurationText": old.get("onlineDurationText") or "",
                 })
         result.append(dev)
     return result
@@ -496,11 +504,17 @@ def hook_lucky():
     state = load_json(STATE_FILE, {})
     state["updatedAt"] = now_str()
     if "stun" in event_type or "wireguard" in event_type:
-        old = state.get("stun", {}).get("publicAddress")
-        state["stun"] = {"publicAddress": address, "source": "Lucky Webhook", "updatedAt": now_str()}
-        state["wireguard"] = {"publicAddress": address, "source": "Lucky Webhook", "updatedAt": now_str()}
+        service = str(payload.get("service") or payload.get("name") or "stun").lower().replace(" ", "_")
+        state.setdefault("vpn", {})
+        old = state.get("vpn", {}).get(service, {}).get("address") or state.get("stun", {}).get("publicAddress")
+        if address:
+            state["vpn"][service] = {"address": address, "stun": address, "source": "Lucky Webhook", "updatedAt": now_str()}
+            # 兼容旧 APP 字段
+            state["stun"] = {"publicAddress": address, "source": "Lucky Webhook", "updatedAt": now_str()}
+            if "wireguard" in service or "wg" in service:
+                state["wireguard"] = {"publicAddress": address, "source": "Lucky Webhook", "updatedAt": now_str()}
         if address and address != old:
-            add_event({"type": event_type, "title": "STUN / WireGuard 地址变化", "name": name, "oldValue": old, "newValue": address})
+            add_event({"type": event_type, "title": f"{service} STUN 地址变化", "name": service, "oldValue": old, "newValue": address})
     elif "ddns" in event_type:
         domain = payload.get("domain") or name
         state.setdefault("ddns", {})
@@ -633,8 +647,23 @@ def api_events():
         return jsonify({"ok": False, "error": "unauthorized"}), 401
     after = int(request.args.get("after", "0"))
     events = load_json(EVENTS_FILE, [])
-    return jsonify({"ok": True, "events": [e for e in events if int(e.get("id", 0)) > after]})
+    return jsonify({"ok": True, "events": [e for e in events if int(e.get("id", 0)) > after and not e.get("deleted")]})
 
+
+@app.route("/api/events/<int:event_id>", methods=["DELETE"])
+def api_delete_event(event_id: int):
+    if not check_app_token():
+        return jsonify({"ok": False, "error": "unauthorized"}), 401
+    events = load_json(EVENTS_FILE, [])
+    changed = False
+    for e in events:
+        if int(e.get("id", 0)) == event_id:
+            e["deleted"] = True
+            e["deletedAt"] = now_str()
+            changed = True
+            break
+    save_json(EVENTS_FILE, events)
+    return jsonify({"ok": True, "deleted": changed, "id": event_id})
 
 
 @app.route("/api/geo", methods=["GET"])
@@ -647,23 +676,73 @@ def api_geo():
     return jsonify({"ok": True, "geo": lookup_geo(ip)})
 
 
+
+def aggregate_daily(day: str) -> Dict[str, Any]:
+    events = [e for e in load_json(EVENTS_FILE, []) if not e.get("deleted") and str(e.get("createdAt", "")).startswith(day)]
+    devices: Dict[str, Dict[str, Any]] = {}
+    vpn_items: List[Dict[str, Any]] = []
+    network_items: List[Dict[str, Any]] = []
+    ddns_items: List[Dict[str, Any]] = []
+    for e in events:
+        typ = str(e.get("type", ""))
+        name = str(e.get("name") or e.get("title") or "未知")
+        if typ.startswith("device_"):
+            d = devices.setdefault(name, {"name": name, "online": 0, "offline": 0, "onlineDurationText": e.get("onlineDurationText", "")})
+            if "online" in typ:
+                d["online"] += 1
+            if "offline" in typ:
+                d["offline"] += 1
+                if e.get("onlineDurationText"):
+                    d["onlineDurationText"] = e.get("onlineDurationText")
+        elif "stun" in typ or "wireguard" in typ or "vpn" in typ:
+            vpn_items.append({"time": str(e.get("createdAt", ""))[11:16], "text": f"{e.get('title') or name} · {e.get('newValue','')}"})
+        elif "router" in typ or "wan" in typ or "nas" in typ:
+            network_items.append({"time": str(e.get("createdAt", ""))[11:16], "text": f"{e.get('title') or name}"})
+        elif "ddns" in typ:
+            ddns_items.append({"time": str(e.get("createdAt", ""))[11:16], "text": f"{e.get('title') or name}"})
+    device_list = []
+    for d in devices.values():
+        dur = f"，在线时长 {d['onlineDurationText']}" if d.get("onlineDurationText") else ""
+        device_list.append({"text": f"{d['name']}：上线 {d['online']} 次，下线 {d['offline']} 次{dur}"})
+    summary = {
+        "deviceChanges": sum(1 for e in events if str(e.get("type", "")).startswith("device_")),
+        "vpnChanges": len(vpn_items),
+        "networkChanges": len(network_items),
+        "ddnsChanges": len(ddns_items),
+        "eventCount": len(events),
+    }
+    sections = {"devices": device_list, "vpn": vpn_items, "network": network_items, "ddns": ddns_items}
+    sections = {k: v for k, v in sections.items() if v}
+    note = "今日暂无异常记录。" if not ddns_items else "今日存在 DDNS 相关变化，请按需检查。"
+    return {"date": day, "summary": summary, "sections": sections, "note": note}
+
+
+def recent_dates(days: int = 7) -> List[str]:
+    from datetime import timedelta
+    today = date.today()
+    return [(today - timedelta(days=i)).isoformat() for i in range(days)]
+
+
 @app.route("/api/daily/latest", methods=["GET"])
-def api_daily():
+def api_daily_latest():
     if not check_app_token():
         return jsonify({"ok": False, "error": "unauthorized"}), 401
-    events = load_json(EVENTS_FILE, [])
-    today = today_str()
-    today_events = [e for e in events if str(e.get("createdAt", "")).startswith(today)]
-    summary = {
-        "date": today,
-        "eventCount": len(today_events),
-        "terminalChanges": len([e for e in today_events if str(e.get("type", "")).startswith("device_")]),
-        "stunChanges": len([e for e in today_events if "stun" in str(e.get("type", ""))]),
-        "ddnsChanges": len([e for e in today_events if "ddns" in str(e.get("type", ""))]),
-        "text": f"今日事件 {len(today_events)} 条，终端变化 {len([e for e in today_events if str(e.get('type','')).startswith('device_')])} 次。",
-    }
-    save_json(DAILY_FILE, summary)
-    return jsonify({"ok": True, "daily": summary})
+    return jsonify({"ok": True, "daily": aggregate_daily(today_str())})
+
+
+@app.route("/api/daily", methods=["GET"])
+def api_daily_by_date():
+    if not check_app_token():
+        return jsonify({"ok": False, "error": "unauthorized"}), 401
+    day = request.args.get("date", today_str())
+    return jsonify({"ok": True, "daily": aggregate_daily(day)})
+
+
+@app.route("/api/daily/list", methods=["GET"])
+def api_daily_list():
+    if not check_app_token():
+        return jsonify({"ok": False, "error": "unauthorized"}), 401
+    return jsonify({"ok": True, "dates": recent_dates(7)})
 
 
 if __name__ == "__main__":
