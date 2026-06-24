@@ -13,7 +13,7 @@ import requests
 import dns.resolver
 from flask import Flask, request, jsonify
 
-APP_VERSION = "0.6.4"
+APP_VERSION = "0.6.6"
 PORT = int(os.environ.get("PORT", "58443"))
 CONFIG_PATH = Path(os.environ.get("CONFIG_PATH", "/app/config/config.yaml"))
 DATA_DIR = Path(os.environ.get("DATA_DIR", "/app/data"))
@@ -24,6 +24,8 @@ STATE_FILE = DATA_DIR / "state.json"
 DEVICES_FILE = DATA_DIR / "devices.json"
 DAILY_FILE = DATA_DIR / "daily.json"
 GEO_CACHE_FILE = DATA_DIR / "geo_cache.json"
+NOTES_DIR = DATA_DIR / "notes"
+NOTES_DIR.mkdir(parents=True, exist_ok=True)
 
 app = Flask(__name__)
 
@@ -143,7 +145,7 @@ def human_duration(seconds: Any) -> str:
     h = sec // 3600
     m = (sec % 3600) // 60
     if h > 0:
-        return f"{h}时{m:02d}分"
+        return f"{h}小时{m:02d}分"
     return f"{m}分"
 
 
@@ -155,7 +157,7 @@ def human_duration_precise(seconds: Any) -> str:
     m = (sec % 3600) // 60
     s = sec % 60
     if h > 0:
-        return f"{h}时{m:02d}分{s:02d}秒"
+        return f"{h}小时{m:02d}分{s:02d}秒"
     if m > 0:
         return f"{m}分{s:02d}秒"
     return f"{s}秒"
@@ -872,6 +874,35 @@ def event_timestamp(e: Dict[str, Any]) -> str:
     return str(e.get("createdAt") or e.get("time") or e.get("offlineAt") or e.get("onlineSince") or "")
 
 
+def note_file(day: str) -> Path:
+    safe = re.sub(r"[^0-9-]", "", day or today_str()) or today_str()
+    return NOTES_DIR / f"{safe}.json"
+
+
+def get_daily_note(day: str) -> str:
+    return str(load_json(note_file(day), {}).get("note", "") or "")
+
+
+def set_daily_note(day: str, note: str) -> None:
+    save_json(note_file(day), {"date": day, "note": note or "", "updatedAt": now_str()})
+
+
+def pretty_duration_text(text: str) -> str:
+    s = str(text or "").strip()
+    if not s or s in {"-", "null", "None"}:
+        return ""
+    m = re.match(r"^(\d+)分(\d+)秒$", s)
+    if m:
+        total_min = int(m.group(1)); sec = int(m.group(2))
+        h, mm = divmod(total_min, 60)
+        return (f"{h}小时" if h else "") + (f"{mm}分" if mm or not h else "") + f"{sec}秒"
+    m = re.match(r"^(\d+)分$", s)
+    if m:
+        total_min = int(m.group(1)); h, mm = divmod(total_min, 60)
+        return f"{h}小时{mm}分" if h else f"{mm}分"
+    return s.replace("时", "小时")
+
+
 def aggregate_daily(day: str) -> Dict[str, Any]:
     events = [e for e in load_json(EVENTS_FILE, []) if not e.get("deleted") and event_timestamp(e).startswith(day)]
     devices: Dict[str, Dict[str, Any]] = {}
@@ -886,17 +917,20 @@ def aggregate_daily(day: str) -> Dict[str, Any]:
             d = devices.setdefault(name, {"name": name, "online": 0, "offline": 0, "onlineDurationText": "", "lastIp": "", "lastSignal": ""})
             if typ == "device_online":
                 d["online"] += 1
-                if e.get("ip"):
-                    d["lastIp"] = e.get("ip")
-                sig = " ".join([str(e.get("rssi") or ""), str(e.get("band") or ""), str(e.get("rxrate") or "")]).strip()
-                if sig:
-                    d["lastSignal"] = sig
             elif typ == "device_offline":
                 d["offline"] += 1
-                if e.get("onlineDurationText"):
-                    d["onlineDurationText"] = e.get("onlineDurationText")
-                if e.get("ip") or e.get("lastIp"):
-                    d["lastIp"] = e.get("ip") or e.get("lastIp")
+            ip = e.get("ip") or e.get("lastIp") or ""
+            if ip:
+                d["lastIp"] = ip
+            rssi = str(e.get("rssi") or e.get("lastRssi") or "").strip()
+            band = str(e.get("band") or e.get("lastBand") or "").strip()
+            rxrate = str(e.get("rxrate") or e.get("lastRxrate") or "").strip()
+            sig = " ".join([x for x in [rssi and f"{rssi}dBm" if not rssi.endswith("dBm") else rssi, band, rxrate] if x]).strip()
+            if sig:
+                d["lastSignal"] = sig
+            dur = pretty_duration_text(str(e.get("onlineDurationText") or ""))
+            if dur:
+                d["onlineDurationText"] = dur
         elif "stun" in typ or "wireguard" in typ or "vpn" in typ:
             vpn_items.append({"time": t, "text": f"{e.get('title') or name} · {e.get('newValue','')}"})
         elif "router" in typ or "wan" in typ or "nas" in typ:
@@ -905,14 +939,17 @@ def aggregate_daily(day: str) -> Dict[str, Any]:
             ddns_items.append({"time": t, "text": f"{e.get('title') or name}"})
     device_list = []
     for d in devices.values():
-        parts = [f"上线 {d['online']} 次", f"下线 {d['offline']} 次"]
+        lines = [f"{d['name']}", f"上线 {d['online']} 次 · 下线 {d['offline']} 次"]
+        details = []
         if d.get("onlineDurationText"):
-            parts.append(f"在线 {d['onlineDurationText']}")
+            details.append(f"在线 {d['onlineDurationText']}")
         if d.get("lastIp"):
-            parts.append(f"IP {d['lastIp']}")
+            details.append(d["lastIp"])
         if d.get("lastSignal"):
-            parts.append(d["lastSignal"])
-        device_list.append({"text": f"{d['name']}：" + "，".join(parts)})
+            details.append(d["lastSignal"])
+        if details:
+            lines.append(" · ".join(details))
+        device_list.append({"text": "\n".join(lines)})
     summary = {
         "deviceChanges": sum(1 for e in events if str(e.get("type", "")).startswith("device_")),
         "vpnChanges": len(vpn_items),
@@ -922,14 +959,26 @@ def aggregate_daily(day: str) -> Dict[str, Any]:
     }
     sections = {"devices": device_list, "vpn": vpn_items, "network": network_items, "ddns": ddns_items}
     sections = {k: v for k, v in sections.items() if v}
-    note = "今日暂无异常记录。" if not ddns_items else "今日存在 DDNS 相关变化，请按需检查。"
-    return {"date": day, "summary": summary, "sections": sections, "note": note}
-
+    return {"date": day, "summary": summary, "sections": sections, "note": get_daily_note(day)}
 
 def recent_dates(days: int = 7) -> List[str]:
     from datetime import timedelta
     today = date.today()
     return [(today - timedelta(days=i)).isoformat() for i in range(days)]
+
+
+
+@app.route("/api/daily/note", methods=["GET", "PUT"])
+def api_daily_note():
+    if not check_app_token():
+        return jsonify({"ok": False, "error": "unauthorized"}), 401
+    day = request.args.get("date", today_str())
+    if request.method == "GET":
+        return jsonify({"ok": True, "date": day, "note": get_daily_note(day)})
+    payload = request.get_json(silent=True) or {}
+    note = str(payload.get("note", ""))[:2000]
+    set_daily_note(day, note)
+    return jsonify({"ok": True, "date": day, "note": note, "updatedAt": now_str()})
 
 
 @app.route("/api/daily/latest", methods=["GET"])
