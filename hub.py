@@ -13,7 +13,7 @@ import requests
 import dns.resolver
 from flask import Flask, request, jsonify
 
-APP_VERSION = "0.6.2"
+APP_VERSION = "0.6.4"
 PORT = int(os.environ.get("PORT", "58443"))
 CONFIG_PATH = Path(os.environ.get("CONFIG_PATH", "/app/config/config.yaml"))
 DATA_DIR = Path(os.environ.get("DATA_DIR", "/app/data"))
@@ -143,8 +143,43 @@ def human_duration(seconds: Any) -> str:
     h = sec // 3600
     m = (sec % 3600) // 60
     if h > 0:
-        return f"{h}时{m}分"
+        return f"{h}时{m:02d}分"
     return f"{m}分"
+
+
+def human_duration_precise(seconds: Any) -> str:
+    sec = to_int(seconds, 0)
+    if sec <= 0:
+        return ""
+    h = sec // 3600
+    m = (sec % 3600) // 60
+    s = sec % 60
+    if h > 0:
+        return f"{h}时{m:02d}分{s:02d}秒"
+    if m > 0:
+        return f"{m}分{s:02d}秒"
+    return f"{s}秒"
+
+
+def parse_time_safe(v: Any) -> Optional[datetime]:
+    if not v:
+        return None
+    text = str(v).strip()
+    for fmt in ["%Y-%m-%d %H:%M:%S", "%Y-%m-%dT%H:%M:%S"]:
+        try:
+            return datetime.strptime(text[:19], fmt)
+        except Exception:
+            pass
+    return None
+
+
+def duration_between(start: Any, end: Any) -> str:
+    st = parse_time_safe(start)
+    et = parse_time_safe(end)
+    if not st or not et:
+        return ""
+    sec = int((et - st).total_seconds())
+    return human_duration_precise(sec)
 
 
 def is_public_ipv6(addr: str) -> bool:
@@ -365,7 +400,11 @@ def build_watched_devices(online_devices: List[Dict[str, Any]]) -> List[Dict[str
                     "rssi": dev.get("rssi"),
                     "band": dev.get("band"),
                     "rxrate": dev.get("rxrate"),
+                    "ssid": dev.get("ssid"),
+                    "connectType": dev.get("connectType"),
+                    "onlineSince": dev.get("onlineSince"),
                     "onlineDurationText": "0分",
+                    "device": {k: dev.get(k) for k in ["name", "mac", "ip", "rssi", "band", "rxrate", "ssid", "connectType", "onlineSince", "hostName", "devType"]},
                 })
         else:
             was_online = bool(old.get("online")) if old_online is not None else False
@@ -387,6 +426,7 @@ def build_watched_devices(online_devices: List[Dict[str, Any]]) -> List[Dict[str
                 "lastChangedAt": now if was_online else old.get("lastChangedAt") or now,
             }
             if was_online:
+                duration_text = duration_between(old.get("onlineSince"), offline_at) or old.get("onlineDurationText") or ""
                 add_event({
                     "type": "device_offline",
                     "title": f"{dev.get('name')} 离线",
@@ -395,13 +435,106 @@ def build_watched_devices(online_devices: List[Dict[str, Any]]) -> List[Dict[str
                     "oldValue": "online",
                     "newValue": "offline",
                     "ip": old.get("ip") or old.get("lastIp"),
+                    "lastIp": old.get("ip") or old.get("lastIp"),
                     "rssi": old.get("rssi"),
                     "band": old.get("band"),
                     "rxrate": old.get("rxrate"),
-                    "onlineDurationText": old.get("onlineDurationText") or "",
+                    "ssid": old.get("ssid"),
+                    "connectType": old.get("connectType"),
+                    "onlineSince": old.get("onlineSince"),
+                    "offlineAt": offline_at,
+                    "onlineDurationText": duration_text,
+                    "device": {k: old.get(k) for k in ["name", "mac", "ip", "rssi", "band", "rxrate", "ssid", "connectType", "onlineSince", "hostName", "devType"]},
                 })
         result.append(dev)
     return result
+
+
+
+def device_snapshot_from_payload(payload: Dict[str, Any]) -> Dict[str, Any]:
+    """Normalize ruijie agent device_event payload into the same field names used by /api/devices."""
+    mac = norm_mac(payload.get("mac"))
+    name = payload.get("name") or payload.get("devRecommend") or payload.get("hostName") or mac or "未知设备"
+    ip = payload.get("ip") or payload.get("userIp") or payload.get("lastIp") or ""
+    rssi = payload.get("rssi") or ""
+    band = payload.get("band") or ""
+    rxrate = payload.get("rxrate") or payload.get("rate") or ""
+    ssid = payload.get("ssid") or ""
+    connect_type = payload.get("connectType") or payload.get("connect_type") or ""
+    now = payload.get("time") or now_str()
+    online_since = payload.get("onlineSince") or payload.get("onlinetime") or payload.get("startTime") or now
+    offline_at = payload.get("offlineAt") or (now if str(payload.get("type", "")).endswith("offline") else "")
+    duration_text = payload.get("onlineDurationText") or ""
+    duration_sec = payload.get("onlineDurationSec") or payload.get("durationSec") or ""
+    if not duration_text and duration_sec not in [None, ""]:
+        duration_text = human_duration_precise(duration_sec)
+    if not duration_text and offline_at:
+        duration_text = duration_between(online_since, offline_at)
+    return {
+        "name": str(name),
+        "mac": mac,
+        "ip": str(ip) if ip else "",
+        "lastIp": str(ip) if ip else "",
+        "rssi": str(rssi) if rssi else "",
+        "band": str(band) if band else "",
+        "rxrate": str(rxrate) if rxrate else "",
+        "ssid": str(ssid) if ssid else "",
+        "connectType": str(connect_type) if connect_type else "",
+        "onlineSince": str(online_since) if online_since else "",
+        "offlineAt": str(offline_at) if offline_at else "",
+        "onlineDurationText": str(duration_text) if duration_text else "",
+        "lastSeenAt": str(payload.get("lastSeenAt") or now),
+        "hostName": str(payload.get("hostName") or ""),
+        "devType": str(payload.get("devType") or ""),
+        "raw": payload,
+    }
+
+
+def upsert_watched_device_from_event(snapshot: Dict[str, Any], online: bool, event_time: str) -> None:
+    devices_state = load_json(DEVICES_FILE, {"online": [], "watched": [], "updatedAt": None})
+    watched = devices_state.get("watched", []) or []
+    mac = norm_mac(snapshot.get("mac"))
+    found = False
+    next_watched = []
+    for d in watched:
+        if norm_mac(d.get("mac")) == mac:
+            nd = dict(d)
+            nd.update({k: v for k, v in snapshot.items() if v not in [None, ""]})
+            nd["online"] = online
+            nd["lastChangedAt"] = event_time
+            if online:
+                nd["ip"] = snapshot.get("ip") or snapshot.get("lastIp") or d.get("ip")
+                nd["offlineAt"] = None
+                nd["onlineSince"] = snapshot.get("onlineSince") or event_time
+                nd["lastSeenAt"] = event_time
+            else:
+                nd["lastIp"] = snapshot.get("lastIp") or snapshot.get("ip") or d.get("ip") or d.get("lastIp")
+                nd["ip"] = None
+                nd["offlineAt"] = snapshot.get("offlineAt") or event_time
+                nd["lastSeenAt"] = snapshot.get("lastSeenAt") or d.get("lastSeenAt") or event_time
+            next_watched.append(nd)
+            found = True
+        else:
+            next_watched.append(d)
+    if not found and mac:
+        nd = dict(snapshot)
+        nd["online"] = online
+        nd["lastChangedAt"] = event_time
+        if online:
+            nd["offlineAt"] = None
+            nd["onlineSince"] = snapshot.get("onlineSince") or event_time
+        else:
+            nd["ip"] = None
+            nd["offlineAt"] = snapshot.get("offlineAt") or event_time
+        next_watched.append(nd)
+    devices_state["watched"] = next_watched
+    devices_state["updatedAt"] = now_str()
+    save_json(DEVICES_FILE, devices_state)
+
+    state = load_json(STATE_FILE, {})
+    state["devices"] = next_watched
+    state["updatedAt"] = now_str()
+    save_json(STATE_FILE, state)
 
 
 def get_exit_ip(ipv6: bool = False) -> Optional[str]:
@@ -569,6 +702,64 @@ def hook_ruijie_devices():
 
 
 
+@app.route("/hook/ruijie/device_event", methods=["POST"])
+def hook_ruijie_device_event():
+    if not check_hook_token():
+        return jsonify({"ok": False, "error": "bad hook token"}), 401
+    payload = request.get_json(silent=True) or {}
+    if not payload:
+        return jsonify({"ok": False, "error": "empty json"}), 400
+    typ = str(payload.get("type") or "").strip()
+    if typ not in ["device_online", "device_offline"]:
+        return jsonify({"ok": False, "error": "type must be device_online/device_offline"}), 400
+
+    event_time = str(payload.get("time") or now_str())
+    snap = device_snapshot_from_payload(payload)
+    name = snap.get("name") or payload.get("name") or snap.get("mac") or "未知设备"
+    online = typ == "device_online"
+
+    # 事件由锐捷 Agent 主动上报，字段优先级高于 Hub 的快照推断。
+    event = {
+        "type": typ,
+        "source": "ruijie_agent",
+        "title": f"{name} {'上线' if online else '离线'}",
+        "name": name,
+        "mac": snap.get("mac"),
+        "time": event_time,
+        "createdAt": event_time,
+        "ip": snap.get("ip") if online else (snap.get("lastIp") or snap.get("ip")),
+        "lastIp": snap.get("lastIp") or snap.get("ip"),
+        "rssi": snap.get("rssi"),
+        "band": snap.get("band"),
+        "rxrate": snap.get("rxrate"),
+        "ssid": snap.get("ssid"),
+        "connectType": snap.get("connectType"),
+        "onlineSince": snap.get("onlineSince"),
+        "offlineAt": snap.get("offlineAt") or (event_time if not online else ""),
+        "onlineDurationText": snap.get("onlineDurationText"),
+        "oldValue": "offline" if online else "online",
+        "newValue": "online" if online else "offline",
+        "device": snap,
+    }
+    if not online and not event.get("onlineDurationText"):
+        event["onlineDurationText"] = duration_between(event.get("onlineSince"), event.get("offlineAt"))
+
+    # 简单去重：同一 MAC 同类型 10 秒内不重复保存。
+    events = load_json(EVENTS_FILE, [])
+    if events:
+        last = events[-1]
+        if norm_mac(last.get("mac")) == norm_mac(event.get("mac")) and last.get("type") == event.get("type"):
+            lt = parse_time_safe(last.get("createdAt") or last.get("time"))
+            nt = parse_time_safe(event_time)
+            if lt and nt and abs((nt - lt).total_seconds()) <= 10:
+                upsert_watched_device_from_event(snap, online, event_time)
+                return jsonify({"ok": True, "dedup": True, "message": "duplicate device event ignored", "time": now_str()})
+
+    saved = add_event(event)
+    upsert_watched_device_from_event(snap, online, event_time)
+    return jsonify({"ok": True, "message": "device event saved", "event": saved, "time": now_str()})
+
+
 @app.route("/hook/ruijie/router", methods=["POST", "GET"])
 def hook_ruijie_router():
     if not check_hook_token():
@@ -677,8 +868,12 @@ def api_geo():
 
 
 
+def event_timestamp(e: Dict[str, Any]) -> str:
+    return str(e.get("createdAt") or e.get("time") or e.get("offlineAt") or e.get("onlineSince") or "")
+
+
 def aggregate_daily(day: str) -> Dict[str, Any]:
-    events = [e for e in load_json(EVENTS_FILE, []) if not e.get("deleted") and str(e.get("createdAt", "")).startswith(day)]
+    events = [e for e in load_json(EVENTS_FILE, []) if not e.get("deleted") and event_timestamp(e).startswith(day)]
     devices: Dict[str, Dict[str, Any]] = {}
     vpn_items: List[Dict[str, Any]] = []
     network_items: List[Dict[str, Any]] = []
@@ -686,24 +881,38 @@ def aggregate_daily(day: str) -> Dict[str, Any]:
     for e in events:
         typ = str(e.get("type", ""))
         name = str(e.get("name") or e.get("title") or "未知")
+        t = event_timestamp(e)[11:16] if len(event_timestamp(e)) >= 16 else ""
         if typ.startswith("device_"):
-            d = devices.setdefault(name, {"name": name, "online": 0, "offline": 0, "onlineDurationText": e.get("onlineDurationText", "")})
-            if "online" in typ:
+            d = devices.setdefault(name, {"name": name, "online": 0, "offline": 0, "onlineDurationText": "", "lastIp": "", "lastSignal": ""})
+            if typ == "device_online":
                 d["online"] += 1
-            if "offline" in typ:
+                if e.get("ip"):
+                    d["lastIp"] = e.get("ip")
+                sig = " ".join([str(e.get("rssi") or ""), str(e.get("band") or ""), str(e.get("rxrate") or "")]).strip()
+                if sig:
+                    d["lastSignal"] = sig
+            elif typ == "device_offline":
                 d["offline"] += 1
                 if e.get("onlineDurationText"):
                     d["onlineDurationText"] = e.get("onlineDurationText")
+                if e.get("ip") or e.get("lastIp"):
+                    d["lastIp"] = e.get("ip") or e.get("lastIp")
         elif "stun" in typ or "wireguard" in typ or "vpn" in typ:
-            vpn_items.append({"time": str(e.get("createdAt", ""))[11:16], "text": f"{e.get('title') or name} · {e.get('newValue','')}"})
+            vpn_items.append({"time": t, "text": f"{e.get('title') or name} · {e.get('newValue','')}"})
         elif "router" in typ or "wan" in typ or "nas" in typ:
-            network_items.append({"time": str(e.get("createdAt", ""))[11:16], "text": f"{e.get('title') or name}"})
+            network_items.append({"time": t, "text": f"{e.get('title') or name}"})
         elif "ddns" in typ:
-            ddns_items.append({"time": str(e.get("createdAt", ""))[11:16], "text": f"{e.get('title') or name}"})
+            ddns_items.append({"time": t, "text": f"{e.get('title') or name}"})
     device_list = []
     for d in devices.values():
-        dur = f"，在线时长 {d['onlineDurationText']}" if d.get("onlineDurationText") else ""
-        device_list.append({"text": f"{d['name']}：上线 {d['online']} 次，下线 {d['offline']} 次{dur}"})
+        parts = [f"上线 {d['online']} 次", f"下线 {d['offline']} 次"]
+        if d.get("onlineDurationText"):
+            parts.append(f"在线 {d['onlineDurationText']}")
+        if d.get("lastIp"):
+            parts.append(f"IP {d['lastIp']}")
+        if d.get("lastSignal"):
+            parts.append(d["lastSignal"])
+        device_list.append({"text": f"{d['name']}：" + "，".join(parts)})
     summary = {
         "deviceChanges": sum(1 for e in events if str(e.get("type", "")).startswith("device_")),
         "vpnChanges": len(vpn_items),

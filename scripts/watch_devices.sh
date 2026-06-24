@@ -1,58 +1,14 @@
 #!/bin/sh
-# LabProbe Ruijie installer v0.3 for BE72 / OpenWrt-like systems.
-# Usage:
-#   sh ruijie_labprobe_install.sh http://192.168.5.46:58443 YOUR_HOOK_TOKEN [pppoe-wan]
-
-HUB_BASE="$1"
-HOOK_TOKEN="$2"
-WAN_IF="${3:-pppoe-wan}"
-
-if [ -z "$HUB_BASE" ] || [ -z "$HOOK_TOKEN" ]; then
-  echo "Usage: sh ruijie_labprobe_install.sh http://192.168.5.46:58443 YOUR_HOOK_TOKEN [pppoe-wan]"
-  exit 1
-fi
-
-mkdir -p /etc/labprobe
-
-cat > /etc/labprobe/push_devices.sh <<'PUSH_DEVICES_EOF'
-#!/bin/sh
-HUB_BASE="__HUB_BASE__"
-HOOK_TOKEN="__HOOK_TOKEN__"
-dev_sta get -m user_list '{"devType":"all","dataType":"timely"}' > /tmp/labprobe_user_list.json 2>/tmp/labprobe_user_list.err
-if [ ! -s /tmp/labprobe_user_list.json ]; then
-  echo "[LabProbe] empty user list"
-  cat /tmp/labprobe_user_list.err 2>/dev/null
-  exit 1
-fi
-curl -sS -m 8 -X POST "$HUB_BASE/hook/ruijie/devices?token=$HOOK_TOKEN" -H "Content-Type:application/json" --data-binary "@/tmp/labprobe_user_list.json"
-echo
-PUSH_DEVICES_EOF
-
-cat > /etc/labprobe/push_router_wan6.sh <<'PUSH_WAN_EOF'
-#!/bin/sh
-HUB_BASE="__HUB_BASE__"
-HOOK_TOKEN="__HOOK_TOKEN__"
-WAN_IF="__WAN_IF__"
-OUT="$(ip -6 -o addr show dev "$WAN_IF" scope global 2>/dev/null)"
-WAN6="$(printf '%s\n' "$OUT" | awk '$0 !~ /deprecated/ && $0 !~ /temporary/ {print $4}' | cut -d/ -f1 | grep -Ev '^(fe80:|fd|fc|ff|::1)' | head -n1)"
-if [ -z "$WAN6" ]; then
-  WAN6="$(printf '%s\n' "$OUT" | awk '{print $4}' | cut -d/ -f1 | grep -Ev '^(fe80:|fd|fc|ff|::1)' | head -n1)"
-fi
-if [ -n "$WAN6" ]; then
-  curl -sS -m 8 -X POST "$HUB_BASE/hook/ruijie/router?token=$HOOK_TOKEN" -H "Content-Type:application/json" -d "{\"wanIf\":\"$WAN_IF\",\"routerWanIpv6\":\"$WAN6\",\"status\":\"ok\"}"
-else
-  curl -sS -m 8 -X POST "$HUB_BASE/hook/ruijie/router?token=$HOOK_TOKEN" -H "Content-Type:application/json" -d "{\"wanIf\":\"$WAN_IF\",\"status\":\"check_failed\",\"message\":\"no public IPv6 found\"}"
-fi
-echo
-PUSH_WAN_EOF
-
-cat > /etc/labprobe/watch_devices.sh <<'WATCH_EOF'
-#!/bin/sh
 # LabProbe Ruijie device event watcher v0.3
 # Usage: sh watch_devices.sh http://192.168.5.46:58443 YOUR_HOOK_TOKEN
 
-HUB_BASE="__HUB_BASE__"
-HOOK_TOKEN="__HOOK_TOKEN__"
+HUB_BASE="$1"
+HOOK_TOKEN="$2"
+
+if [ -z "$HUB_BASE" ] || [ -z "$HOOK_TOKEN" ]; then
+  echo "Usage: sh watch_devices.sh http://192.168.5.46:58443 YOUR_HOOK_TOKEN"
+  exit 1
+fi
 
 # 关注设备：MAC|名称。需要加设备就在这里追加，空格分隔。
 DEVICES="24:1a:e6:bb:16:d9|华为Mate60 da:1f:85:0c:19:fc|iQOO Neo3"
@@ -169,35 +125,3 @@ while true; do
   done
   sleep "$CHECK_INTERVAL"
 done
-
-WATCH_EOF
-
-# Fill placeholders.
-sed -i "s#__HUB_BASE__#$HUB_BASE#g; s#__HOOK_TOKEN__#$HOOK_TOKEN#g; s#__WAN_IF__#$WAN_IF#g" /etc/labprobe/push_devices.sh /etc/labprobe/push_router_wan6.sh /etc/labprobe/watch_devices.sh
-chmod +x /etc/labprobe/push_devices.sh /etc/labprobe/push_router_wan6.sh /etc/labprobe/watch_devices.sh
-
-# cron: keep snapshot and router WAN sync. watcher is long-running daemon.
-crontab -l > /tmp/labprobe_cron 2>/dev/null
-grep -v "labprobe/push_devices.sh" /tmp/labprobe_cron | grep -v "labprobe/push_router_wan6.sh" > /tmp/labprobe_cron_new
-echo "*/1 * * * * /etc/labprobe/push_devices.sh >/tmp/labprobe_devices.log 2>&1" >> /tmp/labprobe_cron_new
-echo "*/1 * * * * /etc/labprobe/push_router_wan6.sh >/tmp/labprobe_router_wan6.log 2>&1" >> /tmp/labprobe_cron_new
-crontab /tmp/labprobe_cron_new
-/etc/init.d/cron enable >/dev/null 2>&1
-/etc/init.d/cron restart >/dev/null 2>&1
-
-# rc.local daemon start.
-killall -9 watch_devices.sh 2>/dev/null
-ps | grep '/etc/labprobe/watch_devices.sh' | grep -v grep | awk '{print $1}' | xargs kill -9 2>/dev/null
-if ! grep -q "/etc/labprobe/watch_devices.sh" /etc/rc.local 2>/dev/null; then
-  sed -i '/exit 0/i /etc/labprobe/watch_devices.sh > /tmp/labprobe_watch.log 2>&1 &' /etc/rc.local
-fi
-/etc/labprobe/watch_devices.sh > /tmp/labprobe_watch.log 2>&1 &
-
-# initial push
-/etc/labprobe/push_devices.sh
-/etc/labprobe/push_router_wan6.sh
-
-echo "[LabProbe] installed v0.3. current crontab:"
-crontab -l
-echo "[LabProbe] watcher process:"
-ps | grep '/etc/labprobe/watch_devices.sh' | grep -v grep
