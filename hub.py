@@ -13,7 +13,7 @@ import requests
 import dns.resolver
 from flask import Flask, request, jsonify
 
-APP_VERSION = "0.7.1"
+APP_VERSION = "0.7.2"
 PORT = int(os.environ.get("PORT", "58443"))
 CONFIG_PATH = Path(os.environ.get("CONFIG_PATH", "/app/config/config.yaml"))
 DATA_DIR = Path(os.environ.get("DATA_DIR", "/app/data"))
@@ -259,6 +259,70 @@ def vpn_addresses_list(state: Optional[Dict[str, Any]] = None) -> List[Dict[str,
             merged[vpn_service_key(name)] = {"name": name, "address": addr, "stun": addr, "source": clean_saved_value(item.get("source")) or "webhook", "updatedAt": clean_saved_value(item.get("updatedAt"))}
     preferred = {"wireguard": 0, "openvpn": 1, "lucky": 2, "easytier": 3, "stun": 4}
     return sorted(merged.values(), key=lambda x: (preferred.get(vpn_service_key(x.get("name")), 50), str(x.get("name", ""))))
+
+
+def parse_vpn_text_content(text: Any) -> Tuple[str, str]:
+    raw = str(text or "").strip().replace("\r", " ").replace("\n", " ")
+    if not raw:
+        return "", ""
+    m = re.search(r"^\s*([^:：]{1,32})\s*[:：]\s*(.+?)\s*$", raw)
+    if m:
+        return clean_saved_value(m.group(1)), clean_vpn_address(m.group(2))
+    return "", clean_vpn_address(raw)
+
+
+def vpn_address_from_event(event: Dict[str, Any]) -> Tuple[str, str]:
+    if not isinstance(event, dict):
+        return "", ""
+    typ = str(event.get("type") or "")
+    title = str(event.get("title") or "")
+    content = event.get("content") or event.get("text") or ""
+    name = clean_saved_value(event.get("name") or event.get("service"))
+    addr = clean_vpn_address(event.get("address") or event.get("newValue") or event.get("value") or event.get("stun"))
+    parsed_name, parsed_addr = parse_vpn_text_content(content)
+    if not name:
+        name = parsed_name
+    if not addr:
+        addr = parsed_addr
+    if not name and title:
+        # 兼容“OpenVPN STUN 地址变化”这类标题。
+        name = clean_saved_value(title.replace("STUN 地址变化", "").replace("地址变化", "").strip())
+    if not name:
+        return "", ""
+    low_name = name.lower()
+    low_type = typ.lower()
+    known = ["wireguard", "openvpn", "open_vpn", "lucky", "easytier", "easy_tier", "stun"]
+    if not any(k in low_name.replace(" ", "_") for k in known) and "stun" not in low_type and "vpn" not in low_type and "lucky" not in low_type:
+        return "", ""
+    return name, addr
+
+
+def ensure_vpn_addresses_from_events(state: Dict[str, Any]) -> Dict[str, Any]:
+    """Repair current VPN/STUN state from recent event history.
+
+    首页读的是 /api/status 当前状态；记录页/每日总结读的是 events。
+    如果老版本只保存了事件、或同地址 webhook 没有新增变化事件，这里会把最近事件补进 current state。
+    """
+    current = {vpn_service_key(x.get("name")): x for x in vpn_addresses_list(state)}
+    changed = False
+    events = load_json(EVENTS_FILE, [])
+    for e in reversed(events[-300:]):
+        name, addr = vpn_address_from_event(e)
+        if not name or not addr:
+            continue
+        key = vpn_service_key(name)
+        if key not in current or not clean_vpn_address(current.get(key, {}).get("address")):
+            item, _ = upsert_vpn_address(name, addr, clean_saved_value(e.get("source")) or "event_repair")
+            if item:
+                current[key] = item
+                state.setdefault("vpn", {})[key] = item
+                changed = True
+    if changed:
+        state["vpnStunAddresses"] = vpn_addresses_list(state)
+        state["vpnAddresses"] = state["vpnStunAddresses"]
+        state["updatedAt"] = now_str()
+        save_json(STATE_FILE, state)
+    return state
 
 
 
@@ -1066,6 +1130,7 @@ def api_status():
         return jsonify({"ok": False, "error": "unauthorized"}), 401
     state = load_json(STATE_FILE, {})
     state = refresh_ddns_and_exit(state)
+    state = ensure_vpn_addresses_from_events(state)
     state["hub"] = {"name": "LabProbe Hub", "version": APP_VERSION, "updatedAt": now_str()}
     state["vpnStunAddresses"] = vpn_addresses_list(state)
     state["vpnAddresses"] = state["vpnStunAddresses"]
