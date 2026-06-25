@@ -13,7 +13,7 @@ import requests
 import dns.resolver
 from flask import Flask, request, jsonify
 
-APP_VERSION = "0.6.7"
+APP_VERSION = "0.6.8"
 PORT = int(os.environ.get("PORT", "58443"))
 CONFIG_PATH = Path(os.environ.get("CONFIG_PATH", "/app/config/config.yaml"))
 DATA_DIR = Path(os.environ.get("DATA_DIR", "/app/data"))
@@ -632,7 +632,7 @@ def hook_lucky():
       "text": {"content": "Lucky：#{ipAddr}"}
     }
 
-    其中 #{ipAddr} 已经是 Lucky 输出的公网地址+端口，Hub 不拆分，原样保存。
+    其中 #{ipAddr} 已经是 Lucky 输出的公网地址+端口，Hub 不拆分，原样保存；content 冒号前缀作为 APP 显示名，例如 OpenVPN：#{ipAddr}。
     """
     if not check_hook_token():
         return jsonify({"ok": False, "error": "bad hook token"}), 401
@@ -717,9 +717,12 @@ def hook_lucky():
         "updatedAt": now_str(),
     }
     state["vpn"][service_key] = item
-    state["luckyStun"] = item
-    # 兼容旧 APP 字段：旧版本只读 state.stun.publicAddress。
-    state["stun"] = {"publicAddress": address, "source": "Lucky Webhook", "updatedAt": now_str()}
+
+    # 只有真正的 Lucky/STUN 推送才写入 luckyStun / stun 兼容字段。
+    # OpenVPN：#{ipAddr} / EasyTier：#{ipAddr} 这类内容只写入 vpn.<service>，避免 APP 把它误显示成 Lucky。
+    if service_key in ["lucky", "lucky_stun", "stun"] or "lucky" in service_key or "stun" in service_key:
+        state["luckyStun"] = item
+        state["stun"] = {"publicAddress": address, "source": "Lucky Webhook", "updatedAt": now_str()}
 
     if address != old:
         add_event({
