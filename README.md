@@ -1,11 +1,29 @@
-# LabProbe Hub v0.6.6
+# LabProbe Hub v0.6.7
 
-本版为 v0.8.0 APP 配套稳定版：
+本版为 Lucky Webhook 简化兼容版。
 
-- 保留 /hook/ruijie/device_event。
-- 保留每日总结和每日备注接口。
-- 保留事件软删除。
-- 在线时长文案统一为“小时/分/秒”。
-- 继续保留路由 WAN IPv6 stale 机制和运营商识别。
+## 更新
 
-升级：覆盖仓库后运行 Docker Actions，绿联执行 `docker compose pull && docker compose up -d`。
+1. `/hook/lucky` 支持钉钉文本格式：`{"msgtype":"text","text":{"content":"Lucky：#{ipAddr}"}}`。
+2. `#{ipAddr}` 按 Lucky 原样输出保存，不拆 IP / 端口。
+3. 收到 Lucky 后写入 `state.vpn.lucky`、`state.luckyStun` 和兼容字段 `state.stun.publicAddress`。
+4. `/api/status` 返回后 APP 首页可显示 Lucky STUN 地址。
+
+## Lucky 填法
+
+接口地址：`http://192.168.5.46:58443/hook/lucky?token=你的HookToken`
+
+请求方法：`POST`
+
+请求头建议填：`Content-Type: application/json`
+
+请求体：
+
+```json
+{
+  "msgtype": "text",
+  "text": {
+    "content": "Lucky：#{ipAddr}"
+  }
+}
+```

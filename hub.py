@@ -13,7 +13,7 @@ import requests
 import dns.resolver
 from flask import Flask, request, jsonify
 
-APP_VERSION = "0.6.6"
+APP_VERSION = "0.6.7"
 PORT = int(os.environ.get("PORT", "58443"))
 CONFIG_PATH = Path(os.environ.get("CONFIG_PATH", "/app/config/config.yaml"))
 DATA_DIR = Path(os.environ.get("DATA_DIR", "/app/data"))
@@ -624,46 +624,122 @@ def health():
 
 @app.route("/hook/lucky", methods=["POST", "GET"])
 def hook_lucky():
+    """Lucky Webhook：兼容简单钉钉文本格式。
+
+    推荐 Lucky 请求体：
+    {
+      "msgtype": "text",
+      "text": {"content": "Lucky：#{ipAddr}"}
+    }
+
+    其中 #{ipAddr} 已经是 Lucky 输出的公网地址+端口，Hub 不拆分，原样保存。
+    """
     if not check_hook_token():
         return jsonify({"ok": False, "error": "bad hook token"}), 401
+
     if request.is_json:
         payload = request.get_json(silent=True) or {}
     else:
         payload = dict(request.form) or dict(request.args)
-    event_type = payload.get("type", "lucky_webhook")
-    address = payload.get("address") or payload.get("ipAddr") or payload.get("value")
-    name = payload.get("name", "Lucky")
-    # 只收到 URL token 的空 webhook 属于测试粘贴错误，不记录事件，避免泄露 token。
-    if event_type == "lucky_webhook" and not address and set(payload.keys()).issubset({"token"}):
-        return jsonify({"ok": True, "ignored": True, "reason": "empty webhook", "time": now_str()})
+
+    def clean_addr(v: Any) -> str:
+        text = str(v or "").strip()
+        if not text:
+            return ""
+        bad = ["null", "none", "-", "#{", "{STUN_", "token=", "Bearer "]
+        low = text.lower()
+        if any(b.lower() in low for b in bad):
+            return ""
+        return text
+
+    def parse_lucky_content(text: str) -> Tuple[str, str]:
+        raw = str(text or "").strip().replace("\r", " ").replace("\n", " ")
+        if not raw:
+            return "Lucky", ""
+        # 兼容：Lucky：公网地址:端口 / Lucky:公网地址:端口
+        m = re.search(r"^\s*([^:：]{1,32})\s*[:：]\s*(.+?)\s*$", raw)
+        if m:
+            return (m.group(1).strip() or "Lucky"), clean_addr(m.group(2))
+        # 没有前缀时也接受整段，方便手动测试。
+        return "Lucky", clean_addr(raw)
+
+    # 兼容钉钉文本格式：{"msgtype":"text","text":{"content":"Lucky：#{ipAddr}"}}
+    text_obj = payload.get("text") if isinstance(payload, dict) else None
+    text_content = ""
+    if isinstance(text_obj, dict):
+        text_content = str(text_obj.get("content") or "")
+    elif isinstance(payload.get("content"), str):
+        text_content = str(payload.get("content") or "")
+
+    parsed_name, parsed_addr = parse_lucky_content(text_content)
+
+    event_type = str(payload.get("type") or "lucky_webhook")
+    name = str(payload.get("name") or parsed_name or "Lucky")
+    address = clean_addr(
+        payload.get("address")
+        or payload.get("ipAddr")
+        or payload.get("newValue")
+        or payload.get("value")
+        or parsed_addr
+    )
+
+    # 只收到 URL token 的空 webhook 属于测试粘贴错误，不记录事件。
+    if not address:
+        safe_payload = {k: v for k, v in payload.items() if str(k).lower() not in ["token", "password", "secret"]}
+        return jsonify({
+            "ok": True,
+            "ignored": True,
+            "reason": "empty or invalid lucky address",
+            "received": safe_payload,
+            "time": now_str(),
+        })
+
     state = load_json(STATE_FILE, {})
     state["updatedAt"] = now_str()
-    if "stun" in event_type or "wireguard" in event_type:
-        service = str(payload.get("service") or payload.get("name") or "stun").lower().replace(" ", "_")
-        state.setdefault("vpn", {})
-        old = state.get("vpn", {}).get(service, {}).get("address") or state.get("stun", {}).get("publicAddress")
-        if address:
-            state["vpn"][service] = {"address": address, "stun": address, "source": "Lucky Webhook", "updatedAt": now_str()}
-            # 兼容旧 APP 字段
-            state["stun"] = {"publicAddress": address, "source": "Lucky Webhook", "updatedAt": now_str()}
-            if "wireguard" in service or "wg" in service:
-                state["wireguard"] = {"publicAddress": address, "source": "Lucky Webhook", "updatedAt": now_str()}
-        if address and address != old:
-            add_event({"type": event_type, "title": f"{service} STUN 地址变化", "name": service, "oldValue": old, "newValue": address})
-    elif "ddns" in event_type:
-        domain = payload.get("domain") or name
-        state.setdefault("ddns", {})
-        old = state.get("ddns", {}).get(domain, {}).get("address")
-        state["ddns"][domain] = {"domain": domain, "address": address, "source": "Lucky Webhook", "updatedAt": now_str()}
-        if address and address != old:
-            add_event({"type": event_type, "title": "DDNS 地址变化", "name": domain, "oldValue": old, "newValue": address})
-    else:
-        safe_payload = {k: v for k, v in payload.items() if k.lower() not in ["token", "password", "secret"]}
-        if address or safe_payload:
-            add_event({"type": event_type, "title": "Lucky Webhook", "name": name, "newValue": address or json.dumps(safe_payload, ensure_ascii=False)})
-    save_json(STATE_FILE, state)
-    return jsonify({"ok": True, "received": payload, "time": now_str()})
 
+    # 简单稳定：Lucky 的 #{ipAddr} 已经是完整公网地址+端口，不拆 ip / port，原样保存。
+    service = str(payload.get("service") or name or "Lucky").strip() or "Lucky"
+    service_key = service.lower().replace(" ", "_")
+    if service_key in ["lucky_stun", "lucky：", "lucky:"]:
+        service_key = "lucky"
+
+    state.setdefault("vpn", {})
+    old = (
+        state.get("vpn", {}).get(service_key, {}).get("address")
+        or state.get("luckyStun", {}).get("address")
+        or state.get("stun", {}).get("publicAddress")
+    )
+    item = {
+        "name": service,
+        "address": address,
+        "stun": address,
+        "source": "Lucky Webhook",
+        "updatedAt": now_str(),
+    }
+    state["vpn"][service_key] = item
+    state["luckyStun"] = item
+    # 兼容旧 APP 字段：旧版本只读 state.stun.publicAddress。
+    state["stun"] = {"publicAddress": address, "source": "Lucky Webhook", "updatedAt": now_str()}
+
+    if address != old:
+        add_event({
+            "type": "stun_changed",
+            "title": f"{service} STUN 地址变化",
+            "name": service,
+            "oldValue": old,
+            "newValue": address,
+            "source": "lucky",
+            "content": text_content,
+        })
+
+    save_json(STATE_FILE, state)
+    return jsonify({
+        "ok": True,
+        "message": "lucky address saved",
+        "name": service,
+        "address": address,
+        "time": now_str(),
+    })
 
 @app.route("/hook/ruijie/devices", methods=["POST"])
 def hook_ruijie_devices():
