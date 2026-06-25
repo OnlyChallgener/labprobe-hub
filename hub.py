@@ -13,7 +13,7 @@ import requests
 import dns.resolver
 from flask import Flask, request, jsonify
 
-APP_VERSION = "0.7.0"
+APP_VERSION = "0.7.1"
 PORT = int(os.environ.get("PORT", "58443"))
 CONFIG_PATH = Path(os.environ.get("CONFIG_PATH", "/app/config/config.yaml"))
 DATA_DIR = Path(os.environ.get("DATA_DIR", "/app/data"))
@@ -21,6 +21,7 @@ DATA_DIR.mkdir(parents=True, exist_ok=True)
 
 EVENTS_FILE = DATA_DIR / "events.json"
 STATE_FILE = DATA_DIR / "state.json"
+VPN_STATE_FILE = DATA_DIR / "vpn_stun_addresses.json"
 DEVICES_FILE = DATA_DIR / "devices.json"
 DEVICE_ARCHIVE_FILE = DATA_DIR / "device_archive.json"
 DAILY_FILE = DATA_DIR / "daily.json"
@@ -169,6 +170,96 @@ def clean_saved_value(v: Any) -> str:
     if text.lower() in ["", "null", "none", "nan"] or text == "-":
         return ""
     return text
+
+
+def clean_vpn_address(v: Any) -> str:
+    text = clean_saved_value(v)
+    if not text:
+        return ""
+    low = text.lower()
+    bad_parts = ["#{", "{stun_", "token=", "bearer ", "authorization"]
+    if any(b in low for b in bad_parts):
+        return ""
+    return text
+
+
+def vpn_service_key(name: Any) -> str:
+    raw = clean_saved_value(name) or "STUN"
+    key = raw.lower().strip().replace(" ", "_").replace("/", "_")
+    key = re.sub(r"[^a-z0-9_一-鿿-]+", "_", key)
+    return key.strip("_") or "stun"
+
+
+def load_vpn_addresses() -> Dict[str, Dict[str, Any]]:
+    raw = load_json(VPN_STATE_FILE, {})
+    return raw if isinstance(raw, dict) else {}
+
+
+def save_vpn_addresses(data: Dict[str, Dict[str, Any]]) -> None:
+    clean: Dict[str, Dict[str, Any]] = {}
+    for k, item in (data or {}).items():
+        if not isinstance(item, dict):
+            continue
+        name = clean_saved_value(item.get("name")) or k
+        address = clean_vpn_address(item.get("address") or item.get("stun"))
+        if not address:
+            continue
+        clean[vpn_service_key(name)] = {
+            "name": name,
+            "address": address,
+            "stun": address,
+            "source": clean_saved_value(item.get("source")) or "webhook",
+            "updatedAt": clean_saved_value(item.get("updatedAt")) or now_str(),
+        }
+    save_json(VPN_STATE_FILE, clean)
+
+
+def upsert_vpn_address(name: Any, address: Any, source: str = "webhook") -> Tuple[Dict[str, Any], str]:
+    service = clean_saved_value(name) or "STUN"
+    addr = clean_vpn_address(address)
+    if not addr:
+        return {}, ""
+    key = vpn_service_key(service)
+    data = load_vpn_addresses()
+    old = clean_vpn_address((data.get(key) or {}).get("address"))
+    item = {
+        "name": service,
+        "address": addr,
+        "stun": addr,
+        "source": source,
+        "updatedAt": now_str(),
+    }
+    data[key] = item
+    save_vpn_addresses(data)
+    return item, old
+
+
+def vpn_addresses_list(state: Optional[Dict[str, Any]] = None) -> List[Dict[str, Any]]:
+    merged: Dict[str, Dict[str, Any]] = {}
+    if isinstance(state, dict):
+        vpn = state.get("vpn")
+        if isinstance(vpn, dict):
+            for k, item in vpn.items():
+                if isinstance(item, dict):
+                    name = clean_saved_value(item.get("name")) or k
+                    addr = clean_vpn_address(item.get("address") or item.get("stun"))
+                    if addr:
+                        merged[vpn_service_key(name)] = {"name": name, "address": addr, "stun": addr, "source": clean_saved_value(item.get("source")) or "state", "updatedAt": clean_saved_value(item.get("updatedAt"))}
+        for legacy_key, default_name in [("luckyStun", "Lucky"), ("stun", "STUN")]:
+            item = state.get(legacy_key)
+            if isinstance(item, dict):
+                name = clean_saved_value(item.get("name")) or default_name
+                addr = clean_vpn_address(item.get("address") or item.get("stun") or item.get("publicAddress"))
+                if addr:
+                    merged.setdefault(vpn_service_key(name), {"name": name, "address": addr, "stun": addr, "source": clean_saved_value(item.get("source")) or "legacy", "updatedAt": clean_saved_value(item.get("updatedAt"))})
+    for k, item in load_vpn_addresses().items():
+        name = clean_saved_value(item.get("name")) or k
+        addr = clean_vpn_address(item.get("address") or item.get("stun"))
+        if addr:
+            merged[vpn_service_key(name)] = {"name": name, "address": addr, "stun": addr, "source": clean_saved_value(item.get("source")) or "webhook", "updatedAt": clean_saved_value(item.get("updatedAt"))}
+    preferred = {"wireguard": 0, "openvpn": 1, "lucky": 2, "easytier": 3, "stun": 4}
+    return sorted(merged.values(), key=lambda x: (preferred.get(vpn_service_key(x.get("name")), 50), str(x.get("name", ""))))
+
 
 
 def merge_non_empty(base: Dict[str, Any], overlay: Dict[str, Any]) -> Dict[str, Any]:
@@ -784,32 +875,20 @@ def hook_lucky():
     state = load_json(STATE_FILE, {})
     state["updatedAt"] = now_str()
 
-    # 简单稳定：Lucky 的 #{ipAddr} 已经是完整公网地址+端口，不拆 ip / port，原样保存。
+    # 简单稳定：#{ipAddr} 已经是完整公网地址+端口，不拆 ip / port，按 content 前缀作为服务名保存。
     service = str(payload.get("service") or name or "Lucky").strip() or "Lucky"
-    service_key = service.lower().replace(" ", "_")
-    if service_key in ["lucky_stun", "lucky：", "lucky:"]:
-        service_key = "lucky"
+    item, old = upsert_vpn_address(service, address, "Lucky Webhook")
+    service_key = vpn_service_key(service)
 
     state.setdefault("vpn", {})
-    old = (
-        state.get("vpn", {}).get(service_key, {}).get("address")
-        or state.get("luckyStun", {}).get("address")
-        or state.get("stun", {}).get("publicAddress")
-    )
-    item = {
-        "name": service,
-        "address": address,
-        "stun": address,
-        "source": "Lucky Webhook",
-        "updatedAt": now_str(),
-    }
     state["vpn"][service_key] = item
+    # /api/status 直接返回动态列表，APP 首页不再只认 WireGuard。
+    state["vpnStunAddresses"] = vpn_addresses_list(state)
 
     # 只有真正的 Lucky/STUN 推送才写入 luckyStun / stun 兼容字段。
-    # OpenVPN：#{ipAddr} / EasyTier：#{ipAddr} 这类内容只写入 vpn.<service>，避免 APP 把它误显示成 Lucky。
     if service_key in ["lucky", "lucky_stun", "stun"] or "lucky" in service_key or "stun" in service_key:
         state["luckyStun"] = item
-        state["stun"] = {"publicAddress": address, "source": "Lucky Webhook", "updatedAt": now_str()}
+        state["stun"] = {"name": service, "publicAddress": address, "address": address, "source": "Lucky Webhook", "updatedAt": now_str()}
 
     if address != old:
         add_event({
@@ -988,6 +1067,8 @@ def api_status():
     state = load_json(STATE_FILE, {})
     state = refresh_ddns_and_exit(state)
     state["hub"] = {"name": "LabProbe Hub", "version": APP_VERSION, "updatedAt": now_str()}
+    state["vpnStunAddresses"] = vpn_addresses_list(state)
+    state["vpnAddresses"] = state["vpnStunAddresses"]
     state["updatedAt"] = now_str()
     save_json(STATE_FILE, state)
     return jsonify({"ok": True, "data": state})
