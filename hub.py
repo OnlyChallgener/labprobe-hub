@@ -13,7 +13,7 @@ import requests
 import dns.resolver
 from flask import Flask, request, jsonify
 
-APP_VERSION = "0.6.8"
+APP_VERSION = "0.7.0"
 PORT = int(os.environ.get("PORT", "58443"))
 CONFIG_PATH = Path(os.environ.get("CONFIG_PATH", "/app/config/config.yaml"))
 DATA_DIR = Path(os.environ.get("DATA_DIR", "/app/data"))
@@ -22,6 +22,7 @@ DATA_DIR.mkdir(parents=True, exist_ok=True)
 EVENTS_FILE = DATA_DIR / "events.json"
 STATE_FILE = DATA_DIR / "state.json"
 DEVICES_FILE = DATA_DIR / "devices.json"
+DEVICE_ARCHIVE_FILE = DATA_DIR / "device_archive.json"
 DAILY_FILE = DATA_DIR / "daily.json"
 GEO_CACHE_FILE = DATA_DIR / "geo_cache.json"
 NOTES_DIR = DATA_DIR / "notes"
@@ -161,6 +162,82 @@ def human_duration_precise(seconds: Any) -> str:
     if m > 0:
         return f"{m}分{s:02d}秒"
     return f"{s}秒"
+
+
+def clean_saved_value(v: Any) -> str:
+    text = "" if v is None else str(v).strip()
+    if text.lower() in ["", "null", "none", "nan"] or text == "-":
+        return ""
+    return text
+
+
+def merge_non_empty(base: Dict[str, Any], overlay: Dict[str, Any]) -> Dict[str, Any]:
+    out = dict(base or {})
+    for k, v in (overlay or {}).items():
+        if clean_saved_value(v):
+            out[k] = v
+        elif k not in out:
+            out[k] = v
+    return out
+
+
+def load_device_archive() -> Dict[str, Dict[str, Any]]:
+    raw = load_json(DEVICE_ARCHIVE_FILE, {})
+    return raw if isinstance(raw, dict) else {}
+
+
+def save_device_archive(data: Dict[str, Dict[str, Any]]) -> None:
+    # MAC 数量很少，但仍然限制一下，避免无限增长。
+    items = list(data.items())[-500:]
+    save_json(DEVICE_ARCHIVE_FILE, dict(items))
+
+
+def archive_device_snapshot(dev: Dict[str, Any]) -> None:
+    mac = norm_mac(dev.get("mac"))
+    if not mac:
+        return
+    archive = load_device_archive()
+    old = archive.get(mac, {})
+    keep_keys = [
+        "name", "mac", "ip", "lastIp", "ssid", "band", "rssi", "rxrate", "channel",
+        "connectType", "onlineSince", "onlineDurationText", "lastSeenAt", "offlineAt",
+        "hostName", "devType", "osType", "manufacture", "devRecommend"
+    ]
+    snap = {k: dev.get(k) for k in keep_keys if k in dev}
+    # 在线时把 ip 同步成 lastIp；离线时保留旧 lastIp，不被 None 覆盖。
+    if clean_saved_value(snap.get("ip")):
+        snap["lastIp"] = snap.get("ip")
+    merged = merge_non_empty(old, snap)
+    merged["mac"] = mac
+    merged["archivedAt"] = now_str()
+    archive[mac] = merged
+    save_device_archive(archive)
+
+
+def hydrate_device_with_archive(dev: Dict[str, Any], archive: Optional[Dict[str, Dict[str, Any]]] = None) -> Dict[str, Any]:
+    mac = norm_mac(dev.get("mac"))
+    if not mac:
+        return dev
+    archive = archive if archive is not None else load_device_archive()
+    old = archive.get(mac, {})
+    if not old:
+        return dev
+    out = dict(dev)
+    # 离线设备长期保留最后一次有效信息；在线设备只补缺失字段。
+    for k in ["name", "lastIp", "ssid", "band", "rssi", "rxrate", "channel", "connectType", "onlineSince", "onlineDurationText", "lastSeenAt", "hostName", "devType", "osType", "manufacture", "devRecommend"]:
+        if not clean_saved_value(out.get(k)) and clean_saved_value(old.get(k)):
+            out[k] = old.get(k)
+    if not bool(out.get("online")):
+        if not clean_saved_value(out.get("ip")) and clean_saved_value(old.get("lastIp") or old.get("ip")):
+            out["lastIp"] = old.get("lastIp") or old.get("ip")
+        if not clean_saved_value(out.get("offlineAt")) and clean_saved_value(old.get("offlineAt")):
+            out["offlineAt"] = old.get("offlineAt")
+    return out
+
+
+def hydrate_watched_list(items: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
+    archive = load_device_archive()
+    return [hydrate_device_with_archive(d, archive) for d in (items or [])]
 
 
 def parse_time_safe(v: Any) -> Optional[datetime]:
@@ -370,11 +447,13 @@ def build_watched_devices(online_devices: List[Dict[str, Any]]) -> List[Dict[str
     previous_state = load_json(DEVICES_FILE, {})
     previous = previous_state.get("watched", [])
     previous_by_mac = {norm_mac(d.get("mac")): d for d in previous}
+    archive = load_device_archive()
     now = now_str()
 
     for w in watched:
         wmac = norm_mac(w.get("mac"))
-        old = previous_by_mac.get(wmac, {})
+        # 历史归档作为底座，devices.json 当前状态作为覆盖。避免离线半小时后锐捷快照缺字段导致 APP 丢失最后 IP / 信号。
+        old = merge_non_empty(archive.get(wmac, {}), previous_by_mac.get(wmac, {}))
         match = by_mac.get(wmac)
         old_online = old.get("online")
 
@@ -389,6 +468,7 @@ def build_watched_devices(online_devices: List[Dict[str, Any]]) -> List[Dict[str
                 "onlineDurationText": match.get("onlineDurationText") or human_duration(match.get("activeTimeSec")),
                 "lastChangedAt": old.get("lastChangedAt") or now,
             })
+            archive_device_snapshot(dev)
             if old_online is not None and old_online is False:
                 dev["lastChangedAt"] = now
                 add_event({
@@ -427,6 +507,8 @@ def build_watched_devices(online_devices: List[Dict[str, Any]]) -> List[Dict[str
                 "offlineAt": offline_at,
                 "lastChangedAt": now if was_online else old.get("lastChangedAt") or now,
             }
+            dev = hydrate_device_with_archive(dev, archive)
+            archive_device_snapshot(dev)
             if was_online:
                 duration_text = duration_between(old.get("onlineSince"), offline_at) or old.get("onlineDurationText") or ""
                 add_event({
@@ -496,12 +578,13 @@ def upsert_watched_device_from_event(snapshot: Dict[str, Any], online: bool, eve
     devices_state = load_json(DEVICES_FILE, {"online": [], "watched": [], "updatedAt": None})
     watched = devices_state.get("watched", []) or []
     mac = norm_mac(snapshot.get("mac"))
+    archive = load_device_archive()
     found = False
     next_watched = []
     for d in watched:
         if norm_mac(d.get("mac")) == mac:
-            nd = dict(d)
-            nd.update({k: v for k, v in snapshot.items() if v not in [None, ""]})
+            nd = merge_non_empty(archive.get(mac, {}), d)
+            nd.update({k: v for k, v in snapshot.items() if clean_saved_value(v)})
             nd["online"] = online
             nd["lastChangedAt"] = event_time
             if online:
@@ -510,10 +593,12 @@ def upsert_watched_device_from_event(snapshot: Dict[str, Any], online: bool, eve
                 nd["onlineSince"] = snapshot.get("onlineSince") or event_time
                 nd["lastSeenAt"] = event_time
             else:
-                nd["lastIp"] = snapshot.get("lastIp") or snapshot.get("ip") or d.get("ip") or d.get("lastIp")
+                nd["lastIp"] = snapshot.get("lastIp") or snapshot.get("ip") or d.get("ip") or d.get("lastIp") or archive.get(mac, {}).get("lastIp")
                 nd["ip"] = None
                 nd["offlineAt"] = snapshot.get("offlineAt") or event_time
                 nd["lastSeenAt"] = snapshot.get("lastSeenAt") or d.get("lastSeenAt") or event_time
+                nd = hydrate_device_with_archive(nd, archive)
+            archive_device_snapshot(nd)
             next_watched.append(nd)
             found = True
         else:
@@ -528,6 +613,8 @@ def upsert_watched_device_from_event(snapshot: Dict[str, Any], online: bool, eve
         else:
             nd["ip"] = None
             nd["offlineAt"] = snapshot.get("offlineAt") or event_time
+            nd = hydrate_device_with_archive(nd, archive)
+        archive_device_snapshot(nd)
         next_watched.append(nd)
     devices_state["watched"] = next_watched
     devices_state["updatedAt"] = now_str()
@@ -752,6 +839,8 @@ def hook_ruijie_devices():
     try:
         payload = json.loads(raw)
         online, total = parse_ruijie_devices(payload)
+        for dev in online:
+            archive_device_snapshot(dev)
     except Exception as e:
         return jsonify({"ok": False, "error": f"parse failed: {e}"}), 400
 
@@ -910,7 +999,11 @@ def api_devices():
         return jsonify({"ok": False, "error": "unauthorized"}), 401
     devices = load_json(DEVICES_FILE, {"online": [], "watched": [], "updatedAt": None})
     view = request.args.get("view", "watched")
-    return jsonify({"ok": True, "updatedAt": devices.get("updatedAt"), "devices": devices.get(view if view in ["online", "watched"] else "watched", []), "onlineDeviceCount": devices.get("onlineDeviceCount", 0)})
+    key = view if view in ["online", "watched"] else "watched"
+    items = devices.get(key, [])
+    if key == "watched":
+        items = hydrate_watched_list(items)
+    return jsonify({"ok": True, "updatedAt": devices.get("updatedAt"), "devices": items, "onlineDeviceCount": devices.get("onlineDeviceCount", 0)})
 
 
 @app.route("/api/events", methods=["GET"])
@@ -982,63 +1075,135 @@ def pretty_duration_text(text: str) -> str:
     return s.replace("时", "小时")
 
 
+def duration_text_to_seconds(text: str) -> int:
+    s = str(text or "").strip().replace("时", "小时")
+    if not s or s in {"-", "null", "None"}:
+        return 0
+    total = 0
+    m = re.search(r"(\d+)小时", s)
+    if m:
+        total += int(m.group(1)) * 3600
+    m = re.search(r"(\d+)分", s)
+    if m:
+        total += int(m.group(1)) * 60
+    m = re.search(r"(\d+)秒", s)
+    if m:
+        total += int(m.group(1))
+    return total
+
+
 def aggregate_daily(day: str) -> Dict[str, Any]:
     events = [e for e in load_json(EVENTS_FILE, []) if not e.get("deleted") and event_timestamp(e).startswith(day)]
     devices: Dict[str, Dict[str, Any]] = {}
     vpn_items: List[Dict[str, Any]] = []
     network_items: List[Dict[str, Any]] = []
     ddns_items: List[Dict[str, Any]] = []
+    device_online_count = 0
+    device_offline_count = 0
+
     for e in events:
         typ = str(e.get("type", ""))
         name = str(e.get("name") or e.get("title") or "未知")
         t = event_timestamp(e)[11:16] if len(event_timestamp(e)) >= 16 else ""
+        new_value = str(e.get("newValue") or e.get("value") or e.get("address") or "").strip()
+        title = str(e.get("title") or name or typ or "事件")
+
         if typ.startswith("device_"):
-            d = devices.setdefault(name, {"name": name, "online": 0, "offline": 0, "onlineDurationText": "", "lastIp": "", "lastSignal": ""})
+            d = devices.setdefault(name, {
+                "name": name,
+                "online": 0,
+                "offline": 0,
+                "onlineDurationSec": 0,
+                "lastIp": "",
+                "lastSignal": "",
+            })
             if typ == "device_online":
                 d["online"] += 1
+                device_online_count += 1
             elif typ == "device_offline":
                 d["offline"] += 1
+                device_offline_count += 1
+
             ip = e.get("ip") or e.get("lastIp") or ""
             if ip:
                 d["lastIp"] = ip
             rssi = str(e.get("rssi") or e.get("lastRssi") or "").strip()
             band = str(e.get("band") or e.get("lastBand") or "").strip()
             rxrate = str(e.get("rxrate") or e.get("lastRxrate") or "").strip()
-            sig = " ".join([x for x in [rssi and f"{rssi}dBm" if not rssi.endswith("dBm") else rssi, band, rxrate] if x]).strip()
-            if sig:
-                d["lastSignal"] = sig
-            dur = pretty_duration_text(str(e.get("onlineDurationText") or ""))
-            if dur:
-                d["onlineDurationText"] = dur
+            sig_parts = []
+            if rssi and rssi not in ["-", "null", "None"]:
+                sig_parts.append(rssi if rssi.endswith("dBm") else f"{rssi}dBm")
+            if band and band not in ["-", "null", "None"]:
+                sig_parts.append(band)
+            if rxrate and rxrate not in ["-", "null", "None"]:
+                sig_parts.append(rxrate)
+            if sig_parts:
+                d["lastSignal"] = " ".join(sig_parts)
+            dur_text = pretty_duration_text(str(e.get("onlineDurationText") or ""))
+            dur_sec = duration_text_to_seconds(dur_text)
+            if dur_sec > 0:
+                d["onlineDurationSec"] += dur_sec
+
         elif "stun" in typ or "wireguard" in typ or "vpn" in typ:
-            vpn_items.append({"time": t, "text": f"{e.get('title') or name} · {e.get('newValue','')}"})
-        elif "router" in typ or "wan" in typ or "nas" in typ:
-            network_items.append({"time": t, "text": f"{e.get('title') or name}"})
+            service = str(e.get("name") or title).replace(" STUN 地址变化", "").replace("地址变化", "").strip() or "VPN/STUN"
+            address = new_value
+            vpn_items.append({
+                "time": t,
+                "name": service,
+                "address": address,
+                "text": f"{service} · {address}" if address else service,
+            })
+
+        elif "router" in typ or "wan" in typ or "nas" in typ or "network" in typ:
+            service = str(e.get("name") or title).strip() or "网络变化"
+            address = new_value or str(e.get("ip") or e.get("ipv6") or e.get("wanIpv6") or "").strip()
+            network_items.append({
+                "time": t,
+                "name": service,
+                "address": address,
+                "text": f"{service} · {address}" if address else service,
+            })
+
         elif "ddns" in typ:
-            ddns_items.append({"time": t, "text": f"{e.get('title') or name}"})
+            ddns_items.append({"time": t, "name": name, "text": f"{title} · {new_value}" if new_value else title})
+
     device_list = []
     for d in devices.values():
-        lines = [f"{d['name']}", f"上线 {d['online']} 次 · 下线 {d['offline']} 次"]
-        details = []
-        if d.get("onlineDurationText"):
-            details.append(f"在线 {d['onlineDurationText']}")
+        duration = human_duration_precise(d.get("onlineDurationSec", 0))
+        detail_parts = []
+        if duration:
+            detail_parts.append(f"在线 {duration}")
         if d.get("lastIp"):
-            details.append(d["lastIp"])
+            detail_parts.append(str(d["lastIp"]))
         if d.get("lastSignal"):
-            details.append(d["lastSignal"])
-        if details:
-            lines.append(" · ".join(details))
-        device_list.append({"text": "\n".join(lines)})
+            detail_parts.append(str(d["lastSignal"]))
+        line2 = f"上线 {d['online']} 次 · 下线 {d['offline']} 次"
+        if detail_parts:
+            line2 += " · " + " · ".join(detail_parts)
+        device_list.append({
+            "name": d["name"],
+            "online": d["online"],
+            "offline": d["offline"],
+            "onlineDurationText": duration,
+            "lastIp": d.get("lastIp", ""),
+            "lastSignal": d.get("lastSignal", ""),
+            "text": f"{d['name']}\n{line2}",
+        })
+
+    note = get_daily_note(day)
     summary = {
-        "deviceChanges": sum(1 for e in events if str(e.get("type", "")).startswith("device_")),
+        "deviceChanges": device_online_count + device_offline_count,
+        "deviceOnline": device_online_count,
+        "deviceOffline": device_offline_count,
         "vpnChanges": len(vpn_items),
         "networkChanges": len(network_items),
         "ddnsChanges": len(ddns_items),
+        "noteCount": 1 if note.strip() else 0,
         "eventCount": len(events),
     }
     sections = {"devices": device_list, "vpn": vpn_items, "network": network_items, "ddns": ddns_items}
     sections = {k: v for k, v in sections.items() if v}
-    return {"date": day, "summary": summary, "sections": sections, "note": get_daily_note(day)}
+    return {"date": day, "summary": summary, "sections": sections, "note": note}
 
 def recent_dates(days: int = 7) -> List[str]:
     from datetime import timedelta
