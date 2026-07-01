@@ -4,6 +4,8 @@ import socket
 import subprocess
 import ipaddress
 import re
+import time
+import threading
 from datetime import datetime, date
 from pathlib import Path
 from typing import Any, Dict, List, Optional, Tuple
@@ -13,7 +15,7 @@ import requests
 import dns.resolver
 from flask import Flask, request, jsonify
 
-APP_VERSION = "0.7.2"
+APP_VERSION = "0.7.3"
 PORT = int(os.environ.get("PORT", "58443"))
 CONFIG_PATH = Path(os.environ.get("CONFIG_PATH", "/app/config/config.yaml"))
 DATA_DIR = Path(os.environ.get("DATA_DIR", "/app/data"))
@@ -31,6 +33,12 @@ NOTES_DIR.mkdir(parents=True, exist_ok=True)
 
 app = Flask(__name__)
 
+DATA_LOCK = threading.RLock()
+REFRESH_LOCK = threading.RLock()
+REFRESH_RUNNING = False
+STATUS_REFRESH_TTL_SEC = int(os.environ.get("STATUS_REFRESH_TTL_SEC", "180"))
+
+
 
 def now_str() -> str:
     return datetime.now().strftime("%Y-%m-%d %H:%M:%S")
@@ -40,18 +48,35 @@ def today_str() -> str:
     return date.today().isoformat()
 
 
+def time_to_epoch(v: Any) -> float:
+    if not v:
+        return 0.0
+    text = str(v).strip()
+    for fmt in ["%Y-%m-%d %H:%M:%S", "%Y-%m-%dT%H:%M:%S"]:
+        try:
+            return datetime.strptime(text[:19], fmt).timestamp()
+        except Exception:
+            pass
+    return 0.0
+
+
 def load_json(path: Path, default: Any) -> Any:
-    if not path.exists():
-        return default
-    try:
-        return json.loads(path.read_text(encoding="utf-8"))
-    except Exception:
-        return default
+    with DATA_LOCK:
+        if not path.exists():
+            return default
+        try:
+            return json.loads(path.read_text(encoding="utf-8"))
+        except Exception:
+            return default
 
 
 def save_json(path: Path, data: Any) -> None:
-    path.parent.mkdir(parents=True, exist_ok=True)
-    path.write_text(json.dumps(data, ensure_ascii=False, indent=2), encoding="utf-8")
+    # v0.7.3：原子写入，避免 APP 刷新和路由器推送同时读写时出现半截 JSON / 覆盖。
+    with DATA_LOCK:
+        path.parent.mkdir(parents=True, exist_ok=True)
+        tmp = path.with_suffix(path.suffix + ".tmp")
+        tmp.write_text(json.dumps(data, ensure_ascii=False, indent=2), encoding="utf-8")
+        os.replace(tmp, path)
 
 
 def load_config() -> Dict[str, Any]:
@@ -859,6 +884,86 @@ def refresh_ddns_and_exit(state: Dict[str, Any]) -> Dict[str, Any]:
     return state
 
 
+def check_push_token() -> bool:
+    token = request.headers.get("X-LabProbe-Token", "").strip()
+    if token and token in {get_hook_token(), get_app_token()}:
+        return True
+    return check_hook_token()
+
+
+@app.route("/api/router/push", methods=["POST"])
+def api_router_push():
+    # 极简路由脚本入口：路由器只 POST snapshot / device_event，Hub 负责保存和去重。
+    if not check_push_token():
+        return jsonify({"ok": False, "error": "bad token"}), 401
+    payload = request.get_json(silent=True) or {}
+    typ = str(payload.get("type") or "snapshot").strip()
+    ts = payload.get("ts")
+    event_time = datetime.fromtimestamp(float(ts)).strftime("%Y-%m-%d %H:%M:%S") if ts else now_str()
+
+    if typ == "snapshot":
+        state = load_json(STATE_FILE, {})
+        state.setdefault("router", {})
+        state.setdefault("nas", {})
+        router_name = clean_saved_value(payload.get("router")) or cfg_get("router.name", "Ruijie")
+        state["router"].update({
+            "name": router_name,
+            "lanIp": clean_saved_value(payload.get("lan_ip")),
+            "wanIpv6": clean_saved_value(payload.get("router_wan6") or payload.get("routerWanIpv6")) or state.get("router", {}).get("wanIpv6"),
+            "routerUpdatedAt": event_time,
+            "routerStatus": "ok",
+        })
+        state["nas"].update({
+            "exitIpv4": clean_saved_value(payload.get("wan_ipv4")),
+            "exitIpv6": clean_saved_value(payload.get("wan_ipv6")),
+            "updatedAt": event_time,
+        })
+        state["updatedAt"] = event_time
+        save_json(STATE_FILE, state)
+        return jsonify({"ok": True, "message": "snapshot saved", "time": now_str()})
+
+    if typ in ["device_event", "device"]:
+        event_name = clean_saved_value(payload.get("event"))
+        mapped = "device_online" if event_name == "online" else "device_offline" if event_name == "offline" else event_name
+        if mapped not in ["device_online", "device_offline"]:
+            return jsonify({"ok": False, "error": "event must be online/offline"}), 400
+        fake_payload = dict(payload)
+        fake_payload["type"] = mapped
+        fake_payload["time"] = event_time
+        fake_payload["lastIp"] = payload.get("ip")
+        # 复用同一套设备事件逻辑。
+        with app.test_request_context(json=fake_payload, headers={"X-LabProbe-Token": request.headers.get("X-LabProbe-Token", "")}):
+            # 不能直接复用 token 校验上下文，改为内联最小保存逻辑。
+            pass
+        snap = device_snapshot_from_payload(fake_payload)
+        online = mapped == "device_online"
+        name = snap.get("name") or snap.get("mac") or "未知设备"
+        event = {
+            "type": mapped, "source": "router_push", "title": f"{name} {'上线' if online else '离线'}",
+            "name": name, "mac": snap.get("mac"), "time": event_time, "createdAt": event_time,
+            "ip": snap.get("ip") if online else (snap.get("lastIp") or snap.get("ip")),
+            "lastIp": snap.get("lastIp") or snap.get("ip"),
+            "rssi": snap.get("rssi"), "band": snap.get("band"), "rxrate": snap.get("rxrate"), "ssid": snap.get("ssid"),
+            "onlineSince": snap.get("onlineSince"), "offlineAt": snap.get("offlineAt") or (event_time if not online else ""),
+            "onlineDurationText": snap.get("onlineDurationText"), "oldValue": "offline" if online else "online", "newValue": "online" if online else "offline",
+            "device": snap,
+        }
+        if not online and not event.get("onlineDurationText"):
+            event["onlineDurationText"] = duration_between(event.get("onlineSince"), event.get("offlineAt"))
+        events = load_json(EVENTS_FILE, [])
+        last = next((e for e in reversed(events) if norm_mac(e.get("mac")) == norm_mac(event.get("mac")) and e.get("type") == event.get("type")), None)
+        if last:
+            lt = parse_time_safe(last.get("createdAt") or last.get("time")); nt = parse_time_safe(event_time)
+            if lt and nt and abs((nt - lt).total_seconds()) <= 300 and mapped == "device_offline":
+                upsert_watched_device_from_event(snap, online, event_time)
+                return jsonify({"ok": True, "dedup": True, "message": "duplicate offline ignored", "time": now_str()})
+        saved = add_event(event)
+        upsert_watched_device_from_event(snap, online, event_time)
+        return jsonify({"ok": True, "message": "device event saved", "event": saved, "time": now_str()})
+
+    return jsonify({"ok": False, "error": "unknown type"}), 400
+
+
 @app.route("/health", methods=["GET"])
 def health():
     return jsonify({"ok": True, "name": "LabProbe Hub", "version": APP_VERSION, "time": now_str()})
@@ -1124,19 +1229,65 @@ def hook_ruijie_router():
     return jsonify({"ok": True, "message": "router check failed, keep previous value", "wanIpv6": old, "wanIf": wan_if, "time": now_str(), "status": "stale"})
 
 
+def _refresh_status_cache_worker(force: bool = False) -> None:
+    global REFRESH_RUNNING
+    with REFRESH_LOCK:
+        if REFRESH_RUNNING:
+            return
+        REFRESH_RUNNING = True
+    try:
+        state = load_json(STATE_FILE, {})
+        # 慢任务放后台：公网出口 curl、DDNS 解析、事件修复，不阻塞 /api/status。
+        state = refresh_ddns_and_exit(state)
+        state = ensure_vpn_addresses_from_events(state)
+        state.setdefault("hub", {})
+        state["hub"].update({"backgroundRefreshedAt": now_str()})
+        state["updatedAt"] = now_str()
+        save_json(STATE_FILE, state)
+    except Exception as e:
+        print(f"[LabProbe] background refresh failed: {e}", flush=True)
+    finally:
+        with REFRESH_LOCK:
+            REFRESH_RUNNING = False
+
+
+def trigger_status_refresh_if_needed(state: Dict[str, Any], force: bool = False) -> None:
+    hub = state.get("hub") if isinstance(state.get("hub"), dict) else {}
+    last = time_to_epoch(hub.get("backgroundRefreshedAt") or state.get("updatedAt"))
+    stale = force or not last or (time.time() - last > STATUS_REFRESH_TTL_SEC)
+    if stale:
+        threading.Thread(target=_refresh_status_cache_worker, kwargs={"force": force}, daemon=True).start()
+
+
 @app.route("/api/status", methods=["GET"])
 def api_status():
     if not check_app_token():
         return jsonify({"ok": False, "error": "unauthorized"}), 401
     state = load_json(STATE_FILE, {})
-    state = refresh_ddns_and_exit(state)
-    state = ensure_vpn_addresses_from_events(state)
-    state["hub"] = {"name": "LabProbe Hub", "version": APP_VERSION, "updatedAt": now_str()}
+    force = request.args.get("refresh", "") in ["1", "true", "yes"]
+    # v0.7.3：状态接口只返回缓存，避免外网 curl / DNS 卡住导致 APP 显示“连通但刷新不了”。
+    trigger_status_refresh_if_needed(state, force=force)
+    state["hub"] = {
+        **(state.get("hub") if isinstance(state.get("hub"), dict) else {}),
+        "name": "LabProbe Hub",
+        "version": APP_VERSION,
+        "updatedAt": now_str(),
+        "statusMode": "cache_first",
+        "refreshRunning": REFRESH_RUNNING,
+    }
     state["vpnStunAddresses"] = vpn_addresses_list(state)
     state["vpnAddresses"] = state["vpnStunAddresses"]
-    state["updatedAt"] = now_str()
-    save_json(STATE_FILE, state)
+    devices_state = load_json(DEVICES_FILE, {"updatedAt": None})
+    state["devicesUpdatedAt"] = devices_state.get("updatedAt")
     return jsonify({"ok": True, "data": state})
+
+
+@app.route("/api/status/refresh", methods=["POST", "GET"])
+def api_status_refresh():
+    if not check_app_token():
+        return jsonify({"ok": False, "error": "unauthorized"}), 401
+    threading.Thread(target=_refresh_status_cache_worker, kwargs={"force": True}, daemon=True).start()
+    return jsonify({"ok": True, "message": "refresh started", "time": now_str()})
 
 
 @app.route("/api/devices", methods=["GET"])
@@ -1238,8 +1389,62 @@ def duration_text_to_seconds(text: str) -> int:
     return total
 
 
+
+def event_device_key(e: Dict[str, Any]) -> str:
+    mac = norm_mac(e.get("mac"))
+    if mac:
+        return "mac:" + mac
+    name = clean_saved_value(e.get("name") or str(e.get("title") or "").replace(" 上线", "").replace(" 离线", "")).lower()
+    if name:
+        return "name:" + name
+    ip = clean_saved_value(e.get("ip") or e.get("lastIp"))
+    return "ip:" + ip if ip else ""
+
+
+def normalize_device_events_for_daily(events: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
+    ordered = sorted(events, key=lambda e: (time_to_epoch(event_timestamp(e)) or 0, int(e.get("id", 0))))
+    state: Dict[str, str] = {}
+    online_at: Dict[str, float] = {}
+    last_offline: Dict[str, float] = {}
+    kept: List[Dict[str, Any]] = []
+    for e in ordered:
+        typ = str(e.get("type", ""))
+        if typ not in ["device_online", "device_offline"]:
+            kept.append(e); continue
+        key = event_device_key(e)
+        if not key:
+            kept.append(e); continue
+        at = time_to_epoch(event_timestamp(e))
+        prev = state.get(key)
+        if typ == "device_online":
+            if prev == "online":
+                continue
+            state[key] = "online"
+            if at:
+                online_at[key] = at
+            kept.append(e)
+            continue
+        # offline
+        dur_sec = duration_text_to_seconds(pretty_duration_text(str(e.get("onlineDurationText") or "")))
+        if dur_sec <= 0 and online_at.get(key) and at and at >= online_at[key]:
+            dur_sec = int(at - online_at[key])
+            e = dict(e)
+            e["onlineDurationText"] = human_duration_precise(dur_sec)
+        if dur_sec <= 0:
+            continue
+        if prev == "offline":
+            continue
+        if at and key in last_offline and 0 <= at - last_offline[key] <= 300:
+            continue
+        state[key] = "offline"
+        if at:
+            last_offline[key] = at
+        online_at.pop(key, None)
+        kept.append(e)
+    return kept
+
 def aggregate_daily(day: str) -> Dict[str, Any]:
-    events = [e for e in load_json(EVENTS_FILE, []) if not e.get("deleted") and event_timestamp(e).startswith(day)]
+    events = normalize_device_events_for_daily([e for e in load_json(EVENTS_FILE, []) if not e.get("deleted") and event_timestamp(e).startswith(day)])
     devices: Dict[str, Dict[str, Any]] = {}
     vpn_items: List[Dict[str, Any]] = []
     network_items: List[Dict[str, Any]] = []
@@ -1255,7 +1460,8 @@ def aggregate_daily(day: str) -> Dict[str, Any]:
         title = str(e.get("title") or name or typ or "事件")
 
         if typ.startswith("device_"):
-            d = devices.setdefault(name, {
+            dkey = event_device_key(e) or name
+            d = devices.setdefault(dkey, {
                 "name": name,
                 "online": 0,
                 "offline": 0,
