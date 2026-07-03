@@ -15,7 +15,7 @@ import requests
 import dns.resolver
 from flask import Flask, request, jsonify
 
-APP_VERSION = "0.7.3"
+APP_VERSION = "0.7.4"
 PORT = int(os.environ.get("PORT", "58443"))
 CONFIG_PATH = Path(os.environ.get("CONFIG_PATH", "/app/config/config.yaml"))
 DATA_DIR = Path(os.environ.get("DATA_DIR", "/app/data"))
@@ -906,18 +906,44 @@ def api_router_push():
         state.setdefault("router", {})
         state.setdefault("nas", {})
         router_name = clean_saved_value(payload.get("router")) or cfg_get("router.name", "Ruijie")
-        state["router"].update({
+        router_wan6 = clean_saved_value(payload.get("router_wan6") or payload.get("routerWanIpv6")) or state.get("router", {}).get("wanIpv6")
+
+        # v0.7.4：路由器脚本只允许更新“路由 WAN6”类字段。
+        # 注意：wan_ipv4 / wan_ipv6 是路由器侧外网探测结果，不能写入 nas.exitIpv4/exitIpv6，
+        # 否则会把 NAS IPv6 错显示成路由 WAN6。
+        router_update = {
             "name": router_name,
             "lanIp": clean_saved_value(payload.get("lan_ip")),
-            "wanIpv6": clean_saved_value(payload.get("router_wan6") or payload.get("routerWanIpv6")) or state.get("router", {}).get("wanIpv6"),
+            "wanIpv6": router_wan6,
             "routerUpdatedAt": event_time,
             "routerStatus": "ok",
-        })
-        state["nas"].update({
-            "exitIpv4": clean_saved_value(payload.get("wan_ipv4")),
-            "exitIpv6": clean_saved_value(payload.get("wan_ipv6")),
-            "updatedAt": event_time,
-        })
+        }
+        wan6_list = payload.get("router_wan6_list") or payload.get("routerWan6List") or payload.get("wan6List")
+        if isinstance(wan6_list, list):
+            cleaned = []
+            seen = set()
+            for i, item in enumerate(wan6_list):
+                if not isinstance(item, dict):
+                    continue
+                ip = clean_saved_value(item.get("ip") or item.get("address") or item.get("value"))
+                if not ip or ip in seen:
+                    continue
+                seen.add(ip)
+                name = clean_saved_value(item.get("name")) or ("主用 WAN" if item.get("primary") or i == 0 else "备用 WAN")
+                cleaned.append({"name": name, "ip": ip, "primary": bool(item.get("primary") or (not cleaned and ip == router_wan6))})
+            if cleaned:
+                if not any(x.get("primary") for x in cleaned):
+                    cleaned[0]["primary"] = True
+                router_update["wan6List"] = cleaned
+        state["router"].update(router_update)
+
+        # 修复老版本污染：如果 NAS IPv6 正好等于路由 WAN6，清空 NAS IPv6，等待 Hub 自己后台探测。
+        # NAS IPv6 必须由 Hub/NAS 本机检测，不能从路由脚本兜底。
+        if router_wan6 and clean_saved_value(state.get("nas", {}).get("exitIpv6")) == router_wan6:
+            state["nas"]["exitIpv6"] = None
+            state["nas"]["updatedAt"] = event_time
+            state["nas"]["note"] = "NAS IPv6 was cleared because it matched router WAN6"
+
         state["updatedAt"] = event_time
         save_json(STATE_FILE, state)
         return jsonify({"ok": True, "message": "snapshot saved", "time": now_str()})
