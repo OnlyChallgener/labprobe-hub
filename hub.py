@@ -15,7 +15,7 @@ import requests
 import dns.resolver
 from flask import Flask, request, jsonify
 
-APP_VERSION = "0.7.4"
+APP_VERSION = "0.7.6"
 PORT = int(os.environ.get("PORT", "58443"))
 CONFIG_PATH = Path(os.environ.get("CONFIG_PATH", "/app/config/config.yaml"))
 DATA_DIR = Path(os.environ.get("DATA_DIR", "/app/data"))
@@ -195,6 +195,80 @@ def clean_saved_value(v: Any) -> str:
     if text.lower() in ["", "null", "none", "nan"] or text == "-":
         return ""
     return text
+
+
+def strip_ip_prefix(v: Any) -> str:
+    text = clean_saved_value(v)
+    if not text:
+        return ""
+    # 允许手动配置 2409:.../64，展示和 WireGuard 只需要纯地址。
+    if "/" in text and not text.startswith("http"):
+        text = text.split("/", 1)[0].strip()
+    if text.startswith("[") and "]" in text:
+        text = text[1:text.index("]")].strip()
+    return text
+
+
+def is_public_ip_text(v: Any, ipv6: bool = False) -> bool:
+    text = strip_ip_prefix(v)
+    if not text:
+        return False
+    try:
+        ip = ipaddress.ip_address(text)
+        if ipv6 and ip.version != 6:
+            return False
+        if not ipv6 and ip.version != 4:
+            return False
+        return ip.is_global
+    except Exception:
+        return False
+
+
+def get_manual_nas_ip(ipv6: bool = False) -> str:
+    # 最高优先级：显式手动配置。用于 Docker bridge 无法直接 curl 出 NAS IPv6 的情况。
+    # docker-compose 可写：NAS_IPV6=2409:...:2a79 或 NAS_IPV6=2409:...:2a79/64
+    keys = ["NAS_IPV6", "LABPROBE_NAS_IPV6", "EXIT_IPV6"] if ipv6 else ["NAS_IPV4", "LABPROBE_NAS_IPV4", "EXIT_IPV4"]
+    for k in keys:
+        v = strip_ip_prefix(os.environ.get(k))
+        if v and is_public_ip_text(v, ipv6=ipv6):
+            return v
+    cfg_keys = [
+        "nas.exit_ipv6", "nas.exitIpv6", "nas.ipv6", "exit_ip.manual_ipv6", "exit_ip.ipv6_manual"
+    ] if ipv6 else [
+        "nas.exit_ipv4", "nas.exitIpv4", "nas.ipv4", "exit_ip.manual_ipv4", "exit_ip.ipv4_manual"
+    ]
+    for k in cfg_keys:
+        v = strip_ip_prefix(cfg_get(k, ""))
+        if v and is_public_ip_text(v, ipv6=ipv6):
+            return v
+    return ""
+
+
+def get_local_global_ip(ipv6: bool = False) -> str:
+    # 低优先级兜底：在 host 网络模式下可从本机网卡读取 NAS IPv6。
+    # Docker bridge 下可能读到容器地址，只有 public/global 才接受。
+    cmd = ["ip", "-6" if ipv6 else "-4", "addr", "show", "scope", "global"]
+    try:
+        out = subprocess.check_output(cmd, text=True, timeout=3)
+    except Exception:
+        return ""
+    candidates = []
+    for line in out.splitlines():
+        line = line.strip()
+        if not line.startswith("inet6 " if ipv6 else "inet "):
+            continue
+        if any(x in line for x in ["tentative", "deprecated"]):
+            continue
+        parts = line.split()
+        if len(parts) < 2:
+            continue
+        ip = strip_ip_prefix(parts[1])
+        if is_public_ip_text(ip, ipv6=ipv6):
+            # 避免优先拿 temporary，先放后面。
+            score = 10 if "temporary" in line else 0
+            candidates.append((score, ip))
+    candidates.sort(key=lambda x: x[0])
+    return candidates[0][1] if candidates else ""
 
 
 def clean_vpn_address(v: Any) -> str:
@@ -807,15 +881,20 @@ def upsert_watched_device_from_event(snapshot: Dict[str, Any], online: bool, eve
 
 
 def get_exit_ip(ipv6: bool = False) -> Optional[str]:
-    # 多源检测 NAS 出口地址。Hub 跑在 NAS 上，所以这里得到的是 NAS 的出口 IPv4 / IPv6。
+    # NAS 出口地址只能由 Hub/NAS 自己获取或手动配置，绝不从 router_wan6 兜底。
+    # 优先级：手动配置 > curl 外网出口 > 本机全局地址。
+    manual = get_manual_nas_ip(ipv6)
+    if manual:
+        return manual
+
     cfg_url = cfg_get("exit_ip.ipv6_url" if ipv6 else "exit_ip.ipv4_url", None)
     urls = []
     if cfg_url:
         urls.append(cfg_url)
     if ipv6:
-        urls += ["https://api6.ipify.org", "https://ipv6.icanhazip.com", "https://6.ipw.cn"]
+        urls += ["https://api6.ipify.org", "https://api64.ipify.org", "https://ipv6.icanhazip.com", "https://v6.ident.me", "https://6.ipw.cn"]
     else:
-        urls += ["https://api.ipify.org", "https://ipv4.icanhazip.com", "https://4.ipw.cn"]
+        urls += ["https://api.ipify.org", "https://ipv4.icanhazip.com", "https://v4.ident.me", "https://4.ipw.cn"]
     seen = set()
     for url in urls:
         if not url or url in seen:
@@ -823,11 +902,15 @@ def get_exit_ip(ipv6: bool = False) -> Optional[str]:
         seen.add(url)
         cmd = ["curl", "-6" if ipv6 else "-4", "-s", "--max-time", "6", url]
         try:
-            out = subprocess.check_output(cmd, text=True).strip()
-            if out and len(out) < 80 and not out.lower().startswith("error"):
+            out = strip_ip_prefix(subprocess.check_output(cmd, text=True, timeout=8))
+            if out and is_public_ip_text(out, ipv6=ipv6):
                 return out
         except Exception:
             pass
+
+    local_ip = get_local_global_ip(ipv6)
+    if local_ip:
+        return local_ip
     return None
 
 
@@ -843,8 +926,23 @@ def refresh_ddns_and_exit(state: Dict[str, Any]) -> Dict[str, Any]:
     nas_ipv4 = get_exit_ip(False)
     nas_ipv6 = get_exit_ip(True)
     state.setdefault("nas", {})
-    state["nas"].update({"exitIpv4": nas_ipv4, "exitIpv6": nas_ipv6, "updatedAt": now_str()})
-    # 路由器 WAN IPv6 由 /hook/ruijie/router 推送；这里不再用 NAS 地址误填。
+
+    # v0.7.6：NAS IPv4 / IPv6 只由 Hub/NAS 自己获取或手动配置。
+    # 检测失败时保留旧值，不清空，避免 APP 里 NAS IPv6 / WireGuard 突然消失。
+    nas_update = {"updatedAt": now_str()}
+    if nas_ipv4:
+        nas_update["exitIpv4"] = nas_ipv4
+        nas_update["exitIpv4Source"] = "manual_or_hub"
+    else:
+        nas_update["exitIpv4LastError"] = "detect_failed_keep_previous"
+    if nas_ipv6:
+        nas_update["exitIpv6"] = nas_ipv6
+        nas_update["exitIpv6Source"] = "manual_or_hub"
+    else:
+        nas_update["exitIpv6LastError"] = "detect_failed_keep_previous"
+    state["nas"].update(nas_update)
+
+    # 路由器 WAN6 由路由脚本推送；只保留 router.*，不参与 NAS 字段。
     state.setdefault("router", {})
     state["router"].setdefault("exitIpv4", None)
     state["router"].setdefault("exitIpv6", state["router"].get("wanIpv6"))
@@ -937,15 +1035,20 @@ def api_router_push():
                 router_update["wan6List"] = cleaned
         state["router"].update(router_update)
 
-        # 修复老版本污染：如果 NAS IPv6 正好等于路由 WAN6，清空 NAS IPv6，等待 Hub 自己后台探测。
-        # NAS IPv6 必须由 Hub/NAS 本机检测，不能从路由脚本兜底。
-        if router_wan6 and clean_saved_value(state.get("nas", {}).get("exitIpv6")) == router_wan6:
-            state["nas"]["exitIpv6"] = None
-            state["nas"]["updatedAt"] = event_time
-            state["nas"]["note"] = "NAS IPv6 was cleared because it matched router WAN6"
+        # v0.7.5：/api/router/push 只允许更新 router.*。
+        # NAS IPv4 / NAS IPv6 是 Hub/NAS 本机出口，不能由路由脚本清空，也不能因为和路由 WAN6 相同就隐藏。
+        # 某些桥接场景下 NAS 出口 IPv6 与路由 WAN6 可能相同，这仍然是有效的 NAS IPv6。
 
         state["updatedAt"] = event_time
         save_json(STATE_FILE, state)
+
+        nas_state = state.get("nas") if isinstance(state.get("nas"), dict) else {}
+        if not clean_saved_value(nas_state.get("exitIpv4")) or not clean_saved_value(nas_state.get("exitIpv6")):
+            try:
+                trigger_status_refresh_if_needed(state, force=True)
+            except Exception:
+                pass
+
         return jsonify({"ok": True, "message": "snapshot saved", "time": now_str()})
 
     if typ in ["device_event", "device"]:
@@ -1279,10 +1382,12 @@ def _refresh_status_cache_worker(force: bool = False) -> None:
 
 def trigger_status_refresh_if_needed(state: Dict[str, Any], force: bool = False) -> None:
     hub = state.get("hub") if isinstance(state.get("hub"), dict) else {}
+    nas = state.get("nas") if isinstance(state.get("nas"), dict) else {}
     last = time_to_epoch(hub.get("backgroundRefreshedAt") or state.get("updatedAt"))
-    stale = force or not last or (time.time() - last > STATUS_REFRESH_TTL_SEC)
+    missing_nas_exit = not clean_saved_value(nas.get("exitIpv4")) or not clean_saved_value(nas.get("exitIpv6"))
+    stale = force or missing_nas_exit or not last or (time.time() - last > STATUS_REFRESH_TTL_SEC)
     if stale:
-        threading.Thread(target=_refresh_status_cache_worker, kwargs={"force": force}, daemon=True).start()
+        threading.Thread(target=_refresh_status_cache_worker, kwargs={"force": force or missing_nas_exit}, daemon=True).start()
 
 
 @app.route("/api/status", methods=["GET"])
