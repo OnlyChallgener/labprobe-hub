@@ -15,7 +15,7 @@ import requests
 import dns.resolver
 from flask import Flask, request, jsonify
 
-APP_VERSION = "0.7.6"
+APP_VERSION = "0.7.7"
 PORT = int(os.environ.get("PORT", "58443"))
 CONFIG_PATH = Path(os.environ.get("CONFIG_PATH", "/app/config/config.yaml"))
 DATA_DIR = Path(os.environ.get("DATA_DIR", "/app/data"))
@@ -455,7 +455,7 @@ def archive_device_snapshot(dev: Dict[str, Any]) -> None:
     keep_keys = [
         "name", "mac", "ip", "lastIp", "ssid", "band", "rssi", "rxrate", "channel",
         "connectType", "onlineSince", "onlineDurationText", "lastSeenAt", "offlineAt",
-        "hostName", "devType", "osType", "manufacture", "devRecommend"
+        "hostName", "devType", "osType", "manufacture", "devRecommend", "ipv6List", "ipv6UpdatedAt", "ndpState", "ndpDev", "wolMode"
     ]
     snap = {k: dev.get(k) for k in keep_keys if k in dev}
     # 在线时把 ip 同步成 lastIp；离线时保留旧 lastIp，不被 None 覆盖。
@@ -478,7 +478,7 @@ def hydrate_device_with_archive(dev: Dict[str, Any], archive: Optional[Dict[str,
         return dev
     out = dict(dev)
     # 离线设备长期保留最后一次有效信息；在线设备只补缺失字段。
-    for k in ["name", "lastIp", "ssid", "band", "rssi", "rxrate", "channel", "connectType", "onlineSince", "onlineDurationText", "lastSeenAt", "hostName", "devType", "osType", "manufacture", "devRecommend"]:
+    for k in ["name", "lastIp", "ssid", "band", "rssi", "rxrate", "channel", "connectType", "onlineSince", "onlineDurationText", "lastSeenAt", "hostName", "devType", "osType", "manufacture", "devRecommend", "ipv6List", "ipv6UpdatedAt", "ndpState", "ndpDev", "wolMode"]:
         if not clean_saved_value(out.get(k)) and clean_saved_value(old.get(k)):
             out[k] = old.get(k)
     if not bool(out.get("online")):
@@ -650,6 +650,67 @@ def lookup_geo(ip: str) -> Dict[str, Any]:
     save_json(GEO_CACHE_FILE, cache)
     return result
 
+def normalize_ipv6_list(values: Any) -> List[str]:
+    raw: List[str] = []
+    if isinstance(values, list):
+        raw = [str(x or "") for x in values]
+    elif isinstance(values, str):
+        raw = re.split(r"[\s,]+", values)
+    out: List[str] = []
+    for v in raw:
+        ip = str(v or "").strip().split("/")[0]
+        if not ip or ":" not in ip or ip.lower().startswith("fe80:"):
+            continue
+        try:
+            addr = ipaddress.ip_address(ip)
+            if addr.version == 6 and not addr.is_link_local and not addr.is_multicast and not addr.is_loopback:
+                out.append(str(addr))
+        except Exception:
+            continue
+    return list(dict.fromkeys(out))[:8]
+
+
+def parse_ipv6_neighbors(payload: Any) -> List[Dict[str, Any]]:
+    items = payload.get("ipv6_neighbors") or payload.get("ipv6Neighbors") or payload.get("ndp") if isinstance(payload, dict) else None
+    if not isinstance(items, list):
+        return []
+    out: List[Dict[str, Any]] = []
+    for item in items:
+        if not isinstance(item, dict):
+            continue
+        mac = norm_mac(item.get("mac") or item.get("lladdr"))
+        ip = clean_saved_value(item.get("ip") or item.get("ipv6") or item.get("address"))
+        ips = normalize_ipv6_list([ip])
+        if mac and ips:
+            out.append({"mac": mac, "ip": ips[0], "state": clean_saved_value(item.get("state")), "dev": clean_saved_value(item.get("dev") or item.get("iface")), "seenAt": now_str()})
+    return out
+
+
+def merge_ipv6_neighbors_to_archive(neighbors: List[Dict[str, Any]]) -> int:
+    if not neighbors:
+        return 0
+    archive = load_device_archive()
+    changed = 0
+    for n in neighbors:
+        mac = norm_mac(n.get("mac"))
+        ip = clean_saved_value(n.get("ip"))
+        if not mac or not ip:
+            continue
+        old = archive.get(mac, {})
+        v6 = normalize_ipv6_list((old.get("ipv6List") or []) + [ip])
+        if v6 != old.get("ipv6List"):
+            old["ipv6List"] = v6
+            old["ipv6UpdatedAt"] = now_str()
+            changed += 1
+        old["mac"] = mac
+        old["ndpState"] = n.get("state")
+        old["ndpDev"] = n.get("dev")
+        old["archivedAt"] = now_str()
+        archive[mac] = old
+    save_device_archive(archive)
+    return changed
+
+
 def parse_ruijie_devices(payload: Any) -> Tuple[List[Dict[str, Any]], int]:
     if isinstance(payload, str):
         payload = json.loads(payload)
@@ -666,6 +727,7 @@ def parse_ruijie_devices(payload: Any) -> Tuple[List[Dict[str, Any]], int]:
             "mac": mac,
             "online": True,
             "ip": item.get("userIp"),
+            "ipv6List": normalize_ipv6_list(item.get("ipv6") or item.get("ipv6List") or item.get("userIpv6") or item.get("userIPv6") or []),
             "connectType": item.get("connectType"),
             "ssid": item.get("ssid"),
             "band": item.get("band"),
@@ -1035,6 +1097,17 @@ def api_router_push():
                 router_update["wan6List"] = cleaned
         state["router"].update(router_update)
 
+        # v0.7.7：路由脚本可附带 IPv6 邻居表；Hub 只按 MAC 合并到设备归档。
+        neighbors = parse_ipv6_neighbors(payload)
+        ipv6_changed = merge_ipv6_neighbors_to_archive(neighbors)
+        if neighbors:
+            devices_state = load_json(DEVICES_FILE, {"online": [], "watched": [], "updatedAt": None})
+            archive = load_device_archive()
+            devices_state["online"] = [hydrate_device_with_archive(d, archive) for d in (devices_state.get("online") or [])]
+            devices_state["watched"] = [hydrate_device_with_archive(d, archive) for d in (devices_state.get("watched") or [])]
+            devices_state["updatedAt"] = event_time
+            save_json(DEVICES_FILE, devices_state)
+
         # v0.7.5：/api/router/push 只允许更新 router.*。
         # NAS IPv4 / NAS IPv6 是 Hub/NAS 本机出口，不能由路由脚本清空，也不能因为和路由 WAN6 相同就隐藏。
         # 某些桥接场景下 NAS 出口 IPv6 与路由 WAN6 可能相同，这仍然是有效的 NAS IPv6。
@@ -1049,7 +1122,7 @@ def api_router_push():
             except Exception:
                 pass
 
-        return jsonify({"ok": True, "message": "snapshot saved", "time": now_str()})
+        return jsonify({"ok": True, "message": "snapshot saved", "ipv6NeighborCount": len(neighbors), "ipv6Changed": ipv6_changed, "time": now_str()})
 
     if typ in ["device_event", "device"]:
         event_name = clean_saved_value(payload.get("event"))
@@ -1216,6 +1289,9 @@ def hook_ruijie_devices():
     try:
         payload = json.loads(raw)
         online, total = parse_ruijie_devices(payload)
+        merge_ipv6_neighbors_to_archive(parse_ipv6_neighbors(payload))
+        archive = load_device_archive()
+        online = [hydrate_device_with_archive(dev, archive) for dev in online]
         for dev in online:
             archive_device_snapshot(dev)
     except Exception as e:
@@ -1419,6 +1495,47 @@ def api_status_refresh():
         return jsonify({"ok": False, "error": "unauthorized"}), 401
     threading.Thread(target=_refresh_status_cache_worker, kwargs={"force": True}, daemon=True).start()
     return jsonify({"ok": True, "message": "refresh started", "time": now_str()})
+
+
+def build_magic_packet(mac: str) -> bytes:
+    parts = bytes(int(x, 16) for x in norm_mac(mac).split(":"))
+    if len(parts) != 6:
+        raise ValueError("invalid mac")
+    return b"\xff" * 6 + parts * 16
+
+
+@app.route("/api/wol", methods=["POST"])
+def api_wol():
+    if not check_app_token():
+        return jsonify({"ok": False, "error": "unauthorized"}), 401
+    payload = request.get_json(silent=True) or {}
+    mac = norm_mac(payload.get("mac"))
+    if not mac:
+        return jsonify({"ok": False, "error": "invalid mac"}), 400
+    port = to_int(payload.get("port"), 9) or 9
+    packet = build_magic_packet(mac)
+    targets = cfg_get("wol.broadcasts", []) or ["255.255.255.255"]
+    if isinstance(targets, str):
+        targets = [targets]
+    sent = 0
+    errors: List[str] = []
+    sock = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
+    try:
+        sock.setsockopt(socket.SOL_SOCKET, socket.SO_BROADCAST, 1)
+        sock.settimeout(1.5)
+        for host in targets:
+            for p in [port, 9, 7]:
+                try:
+                    sock.sendto(packet, (str(host), int(p)))
+                    sent += 1
+                except Exception as e:
+                    errors.append(f"{host}:{p} {e}")
+    finally:
+        sock.close()
+    if sent <= 0:
+        return jsonify({"ok": False, "error": "; ".join(errors[-3:]) or "send failed"}), 500
+    add_event({"type": "wol_sent", "title": "WOL 唤醒", "name": mac, "newValue": f"sent {sent}", "mac": mac})
+    return jsonify({"ok": True, "message": f"Hub 已发送 WOL · {sent} 个广播包", "mac": mac, "sent": sent, "time": now_str()})
 
 
 @app.route("/api/devices", methods=["GET"])
