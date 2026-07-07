@@ -15,7 +15,7 @@ import requests
 import dns.resolver
 from flask import Flask, request, jsonify
 
-APP_VERSION = "0.7.7"
+APP_VERSION = "0.7.9"
 PORT = int(os.environ.get("PORT", "58443"))
 CONFIG_PATH = Path(os.environ.get("CONFIG_PATH", "/app/config/config.yaml"))
 DATA_DIR = Path(os.environ.get("DATA_DIR", "/app/data"))
@@ -108,13 +108,56 @@ def get_hook_token() -> str:
     return os.environ.get("HOOK_TOKEN") or cfg_get("server.hook_token", "change-hook-token")
 
 
+def _auth_tokens_from_request() -> List[str]:
+    """Collect all supported auth token locations.
+
+    APP pages normally use Authorization: Bearer <APP_TOKEN>.
+    Router scripts use X-LabProbe-Token / URL token with HOOK_TOKEN.
+    Debugging from router shell is easier when GET APIs accept the same token
+    headers as /api/router/push, so read-only APIs can accept either app or hook
+    token without weakening POST/WOL behavior.
+    """
+    tokens: List[str] = []
+
+    auth = request.headers.get("Authorization", "").strip()
+    if auth.lower().startswith("bearer "):
+        tokens.append(auth[7:].strip())
+    elif auth:
+        tokens.append(auth)
+
+    for header in [
+        "X-LabProbe-Token",
+        "X-Labprobe-Token",
+        "X-Hook-Token",
+        "X-Api-Token",
+        "X-API-Key",
+        "X-LabProbe-Hook-Token",
+    ]:
+        v = request.headers.get(header, "").strip()
+        if v:
+            tokens.append(v)
+
+    for arg in ["token", "app_token", "appToken", "hook_token", "hookToken", "key"]:
+        v = request.args.get(arg, "").strip()
+        if v:
+            tokens.append(v)
+
+    return [t for t in tokens if t]
+
+
 def check_app_token() -> bool:
-    token = request.headers.get("Authorization", "").replace("Bearer ", "").strip()
-    return token and token == get_app_token()
+    app_token = get_app_token()
+    return any(t == app_token for t in _auth_tokens_from_request())
 
 
 def check_hook_token() -> bool:
-    return request.args.get("token", "") == get_hook_token()
+    hook_token = get_hook_token()
+    return any(t == hook_token for t in _auth_tokens_from_request())
+
+
+def check_read_token() -> bool:
+    allowed = {get_app_token(), get_hook_token()}
+    return any(t in allowed for t in _auth_tokens_from_request())
 
 
 def add_event(event: Dict[str, Any]) -> Dict[str, Any]:
@@ -481,6 +524,18 @@ def hydrate_device_with_archive(dev: Dict[str, Any], archive: Optional[Dict[str,
     for k in ["name", "lastIp", "ssid", "band", "rssi", "rxrate", "channel", "connectType", "onlineSince", "onlineDurationText", "lastSeenAt", "hostName", "devType", "osType", "manufacture", "devRecommend", "ipv6List", "ipv6UpdatedAt", "ndpState", "ndpDev", "wolMode"]:
         if not clean_saved_value(out.get(k)) and clean_saved_value(old.get(k)):
             out[k] = old.get(k)
+
+    # v0.7.9: expose the preferred global IPv6 as flat fields too, because
+    # older/newer APP builds may read either ipv6 or ipv6List.
+    ipv6_list = normalize_ipv6_list(out.get("ipv6List") or old.get("ipv6List") or [])
+    if ipv6_list:
+        out["ipv6List"] = ipv6_list
+        if not clean_saved_value(out.get("ipv6")):
+            out["ipv6"] = ipv6_list[0]
+        if not clean_saved_value(out.get("ipv6Address")):
+            out["ipv6Address"] = ipv6_list[0]
+        if not clean_saved_value(out.get("globalIpv6")):
+            out["globalIpv6"] = ipv6_list[0]
     if not bool(out.get("online")):
         if not clean_saved_value(out.get("ip")) and clean_saved_value(old.get("lastIp") or old.get("ip")):
             out["lastIp"] = old.get("lastIp") or old.get("ip")
@@ -1504,7 +1559,7 @@ def trigger_status_refresh_if_needed(state: Dict[str, Any], force: bool = False)
 
 @app.route("/api/status", methods=["GET"])
 def api_status():
-    if not check_app_token():
+    if not check_read_token():
         return jsonify({"ok": False, "error": "unauthorized"}), 401
     state = load_json(STATE_FILE, {})
     force = request.args.get("refresh", "") in ["1", "true", "yes"]
@@ -1576,7 +1631,7 @@ def api_wol():
 
 @app.route("/api/devices", methods=["GET"])
 def api_devices():
-    if not check_app_token():
+    if not check_read_token():
         return jsonify({"ok": False, "error": "unauthorized"}), 401
     devices = load_json(DEVICES_FILE, {"online": [], "watched": [], "updatedAt": None})
     view = request.args.get("view", "watched")
@@ -1584,18 +1639,21 @@ def api_devices():
     archive = load_device_archive()
     items = [hydrate_device_with_archive(d, archive) for d in (devices.get(key, []) or [])]
     # v0.7.8：online / watched 都在返回前按 MAC 合并 IPv6 邻居归档，避免 Router Agent 已上报但 APP 仍显示 --。
+    archive = load_device_archive()
+    ipv6_neighbor_count = sum(1 for _, a in archive.items() if normalize_ipv6_list(a.get("ipv6List") or []))
     return jsonify({
         "ok": True,
         "updatedAt": devices.get("updatedAt"),
         "devices": items,
         "onlineDeviceCount": devices.get("onlineDeviceCount", 0),
         "ipv6Hydrated": True,
+        "ipv6NeighborCount": ipv6_neighbor_count,
     })
 
 
 @app.route("/api/ipv6-neighbors", methods=["GET"])
 def api_ipv6_neighbors():
-    if not check_app_token():
+    if not check_read_token():
         return jsonify({"ok": False, "error": "unauthorized"}), 401
     archive = load_device_archive()
     rows = []
@@ -1616,7 +1674,7 @@ def api_ipv6_neighbors():
 
 @app.route("/api/events", methods=["GET"])
 def api_events():
-    if not check_app_token():
+    if not check_read_token():
         return jsonify({"ok": False, "error": "unauthorized"}), 401
     after = int(request.args.get("after", "0"))
     events = load_json(EVENTS_FILE, [])
