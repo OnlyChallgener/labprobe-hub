@@ -670,20 +670,56 @@ def normalize_ipv6_list(values: Any) -> List[str]:
     return list(dict.fromkeys(out))[:8]
 
 
-def parse_ipv6_neighbors(payload: Any) -> List[Dict[str, Any]]:
-    items = payload.get("ipv6_neighbors") or payload.get("ipv6Neighbors") or payload.get("ndp") if isinstance(payload, dict) else None
-    if not isinstance(items, list):
-        return []
+
+def parse_ipv6_neighbor_text(text: str) -> List[Dict[str, Any]]:
+    """Parse `ip -6 neigh show` text lines from router agent.
+    Example: 2409:... dev br-lan lladdr 6c:1f:f7:76:71:04 REACHABLE
+    """
     out: List[Dict[str, Any]] = []
+    for line in str(text or "").splitlines():
+        raw = line.strip()
+        if not raw:
+            continue
+        m = re.search(r"(?P<ip>[0-9a-fA-F:]{3,})(?:/\d+)?\s+dev\s+(?P<dev>\S+).*?lladdr\s+(?P<mac>[0-9a-fA-F:]{2}(?::[0-9a-fA-F:]{2}){5})(?:\s+(?P<state>[A-Z_]+))?", raw)
+        if not m:
+            continue
+        mac = norm_mac(m.group("mac"))
+        ips = normalize_ipv6_list([m.group("ip")])
+        if mac and ips:
+            out.append({"mac": mac, "ip": ips[0], "state": clean_saved_value(m.group("state")), "dev": clean_saved_value(m.group("dev")), "seenAt": now_str()})
+    return out
+
+def parse_ipv6_neighbors(payload: Any) -> List[Dict[str, Any]]:
+    if not isinstance(payload, dict):
+        return []
+    items = payload.get("ipv6_neighbors") or payload.get("ipv6Neighbors") or payload.get("ndp") or payload.get("neighbors")
+    text = payload.get("ipv6_neighbors_text") or payload.get("ipv6NeighborsText") or payload.get("ip6_neigh") or payload.get("ip6Neigh") or payload.get("ndpText")
+
+    out: List[Dict[str, Any]] = []
+    if isinstance(items, str):
+        out += parse_ipv6_neighbor_text(items)
+        items = []
+    if isinstance(text, str):
+        out += parse_ipv6_neighbor_text(text)
+    if not isinstance(items, list):
+        items = []
+
     for item in items:
         if not isinstance(item, dict):
             continue
-        mac = norm_mac(item.get("mac") or item.get("lladdr"))
-        ip = clean_saved_value(item.get("ip") or item.get("ipv6") or item.get("address"))
+        mac = norm_mac(item.get("mac") or item.get("lladdr") or item.get("linkLayerAddress"))
+        ip = clean_saved_value(item.get("ip") or item.get("ipv6") or item.get("address") or item.get("addr"))
         ips = normalize_ipv6_list([ip])
         if mac and ips:
-            out.append({"mac": mac, "ip": ips[0], "state": clean_saved_value(item.get("state")), "dev": clean_saved_value(item.get("dev") or item.get("iface")), "seenAt": now_str()})
-    return out
+            out.append({"mac": mac, "ip": ips[0], "state": clean_saved_value(item.get("state")), "dev": clean_saved_value(item.get("dev") or item.get("iface") or item.get("ifname")), "seenAt": now_str()})
+
+    # 去重：同一个 MAC + IPv6 只保留一次。
+    dedup: Dict[str, Dict[str, Any]] = {}
+    for n in out:
+        key = f"{norm_mac(n.get('mac'))}|{clean_saved_value(n.get('ip'))}"
+        if key.strip("|"):
+            dedup[key] = n
+    return list(dedup.values())
 
 
 def merge_ipv6_neighbors_to_archive(neighbors: List[Dict[str, Any]]) -> int:
@@ -1545,10 +1581,37 @@ def api_devices():
     devices = load_json(DEVICES_FILE, {"online": [], "watched": [], "updatedAt": None})
     view = request.args.get("view", "watched")
     key = view if view in ["online", "watched"] else "watched"
-    items = devices.get(key, [])
-    if key == "watched":
-        items = hydrate_watched_list(items)
-    return jsonify({"ok": True, "updatedAt": devices.get("updatedAt"), "devices": items, "onlineDeviceCount": devices.get("onlineDeviceCount", 0)})
+    archive = load_device_archive()
+    items = [hydrate_device_with_archive(d, archive) for d in (devices.get(key, []) or [])]
+    # v0.7.8：online / watched 都在返回前按 MAC 合并 IPv6 邻居归档，避免 Router Agent 已上报但 APP 仍显示 --。
+    return jsonify({
+        "ok": True,
+        "updatedAt": devices.get("updatedAt"),
+        "devices": items,
+        "onlineDeviceCount": devices.get("onlineDeviceCount", 0),
+        "ipv6Hydrated": True,
+    })
+
+
+@app.route("/api/ipv6-neighbors", methods=["GET"])
+def api_ipv6_neighbors():
+    if not check_app_token():
+        return jsonify({"ok": False, "error": "unauthorized"}), 401
+    archive = load_device_archive()
+    rows = []
+    for mac, item in archive.items():
+        ipv6_list = normalize_ipv6_list(item.get("ipv6List") or [])
+        if ipv6_list:
+            rows.append({
+                "mac": mac,
+                "ipv6List": ipv6_list,
+                "ipv6UpdatedAt": item.get("ipv6UpdatedAt", ""),
+                "ndpState": item.get("ndpState", ""),
+                "ndpDev": item.get("ndpDev", ""),
+                "name": item.get("name", ""),
+                "ip": item.get("ip") or item.get("lastIp") or "",
+            })
+    return jsonify({"ok": True, "count": len(rows), "neighbors": rows})
 
 
 @app.route("/api/events", methods=["GET"])
