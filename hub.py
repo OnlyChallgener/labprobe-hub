@@ -15,7 +15,7 @@ import requests
 import dns.resolver
 from flask import Flask, request, jsonify
 
-APP_VERSION = "0.7.9"
+APP_VERSION = "0.8.0"
 PORT = int(os.environ.get("PORT", "58443"))
 CONFIG_PATH = Path(os.environ.get("CONFIG_PATH", "/app/config/config.yaml"))
 DATA_DIR = Path(os.environ.get("DATA_DIR", "/app/data"))
@@ -205,6 +205,107 @@ def human_bytes(v: Any) -> str:
             return f"{size:.0f}{unit}" if unit == "B" else f"{size:.1f}{unit}"
         size /= 1024
     return str(n)
+
+
+TRAFFIC_UNIT_BYTES = {
+    "": 1,
+    "B": 1,
+    "K": 1024,
+    "KB": 1024,
+    "KIB": 1024,
+    "M": 1024 ** 2,
+    "MB": 1024 ** 2,
+    "MIB": 1024 ** 2,
+    "G": 1024 ** 3,
+    "GB": 1024 ** 3,
+    "GIB": 1024 ** 3,
+    "T": 1024 ** 4,
+    "TB": 1024 ** 4,
+    "TIB": 1024 ** 4,
+}
+
+
+def traffic_bytes(v: Any) -> Optional[int]:
+    """Convert Ruijie traffic values to bytes without turning missing data into zero."""
+    if v is None or isinstance(v, bool):
+        return None
+    if isinstance(v, (int, float)):
+        return max(0, int(v))
+    text = str(v).strip().replace(",", "")
+    if not text:
+        return None
+    match = re.search(r"(?i)([0-9]+(?:\.[0-9]+)?)\s*(TIB|TB|T|GIB|GB|G|MIB|MB|M|KIB|KB|K|B)?", text)
+    if not match:
+        return None
+    number = float(match.group(1))
+    unit = (match.group(2) or "").upper()
+    return max(0, int(number * TRAFFIC_UNIT_BYTES.get(unit, 1)))
+
+
+def first_traffic_value(item: Dict[str, Any], keys: List[str]) -> Any:
+    containers = [item]
+    for container_key in ["traffic", "flow", "trafficStats", "flowStats", "statistics", "stats"]:
+        container = item.get(container_key)
+        if isinstance(container, dict):
+            containers.append(container)
+    for container in containers:
+        for key in keys:
+            if key in container and container.get(key) not in [None, ""]:
+                return container.get(key)
+    return None
+
+
+def normalize_device_traffic(item: Dict[str, Any]) -> Dict[str, Any]:
+    """Expose stable traffic keys consumed by LabProbeApp.
+
+    Ruijie user_list uses dailyUp/dailyDown for today's counters and up/down
+    for the current router-uptime counters. Extra aliases keep this compatible
+    with firmware variants without changing the raw payload.
+    """
+    today_upload = traffic_bytes(first_traffic_value(item, [
+        "dailyUp", "todayUp", "dayUp", "dailyUpload", "todayUpload",
+        "daily_up", "today_up", "todayTx", "todayTxBytes",
+    ]))
+    today_download = traffic_bytes(first_traffic_value(item, [
+        "dailyDown", "todayDown", "dayDown", "dailyDownload", "todayDownload",
+        "daily_down", "today_down", "todayRx", "todayRxBytes",
+    ]))
+    total_upload = traffic_bytes(first_traffic_value(item, [
+        "up", "totalUp", "realtimeUp", "realTimeUp", "totalUpload",
+        "total_up", "realtime_up", "totalTx", "totalTxBytes",
+    ]))
+    total_download = traffic_bytes(first_traffic_value(item, [
+        "down", "totalDown", "realtimeDown", "realTimeDown", "totalDownload",
+        "total_down", "realtime_down", "totalRx", "totalRxBytes",
+    ]))
+
+    out: Dict[str, Any] = {}
+    today_group: Dict[str, int] = {}
+    total_group: Dict[str, int] = {}
+    if today_upload is not None:
+        out["todayUpload"] = today_upload
+        out["dailyUpBytes"] = today_upload
+        today_group["upload"] = today_upload
+    if today_download is not None:
+        out["todayDownload"] = today_download
+        out["dailyDownBytes"] = today_download
+        today_group["download"] = today_download
+    if total_upload is not None:
+        out["totalUpload"] = total_upload
+        out["upBytes"] = total_upload
+        total_group["upload"] = total_upload
+    if total_download is not None:
+        out["totalDownload"] = total_download
+        out["downBytes"] = total_download
+        total_group["download"] = total_download
+    if today_group:
+        out["todayTraffic"] = today_group
+        out["trafficDate"] = today_str()
+    if total_group:
+        out["realtimeTraffic"] = total_group
+    if today_group or total_group:
+        out["trafficUpdatedAt"] = now_str()
+    return out
 
 
 
@@ -498,9 +599,15 @@ def archive_device_snapshot(dev: Dict[str, Any]) -> None:
     keep_keys = [
         "name", "mac", "ip", "lastIp", "ssid", "band", "rssi", "rxrate", "channel",
         "connectType", "onlineSince", "onlineDurationText", "lastSeenAt", "offlineAt",
-        "hostName", "devType", "osType", "manufacture", "devRecommend", "ipv6List", "ipv6UpdatedAt", "ndpState", "ndpDev", "wolMode"
+        "hostName", "devType", "osType", "manufacture", "devRecommend", "ipv6List", "ipv6UpdatedAt", "ndpState", "ndpDev", "wolMode",
+        "todayUpload", "todayDownload", "totalUpload", "totalDownload", "todayTraffic", "realtimeTraffic",
+        "dailyUpBytes", "dailyDownBytes", "upBytes", "downBytes", "trafficDate", "trafficUpdatedAt", "trafficText"
     ]
     snap = {k: dev.get(k) for k in keep_keys if k in dev}
+    if clean_saved_value(snap.get("trafficDate")) and snap.get("trafficDate") != old.get("trafficDate"):
+        old = dict(old)
+        for key in ["todayUpload", "todayDownload", "todayTraffic", "dailyUpBytes", "dailyDownBytes"]:
+            old.pop(key, None)
     # 在线时把 ip 同步成 lastIp；离线时保留旧 lastIp，不被 None 覆盖。
     if clean_saved_value(snap.get("ip")):
         snap["lastIp"] = snap.get("ip")
@@ -521,7 +628,15 @@ def hydrate_device_with_archive(dev: Dict[str, Any], archive: Optional[Dict[str,
         return dev
     out = dict(dev)
     # 离线设备长期保留最后一次有效信息；在线设备只补缺失字段。
-    for k in ["name", "lastIp", "ssid", "band", "rssi", "rxrate", "channel", "connectType", "onlineSince", "onlineDurationText", "lastSeenAt", "hostName", "devType", "osType", "manufacture", "devRecommend", "ipv6List", "ipv6UpdatedAt", "ndpState", "ndpDev", "wolMode"]:
+    hydrate_keys = [
+        "name", "lastIp", "ssid", "band", "rssi", "rxrate", "channel", "connectType", "onlineSince",
+        "onlineDurationText", "lastSeenAt", "hostName", "devType", "osType", "manufacture", "devRecommend",
+        "ipv6List", "ipv6UpdatedAt", "ndpState", "ndpDev", "wolMode",
+        "totalUpload", "totalDownload", "realtimeTraffic", "upBytes", "downBytes", "trafficUpdatedAt", "trafficText",
+    ]
+    if old.get("trafficDate") == today_str():
+        hydrate_keys.extend(["todayUpload", "todayDownload", "todayTraffic", "dailyUpBytes", "dailyDownBytes", "trafficDate"])
+    for k in hydrate_keys:
         if not clean_saved_value(out.get(k)) and clean_saved_value(old.get(k)):
             out[k] = old.get(k)
 
@@ -813,7 +928,8 @@ def parse_ruijie_devices(payload: Any) -> Tuple[List[Dict[str, Any]], int]:
         mac = norm_mac(item.get("mac"))
         if not mac:
             continue
-        devices.append({
+        traffic = normalize_device_traffic(item)
+        device = {
             "name": prefer_name(item),
             "mac": mac,
             "online": True,
@@ -836,13 +952,11 @@ def parse_ruijie_devices(payload: Any) -> Tuple[List[Dict[str, Any]], int]:
             "devType": item.get("devType"),
             "devRecommend": item.get("devRecommend"),
             "deviceAliasName": item.get("deviceAliasName"),
-            "upBytes": to_int(item.get("up"), 0),
-            "downBytes": to_int(item.get("down"), 0),
-            "dailyUpBytes": to_int(item.get("dailyUp"), 0),
-            "dailyDownBytes": to_int(item.get("dailyDown"), 0),
-            "trafficText": f"↑{human_bytes(item.get('up'))} ↓{human_bytes(item.get('down'))}",
+            "trafficText": f"↑{human_bytes(traffic.get('totalUpload'))} ↓{human_bytes(traffic.get('totalDownload'))}",
             "raw": item,
-        })
+        }
+        device.update(traffic)
+        devices.append(device)
     total = to_int(payload.get("total"), len(devices)) if isinstance(payload, dict) else len(devices)
     return devices, total
 
@@ -961,7 +1075,7 @@ def device_snapshot_from_payload(payload: Dict[str, Any]) -> Dict[str, Any]:
         duration_text = human_duration_precise(duration_sec)
     if not duration_text and offline_at:
         duration_text = duration_between(online_since, offline_at)
-    return {
+    snapshot = {
         "name": str(name),
         "mac": mac,
         "ip": str(ip) if ip else "",
@@ -979,6 +1093,8 @@ def device_snapshot_from_payload(payload: Dict[str, Any]) -> Dict[str, Any]:
         "devType": str(payload.get("devType") or ""),
         "raw": payload,
     }
+    snapshot.update(normalize_device_traffic(payload))
+    return snapshot
 
 
 def upsert_watched_device_from_event(snapshot: Dict[str, Any], online: bool, event_time: str) -> None:
