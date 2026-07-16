@@ -18,13 +18,25 @@ jobs:
         working-directory: labrelay
     steps:
       - uses: actions/checkout@v4
+
+      - name: Read LabRelay version
+        shell: bash
+        run: |
+          VERSION="$(sed -n 's/^version = "\([^"]*\)"/\1/p' Cargo.toml | head -1)"
+          test -n "$VERSION"
+          echo "LABRELAY_VERSION=$VERSION" >> "$GITHUB_ENV"
+
       - uses: dtolnay/rust-toolchain@stable
+
       - name: Run Rust tests
         run: cargo test --all-targets
+
       - name: Install cross
         run: cargo install cross --locked
+
       - name: Build static ARM64 binary
         run: cross build --release --target aarch64-unknown-linux-musl
+
       - name: Prepare router package
         run: |
           mkdir -p ../dist/labrelay-router
@@ -32,10 +44,11 @@ jobs:
           cp ../scripts/labrelay_agent.sh ../scripts/labrelay.init ../scripts/labrelay-agent.init ../scripts/install_labrelay.sh ../dist/labrelay-router/
           cd ../dist/labrelay-router
           sha256sum labrelay-aarch64-musl > SHA256SUMS.txt
-          tar -czf ../labrelay-router-aarch64-v0.1.0.tar.gz .
+          tar -czf "../labrelay-router-aarch64-v${LABRELAY_VERSION}.tar.gz" .
+
       - uses: actions/upload-artifact@v4
         with:
-          name: labrelay-router-aarch64-v0.1.0
+          name: labrelay-router-aarch64-v${{ env.LABRELAY_VERSION }}
           path: |
             dist/labrelay-router/
-            dist/labrelay-router-aarch64-v0.1.0.tar.gz
+            dist/labrelay-router-aarch64-v${{ env.LABRELAY_VERSION }}.tar.gz

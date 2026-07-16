@@ -1,31 +1,42 @@
-# LabRelay v0.1.0
+# LabRelay v0.1.1
 
-面向 LabProbe / 极客网探的轻量 Rust 四层 TCP 反代服务。
+面向 OpenWrt/嵌入式 Linux 路由器的轻量 TCP IPv6 四层反代。
 
-## 第一版范围
+支持：
 
-- 公网 IPv6 TCP → 内网 IPv4（6→4）
-- 公网 IPv6 TCP → 内网 IPv6（6→6）
-- 6→6 完整 IPv6、MAC + IPv6 后缀动态匹配
-- 多规则、启停、编辑、自动到期
-- 最大连接数、空闲超时、当前连接数、上下行字节统计
-- Unix Socket 结构化控制
-- 不支持 UDP、4→4、HTTP Host/SNI、TLS 解密
-- 不修改防火墙
+- TCP IPv6 → IPv4
+- TCP IPv6 → IPv6
+- MAC + IPv6 后 64 位动态目标解析
+- 持久化规则和开机自动恢复
+- 规则 revision 幂等执行
+- 结构化错误码
+- 当前/峰值连接和累计流量
+- 本机 Unix Socket 控制
 
-## 路由器要求
+不包含：
 
-- Linux aarch64
-- `ip`、`curl`、OpenWrt `procd`
-- 手动放行 WAN6 → 路由器 INPUT TCP 20000–20020
+- UDP
+- 4→4
+- 任意 Shell 执行
+- 自动防火墙修改
+- HTTPS 证书终止
 
-## 本机测试
+构建：
 
 ```sh
-cargo run -- daemon --config ./relay.json --socket /tmp/labrelay-test.sock --state /tmp/labrelay-state.json
-cargo run -- ctl --socket /tmp/labrelay-test.sock '{"action":"status"}'
+cargo test --all-targets
+cargo build --release --target aarch64-unknown-linux-musl
 ```
 
-## 编译 BE72 静态程序
+GitHub Actions 产物：
 
-GitHub Actions 运行 `Build LabRelay Router Binary`，下载 `labrelay-router-aarch64-v0.1.0`。
+```text
+labrelay-router-aarch64-v0.1.1
+```
+
+运行状态：
+
+```sh
+/usr/bin/labrelay version
+/usr/bin/labrelay ctl '{"action":"status"}'
+```

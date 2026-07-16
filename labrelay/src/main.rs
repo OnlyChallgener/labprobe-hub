@@ -18,7 +18,8 @@ use tokio::sync::{watch, Mutex, RwLock, Semaphore};
 use tokio::task::JoinHandle;
 use tokio::time::{sleep, timeout};
 
-const VERSION: &str = "0.1.0";
+const VERSION: &str = "0.1.1";
+const PROTOCOL_VERSION: u32 = 2;
 const DEFAULT_CONFIG: &str = "/etc/labprobe/relay.json";
 const DEFAULT_SOCKET: &str = "/tmp/labrelay.sock";
 const DEFAULT_STATE: &str = "/tmp/labrelay/state.json";
@@ -28,11 +29,12 @@ fn default_true() -> bool { true }
 fn default_max_connections() -> u32 { 32 }
 fn default_idle_timeout() -> u64 { 300 }
 
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
 #[serde(default, rename_all = "camelCase")]
 struct Rule {
     id: String,
     name: String,
+    revision: u64,
     enabled: bool,
     mode: String,
     listen_port: u16,
@@ -44,6 +46,7 @@ struct Rule {
     target_port: u16,
     prefer_current_prefix: bool,
     expires_at: Option<u64>,
+    lease_seconds: u64,
     max_connections: u32,
     idle_timeout_sec: u64,
 }
@@ -53,6 +56,7 @@ impl Default for Rule {
         Self {
             id: String::new(),
             name: String::new(),
+            revision: 1,
             enabled: false,
             mode: "6to4".to_string(),
             listen_port: 0,
@@ -64,6 +68,7 @@ impl Default for Rule {
             target_port: 0,
             prefer_current_prefix: default_true(),
             expires_at: None,
+            lease_seconds: 0,
             max_connections: default_max_connections(),
             idle_timeout_sec: default_idle_timeout(),
         }
@@ -87,11 +92,15 @@ struct RuntimeSnapshot {
     listen: String,
     resolved_target: String,
     active_connections: u64,
+    peak_connections: u64,
     total_upload_bytes: u64,
     total_download_bytes: u64,
     started_at: Option<u64>,
     expires_at: Option<u64>,
     last_resolved_at: Option<u64>,
+    last_connection_at: Option<u64>,
+    last_error_at: Option<u64>,
+    last_error_code: String,
     last_error: String,
 }
 
@@ -105,11 +114,15 @@ impl RuntimeSnapshot {
             listen: format!("[::]:{}", rule.listen_port),
             resolved_target: String::new(),
             active_connections: 0,
+            peak_connections: 0,
             total_upload_bytes: 0,
             total_download_bytes: 0,
             started_at: None,
             expires_at: rule.expires_at,
             last_resolved_at: None,
+            last_connection_at: None,
+            last_error_at: None,
+            last_error_code: String::new(),
             last_error: String::new(),
         }
     }
@@ -118,6 +131,7 @@ impl RuntimeSnapshot {
 struct RuntimeShared {
     base: RwLock<RuntimeSnapshot>,
     active: AtomicU64,
+    peak: AtomicU64,
     upload: AtomicU64,
     download: AtomicU64,
 }
@@ -125,12 +139,14 @@ struct RuntimeShared {
 impl RuntimeShared {
     fn new(mut snapshot: RuntimeSnapshot) -> Self {
         let active = snapshot.active_connections;
+        let peak = snapshot.peak_connections.max(active);
         let upload = snapshot.total_upload_bytes;
         let download = snapshot.total_download_bytes;
         snapshot.active_connections = 0;
         Self {
             base: RwLock::new(snapshot),
             active: AtomicU64::new(active),
+            peak: AtomicU64::new(peak),
             upload: AtomicU64::new(upload),
             download: AtomicU64::new(download),
         }
@@ -139,6 +155,7 @@ impl RuntimeShared {
     async fn snapshot(&self) -> RuntimeSnapshot {
         let mut s = self.base.read().await.clone();
         s.active_connections = self.active.load(Ordering::Relaxed);
+        s.peak_connections = self.peak.load(Ordering::Relaxed);
         s.total_upload_bytes = self.upload.load(Ordering::Relaxed);
         s.total_download_bytes = self.download.load(Ordering::Relaxed);
         s
@@ -182,7 +199,7 @@ impl Manager {
     async fn persist(&self) -> Result<()> {
         let mut rules: Vec<Rule> = self.rules.read().await.values().cloned().collect();
         rules.sort_by_key(|r| r.listen_port);
-        let cfg = ConfigFile { version: 1, rules };
+        let cfg = ConfigFile { version: 2, rules };
         atomic_json_write(&self.config_path, &cfg)
     }
 
@@ -201,17 +218,46 @@ impl Manager {
     async fn upsert(&self, mut rule: Rule) -> Result<Value> {
         normalize_rule(&mut rule);
         validate_rule(&rule, self.port_min, self.port_max)?;
+        let existing = self.rules.read().await.get(&rule.id).cloned();
+        if let Some(old) = existing.as_ref() {
+            if rule.revision < old.revision {
+                return Ok(json!({
+                    "ok": true,
+                    "id": rule.id,
+                    "phase": "already_applied",
+                    "ignored": "stale_revision",
+                    "ruleRevision": old.revision
+                }));
+            }
+        }
         self.ensure_port_available(&rule).await?;
         let id = rule.id.clone();
         let enabled = rule.enabled;
-        self.rules.write().await.insert(id.clone(), rule);
+        let identical = existing.as_ref().map(|old| old == &rule).unwrap_or(false);
+        let runtime_exists = self.runtimes.lock().await.get(&id).map(|h| !h.join.is_finished()).unwrap_or(false);
+
+        if identical {
+            if enabled && !runtime_exists {
+                return self.start_rule(&id).await;
+            }
+            if !enabled && runtime_exists {
+                return self.stop_rule(&id, false, Some(rule.revision)).await;
+            }
+            return Ok(json!({
+                "ok": true,
+                "id": id,
+                "phase": "already_applied",
+                "ruleRevision": rule.revision
+            }));
+        }
+
+        self.rules.write().await.insert(id.clone(), rule.clone());
         self.persist().await?;
         if enabled {
-            self.start_rule(&id).await?;
+            self.start_rule(&id).await
         } else {
-            self.stop_rule(&id, true).await?;
+            self.stop_rule(&id, false, Some(rule.revision)).await
         }
-        Ok(json!({"ok": true, "id": id}))
     }
 
     async fn start_rule(&self, id: &str) -> Result<Value> {
@@ -219,7 +265,7 @@ impl Manager {
         validate_rule(&rule, self.port_min, self.port_max)?;
         self.ensure_port_available(&rule).await?;
         if is_expired(&rule) {
-            self.set_cached_state(&rule, "expired", "rule expired").await;
+            self.set_cached_state(&rule, "expired", "RULE_EXPIRED", "rule expired").await;
             bail!("rule expired");
         }
         self.stop_runtime(id, true).await;
@@ -227,7 +273,9 @@ impl Manager {
         let listener = match create_ipv6_listener(rule.listen_port) {
             Ok(listener) => listener,
             Err(error) => {
-                self.set_cached_state(&rule, "error", &error.to_string()).await;
+                let message = error.to_string();
+                let code = classify_error(&message);
+                self.set_cached_state(&rule, "error", code, &message).await;
                 return Err(error);
             }
         };
@@ -241,16 +289,24 @@ impl Manager {
             listen: format!("[::]:{}", rule.listen_port),
             resolved_target: previous.as_ref().map(|x| x.resolved_target.clone()).unwrap_or_default(),
             active_connections: 0,
+            peak_connections: previous.as_ref().map(|x| x.peak_connections).unwrap_or(0),
             total_upload_bytes: previous.as_ref().map(|x| x.total_upload_bytes).unwrap_or(0),
             total_download_bytes: previous.as_ref().map(|x| x.total_download_bytes).unwrap_or(0),
             started_at: Some(now_epoch()),
             expires_at: rule.expires_at,
-            last_resolved_at: None,
+            last_resolved_at: previous.as_ref().and_then(|x| x.last_resolved_at),
+            last_connection_at: previous.as_ref().and_then(|x| x.last_connection_at),
+            last_error_at: None,
+            last_error_code: String::new(),
             last_error: String::new(),
         };
         let shared = Arc::new(RuntimeShared::new(snapshot));
-        let target = Arc::new(RwLock::new(resolve_rule_target(&rule, &self.lan_if).await.ok()));
-        update_target_status(&shared, &rule, target.read().await.clone(), None).await;
+        let initial_target = resolve_rule_target(&rule, &self.lan_if).await;
+        let target = Arc::new(RwLock::new(initial_target.as_ref().ok().copied()));
+        match initial_target {
+            Ok(ip) => update_target_status(&shared, &rule, Some(ip), None).await,
+            Err(e) => update_target_status(&shared, &rule, None, Some(e.to_string())).await,
+        }
 
         let (cancel_tx, cancel_rx) = watch::channel(false);
         let shared_task = shared.clone();
@@ -261,7 +317,13 @@ impl Manager {
             run_listener(listener, rule_task, lan_if, target_task, shared_task, cancel_rx).await;
         });
         self.runtimes.lock().await.insert(id.to_string(), RuntimeHandle { cancel: cancel_tx, join, shared });
-        Ok(json!({"ok": true, "id": id, "state": "running"}))
+        Ok(json!({
+            "ok": true,
+            "id": id,
+            "state": "starting",
+            "phase": "applied",
+            "ruleRevision": rule.revision
+        }))
     }
 
     async fn ensure_port_available(&self, rule: &Rule) -> Result<()> {
@@ -279,29 +341,49 @@ impl Manager {
         if let Some(handle) = handle {
             let _ = handle.cancel.send(true);
             let _ = timeout(Duration::from_secs(3), handle.join).await;
+            for _ in 0..30 {
+                if handle.shared.active.load(Ordering::Relaxed) == 0 { break; }
+                sleep(Duration::from_millis(100)).await;
+            }
             let mut snap = handle.shared.snapshot().await;
             if mark_stopped && snap.state != "expired" {
-                snap.state = "stopped".to_string();
+                snap.state = if snap.active_connections > 0 { "draining" } else { "stopped" }.to_string();
             }
-            snap.active_connections = 0;
-            self.last_status.write().await.insert(id.to_string(), snap);
+            self.last_status.write().await.insert(id.to_string(), snap.clone());
+            if mark_stopped && snap.active_connections > 0 {
+                let cache = self.last_status.clone();
+                let shared = handle.shared.clone();
+                let id_owned = id.to_string();
+                tokio::spawn(async move {
+                    for _ in 0..300 {
+                        if shared.active.load(Ordering::Relaxed) == 0 { break; }
+                        sleep(Duration::from_millis(100)).await;
+                    }
+                    let mut final_snap = shared.snapshot().await;
+                    final_snap.state = "stopped".to_string();
+                    final_snap.active_connections = 0;
+                    cache.write().await.insert(id_owned, final_snap);
+                });
+            }
         }
     }
 
-    async fn stop_rule(&self, id: &str, update_config: bool) -> Result<Value> {
-        if update_config {
+    async fn stop_rule(&self, id: &str, update_config: bool, revision: Option<u64>) -> Result<Value> {
+        if update_config || revision.is_some() {
             let mut rules = self.rules.write().await;
             let rule = rules.get_mut(id).ok_or_else(|| anyhow!("rule not found"))?;
-            rule.enabled = false;
+            if update_config { rule.enabled = false; }
+            if let Some(rev) = revision { rule.revision = rule.revision.max(rev); }
             drop(rules);
             self.persist().await?;
         }
         self.stop_runtime(id, true).await;
-        if let Some(rule) = self.rules.read().await.get(id).cloned() {
+        let revision = if let Some(rule) = self.rules.read().await.get(id).cloned() {
             let mut cache = self.last_status.write().await;
             cache.entry(id.to_string()).or_insert_with(|| RuntimeSnapshot::stopped(&rule)).state = "stopped".to_string();
-        }
-        Ok(json!({"ok": true, "id": id, "state": "stopped"}))
+            rule.revision
+        } else { 0 };
+        Ok(json!({"ok": true, "id": id, "state": "stopped", "phase": "applied", "ruleRevision": revision}))
     }
 
     async fn enable_rule(&self, id: &str) -> Result<Value> {
@@ -309,6 +391,7 @@ impl Manager {
             let mut rules = self.rules.write().await;
             let rule = rules.get_mut(id).ok_or_else(|| anyhow!("rule not found"))?;
             rule.enabled = true;
+            rule.revision = rule.revision.saturating_add(1).max(1);
         }
         self.persist().await?;
         self.start_rule(id).await
@@ -319,13 +402,15 @@ impl Manager {
         let removed = self.rules.write().await.remove(id).is_some();
         self.last_status.write().await.remove(id);
         self.persist().await?;
-        Ok(json!({"ok": true, "id": id, "deleted": removed}))
+        Ok(json!({"ok": true, "id": id, "deleted": removed, "phase": "applied"}))
     }
 
-    async fn set_cached_state(&self, rule: &Rule, state: &str, err: &str) {
+    async fn set_cached_state(&self, rule: &Rule, state: &str, error_code: &str, error: &str) {
         let mut snap = self.last_status.read().await.get(&rule.id).cloned().unwrap_or_else(|| RuntimeSnapshot::stopped(rule));
         snap.state = state.to_string();
-        snap.last_error = err.to_string();
+        snap.last_error_code = error_code.to_string();
+        snap.last_error = error.to_string();
+        snap.last_error_at = if error.is_empty() { None } else { Some(now_epoch()) };
         self.last_status.write().await.insert(rule.id.clone(), snap);
     }
 
@@ -351,6 +436,16 @@ impl Manager {
         json!({
             "ok": true,
             "version": VERSION,
+            "relayVersion": VERSION,
+            "protocolVersion": PROTOCOL_VERSION,
+            "capabilities": {
+                "tcp6to4": true,
+                "tcp6to6": true,
+                "ipv6Suffix": true,
+                "structuredErrors": true,
+                "ruleRevision": true,
+                "udp": false
+            },
             "updatedAt": now_epoch(),
             "portRange": {"min": self.port_min, "max": self.port_max},
             "rules": rows
@@ -395,9 +490,7 @@ async fn run_listener(
             }
             _ = resolve_tick.tick() => {
                 if is_expired(&rule) {
-                    let mut base = shared.base.write().await;
-                    base.state = "expired".to_string();
-                    base.last_error = "rule expired".to_string();
+                    set_runtime_error(&shared, "expired", "RULE_EXPIRED", "rule expired").await;
                     break;
                 }
                 if rule.mode == "6to6" && rule.target_mode == "ipv6_suffix" {
@@ -416,19 +509,16 @@ async fn run_listener(
             accepted = listener.accept() => {
                 match accepted {
                     Ok((stream, _peer)) => {
-                        let target_ip = target.read().await.clone();
+                        let target_ip = *target.read().await;
                         let Some(target_ip) = target_ip else {
-                            let mut base = shared.base.write().await;
-                            base.state = "waiting_target".to_string();
-                            base.last_error = "target IPv6 not resolved".to_string();
+                            set_runtime_error(&shared, "waiting_target", "IPV6_NOT_FOUND", "target IPv6 not resolved").await;
                             drop(stream);
                             continue;
                         };
                         let permit = match semaphore.clone().try_acquire_owned() {
                             Ok(p) => p,
                             Err(_) => {
-                                let mut base = shared.base.write().await;
-                                base.last_error = "maximum connections reached".to_string();
+                                set_runtime_error(&shared, "running", "MAX_CONNECTIONS", "maximum connections reached").await;
                                 drop(stream);
                                 continue;
                             }
@@ -438,16 +528,27 @@ async fn run_listener(
                         let idle = rule.idle_timeout_sec;
                         tokio::spawn(async move {
                             let _permit = permit;
-                            shared_conn.active.fetch_add(1, Ordering::Relaxed);
+                            let active_now = shared_conn.active.fetch_add(1, Ordering::Relaxed) + 1;
+                            update_atomic_max(&shared_conn.peak, active_now);
+                            {
+                                let mut base = shared_conn.base.write().await;
+                                base.last_connection_at = Some(now_epoch());
+                            }
                             let result = proxy_connection(stream, target_addr, idle, shared_conn.clone()).await;
                             shared_conn.active.fetch_sub(1, Ordering::Relaxed);
                             if let Err(e) = result {
-                                shared_conn.base.write().await.last_error = e.to_string();
+                                let message = e.to_string();
+                                let code = classify_error(&message).to_string();
+                                let mut base = shared_conn.base.write().await;
+                                base.last_error_code = code;
+                                base.last_error = message;
+                                base.last_error_at = Some(now_epoch());
                             }
                         });
                     }
                     Err(e) => {
-                        shared.base.write().await.last_error = format!("accept failed: {}", e);
+                        let message = format!("accept failed: {}", e);
+                        set_runtime_error(&shared, "error", "ACCEPT_FAILED", &message).await;
                         sleep(Duration::from_millis(200)).await;
                     }
                 }
@@ -456,7 +557,7 @@ async fn run_listener(
     }
     let mut base = shared.base.write().await;
     if base.state != "expired" {
-        base.state = "stopped".to_string();
+        base.state = if shared.active.load(Ordering::Relaxed) > 0 { "draining" } else { "stopped" }.to_string();
     }
 }
 
@@ -469,7 +570,9 @@ async fn proxy_connection(mut client: TcpStream, target: SocketAddr, idle_timeou
     {
         let mut base = shared.base.write().await;
         base.state = "running".to_string();
+        base.last_error_code.clear();
         base.last_error.clear();
+        base.last_error_at = None;
     }
     let mut cbuf = vec![0u8; 32 * 1024];
     let mut ubuf = vec![0u8; 32 * 1024];
@@ -506,17 +609,59 @@ async fn proxy_connection(mut client: TcpStream, target: SocketAddr, idle_timeou
     Ok(())
 }
 
+async fn set_runtime_error(shared: &Arc<RuntimeShared>, state: &str, code: &str, message: &str) {
+    let mut base = shared.base.write().await;
+    base.state = state.to_string();
+    base.last_error_code = code.to_string();
+    base.last_error = message.to_string();
+    base.last_error_at = Some(now_epoch());
+}
+
 async fn update_target_status(shared: &Arc<RuntimeShared>, rule: &Rule, target: Option<IpAddr>, error: Option<String>) {
     let mut base = shared.base.write().await;
     if let Some(ip) = target {
         base.resolved_target = format_target(ip, rule.target_port);
         base.last_resolved_at = Some(now_epoch());
         base.state = "running".to_string();
+        base.last_error_code.clear();
         base.last_error.clear();
+        base.last_error_at = None;
     } else {
+        base.resolved_target.clear();
         base.state = "waiting_target".to_string();
-        base.last_error = error.unwrap_or_else(|| "target unavailable".to_string());
+        let message = error.unwrap_or_else(|| "target unavailable".to_string());
+        base.last_error_code = classify_error(&message).to_string();
+        base.last_error = message;
+        base.last_error_at = Some(now_epoch());
     }
+}
+
+fn update_atomic_max(value: &AtomicU64, candidate: u64) {
+    let mut current = value.load(Ordering::Relaxed);
+    while candidate > current {
+        match value.compare_exchange_weak(current, candidate, Ordering::Relaxed, Ordering::Relaxed) {
+            Ok(_) => break,
+            Err(actual) => current = actual,
+        }
+    }
+}
+
+fn classify_error(message: &str) -> &'static str {
+    let text = message.to_ascii_lowercase();
+    if text.contains("rule expired") { "RULE_EXPIRED" }
+    else if text.contains("permission denied") { "LISTEN_PERMISSION" }
+    else if text.contains("address already in use") || text.contains("already reserved") { "PORT_IN_USE" }
+    else if text.contains("bind [::]") { "LISTEN_FAILED" }
+    else if text.contains("target connect timeout") { "TARGET_TIMEOUT" }
+    else if text.contains("connection refused") { "TARGET_REFUSED" }
+    else if text.contains("no ipv6 neighbor") || text.contains("target ipv6 not resolved") { "IPV6_NOT_FOUND" }
+    else if text.contains("ambiguous suffix") { "IPV6_AMBIGUOUS" }
+    else if text.contains("not routed through") { "TARGET_OUTSIDE_LAN" }
+    else if text.contains("maximum connections") { "MAX_CONNECTIONS" }
+    else if text.contains("idle timeout") { "IDLE_TIMEOUT" }
+    else if text.contains("rule not found") { "RULE_NOT_FOUND" }
+    else if text.contains("invalid") { "INVALID_RULE" }
+    else { "RELAY_ERROR" }
 }
 
 async fn resolve_rule_target(rule: &Rule, lan_if: &str) -> Result<IpAddr> {
@@ -640,6 +785,7 @@ fn suffix_bytes(raw: &str) -> Result<[u8; 8]> {
 
 fn normalize_rule(rule: &mut Rule) {
     rule.id = rule.id.trim().to_ascii_lowercase();
+    rule.revision = rule.revision.max(1);
     rule.name = rule.name.trim().to_string();
     rule.mode = rule.mode.trim().to_ascii_lowercase();
     rule.target_mode = rule.target_mode.trim().to_ascii_lowercase();
@@ -647,6 +793,7 @@ fn normalize_rule(rule: &mut Rule) {
     rule.target_ipv6 = strip_brackets(&rule.target_ipv6).to_string();
     rule.target_ipv6_suffix = rule.target_ipv6_suffix.trim().to_ascii_lowercase();
     rule.target_mac = normalize_mac(&rule.target_mac);
+    rule.lease_seconds = rule.lease_seconds.min(7 * 86400);
     rule.max_connections = rule.max_connections.clamp(1, 256);
     rule.idle_timeout_sec = rule.idle_timeout_sec.clamp(30, 3600);
 }
@@ -687,9 +834,9 @@ fn normalize_mac(v: &str) -> String { v.trim().replace('-', ":").to_ascii_lowerc
 fn format_target(ip: IpAddr, port: u16) -> String { match ip { IpAddr::V4(v) => format!("{}:{}", v, port), IpAddr::V6(v) => format!("[{}]:{}", v, port) } }
 
 fn load_config(path: &Path) -> Result<ConfigFile> {
-    if !path.exists() { return Ok(ConfigFile { version: 1, rules: Vec::new() }); }
+    if !path.exists() { return Ok(ConfigFile { version: 2, rules: Vec::new() }); }
     let text = fs::read_to_string(path).with_context(|| format!("read {}", path.display()))?;
-    if text.trim().is_empty() { return Ok(ConfigFile { version: 1, rules: Vec::new() }); }
+    if text.trim().is_empty() { return Ok(ConfigFile { version: 2, rules: Vec::new() }); }
     serde_json::from_str(&text).with_context(|| format!("parse {}", path.display()))
 }
 
@@ -701,15 +848,23 @@ fn atomic_json_write<T: Serialize>(path: &Path, data: &T) -> Result<()> {
 fn atomic_value_write(path: &Path, value: &Value) -> Result<()> {
     if let Some(parent) = path.parent() { fs::create_dir_all(parent)?; }
     let tmp = path.with_extension("tmp");
-    fs::write(&tmp, serde_json::to_vec_pretty(value)?)?;
+    let bytes = serde_json::to_vec_pretty(value)?;
+    {
+        let mut file = fs::File::create(&tmp)?;
+        file.write_all(&bytes)?;
+        file.sync_all()?;
+    }
     fs::rename(&tmp, path)?;
+    if let Some(parent) = path.parent() {
+        if let Ok(dir) = fs::File::open(parent) { let _ = dir.sync_all(); }
+    }
     Ok(())
 }
 
 async fn handle_command_fixed(manager: Manager, raw: &str) -> Value {
     let v: Value = match serde_json::from_str(raw) {
         Ok(v) => v,
-        Err(_) => return json!({"ok": false, "error": "invalid JSON"}),
+        Err(_) => return json!({"ok": false, "errorCode": "INVALID_JSON", "error": "invalid JSON"}),
     };
     let action = v.get("action").and_then(Value::as_str).unwrap_or("");
     let result = match action {
@@ -719,11 +874,18 @@ async fn handle_command_fixed(manager: Manager, raw: &str) -> Value {
             Err(e) => Err(e.into()),
         },
         "start" => manager.enable_rule(v.get("id").and_then(Value::as_str).unwrap_or("")).await,
-        "stop" => manager.stop_rule(v.get("id").and_then(Value::as_str).unwrap_or(""), true).await,
+        "stop" => manager.stop_rule(
+            v.get("id").and_then(Value::as_str).unwrap_or(""),
+            true,
+            v.get("revision").and_then(Value::as_u64),
+        ).await,
         "delete" => manager.delete_rule(v.get("id").and_then(Value::as_str).unwrap_or("")).await,
         _ => Err(anyhow!("unknown action")),
     };
-    result.unwrap_or_else(|e| json!({"ok": false, "error": e.to_string()}))
+    result.unwrap_or_else(|e| {
+        let message = e.to_string();
+        json!({"ok": false, "errorCode": classify_error(&message), "error": message})
+    })
 }
 
 async fn unix_server_fixed(manager: Manager, socket_path: PathBuf) -> Result<()> {
@@ -766,16 +928,53 @@ fn agent_apply(socket_path: &Path, input_path: &Path) -> Result<Value> {
     for command in commands {
         let command_id = command.get("id").and_then(Value::as_str).unwrap_or("").to_string();
         let action = command.get("action").and_then(Value::as_str).unwrap_or("");
+        let rule_revision = command.get("ruleRevision").and_then(Value::as_u64).unwrap_or(0);
+        let expires_epoch = command.get("expiresEpoch").and_then(Value::as_u64).unwrap_or(u64::MAX);
+        if expires_epoch <= now_epoch() {
+            acks.push(json!({
+                "id": command_id,
+                "ok": false,
+                "phase": "failed",
+                "ruleRevision": rule_revision,
+                "errorCode": "COMMAND_EXPIRED",
+                "error": "command expired"
+            }));
+            continue;
+        }
         let payload = command.get("payload").cloned().unwrap_or_else(|| json!({}));
         let local = match action {
             "upsert" => json!({"action": "upsert", "rule": payload.get("rule").cloned().unwrap_or(Value::Null)}),
-            "start" | "stop" | "delete" => json!({"action": action, "id": payload.get("id").and_then(Value::as_str).unwrap_or("")}),
+            "start" => json!({"action": "start", "id": payload.get("id").and_then(Value::as_str).unwrap_or("")}),
+            "stop" => json!({
+                "action": "stop",
+                "id": payload.get("id").and_then(Value::as_str).unwrap_or(""),
+                "revision": payload.get("revision").and_then(Value::as_u64).unwrap_or(rule_revision)
+            }),
+            "delete" => json!({"action": "delete", "id": payload.get("id").and_then(Value::as_str).unwrap_or("")}),
             _ => json!({"action": "invalid"}),
         };
-        let result = ctl_request(socket_path, &local).unwrap_or_else(|e| json!({"ok": false, "error": e.to_string()}));
-        acks.push(json!({"id": command_id, "ok": result.get("ok").and_then(Value::as_bool).unwrap_or(false), "result": result}));
+        let result = ctl_request(socket_path, &local).unwrap_or_else(|e| {
+            let message = e.to_string();
+            json!({"ok": false, "errorCode": classify_error(&message), "error": message})
+        });
+        let ok = result.get("ok").and_then(Value::as_bool).unwrap_or(false);
+        let phase = result.get("phase").and_then(Value::as_str).unwrap_or(if ok { "applied" } else { "failed" });
+        acks.push(json!({
+            "id": command_id,
+            "ok": ok,
+            "phase": phase,
+            "ruleRevision": result.get("ruleRevision").and_then(Value::as_u64).unwrap_or(rule_revision),
+            "errorCode": result.get("errorCode").and_then(Value::as_str).unwrap_or(""),
+            "error": result.get("error").and_then(Value::as_str).unwrap_or(""),
+            "result": result
+        }));
     }
-    Ok(json!({"acks": acks, "appliedAt": now_epoch()}))
+    Ok(json!({
+        "protocolVersion": PROTOCOL_VERSION,
+        "relayVersion": VERSION,
+        "acks": acks,
+        "appliedAt": now_epoch()
+    }))
 }
 
 async fn daemon(args: &[String]) -> Result<()> {
@@ -898,5 +1097,27 @@ mod tests {
             ..Rule::default()
         };
         assert!(validate_rule(&rule, 20000, 20020).is_err());
+    }
+
+    #[test]
+    fn classifies_structured_errors() {
+        assert_eq!(classify_error("Address already in use"), "PORT_IN_USE");
+        assert_eq!(classify_error("target connect timeout"), "TARGET_TIMEOUT");
+        assert_eq!(classify_error("no IPv6 neighbor matches suffix/MAC"), "IPV6_NOT_FOUND");
+    }
+
+    #[test]
+    fn defaults_protocol_fields_for_legacy_rules() {
+        let rule: Rule = serde_json::from_value(json!({
+            "id": "legacy",
+            "name": "Legacy",
+            "mode": "6to4",
+            "listenPort": 20001,
+            "targetMode": "ipv4",
+            "targetIpv4": "192.168.5.46",
+            "targetPort": 443
+        })).unwrap();
+        assert_eq!(rule.revision, 1);
+        assert_eq!(rule.lease_seconds, 0);
     }
 }

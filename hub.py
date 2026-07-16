@@ -16,7 +16,11 @@ import requests
 import dns.resolver
 from flask import Flask, request, jsonify
 
-APP_VERSION = "0.8.3"
+VERSION_FILE = Path(__file__).resolve().with_name("VERSION")
+APP_VERSION = (
+    os.environ.get("LABPROBE_HUB_VERSION")
+    or (VERSION_FILE.read_text(encoding="utf-8").strip() if VERSION_FILE.exists() else "0.8.4")
+)
 PORT = int(os.environ.get("PORT", "58443"))
 CONFIG_PATH = Path(os.environ.get("CONFIG_PATH", "/app/config/config.yaml"))
 DATA_DIR = Path(os.environ.get("DATA_DIR", "/app/data"))
@@ -2192,21 +2196,36 @@ def trigger_status_refresh_if_needed(state: Dict[str, Any], force: bool = False)
 
 
 # ---------------------------------------------------------------------------
-# LabRelay / Port Mapping (Hub v0.8.3)
+# LabRelay / Port Mapping (Hub v0.8.4, protocol v2)
 # APP manages structured rules; router agent polls commands with HOOK_TOKEN.
+# Hub keeps desired state separate from router-reported actual state.
 # No endpoint accepts arbitrary shell commands and Hub never edits firewall.
 # ---------------------------------------------------------------------------
 
+PORTMAP_PROTOCOL_VERSION = 2
+PORTMAP_COMMAND_TTL_SEC = 300
+PORTMAP_COMMAND_MAX_ATTEMPTS = 8
+PORTMAP_AGENT_ONLINE_SEC = 35
+PORTMAP_COMMAND_HISTORY_LIMIT = 200
+PORTMAP_HISTORY_RETENTION_SEC = 7 * 86400
+PORTMAP_HISTORY_MAX_SAMPLES = max(1440, min(10080, to_int(os.environ.get("PORTMAP_HISTORY_MAX_SAMPLES"), 4320) or 4320))
+
+
 def _portmap_router_name() -> str:
-    # Use a stable agent identifier, not router.name (which is a display label and
-    # may contain spaces such as "Ruijie BE72"). The router installer defaults to
-    # BE72Pro, so both sides work without changing existing display-name config.
     return (
         clean_saved_value(os.environ.get("PORTMAP_ROUTER_NAME"))
         or clean_saved_value(cfg_get("router.portmap_id", ""))
         or clean_saved_value(cfg_get("router.agent_name", ""))
         or "BE72Pro"
     )
+
+
+def _portmap_port_range() -> Tuple[int, int]:
+    minimum = max(1, min(65535, to_int(os.environ.get("PORTMAP_PORT_MIN"), 20000) or 20000))
+    maximum = max(1, min(65535, to_int(os.environ.get("PORTMAP_PORT_MAX"), 20020) or 20020))
+    if minimum > maximum:
+        minimum, maximum = maximum, minimum
+    return minimum, maximum
 
 
 def _portmap_rule_id(value: Any = None) -> str:
@@ -2251,25 +2270,21 @@ def _portmap_time_epoch(value: Any) -> Optional[int]:
 
 
 def _portmap_lease_seconds(src: Dict[str, Any], old: Dict[str, Any], expires_at: Optional[int]) -> int:
-    """Return the repeatable duration for a timed rule.
-
-    leaseSeconds is persisted independently from expiresAt so an expired rule can
-    be started again with its previous duration. Legacy v0.8.2 rules are migrated
-    by deriving the original duration from createdAt/updatedAt when possible.
-    """
     raw = src.get("leaseSeconds", old.get("leaseSeconds"))
     lease = max(0, min(7 * 86400, to_int(raw, 0)))
     if lease > 0 or expires_at is None:
         return lease
-
     base = _portmap_time_epoch(old.get("createdAt") or src.get("createdAt"))
     if base and expires_at > base:
         return max(60, min(7 * 86400, expires_at - base))
-
     updated = _portmap_time_epoch(old.get("updatedAt") or src.get("updatedAt"))
     if updated and expires_at > updated:
         return max(60, min(7 * 86400, expires_at - updated))
     return 0
+
+
+def _portmap_desired_state(rule: Dict[str, Any]) -> str:
+    return "running" if bool(rule.get("enabled")) else "stopped"
 
 
 def _clean_portmap_rule(payload: Dict[str, Any], existing: Optional[Dict[str, Any]] = None) -> Dict[str, Any]:
@@ -2281,8 +2296,9 @@ def _clean_portmap_rule(payload: Dict[str, Any], existing: Optional[Dict[str, An
         raise ValueError("映射类型只能是 6to4 或 6to6")
     listen_port = to_int(src.get("listenPort"), 0)
     target_port = to_int(src.get("targetPort"), 0)
-    if not 20000 <= listen_port <= 20020:
-        raise ValueError("监听端口必须在 20000-20020")
+    port_min, port_max = _portmap_port_range()
+    if not port_min <= listen_port <= port_max:
+        raise ValueError(f"监听端口必须在 {port_min}-{port_max}")
     if not 1 <= target_port <= 65535:
         raise ValueError("目标端口无效")
     name = clean_saved_value(src.get("name"))[:64]
@@ -2325,11 +2341,15 @@ def _clean_portmap_rule(payload: Dict[str, Any], existing: Optional[Dict[str, An
     lease_seconds = _portmap_lease_seconds(src, old, expires_at)
     if expires_at is None:
         lease_seconds = 0
+    revision = max(1, to_int(old.get("revision"), 0) + 1) if old else max(1, to_int(src.get("revision"), 1))
     now = now_str()
+    enabled = bool(src.get("enabled", False))
     return {
         "id": rule_id,
         "name": name,
-        "enabled": bool(src.get("enabled", False)),
+        "revision": revision,
+        "enabled": enabled,
+        "desiredState": "running" if enabled else "stopped",
         "mode": mode,
         "listenPort": listen_port,
         "targetMode": target_mode,
@@ -2351,12 +2371,27 @@ def _clean_portmap_rule(payload: Dict[str, Any], existing: Optional[Dict[str, An
 def _load_portmap_rules() -> List[Dict[str, Any]]:
     raw = load_json(PORTMAP_RULES_FILE, {"rules": []})
     rows = raw.get("rules", []) if isinstance(raw, dict) else raw if isinstance(raw, list) else []
-    return [x for x in rows if isinstance(x, dict) and clean_saved_value(x.get("id"))]
+    out: List[Dict[str, Any]] = []
+    for item in rows:
+        if not isinstance(item, dict) or not clean_saved_value(item.get("id")):
+            continue
+        row = dict(item)
+        row["revision"] = max(1, to_int(row.get("revision"), 1))
+        row["desiredState"] = _portmap_desired_state(row)
+        row["leaseSeconds"] = max(0, to_int(row.get("leaseSeconds"), 0))
+        out.append(row)
+    return out
 
 
 def _save_portmap_rules(rows: List[Dict[str, Any]]) -> None:
-    rows = sorted(rows[-100:], key=lambda x: (to_int(x.get("listenPort"), 0), clean_saved_value(x.get("name"))))
-    save_json(PORTMAP_RULES_FILE, {"version": 1, "updatedAt": now_str(), "rules": rows})
+    cleaned = []
+    for item in rows[-100:]:
+        row = dict(item)
+        row["revision"] = max(1, to_int(row.get("revision"), 1))
+        row["desiredState"] = _portmap_desired_state(row)
+        cleaned.append(row)
+    cleaned.sort(key=lambda x: (to_int(x.get("listenPort"), 0), clean_saved_value(x.get("name"))))
+    save_json(PORTMAP_RULES_FILE, {"version": 2, "protocolVersion": PORTMAP_PROTOCOL_VERSION, "updatedAt": now_str(), "rules": cleaned})
 
 
 def _portmap_check_conflict(rows: List[Dict[str, Any]], rule: Dict[str, Any]) -> None:
@@ -2371,43 +2406,94 @@ def _portmap_command_rule_id(action: str, payload: Dict[str, Any]) -> str:
     return clean_saved_value(payload.get("id"))
 
 
+def _portmap_command_revision(action: str, payload: Dict[str, Any]) -> int:
+    if action == "upsert" and isinstance(payload.get("rule"), dict):
+        return max(0, to_int(payload.get("rule", {}).get("revision"), 0))
+    return max(0, to_int(payload.get("revision"), 0))
+
+
+def _prune_portmap_commands(commands: List[Dict[str, Any]], now_epoch: int) -> List[Dict[str, Any]]:
+    active: List[Dict[str, Any]] = []
+    finished: List[Dict[str, Any]] = []
+    for command in commands:
+        if not isinstance(command, dict):
+            continue
+        status = clean_saved_value(command.get("status"))
+        if status in ["pending", "delivered"]:
+            active.append(command)
+            continue
+        finished_epoch = to_int(command.get("finishedEpoch"), to_int(command.get("createdEpoch"), now_epoch))
+        if now_epoch - finished_epoch <= PORTMAP_HISTORY_RETENTION_SEC:
+            finished.append(command)
+    finished = finished[-PORTMAP_COMMAND_HISTORY_LIMIT:]
+    return (finished + active)[-500:]
+
+
 def _queue_portmap_command(action: str, payload: Dict[str, Any], router: Optional[str] = None) -> Dict[str, Any]:
     data = load_json(PORTMAP_COMMANDS_FILE, {"commands": []})
     commands = data.get("commands", []) if isinstance(data, dict) else []
     now_epoch = int(time.time())
-    commands = [c for c in commands if isinstance(c, dict) and not (
-        c.get("status") in ["done", "failed"] and now_epoch - to_int(c.get("finishedEpoch"), now_epoch) > 86400
-    )][-500:]
+    commands = _prune_portmap_commands(commands, now_epoch)
     target_router = router or _portmap_router_name()
     rule_id = _portmap_command_rule_id(action, payload)
+    revision = _portmap_command_revision(action, payload)
+
+    same_command = None
     for existing in reversed(commands):
         if existing.get("router") != target_router or existing.get("status") not in ["pending", "delivered"]:
             continue
-        if existing.get("action") == action and _portmap_command_rule_id(action, existing.get("payload") or {}) == rule_id:
-            existing["payload"] = payload
-            existing["status"] = "pending"
-            existing["updatedAt"] = now_str()
-            save_json(PORTMAP_COMMANDS_FILE, {"commands": commands})
-            return existing
+        existing_action = clean_saved_value(existing.get("action"))
+        existing_rule_id = _portmap_command_rule_id(existing_action, existing.get("payload") or {})
+        if existing_rule_id != rule_id:
+            continue
+        old_revision = max(0, to_int(existing.get("ruleRevision"), 0))
+        if existing_action == action and revision >= old_revision and same_command is None:
+            same_command = existing
+        elif revision >= old_revision:
+            existing["status"] = "superseded"
+            existing["finishedAt"] = now_str()
+            existing["finishedEpoch"] = now_epoch
+
+    if same_command is not None:
+        same_command.update({
+            "payload": payload,
+            "status": "pending",
+            "attempts": 0,
+            "updatedAt": now_str(),
+            "protocolVersion": PORTMAP_PROTOCOL_VERSION,
+            "ruleRevision": revision,
+            "expiresEpoch": now_epoch + PORTMAP_COMMAND_TTL_SEC,
+        })
+        save_json(PORTMAP_COMMANDS_FILE, {"version": 2, "commands": commands})
+        return same_command
+
     command = {
         "id": f"cmd-{int(time.time() * 1000)}-{secrets.token_hex(3)}",
         "router": target_router,
         "action": action,
         "payload": payload,
+        "protocolVersion": PORTMAP_PROTOCOL_VERSION,
+        "ruleRevision": revision,
         "status": "pending",
         "attempts": 0,
         "createdAt": now_str(),
         "createdEpoch": now_epoch,
+        "expiresEpoch": now_epoch + PORTMAP_COMMAND_TTL_SEC,
     }
     commands.append(command)
-    save_json(PORTMAP_COMMANDS_FILE, {"commands": commands})
+    save_json(PORTMAP_COMMANDS_FILE, {"version": 2, "commands": _prune_portmap_commands(commands, now_epoch)})
     return command
+
+
+def _portmap_status_payload(router_status: Dict[str, Any]) -> Dict[str, Any]:
+    status = router_status.get("status") if isinstance(router_status.get("status"), dict) else router_status
+    return status if isinstance(status, dict) else {}
 
 
 def _portmap_runtime_map(router_status: Dict[str, Any]) -> Dict[str, Dict[str, Any]]:
     out: Dict[str, Dict[str, Any]] = {}
-    status = router_status.get("status") if isinstance(router_status.get("status"), dict) else router_status
-    for row in status.get("rules", []) if isinstance(status, dict) else []:
+    status = _portmap_status_payload(router_status)
+    for row in status.get("rules", []) if isinstance(status.get("rules"), list) else []:
         if not isinstance(row, dict):
             continue
         runtime = row.get("runtime") if isinstance(row.get("runtime"), dict) else {}
@@ -2418,14 +2504,40 @@ def _portmap_runtime_map(router_status: Dict[str, Any]) -> Dict[str, Dict[str, A
     return out
 
 
+def _portmap_local_rule_map(router_status: Dict[str, Any]) -> Dict[str, Dict[str, Any]]:
+    out: Dict[str, Dict[str, Any]] = {}
+    status = _portmap_status_payload(router_status)
+    for row in status.get("rules", []) if isinstance(status.get("rules"), list) else []:
+        if not isinstance(row, dict):
+            continue
+        rule = row.get("rule") if isinstance(row.get("rule"), dict) else {}
+        runtime = row.get("runtime") if isinstance(row.get("runtime"), dict) else {}
+        rid = clean_saved_value(rule.get("id") or runtime.get("id"))
+        if rid:
+            out[rid] = rule
+    return out
+
+
+def _portmap_sync_state(desired: str, actual: str, agent_online: bool) -> str:
+    if not agent_online:
+        return "agent_offline"
+    if actual in ["error", "port_in_use", "target_unreachable", "version_mismatch"]:
+        return "error"
+    if desired == "running" and actual == "running":
+        return "synced"
+    if desired == "stopped" and actual in ["stopped", "expired", ""]:
+        return "synced"
+    return "syncing"
+
+
 def _append_portmap_history(status_payload: Dict[str, Any]) -> None:
     history = load_json(PORTMAP_HISTORY_FILE, {})
     if not isinstance(history, dict):
         history = {}
     now_epoch = int(time.time())
-    status = status_payload.get("status") if isinstance(status_payload.get("status"), dict) else status_payload
+    status = _portmap_status_payload(status_payload)
     changed = False
-    for row in status.get("rules", []) if isinstance(status, dict) else []:
+    for row in status.get("rules", []) if isinstance(status.get("rules"), list) else []:
         if not isinstance(row, dict):
             continue
         runtime = row.get("runtime") if isinstance(row.get("runtime"), dict) else {}
@@ -2433,19 +2545,31 @@ def _append_portmap_history(status_payload: Dict[str, Any]) -> None:
         if not rid:
             continue
         samples = history.get(rid, []) if isinstance(history.get(rid), list) else []
+        samples = [x for x in samples if isinstance(x, dict) and now_epoch - to_int(x.get("time"), 0) <= PORTMAP_HISTORY_RETENTION_SEC]
         if samples and now_epoch - to_int(samples[-1].get("time"), 0) < 60:
+            history[rid] = samples
             continue
         samples.append({
             "time": now_epoch,
             "activeConnections": to_int(runtime.get("activeConnections"), 0),
+            "peakConnections": to_int(runtime.get("peakConnections"), 0),
             "uploadBytes": to_int(runtime.get("totalUploadBytes"), 0),
             "downloadBytes": to_int(runtime.get("totalDownloadBytes"), 0),
             "state": clean_saved_value(runtime.get("state")),
+            "errorCode": clean_saved_value(runtime.get("lastErrorCode")),
         })
-        history[rid] = samples[-1440:]
+        history[rid] = samples[-PORTMAP_HISTORY_MAX_SAMPLES:]
+        changed = True
+    if len(history) > 100:
+        latest = sorted(history.items(), key=lambda kv: to_int((kv[1] or [{}])[-1].get("time"), 0), reverse=True)[:100]
+        history = dict(latest)
         changed = True
     if changed:
         save_json(PORTMAP_HISTORY_FILE, history)
+
+
+def _portmap_error(code: str, message: str, status: int = 400):
+    return jsonify({"ok": False, "error": message, "errorCode": code}), status
 
 
 @app.route("/api/portmaps", methods=["GET", "POST"])
@@ -2456,16 +2580,38 @@ def api_portmaps():
         rules = _load_portmap_rules()
         router_status = load_json(PORTMAP_ROUTER_STATUS_FILE, {})
         runtime = _portmap_runtime_map(router_status)
-        rows = [{**r, "runtime": runtime.get(r.get("id"), {})} for r in rules]
+        status_payload = _portmap_status_payload(router_status)
         received_epoch = to_int(router_status.get("receivedEpoch"), 0) if isinstance(router_status, dict) else 0
-        agent_online = bool(received_epoch and time.time() - received_epoch <= 35)
+        agent_online = bool(received_epoch and time.time() - received_epoch <= PORTMAP_AGENT_ONLINE_SEC)
+        rows = []
+        for rule in rules:
+            actual_runtime = runtime.get(rule.get("id"), {})
+            actual_state = clean_saved_value(actual_runtime.get("state")) or "unknown"
+            desired_state = _portmap_desired_state(rule)
+            rows.append({
+                **rule,
+                "desiredState": desired_state,
+                "actualState": actual_state,
+                "syncState": _portmap_sync_state(desired_state, actual_state, agent_online),
+                "runtime": actual_runtime,
+            })
+        reported_range = status_payload.get("portRange") if isinstance(status_payload.get("portRange"), dict) else {}
+        port_min, port_max = _portmap_port_range()
         return jsonify({
             "ok": True,
+            "protocolVersion": PORTMAP_PROTOCOL_VERSION,
+            "hubVersion": APP_VERSION,
             "rules": rows,
-            "portRange": {"min": 20000, "max": 20020},
+            "portRange": {
+                "min": to_int(reported_range.get("min"), port_min) or port_min,
+                "max": to_int(reported_range.get("max"), port_max) or port_max,
+            },
             "router": router_status.get("router", _portmap_router_name()) if isinstance(router_status, dict) else _portmap_router_name(),
             "agentOnline": agent_online,
             "agentLastSeenAt": router_status.get("receivedAt", "") if isinstance(router_status, dict) else "",
+            "agentVersion": clean_saved_value(router_status.get("agentVersion")) if isinstance(router_status, dict) else "",
+            "relayVersion": clean_saved_value(status_payload.get("relayVersion") or status_payload.get("version")),
+            "capabilities": status_payload.get("capabilities") if isinstance(status_payload.get("capabilities"), dict) else {},
         })
 
     if not check_app_token():
@@ -2480,8 +2626,10 @@ def api_portmaps():
         _queue_portmap_command("upsert", {"rule": rule})
         add_event({"type": "portmap_created", "title": f"端口映射已创建：{rule['name']}", "name": rule["name"], "newValue": f"IPv6:{rule['listenPort']}"})
         return jsonify({"ok": True, "rule": rule}), 201
+    except ValueError as e:
+        return _portmap_error("INVALID_RULE", str(e))
     except Exception as e:
-        return jsonify({"ok": False, "error": str(e)}), 400
+        return _portmap_error("INTERNAL_ERROR", str(e), 500)
 
 
 @app.route("/api/portmaps/<rule_id>", methods=["PUT", "DELETE"])
@@ -2491,10 +2639,10 @@ def api_portmap_item(rule_id: str):
     rows = _load_portmap_rules()
     old = next((x for x in rows if x.get("id") == rule_id), None)
     if not old:
-        return jsonify({"ok": False, "error": "rule not found"}), 404
+        return _portmap_error("RULE_NOT_FOUND", "rule not found", 404)
     if request.method == "DELETE":
         _save_portmap_rules([x for x in rows if x.get("id") != rule_id])
-        _queue_portmap_command("delete", {"id": rule_id})
+        _queue_portmap_command("delete", {"id": rule_id, "revision": to_int(old.get("revision"), 1) + 1})
         add_event({"type": "portmap_deleted", "title": f"端口映射已删除：{old.get('name')}", "name": old.get("name"), "oldValue": str(old.get("listenPort"))})
         return jsonify({"ok": True, "deleted": True, "id": rule_id})
     try:
@@ -2506,8 +2654,10 @@ def api_portmap_item(rule_id: str):
         _save_portmap_rules(rows)
         _queue_portmap_command("upsert", {"rule": rule})
         return jsonify({"ok": True, "rule": rule})
+    except ValueError as e:
+        return _portmap_error("INVALID_RULE", str(e))
     except Exception as e:
-        return jsonify({"ok": False, "error": str(e)}), 400
+        return _portmap_error("INTERNAL_ERROR", str(e), 500)
 
 
 @app.route("/api/portmaps/<rule_id>/<action>", methods=["POST"])
@@ -2515,29 +2665,31 @@ def api_portmap_action(rule_id: str, action: str):
     if not check_app_token():
         return jsonify({"ok": False, "error": "unauthorized"}), 401
     if action not in ["start", "stop"]:
-        return jsonify({"ok": False, "error": "invalid action"}), 400
+        return _portmap_error("INVALID_ACTION", "invalid action")
     rows = _load_portmap_rules()
     rule = next((x for x in rows if x.get("id") == rule_id), None)
     if not rule:
-        return jsonify({"ok": False, "error": "rule not found"}), 404
+        return _portmap_error("RULE_NOT_FOUND", "rule not found", 404)
     rule = dict(rule)
+    rule["revision"] = max(1, to_int(rule.get("revision"), 1) + 1)
     rule["enabled"] = action == "start"
+    rule["desiredState"] = "running" if action == "start" else "stopped"
     if action == "start":
         expires_at = _portmap_epoch(rule.get("expiresAt"))
         lease_seconds = max(0, to_int(rule.get("leaseSeconds"), 0))
         now_epoch = int(time.time())
-        # A timed rule that has already expired starts a fresh lease using the
-        # exact duration selected last time. A manually stopped rule that has
-        # not expired keeps its remaining time.
         if expires_at is not None and expires_at <= now_epoch:
             if lease_seconds <= 0:
-                return jsonify({"ok": False, "error": "旧规则缺少有效期时长，请编辑并重新选择有效期"}), 400
+                return _portmap_error("LEASE_MISSING", "旧规则缺少有效期时长，请编辑并重新选择有效期")
             rule["expiresAt"] = now_epoch + lease_seconds
     rule["updatedAt"] = now_str()
     rows = [rule if x.get("id") == rule_id else x for x in rows]
     _save_portmap_rules(rows)
-    _queue_portmap_command("upsert" if action == "start" else "stop", {"rule": rule} if action == "start" else {"id": rule_id})
-    return jsonify({"ok": True, "rule": rule, "action": action})
+    if action == "start":
+        command = _queue_portmap_command("upsert", {"rule": rule})
+    else:
+        command = _queue_portmap_command("stop", {"id": rule_id, "revision": rule["revision"]})
+    return jsonify({"ok": True, "rule": rule, "action": action, "commandId": command.get("id")})
 
 
 @app.route("/api/portmaps/<rule_id>/history", methods=["GET"])
@@ -2551,10 +2703,23 @@ def api_portmap_history(rule_id: str):
     return jsonify({"ok": True, "id": rule_id, "minutes": minutes, "samples": [x for x in samples if to_int(x.get("time"), 0) >= cutoff]})
 
 
+@app.route("/api/router/portmaps/auth-test", methods=["GET"])
+def api_router_portmap_auth_test():
+    if not check_hook_token():
+        return jsonify({"ok": False, "error": "bad hook token", "errorCode": "BAD_HOOK_TOKEN"}), 401
+    return jsonify({
+        "ok": True,
+        "hubVersion": APP_VERSION,
+        "protocolVersion": PORTMAP_PROTOCOL_VERSION,
+        "router": clean_saved_value(request.args.get("router")) or _portmap_router_name(),
+        "time": now_str(),
+    })
+
+
 @app.route("/api/router/portmaps/commands", methods=["GET"])
 def api_router_portmap_commands():
     if not check_hook_token():
-        return jsonify({"ok": False, "error": "bad hook token"}), 401
+        return jsonify({"ok": False, "error": "bad hook token", "errorCode": "BAD_HOOK_TOKEN"}), 401
     router = clean_saved_value(request.args.get("router")) or _portmap_router_name()
     limit = max(1, min(50, to_int(request.args.get("limit"), 20) or 20))
     data = load_json(PORTMAP_COMMANDS_FILE, {"commands": []})
@@ -2565,81 +2730,136 @@ def api_router_portmap_commands():
     for command in commands:
         if not isinstance(command, dict) or command.get("router") != router:
             continue
-        retry_due = command.get("status") == "delivered" and now_epoch - to_int(command.get("deliveredEpoch"), 0) >= 15 and to_int(command.get("attempts"), 0) < 5
+        if to_int(command.get("expiresEpoch"), now_epoch + 1) <= now_epoch and command.get("status") in ["pending", "delivered"]:
+            command["status"] = "expired"
+            command["errorCode"] = "COMMAND_EXPIRED"
+            command["finishedAt"] = now_str()
+            command["finishedEpoch"] = now_epoch
+            changed = True
+            continue
+        retry_due = (
+            command.get("status") == "delivered"
+            and now_epoch - to_int(command.get("deliveredEpoch"), 0) >= 15
+            and to_int(command.get("attempts"), 0) < PORTMAP_COMMAND_MAX_ATTEMPTS
+        )
         if command.get("status") == "pending" or retry_due:
             command["status"] = "delivered"
             command["deliveredAt"] = now_str()
             command["deliveredEpoch"] = now_epoch
             command["attempts"] = to_int(command.get("attempts"), 0) + 1
-            selected.append({k: command.get(k) for k in ["id", "action", "payload", "createdAt"]})
+            selected.append({k: command.get(k) for k in ["id", "action", "payload", "protocolVersion", "ruleRevision", "createdAt", "expiresEpoch"]})
             changed = True
             if len(selected) >= limit:
                 break
     if changed:
-        save_json(PORTMAP_COMMANDS_FILE, {"commands": commands})
-    return jsonify({"ok": True, "commands": selected, "time": now_str()})
+        save_json(PORTMAP_COMMANDS_FILE, {"version": 2, "commands": _prune_portmap_commands(commands, now_epoch)})
+    return jsonify({
+        "ok": True,
+        "protocolVersion": PORTMAP_PROTOCOL_VERSION,
+        "hubVersion": APP_VERSION,
+        "commands": selected,
+        "time": now_str(),
+    })
 
 
 @app.route("/api/router/portmaps/ack", methods=["POST"])
 def api_router_portmap_ack():
     if not check_hook_token():
-        return jsonify({"ok": False, "error": "bad hook token"}), 401
+        return jsonify({"ok": False, "error": "bad hook token", "errorCode": "BAD_HOOK_TOKEN"}), 401
     payload = request.get_json(silent=True) or {}
     acks = payload.get("acks", []) if isinstance(payload.get("acks"), list) else []
     data = load_json(PORTMAP_COMMANDS_FILE, {"commands": []})
     commands = data.get("commands", []) if isinstance(data, dict) else []
     ack_map = {clean_saved_value(x.get("id")): x for x in acks if isinstance(x, dict)}
     changed = 0
+    now_epoch = int(time.time())
     for command in commands:
         ack = ack_map.get(clean_saved_value(command.get("id")))
         if not ack:
             continue
-        command["status"] = "done" if bool(ack.get("ok")) else "failed"
+        ok = bool(ack.get("ok"))
+        phase = clean_saved_value(ack.get("phase")) or ("applied" if ok else "failed")
+        command["status"] = "done" if ok else "failed"
+        command["phase"] = phase
         command["result"] = ack.get("result")
+        command["errorCode"] = clean_saved_value(ack.get("errorCode") or (ack.get("result") or {}).get("errorCode"))
+        command["errorMessage"] = clean_saved_value(ack.get("error") or (ack.get("result") or {}).get("error"))
+        command["appliedRevision"] = to_int(ack.get("ruleRevision"), to_int(command.get("ruleRevision"), 0))
         command["finishedAt"] = now_str()
-        command["finishedEpoch"] = int(time.time())
+        command["finishedEpoch"] = now_epoch
         changed += 1
     if changed:
-        save_json(PORTMAP_COMMANDS_FILE, {"commands": commands})
+        save_json(PORTMAP_COMMANDS_FILE, {"version": 2, "commands": _prune_portmap_commands(commands, now_epoch)})
     return jsonify({"ok": True, "acknowledged": changed})
 
 
 @app.route("/api/router/portmaps/status", methods=["POST"])
 def api_router_portmap_status():
     if not check_hook_token():
-        return jsonify({"ok": False, "error": "bad hook token"}), 401
+        return jsonify({"ok": False, "error": "bad hook token", "errorCode": "BAD_HOOK_TOKEN"}), 401
     payload = request.get_json(silent=True) or {}
     router = clean_saved_value(request.args.get("router")) or _portmap_router_name()
     record = {
         "router": router,
         "receivedAt": now_str(),
         "receivedEpoch": int(time.time()),
+        "agentVersion": clean_saved_value(request.headers.get("X-LabProbe-Agent-Version")),
+        "agentProtocolVersion": to_int(request.headers.get("X-LabProbe-Protocol-Version"), 1),
         "status": payload,
     }
     save_json(PORTMAP_ROUTER_STATUS_FILE, record)
     _append_portmap_history(record)
 
-    # Reconcile Hub desired rules with router-local rules. This recovers from a
-    # replaced binary/config or router reset without requiring APP to edit each rule.
-    desired = {clean_saved_value(x.get("id")): x for x in _load_portmap_rules() if clean_saved_value(x.get("id"))}
-    local_rows = payload.get("rules", []) if isinstance(payload.get("rules"), list) else []
-    local = {}
-    for row in local_rows:
-        if not isinstance(row, dict):
-            continue
-        local_rule = row.get("rule") if isinstance(row.get("rule"), dict) else {}
-        rid = clean_saved_value(local_rule.get("id") or (row.get("runtime") or {}).get("id"))
-        if rid:
-            local[rid] = local_rule
-    compare_keys = ["enabled", "mode", "listenPort", "targetMode", "targetIpv4", "targetIpv6", "targetIpv6Suffix", "targetMac", "targetPort", "expiresAt", "leaseSeconds", "maxConnections", "idleTimeoutSec"]
+    desired_rows = _load_portmap_rules()
+    local = _portmap_local_rule_map(record)
+    runtime = _portmap_runtime_map(record)
+    now_epoch = int(time.time())
+    changed_rules = False
+
+    # Timed rules become desired-stopped when the router confirms expiry. This
+    # avoids endless restart attempts while preserving leaseSeconds for the next start.
+    for index, rule in enumerate(desired_rows):
+        rid = clean_saved_value(rule.get("id"))
+        expires_at = _portmap_epoch(rule.get("expiresAt"))
+        actual_state = clean_saved_value((runtime.get(rid) or {}).get("state"))
+        if bool(rule.get("enabled")) and expires_at is not None and expires_at <= now_epoch and actual_state in ["expired", "stopped", ""]:
+            updated = dict(rule)
+            updated["enabled"] = False
+            updated["desiredState"] = "stopped"
+            updated["revision"] = max(1, to_int(updated.get("revision"), 1) + 1)
+            updated["updatedAt"] = now_str()
+            desired_rows[index] = updated
+            _queue_portmap_command("stop", {"id": rid, "revision": updated["revision"]}, router)
+            changed_rules = True
+    if changed_rules:
+        _save_portmap_rules(desired_rows)
+
+    desired = {clean_saved_value(x.get("id")): x for x in desired_rows if clean_saved_value(x.get("id"))}
+    relay_protocol = max(1, to_int(payload.get("protocolVersion"), 1))
+    compare_keys = [
+        "enabled", "mode", "listenPort", "targetMode", "targetIpv4",
+        "targetIpv6", "targetIpv6Suffix", "targetMac", "targetPort", "expiresAt",
+        "maxConnections", "idleTimeoutSec"
+    ]
+    if relay_protocol >= 2:
+        compare_keys = ["revision", *compare_keys, "leaseSeconds"]
+    queued = 0
     for rid, rule in desired.items():
         local_rule = local.get(rid)
         if not local_rule or any(local_rule.get(k) != rule.get(k) for k in compare_keys):
             _queue_portmap_command("upsert", {"rule": rule}, router)
+            queued += 1
     for rid in set(local) - set(desired):
-        _queue_portmap_command("delete", {"id": rid}, router)
+        _queue_portmap_command("delete", {"id": rid, "revision": to_int(local[rid].get("revision"), 0) + 1}, router)
+        queued += 1
 
-    return jsonify({"ok": True, "receivedAt": record["receivedAt"]})
+    return jsonify({
+        "ok": True,
+        "receivedAt": record["receivedAt"],
+        "protocolVersion": PORTMAP_PROTOCOL_VERSION,
+        "hubVersion": APP_VERSION,
+        "reconcileQueued": queued,
+    })
 
 
 @app.route("/api/status", methods=["GET"])

@@ -14,6 +14,14 @@ jobs:
       - name: Checkout
         uses: actions/checkout@v4
 
+      - name: Read version
+        id: version
+        shell: bash
+        run: |
+          VERSION="$(tr -d '[:space:]' < VERSION)"
+          test -n "$VERSION"
+          echo "value=$VERSION" >> "$GITHUB_OUTPUT"
+
       - name: Set up QEMU
         uses: docker/setup-qemu-action@v3
 
@@ -33,6 +41,8 @@ jobs:
           file: ./Dockerfile
           push: true
           platforms: linux/arm64
+          build-args: |
+            HUB_VERSION=${{ steps.version.outputs.value }}
           tags: |
             ${{ secrets.DOCKERHUB_USERNAME }}/labprobe-hub:latest
-            ${{ secrets.DOCKERHUB_USERNAME }}/labprobe-hub:0.8.3
+            ${{ secrets.DOCKERHUB_USERNAME }}/labprobe-hub:${{ steps.version.outputs.value }}
