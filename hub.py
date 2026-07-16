@@ -16,7 +16,7 @@ import requests
 import dns.resolver
 from flask import Flask, request, jsonify
 
-APP_VERSION = "0.8.2"
+APP_VERSION = "0.8.3"
 PORT = int(os.environ.get("PORT", "58443"))
 CONFIG_PATH = Path(os.environ.get("CONFIG_PATH", "/app/config/config.yaml"))
 DATA_DIR = Path(os.environ.get("DATA_DIR", "/app/data"))
@@ -2192,7 +2192,7 @@ def trigger_status_refresh_if_needed(state: Dict[str, Any], force: bool = False)
 
 
 # ---------------------------------------------------------------------------
-# LabRelay / Port Mapping (Hub v0.8.2)
+# LabRelay / Port Mapping (Hub v0.8.3)
 # APP manages structured rules; router agent polls commands with HOOK_TOKEN.
 # No endpoint accepts arbitrary shell commands and Hub never edits firewall.
 # ---------------------------------------------------------------------------
@@ -2238,6 +2238,38 @@ def _portmap_epoch(value: Any) -> Optional[int]:
         return n if n > 0 else None
     except Exception:
         return None
+
+
+def _portmap_time_epoch(value: Any) -> Optional[int]:
+    raw = clean_saved_value(value)
+    if not raw:
+        return None
+    try:
+        return int(datetime.strptime(raw, "%Y-%m-%d %H:%M:%S").timestamp())
+    except Exception:
+        return None
+
+
+def _portmap_lease_seconds(src: Dict[str, Any], old: Dict[str, Any], expires_at: Optional[int]) -> int:
+    """Return the repeatable duration for a timed rule.
+
+    leaseSeconds is persisted independently from expiresAt so an expired rule can
+    be started again with its previous duration. Legacy v0.8.2 rules are migrated
+    by deriving the original duration from createdAt/updatedAt when possible.
+    """
+    raw = src.get("leaseSeconds", old.get("leaseSeconds"))
+    lease = max(0, min(7 * 86400, to_int(raw, 0)))
+    if lease > 0 or expires_at is None:
+        return lease
+
+    base = _portmap_time_epoch(old.get("createdAt") or src.get("createdAt"))
+    if base and expires_at > base:
+        return max(60, min(7 * 86400, expires_at - base))
+
+    updated = _portmap_time_epoch(old.get("updatedAt") or src.get("updatedAt"))
+    if updated and expires_at > updated:
+        return max(60, min(7 * 86400, expires_at - updated))
+    return 0
 
 
 def _clean_portmap_rule(payload: Dict[str, Any], existing: Optional[Dict[str, Any]] = None) -> Dict[str, Any]:
@@ -2289,6 +2321,10 @@ def _clean_portmap_rule(payload: Dict[str, Any], existing: Optional[Dict[str, An
 
     max_connections = max(1, min(256, to_int(src.get("maxConnections"), 32) or 32))
     idle_timeout = max(30, min(3600, to_int(src.get("idleTimeoutSec"), 300) or 300))
+    expires_at = _portmap_epoch(src.get("expiresAt"))
+    lease_seconds = _portmap_lease_seconds(src, old, expires_at)
+    if expires_at is None:
+        lease_seconds = 0
     now = now_str()
     return {
         "id": rule_id,
@@ -2303,7 +2339,8 @@ def _clean_portmap_rule(payload: Dict[str, Any], existing: Optional[Dict[str, An
         "targetMac": target_mac,
         "targetPort": target_port,
         "preferCurrentPrefix": bool(src.get("preferCurrentPrefix", True)),
-        "expiresAt": _portmap_epoch(src.get("expiresAt")),
+        "expiresAt": expires_at,
+        "leaseSeconds": lease_seconds,
         "maxConnections": max_connections,
         "idleTimeoutSec": idle_timeout,
         "createdAt": old.get("createdAt") or now,
@@ -2485,6 +2522,17 @@ def api_portmap_action(rule_id: str, action: str):
         return jsonify({"ok": False, "error": "rule not found"}), 404
     rule = dict(rule)
     rule["enabled"] = action == "start"
+    if action == "start":
+        expires_at = _portmap_epoch(rule.get("expiresAt"))
+        lease_seconds = max(0, to_int(rule.get("leaseSeconds"), 0))
+        now_epoch = int(time.time())
+        # A timed rule that has already expired starts a fresh lease using the
+        # exact duration selected last time. A manually stopped rule that has
+        # not expired keeps its remaining time.
+        if expires_at is not None and expires_at <= now_epoch:
+            if lease_seconds <= 0:
+                return jsonify({"ok": False, "error": "旧规则缺少有效期时长，请编辑并重新选择有效期"}), 400
+            rule["expiresAt"] = now_epoch + lease_seconds
     rule["updatedAt"] = now_str()
     rows = [rule if x.get("id") == rule_id else x for x in rows]
     _save_portmap_rules(rows)
@@ -2583,7 +2631,7 @@ def api_router_portmap_status():
         rid = clean_saved_value(local_rule.get("id") or (row.get("runtime") or {}).get("id"))
         if rid:
             local[rid] = local_rule
-    compare_keys = ["enabled", "mode", "listenPort", "targetMode", "targetIpv4", "targetIpv6", "targetIpv6Suffix", "targetMac", "targetPort", "expiresAt", "maxConnections", "idleTimeoutSec"]
+    compare_keys = ["enabled", "mode", "listenPort", "targetMode", "targetIpv4", "targetIpv6", "targetIpv6Suffix", "targetMac", "targetPort", "expiresAt", "leaseSeconds", "maxConnections", "idleTimeoutSec"]
     for rid, rule in desired.items():
         local_rule = local.get(rid)
         if not local_rule or any(local_rule.get(k) != rule.get(k) for k in compare_keys):
