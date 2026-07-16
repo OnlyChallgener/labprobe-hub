@@ -334,6 +334,28 @@ def human_duration_precise(seconds: Any) -> str:
     return f"{s}秒"
 
 
+def today_online_seconds_from_item(item: Dict[str, Any]) -> int:
+    """Online duration within today's local-day window.
+
+    Ruijie activeTime/onlinetime may be cumulative since the client came online.
+    The traffic ranking page should show today's online duration, so clamp it to
+    [today 00:00, now]. This also works for wired clients when user_list has an
+    online timestamp or activeTime.
+    """
+    now = datetime.now()
+    midnight = datetime.combine(date.today(), datetime.min.time())
+    seconds_since_midnight = max(0, int((now - midnight).total_seconds()))
+
+    active = to_int(item.get("activeTime") or item.get("onlineDurationSec") or item.get("durationSec"), 0)
+    start = parse_time_safe(item.get("onlinetime") or item.get("onlineSince") or item.get("startTime"))
+    if start:
+        window_start = max(start, midnight)
+        return max(0, int((now - window_start).total_seconds()))
+    if active > 0:
+        return min(active, seconds_since_midnight)
+    return 0
+
+
 def clean_saved_value(v: Any) -> str:
     text = "" if v is None else str(v).strip()
     if text.lower() in ["", "null", "none", "nan"] or text == "-":
@@ -599,7 +621,9 @@ def archive_device_snapshot(dev: Dict[str, Any]) -> None:
     keep_keys = [
         "name", "mac", "ip", "lastIp", "ssid", "band", "rssi", "rxrate", "channel",
         "connectType", "onlineSince", "onlineDurationText", "lastSeenAt", "offlineAt",
-        "hostName", "devType", "osType", "manufacture", "devRecommend", "ipv6List", "ipv6UpdatedAt", "ndpState", "ndpDev", "wolMode",
+        "todayOnlineDurationSec", "todayOnlineDurationText",
+        "hostName", "devType", "osType", "manufacture", "devRecommend", "ipv6", "ipv6Address", "globalIpv6",
+        "ipv6List", "ipv6Records", "ipv6UpdatedAt", "ndpState", "ndpDev", "wolMode",
         "todayUpload", "todayDownload", "totalUpload", "totalDownload", "todayTraffic", "realtimeTraffic",
         "dailyUpBytes", "dailyDownBytes", "upBytes", "downBytes", "trafficDate", "trafficUpdatedAt", "trafficText"
     ]
@@ -630,8 +654,9 @@ def hydrate_device_with_archive(dev: Dict[str, Any], archive: Optional[Dict[str,
     # 离线设备长期保留最后一次有效信息；在线设备只补缺失字段。
     hydrate_keys = [
         "name", "lastIp", "ssid", "band", "rssi", "rxrate", "channel", "connectType", "onlineSince",
-        "onlineDurationText", "lastSeenAt", "hostName", "devType", "osType", "manufacture", "devRecommend",
-        "ipv6List", "ipv6UpdatedAt", "ndpState", "ndpDev", "wolMode",
+        "onlineDurationText", "todayOnlineDurationSec", "todayOnlineDurationText", "lastSeenAt",
+        "hostName", "devType", "osType", "manufacture", "devRecommend",
+        "ipv6", "ipv6Address", "globalIpv6", "ipv6List", "ipv6Records", "ipv6UpdatedAt", "ndpState", "ndpDev", "wolMode",
         "totalUpload", "totalDownload", "realtimeTraffic", "upBytes", "downBytes", "trafficUpdatedAt", "trafficText",
     ]
     if old.get("trafficDate") == today_str():
@@ -642,6 +667,18 @@ def hydrate_device_with_archive(dev: Dict[str, Any], archive: Optional[Dict[str,
 
     # v0.7.9: expose the preferred global IPv6 as flat fields too, because
     # older/newer APP builds may read either ipv6 or ipv6List.
+    current_prefixes = normalize_ipv6_prefixes((load_json(STATE_FILE, {}).get("router") or {}).get("lanIpv6Prefixes") or [])
+    ipv6_records = normalize_ipv6_records(out.get("ipv6Records") or old.get("ipv6Records") or [], current_prefixes)
+    if ipv6_records:
+        best = pick_primary_ipv6(ipv6_records)
+        ordered = [best] + [r["ip"] for r in sorted(ipv6_records, key=score_ipv6_record, reverse=True) if r.get("ip") != best]
+        out["ipv6Records"] = ipv6_records
+        out["ipv6List"] = normalize_ipv6_list(ordered)
+        if best:
+            out["ipv6"] = best
+            out["ipv6Address"] = best
+            out["globalIpv6"] = best
+
     ipv6_list = normalize_ipv6_list(out.get("ipv6List") or old.get("ipv6List") or [])
     if ipv6_list:
         out["ipv6List"] = ipv6_list
@@ -833,11 +870,214 @@ def normalize_ipv6_list(values: Any) -> List[str]:
             continue
         try:
             addr = ipaddress.ip_address(ip)
-            if addr.version == 6 and not addr.is_link_local and not addr.is_multicast and not addr.is_loopback:
+            if (
+                addr.version == 6
+                and not addr.is_link_local
+                and not addr.is_multicast
+                and not addr.is_loopback
+                and not addr.ipv4_mapped
+            ):
                 out.append(str(addr))
         except Exception:
             continue
     return list(dict.fromkeys(out))[:8]
+
+
+def normalize_ipv6_prefixes(values: Any) -> List[str]:
+    raw: List[str] = []
+    if isinstance(values, list):
+        raw = [str(x.get("prefix") if isinstance(x, dict) else x) for x in values]
+    elif isinstance(values, str):
+        raw = re.split(r"[\s,]+", values)
+    out: List[str] = []
+    for v in raw:
+        text = clean_saved_value(v)
+        if not text or ":" not in text:
+            continue
+        try:
+            net = ipaddress.ip_network(text, strict=False)
+            if net.version == 6 and not net.is_link_local and not net.is_multicast and not net.is_loopback:
+                out.append(str(net))
+        except Exception:
+            continue
+    return list(dict.fromkeys(out))[:16]
+
+
+def normalize_ipv6_items(values: Any, default_name: str = "IPv6") -> List[Dict[str, Any]]:
+    items: List[Any] = values if isinstance(values, list) else []
+    out: List[Dict[str, Any]] = []
+    seen = set()
+    for i, item in enumerate(items):
+        if isinstance(item, str):
+            item = {"ip": item}
+        if not isinstance(item, dict):
+            continue
+        ips = normalize_ipv6_list([item.get("ip") or item.get("address") or item.get("ipv6") or item.get("value")])
+        if not ips or ips[0] in seen:
+            continue
+        seen.add(ips[0])
+        name = clean_saved_value(item.get("name")) or (default_name if i == 0 else f"{default_name} {i + 1}")
+        out.append({
+            "name": name,
+            "ip": ips[0],
+            "dev": clean_saved_value(item.get("dev") or item.get("iface") or item.get("ifname")),
+            "primary": bool(item.get("primary")) or (i == 0),
+        })
+    if out and not any(x.get("primary") for x in out):
+        out[0]["primary"] = True
+    return out[:16]
+
+
+def ipv6_in_prefixes(ip: str, prefixes: List[str]) -> bool:
+    if not ip or not prefixes:
+        return False
+    try:
+        addr = ipaddress.ip_address(ip)
+        return any(addr in ipaddress.ip_network(p, strict=False) for p in prefixes)
+    except Exception:
+        return False
+
+
+def is_ula_ipv6(ip: str) -> bool:
+    try:
+        addr = ipaddress.ip_address(ip)
+        return addr.version == 6 and addr.is_private and str(addr).lower().startswith(("fc", "fd"))
+    except Exception:
+        return False
+
+
+def is_temporary_ipv6(ip: str, source: str = "") -> bool:
+    source_l = str(source or "").lower()
+    if "temp" in source_l or "privacy" in source_l:
+        return True
+    try:
+        addr = ipaddress.ip_address(ip)
+        parts = addr.exploded.split(":")
+        iid = "".join(parts[4:])
+        return "fffe" not in iid.lower()
+    except Exception:
+        return False
+
+
+def ipv6_reachability_score(state: Any) -> int:
+    s = clean_saved_value(state).upper()
+    if s == "REACHABLE":
+        return 20
+    if s in ["DELAY", "PROBE"]:
+        return 12
+    if s == "STALE":
+        return 4
+    if s == "FAILED":
+        return -30
+    return 0
+
+
+def score_ipv6_record(rec: Dict[str, Any]) -> int:
+    ip = clean_saved_value(rec.get("ip"))
+    if not ip:
+        return -9999
+    score = 0
+    try:
+        addr = ipaddress.ip_address(ip)
+        if addr.version != 6 or addr.is_link_local or addr.is_multicast or addr.is_loopback or addr.ipv4_mapped:
+            return -9999
+        if addr.is_global:
+            score += 100
+        elif is_ula_ipv6(ip):
+            score += 40
+    except Exception:
+        return -9999
+    if rec.get("currentPrefix"):
+        score += 25
+    if rec.get("historical"):
+        score -= 35
+    score += ipv6_reachability_score(rec.get("state") or rec.get("ndState"))
+    source = str(rec.get("source") or "")
+    if "hub_local" in source:
+        score += 80
+    if "dhcp" in source.lower():
+        score += 10
+    if not is_temporary_ipv6(ip, source):
+        score += 8
+    else:
+        score -= 10
+    score += min(5, int(time_to_epoch(rec.get("lastSeen") or rec.get("lastSeenAt")) // 86400) % 6)
+    return score
+
+
+def pick_primary_ipv6(records: List[Dict[str, Any]]) -> str:
+    valid = [r for r in records if score_ipv6_record(r) > -9999]
+    if not valid:
+        return ""
+    valid.sort(key=lambda r: (score_ipv6_record(r), time_to_epoch(r.get("lastReachable") or r.get("lastSeen"))), reverse=True)
+    return clean_saved_value(valid[0].get("ip"))
+
+
+def normalize_ipv6_records(records: Any, current_prefixes: Optional[List[str]] = None) -> List[Dict[str, Any]]:
+    current_prefixes = current_prefixes or []
+    out: List[Dict[str, Any]] = []
+    if isinstance(records, dict):
+        records = list(records.values())
+    if not isinstance(records, list):
+        records = []
+    for item in records:
+        if isinstance(item, str):
+            item = {"ip": item}
+        if not isinstance(item, dict):
+            continue
+        ips = normalize_ipv6_list([item.get("ip") or item.get("ipv6") or item.get("address") or item.get("addr")])
+        if not ips:
+            continue
+        ip = ips[0]
+        state = clean_saved_value(item.get("state") or item.get("ndState"))
+        source = clean_saved_value(item.get("source")) or "unknown"
+        rec = {
+            "ip": ip,
+            "firstSeen": clean_saved_value(item.get("firstSeen") or item.get("seenAt") or item.get("lastSeen")) or now_str(),
+            "lastSeen": clean_saved_value(item.get("lastSeen") or item.get("seenAt")) or now_str(),
+            "lastReachable": clean_saved_value(item.get("lastReachable")),
+            "source": source,
+            "state": state,
+            "dev": clean_saved_value(item.get("dev") or item.get("iface") or item.get("ifname")),
+            "currentPrefix": ipv6_in_prefixes(ip, current_prefixes),
+            "temporary": bool(item.get("temporary")) or is_temporary_ipv6(ip, source),
+        }
+        if not rec["lastReachable"] and state.upper() in ["REACHABLE", "DELAY", "PROBE"]:
+            rec["lastReachable"] = rec["lastSeen"]
+        rec["historical"] = bool(current_prefixes and not rec["currentPrefix"] and not is_ula_ipv6(ip))
+        out.append(rec)
+    dedup: Dict[str, Dict[str, Any]] = {}
+    for rec in out:
+        dedup[rec["ip"]] = rec
+    return list(dedup.values())[:24]
+
+
+def local_hub_ipv6_records() -> List[Dict[str, Any]]:
+    out = []
+    for ip in normalize_ipv6_list([get_local_global_ip(True)]):
+        out.append({
+            "ip": ip,
+            "firstSeen": now_str(),
+            "lastSeen": now_str(),
+            "lastReachable": now_str(),
+            "source": "hub_local_probe",
+            "state": "REACHABLE",
+            "dev": "hub",
+            "currentPrefix": True,
+            "temporary": is_temporary_ipv6(ip, "hub_local_probe"),
+            "historical": False,
+        })
+    return out
+
+
+def configured_nas_macs() -> set:
+    raw = cfg_get("nas.mac", None) or cfg_get("nas.macs", None) or cfg_get("nas.device_mac", None)
+    vals: List[str] = []
+    if isinstance(raw, list):
+        vals = [str(x) for x in raw]
+    elif raw:
+        vals = re.split(r"[\s,;]+", str(raw))
+    return {norm_mac(x) for x in vals if norm_mac(x)}
 
 
 
@@ -856,13 +1096,14 @@ def parse_ipv6_neighbor_text(text: str) -> List[Dict[str, Any]]:
         mac = norm_mac(m.group("mac"))
         ips = normalize_ipv6_list([m.group("ip")])
         if mac and ips:
-            out.append({"mac": mac, "ip": ips[0], "state": clean_saved_value(m.group("state")), "dev": clean_saved_value(m.group("dev")), "seenAt": now_str()})
+            out.append({"mac": mac, "ip": ips[0], "state": clean_saved_value(m.group("state")), "dev": clean_saved_value(m.group("dev")), "seenAt": now_str(), "source": "router_ndp"})
     return out
 
 def parse_ipv6_neighbors(payload: Any) -> List[Dict[str, Any]]:
     if not isinstance(payload, dict):
         return []
     items = payload.get("ipv6_neighbors") or payload.get("ipv6Neighbors") or payload.get("ndp") or payload.get("neighbors")
+    leases = payload.get("dhcpv6_leases") or payload.get("dhcpv6Leases") or payload.get("leases") or []
     text = payload.get("ipv6_neighbors_text") or payload.get("ipv6NeighborsText") or payload.get("ip6_neigh") or payload.get("ip6Neigh") or payload.get("ndpText")
 
     out: List[Dict[str, Any]] = []
@@ -881,7 +1122,31 @@ def parse_ipv6_neighbors(payload: Any) -> List[Dict[str, Any]]:
         ip = clean_saved_value(item.get("ip") or item.get("ipv6") or item.get("address") or item.get("addr"))
         ips = normalize_ipv6_list([ip])
         if mac and ips:
-            out.append({"mac": mac, "ip": ips[0], "state": clean_saved_value(item.get("state")), "dev": clean_saved_value(item.get("dev") or item.get("iface") or item.get("ifname")), "seenAt": now_str()})
+            out.append({
+                "mac": mac,
+                "ip": ips[0],
+                "state": clean_saved_value(item.get("state")),
+                "dev": clean_saved_value(item.get("dev") or item.get("iface") or item.get("ifname")),
+                "seenAt": clean_saved_value(item.get("seenAt") or item.get("collectedAt")) or now_str(),
+                "source": clean_saved_value(item.get("source")) or "router_ndp",
+            })
+
+    if isinstance(leases, list):
+        for item in leases:
+            if not isinstance(item, dict):
+                continue
+            mac = norm_mac(item.get("mac") or item.get("duidMac") or item.get("lladdr"))
+            ip = clean_saved_value(item.get("ip") or item.get("ipv6") or item.get("address") or item.get("addr"))
+            ips = normalize_ipv6_list([ip])
+            if mac and ips:
+                out.append({
+                    "mac": mac,
+                    "ip": ips[0],
+                    "state": clean_saved_value(item.get("state")) or "LEASED",
+                    "dev": clean_saved_value(item.get("dev") or item.get("iface") or item.get("ifname")) or "dhcpv6",
+                    "seenAt": clean_saved_value(item.get("seenAt") or item.get("collectedAt")) or now_str(),
+                    "source": "dhcpv6_lease",
+                })
 
     # 去重：同一个 MAC + IPv6 只保留一次。
     dedup: Dict[str, Dict[str, Any]] = {}
@@ -892,20 +1157,62 @@ def parse_ipv6_neighbors(payload: Any) -> List[Dict[str, Any]]:
     return list(dedup.values())
 
 
-def merge_ipv6_neighbors_to_archive(neighbors: List[Dict[str, Any]]) -> int:
+def merge_ipv6_neighbors_to_archive(neighbors: List[Dict[str, Any]], current_prefixes: Optional[List[str]] = None) -> int:
     if not neighbors:
         return 0
+    current_prefixes = current_prefixes or []
     archive = load_device_archive()
     changed = 0
+    nas_macs = configured_nas_macs()
+    local_records = local_hub_ipv6_records()
     for n in neighbors:
         mac = norm_mac(n.get("mac"))
         ip = clean_saved_value(n.get("ip"))
         if not mac or not ip:
             continue
         old = archive.get(mac, {})
-        v6 = normalize_ipv6_list((old.get("ipv6List") or []) + [ip])
-        if v6 != old.get("ipv6List"):
-            old["ipv6List"] = v6
+        old_records = normalize_ipv6_records(old.get("ipv6Records") or old.get("ipv6List") or [], current_prefixes)
+        by_ip = {r.get("ip"): r for r in old_records if r.get("ip")}
+
+        source = clean_saved_value(n.get("source")) or "router_ndp"
+        if nas_macs and mac in nas_macs:
+            # Router NDP for the Hub/NAS is only cross-check data. The Hub's
+            # own local probe has higher authority and must not be overwritten.
+            source = "router_ndp_crosscheck"
+        seen_at = clean_saved_value(n.get("seenAt")) or now_str()
+        rec = by_ip.get(ip, {"ip": ip, "firstSeen": seen_at})
+        rec["lastSeen"] = seen_at
+        rec["source"] = source
+        rec["state"] = clean_saved_value(n.get("state"))
+        rec["dev"] = clean_saved_value(n.get("dev"))
+        rec["currentPrefix"] = ipv6_in_prefixes(ip, current_prefixes)
+        rec["temporary"] = is_temporary_ipv6(ip, source)
+        if rec["state"].upper() in ["REACHABLE", "DELAY", "PROBE", "LEASED"]:
+            rec["lastReachable"] = seen_at
+        rec["historical"] = bool(current_prefixes and not rec["currentPrefix"] and not is_ula_ipv6(ip))
+        by_ip[ip] = rec
+
+        if nas_macs and mac in nas_macs:
+            for local_rec in local_records:
+                local_ip = local_rec.get("ip")
+                if local_ip:
+                    existing = by_ip.get(local_ip, {"ip": local_ip, "firstSeen": local_rec.get("firstSeen")})
+                    existing.update(local_rec)
+                    by_ip[local_ip] = existing
+
+        # Re-evaluate existing records after a router mode/prefix change. Old
+        # GUA from the previous prefix stays as history, but no longer wins.
+        merged_records = normalize_ipv6_records(list(by_ip.values()), current_prefixes)
+        best = pick_primary_ipv6(merged_records)
+        ipv6_list = [best] + [r["ip"] for r in sorted(merged_records, key=score_ipv6_record, reverse=True) if r.get("ip") != best]
+        ipv6_list = normalize_ipv6_list(ipv6_list)
+        if merged_records != old.get("ipv6Records") or ipv6_list != old.get("ipv6List") or best != old.get("ipv6"):
+            old["ipv6Records"] = merged_records
+            old["ipv6List"] = ipv6_list
+            if best:
+                old["ipv6"] = best
+                old["ipv6Address"] = best
+                old["globalIpv6"] = best
             old["ipv6UpdatedAt"] = now_str()
             changed += 1
         old["mac"] = mac
@@ -929,6 +1236,7 @@ def parse_ruijie_devices(payload: Any) -> Tuple[List[Dict[str, Any]], int]:
         if not mac:
             continue
         traffic = normalize_device_traffic(item)
+        today_online_sec = today_online_seconds_from_item(item)
         device = {
             "name": prefer_name(item),
             "mac": mac,
@@ -945,6 +1253,8 @@ def parse_ruijie_devices(payload: Any) -> Tuple[List[Dict[str, Any]], int]:
             "onlineSince": item.get("onlinetime"),
             "activeTimeSec": to_int(item.get("activeTime"), 0),
             "onlineDurationText": human_duration(item.get("activeTime")),
+            "todayOnlineDurationSec": today_online_sec,
+            "todayOnlineDurationText": human_duration(today_online_sec),
             "lastSeenAt": now_str(),
             "hostName": item.get("hostName"),
             "manufacture": item.get("manufacture"),
@@ -1206,6 +1516,7 @@ def refresh_ddns_and_exit(state: Dict[str, Any]) -> Dict[str, Any]:
         nas_update["exitIpv4LastError"] = "detect_failed_keep_previous"
     if nas_ipv6:
         nas_update["exitIpv6"] = nas_ipv6
+        nas_update["localIpv6List"] = normalize_ipv6_list([nas_ipv6])
         nas_update["exitIpv6Source"] = "manual_or_hub"
     else:
         nas_update["exitIpv6LastError"] = "detect_failed_keep_previous"
@@ -1273,7 +1584,20 @@ def api_router_push():
         state.setdefault("router", {})
         state.setdefault("nas", {})
         router_name = clean_saved_value(payload.get("router")) or cfg_get("router.name", "Ruijie")
-        router_wan6 = clean_saved_value(payload.get("router_wan6") or payload.get("routerWanIpv6")) or state.get("router", {}).get("wanIpv6")
+        wan_items = normalize_ipv6_items(
+            payload.get("wan_ipv6_list") or payload.get("wanIpv6List") or payload.get("router_wan6_list") or payload.get("routerWan6List") or payload.get("wan6List"),
+            "WAN IPv6",
+        )
+        has_new_ipv6_snapshot = any(k in payload for k in ["ipv6_mode", "ipv6Mode", "wan_ipv6_list", "wanIpv6List", "lan_ipv6_prefixes", "lanIpv6Prefixes"])
+        router_items = normalize_ipv6_items(payload.get("router_ipv6_list") or payload.get("routerIpv6List"), "Router IPv6")
+        lan_items = normalize_ipv6_items(payload.get("lan_ipv6_list") or payload.get("lanIpv6List"), "LAN IPv6")
+        lan_prefixes = normalize_ipv6_prefixes(payload.get("lan_ipv6_prefixes") or payload.get("lanIpv6Prefixes"))
+        router_wan6 = (
+            clean_saved_value(payload.get("router_wan6") or payload.get("routerWanIpv6") or payload.get("wanIpv6"))
+            or next((x.get("ip") for x in wan_items if x.get("primary")), "")
+            or (wan_items[0].get("ip") if wan_items else "")
+            or ("" if has_new_ipv6_snapshot else state.get("router", {}).get("wanIpv6"))
+        )
 
         # v0.7.4：路由器脚本只允许更新“路由 WAN6”类字段。
         # 注意：wan_ipv4 / wan_ipv6 是路由器侧外网探测结果，不能写入 nas.exitIpv4/exitIpv6，
@@ -1281,12 +1605,23 @@ def api_router_push():
         router_update = {
             "name": router_name,
             "lanIp": clean_saved_value(payload.get("lan_ip")),
+            "ipv6Mode": clean_saved_value(payload.get("ipv6_mode") or payload.get("ipv6Mode")) or "unknown",
+            "ipv6DefaultIf": clean_saved_value(payload.get("ipv6_default_if") or payload.get("ipv6DefaultIf")),
             "wanIpv6": router_wan6,
             "routerUpdatedAt": event_time,
             "routerStatus": "ok",
         }
+        if router_items or ("router_ipv6_list" in payload or "routerIpv6List" in payload):
+            router_update["routerIpv6List"] = router_items
+        if wan_items or ("wan_ipv6_list" in payload or "wanIpv6List" in payload):
+            router_update["wanIpv6List"] = wan_items
+            router_update["wan6List"] = [{"name": x.get("name"), "ip": x.get("ip"), "primary": x.get("primary")} for x in wan_items]
+        if lan_items or ("lan_ipv6_list" in payload or "lanIpv6List" in payload):
+            router_update["lanIpv6List"] = lan_items
+        if lan_prefixes or ("lan_ipv6_prefixes" in payload or "lanIpv6Prefixes" in payload):
+            router_update["lanIpv6Prefixes"] = lan_prefixes
         wan6_list = payload.get("router_wan6_list") or payload.get("routerWan6List") or payload.get("wan6List")
-        if isinstance(wan6_list, list):
+        if isinstance(wan6_list, list) and not wan_items:
             cleaned = []
             seen = set()
             for i, item in enumerate(wan6_list):
@@ -1306,7 +1641,7 @@ def api_router_push():
 
         # v0.7.7：路由脚本可附带 IPv6 邻居表；Hub 只按 MAC 合并到设备归档。
         neighbors = parse_ipv6_neighbors(payload)
-        ipv6_changed = merge_ipv6_neighbors_to_archive(neighbors)
+        ipv6_changed = merge_ipv6_neighbors_to_archive(neighbors, lan_prefixes or state.get("router", {}).get("lanIpv6Prefixes") or [])
         if neighbors:
             devices_state = load_json(DEVICES_FILE, {"online": [], "watched": [], "updatedAt": None})
             archive = load_device_archive()
