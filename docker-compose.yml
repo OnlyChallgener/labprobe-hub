@@ -1,6 +1,6 @@
 services:
   labprobe-hub:
-    image: ${DOCKERHUB_USERNAME:-yourname}/labprobe-hub:0.8.2
+    image: ${DOCKERHUB_USERNAME:-yourname}/labprobe-hub:0.8.4
     container_name: labprobe-hub
     network_mode: host
     restart: unless-stopped
@@ -9,6 +9,8 @@ services:
       - HOOK_TOKEN=${HOOK_TOKEN}
       - NAS_MAC=${NAS_MAC:-}
       - PORTMAP_ROUTER_NAME=${PORTMAP_ROUTER_NAME:-BE72Pro}
+      - PORTMAP_PORT_MIN=${PORTMAP_PORT_MIN:-20000}
+      - PORTMAP_PORT_MAX=${PORTMAP_PORT_MAX:-20020}
       - PORT=58443
       - TZ=Asia/Shanghai
       - CONFIG_PATH=/app/config/config.yaml
