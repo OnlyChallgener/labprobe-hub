@@ -846,7 +846,7 @@ async fn main() -> Result<()> {
         }
         Some("version") | Some("--version") | Some("-V") => { println!("labrelay {}", VERSION); Ok(()) }
         _ => {
-            eprintln!("Usage:\n  labrelay daemon [--config PATH] [--socket PATH] [--state PATH] [--port-min 20000] [--port-max 20020] [--lan-if br-lan]\n  labrelay ctl '{\"action\":\"status\"}' [--socket PATH]\n  labrelay agent-apply --file commands.json [--socket PATH]\n  labrelay version");
+            eprintln!("Usage:\n  labrelay daemon [--config PATH] [--socket PATH] [--state PATH] [--port-min 20000] [--port-max 20020] [--lan-if br-lan]\n  labrelay ctl '{{\"action\":\"status\"}}' [--socket PATH]\n  labrelay agent-apply --file commands.json [--socket PATH]\n  labrelay version");
             Ok(())
         }
     }
