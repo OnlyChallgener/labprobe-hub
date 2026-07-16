@@ -21,6 +21,8 @@ nas:
 router:
   enabled: true
   name: "Ruijie BE72"
+  # 端口映射 Agent 的稳定标识；需与 install_labrelay.sh 第 3 个参数一致。
+  portmap_id: "BE72Pro"
   mode: "push"
 
 # 只显示你关注的设备。mac 要写真实 MAC。
