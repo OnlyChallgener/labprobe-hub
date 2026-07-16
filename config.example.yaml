@@ -13,6 +13,11 @@ ddns:
     expect: "nas_ipv6"
     record_types: ["A", "AAAA"]
 
+# Hub 所在 NAS。用于确保 NAS 设备卡优先采用 Hub 本机实际路由源 IPv6，
+# 路由器邻居表中的地址仅作交叉验证。
+nas:
+  mac: "6C:1F:F7:76:71:04"
+
 router:
   enabled: true
   name: "Ruijie BE72"
