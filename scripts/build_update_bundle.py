@@ -43,7 +43,6 @@ def main() -> int:
     parser.add_argument("--app-version-name", required=True)
     parser.add_argument("--app-version-code", required=True, type=int)
     parser.add_argument("--agent-arm64", required=True, type=Path)
-    parser.add_argument("--agent-amd64", required=True, type=Path)
     parser.add_argument("--agent-version", required=True)
     parser.add_argument("--installer", type=Path, default=Path(__file__).with_name("labprobe-install.sh"))
     parser.add_argument("--output", type=Path, default=Path("update-bundle"))
@@ -52,7 +51,7 @@ def main() -> int:
     parser.add_argument("--agent-changelog", default="")
     args = parser.parse_args()
 
-    sources = [args.app_apk, args.agent_arm64, args.agent_amd64, args.installer]
+    sources = [args.app_apk, args.agent_arm64, args.installer]
     missing = [str(path) for path in sources if not path.is_file()]
     if missing:
         parser.error("missing input files: " + ", ".join(missing))
@@ -62,15 +61,16 @@ def main() -> int:
     agent_dir = args.output / "agent"
     app_dir.mkdir(parents=True, exist_ok=True)
     agent_dir.mkdir(parents=True, exist_ok=True)
+    for stale in agent_dir.glob("labrelay-linux-*"):
+        if stale.name != "labrelay-linux-arm64":
+            stale.unlink()
 
     apk_name = f"LabProbeApp-v{args.app_version_name}.apk"
     apk = app_dir / apk_name
     arm64 = agent_dir / "labrelay-linux-arm64"
-    amd64 = agent_dir / "labrelay-linux-amd64"
     installer = agent_dir / "install.sh"
     shutil.copy2(args.app_apk, apk)
     shutil.copy2(args.agent_arm64, arm64)
-    shutil.copy2(args.agent_amd64, amd64)
     shutil.copy2(args.installer, installer)
 
     app_fallback = f"https://github.com/OnlyChallgener/LabProbeApp/releases/latest/download/{apk_name}"
@@ -90,7 +90,6 @@ def main() -> int:
     write_json(app_dir / "update.json", update_json)
 
     arm_meta = artifact(arm64, f"{root}/agent/{arm64.name}", f"{agent_fallback}/{arm64.name}")
-    amd_meta = artifact(amd64, f"{root}/agent/{amd64.name}", f"{agent_fallback}/{amd64.name}")
     installer_meta = artifact(installer, f"{root}/agent/install.sh", f"{agent_fallback}/labprobe-install.sh")
     latest_json = {
         "schemaVersion": 1,
@@ -99,19 +98,18 @@ def main() -> int:
         "installUrl": installer_meta["url"],
         "installer": installer_meta,
         "checksumsUrl": f"{root}/agent/checksums.txt",
-        "binaries": {"arm64": arm_meta, "amd64": amd_meta},
+        "binaries": {"arm64": arm_meta},
     }
     write_json(agent_dir / "latest.json", latest_json)
 
     checksums = [
         f"{arm_meta['sha256']}  {arm64.name}",
-        f"{amd_meta['sha256']}  {amd64.name}",
         f"{installer_meta['sha256']}  install.sh",
     ]
     (agent_dir / "checksums.txt").write_text("\n".join(checksums) + "\n", encoding="utf-8")
     print(f"bundle={args.output.resolve()}")
     print(f"app={apk_name} sha256={app_meta['sha256']} sizeBytes={app_meta['sizeBytes']}")
-    print(f"agent={args.agent_version} arm64={arm_meta['sizeBytes']} amd64={amd_meta['sizeBytes']}")
+    print(f"agent={args.agent_version} arm64={arm_meta['sizeBytes']}")
     return 0
 
 

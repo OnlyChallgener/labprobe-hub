@@ -59,7 +59,7 @@ REFRESH_LOCK = threading.RLock()
 REFRESH_RUNNING = False
 STATUS_REFRESH_TTL_SEC = int(os.environ.get("STATUS_REFRESH_TTL_SEC", "180"))
 STORE = SQLiteStore(DATA_DIR, BACKUPS_DIR, DB_PATH)
-UPDATE_REPOSITORY_ROOT = os.environ.get("UPDATE_REPOSITORY_ROOT", "https://lab.net86.dynv6.net:27772").rstrip("/")
+UPDATE_REPOSITORY_ROOT = (os.environ.get("UPDATE_REPOSITORY_ROOT") or "").strip().rstrip("/") or "https://lab.net86.dynv6.net:27772"
 AGENT_MANIFEST_URL = f"{UPDATE_REPOSITORY_ROOT}/agent/latest.json"
 AGENT_INSTALLER_URL = f"{UPDATE_REPOSITORY_ROOT}/agent/install.sh"
 AGENT_RELEASE_CACHE: Dict[str, Any] = {"at": 0.0, "data": None}
@@ -215,7 +215,7 @@ def hub_name() -> str:
 def primary_router_name() -> str:
     return env_compat(
         "PRIMARY_ROUTER_NAME", "PORTMAP_ROUTER_NAME",
-        default=str(cfg_get("router.name", "Ruijie")),
+        default=str(cfg_get("router.name", "")),
     )
 
 
@@ -2087,7 +2087,7 @@ def agent_release_manifest(force: bool = False) -> Dict[str, Any]:
     root = response.json()
     version = clean_saved_value(root.get("versionName") or root.get("version"))
     binaries = root.get("binaries")
-    if not version or not isinstance(binaries, dict) or not isinstance(binaries.get("arm64"), dict) or not isinstance(binaries.get("amd64"), dict):
+    if not version or not isinstance(binaries, dict) or not isinstance(binaries.get("arm64"), dict):
         raise ValueError("agent latest.json is invalid")
     AGENT_RELEASE_CACHE.update({"at": now, "data": root})
     return root
@@ -2096,6 +2096,28 @@ def agent_release_manifest(force: bool = False) -> Dict[str, Any]:
 def agent_status_for(router: str) -> Dict[str, Any]:
     statuses = load_json(AGENT_STATUS_FILE, {})
     return statuses.get(router, {}) if isinstance(statuses, dict) and isinstance(statuses.get(router), dict) else {}
+
+
+def resolve_agent_router(preferred: str) -> str:
+    statuses = load_json(AGENT_STATUS_FILE, {})
+    if not isinstance(statuses, dict):
+        return preferred
+    preferred = clean_saved_value(preferred)
+    if preferred and isinstance(statuses.get(preferred), dict):
+        return preferred
+    reported = [
+        (clean_saved_value(name), value)
+        for name, value in statuses.items()
+        if clean_saved_value(name) and isinstance(value, dict)
+    ]
+    if not reported:
+        return preferred
+    online = sorted(
+        reported,
+        key=lambda item: time_to_epoch(item[1].get("lastSeenAt") or item[1].get("time") or 0),
+        reverse=True,
+    )
+    return online[0][0] if online else preferred
 
 
 def latest_agent_command(router: str) -> Dict[str, Any]:
@@ -2108,7 +2130,7 @@ def latest_agent_command(router: str) -> Dict[str, Any]:
 def api_agent_update_status():
     if not check_app_token():
         return jsonify({"ok": False, "error": "unauthorized"}), 401
-    router = clean_saved_value(request.args.get("router")) or primary_router_name()
+    router = resolve_agent_router(clean_saved_value(request.args.get("router")) or primary_router_name()) or "router"
     status = agent_status_for(router)
     command = latest_agent_command(router)
     try:
@@ -2130,7 +2152,7 @@ def api_agent_update_status():
             "latestVersion": "未知", "updateAvailable": False,
             "state": command.get("state") or status.get("updateState") or "idle",
             "message": f"更新仓检查失败：{exc}", "lastSeenAt": status.get("lastSeenAt", ""),
-        }), 502
+        })
 
 
 @app.route("/api/agent/update", methods=["POST"])
@@ -2138,7 +2160,7 @@ def api_agent_update_request():
     if not check_app_token():
         return jsonify({"ok": False, "error": "unauthorized"}), 401
     payload = request.get_json(silent=True) or {}
-    router = clean_saved_value(payload.get("router")) or primary_router_name()
+    router = resolve_agent_router(clean_saved_value(payload.get("router")) or primary_router_name()) or "router"
     try:
         manifest = agent_release_manifest(force=True)
     except Exception as exc:
@@ -2637,7 +2659,8 @@ def _portmap_router_name() -> str:
         or clean_saved_value(cfg_get("router.portmap_id", ""))
         or clean_saved_value(cfg_get("router.agent_name", ""))
         or clean_saved_value(cfg_get("router.name", ""))
-        or "Ruijie"
+        or resolve_agent_router("")
+        or "router"
     )
 
 

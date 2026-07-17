@@ -8,9 +8,10 @@ server:
 
 router:
   enabled: true
-  name: "Ruijie"
-  agent_name: "Ruijie"
-  portmap_id: "Ruijie"
+  # Optional display name. Leave blank to use the name reported by the paired Agent.
+  name: ""
+  agent_name: ""
+  portmap_id: ""
   mode: "push"
 
 # 只显示明确关注的终端；示例地址均为文档用途。

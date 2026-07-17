@@ -37,7 +37,7 @@ impl Default for AgentConfig {
             version: 1,
             hub_url: String::new(),
             client_token: String::new(),
-            router_name: "Ruijie".into(),
+            router_name: "router".into(),
             interval_seconds: 15,
             status_interval_seconds: 15,
             relay_socket: "/tmp/labrelay.sock".into(),
@@ -53,6 +53,7 @@ struct AgentState {
     devices: BTreeMap<String, Value>,
     pending_events: Vec<Value>,
     last_success_at: u64,
+    last_status_log_at: u64,
     last_error: String,
     last_command_at: u64,
     update_state: String,
@@ -563,10 +564,26 @@ async fn agent_cycle(client: &Client, config: &AgentConfig, state: &mut AgentSta
     flush_device_events(client, config, state).await;
     post_json(client, config, "/api/router/push", &router_snapshot(config)).await?;
     sync_portmaps(client, config, state).await?;
-    state.last_success_at = now_epoch();
+    let now = now_epoch();
+    state.last_success_at = now;
     state.last_error.clear();
     state.update_state = "idle".into();
     state.update_message.clear();
+    if state.last_status_log_at == 0
+        || now.saturating_sub(state.last_status_log_at)
+            >= config.status_interval_seconds.clamp(60, 600)
+    {
+        log_line(
+            config,
+            "INFO",
+            &format!(
+                "sync ok: devices={} pending_events={}",
+                state.devices.len(),
+                state.pending_events.len()
+            ),
+        );
+        state.last_status_log_at = now;
+    }
     Ok(())
 }
 
@@ -599,7 +616,7 @@ pub async fn pair(args: &[String]) -> Result<()> {
         .trim_end_matches('/')
         .to_string();
     let code = arg_value(args, "--code").ok_or_else(|| anyhow!("missing --code"))?;
-    let name = arg_value(args, "--name").unwrap_or_else(|| "Ruijie".into());
+    let name = arg_value(args, "--name").unwrap_or_else(|| "router".into());
     let path = config_path(args);
     let response = http_client()?
         .post(format!("{}/api/pair", hub))

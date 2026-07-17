@@ -19,8 +19,6 @@ jobs:
         include:
           - target: aarch64-unknown-linux-musl
             arch: arm64
-          - target: x86_64-unknown-linux-musl
-            arch: amd64
     runs-on: ubuntu-latest
     defaults:
       run:
@@ -41,7 +39,7 @@ jobs:
           cd ../dist
           sha256sum labrelay-linux-${{ matrix.arch }} > labrelay-linux-${{ matrix.arch }}.sha256
       - name: Prepare installer
-        if: matrix.arch == 'amd64'
+        if: matrix.arch == 'arm64'
         run: cp ../scripts/labprobe-install.sh ../dist/labprobe-install.sh
       - uses: actions/upload-artifact@v4
         with:
@@ -57,7 +55,7 @@ jobs:
             dist/labrelay-linux-${{ matrix.arch }}
             dist/labrelay-linux-${{ matrix.arch }}.sha256
       - name: Publish installer
-        if: startsWith(github.ref, 'refs/tags/labrelay-v') && matrix.arch == 'amd64'
+        if: startsWith(github.ref, 'refs/tags/labrelay-v') && matrix.arch == 'arm64'
         uses: softprops/action-gh-release@v2
         with:
           files: dist/labprobe-install.sh

@@ -1,5 +1,5 @@
 #!/bin/sh
-# LabProbe Ruijie Rust Agent installer for BusyBox ash.
+# LabProbe Rust Agent installer for adapted Ruijie routers, compatible with BusyBox ash.
 # Usage: wget -O /tmp/labprobe-install.sh URL && sh /tmp/labprobe-install.sh
 
 set -u
@@ -35,8 +35,7 @@ need_root() { [ "$(id -u 2>/dev/null)" = "0" ] || fail "请使用 root 运行"; 
 detect_arch() {
   case "$(uname -m 2>/dev/null)" in
     aarch64|arm64) ARCH="arm64" ;;
-    x86_64|amd64) ARCH="amd64" ;;
-    *) fail "不支持的 CPU 架构：$(uname -m 2>/dev/null)" ;;
+    *) fail "Rust Agent 仅支持已适配锐捷路由器的 ARM64 架构：$(uname -m 2>/dev/null)" ;;
   esac
 }
 
@@ -146,10 +145,25 @@ cleanup_legacy() {
   crontab -l >/tmp/labprobe-cron.old 2>/dev/null || true
   grep -v '/etc/labprobe/.*\(push_devices\|push_router_wan6\|watch_devices\|ruijie_push_to_labprobe\|labrelay_agent\)\.sh' /tmp/labprobe-cron.old >/tmp/labprobe-cron.new 2>/dev/null || true
   crontab /tmp/labprobe-cron.new 2>/dev/null || true
+  for service in labrelay_agent labrelay; do
+    old_init="/etc/init.d/$service"
+    if [ -f "$old_init" ]; then
+      [ -x "$old_init" ] && "$old_init" stop >/dev/null 2>&1 || true
+      [ -x "$old_init" ] && "$old_init" disable >/dev/null 2>&1 || true
+      mv "$old_init" "$BACKUP/$service.legacy-init"
+    fi
+  done
+  # The unified service has not started yet, so any remaining labrelay process
+  # belongs to a legacy init/script and must not survive the migration.
+  killall labrelay >/dev/null 2>&1 || true
+  for old_pid in $(ps w 2>/dev/null | awk '/\/etc\/labprobe\/(labrelay_agent|ruijie_push_to_labprobe|push_devices|push_router_wan6|watch_devices)\.sh/ && !/awk/ {print $1}'); do
+    kill "$old_pid" >/dev/null 2>&1 || true
+  done
   for old in push_devices.sh push_router_wan6.sh watch_devices.sh ruijie_push_to_labprobe.sh labrelay_agent.sh; do
     [ -f "$INSTALL_DIR/$old" ] && mv "$INSTALL_DIR/$old" "$BACKUP/$old.legacy"
   done
   rm -rf /tmp/labprobe_agent.lock /tmp/labprobe_watch_state
+  say "旧 cron、Shell Agent、旧 init 和残留进程已停用，业务由统一 Rust Agent 接管"
 }
 
 write_service() {
@@ -190,6 +204,14 @@ rollback() {
     [ -f "$legacy" ] || continue
     old_name="$(basename "$legacy" .legacy)"
     mv "$legacy" "$INSTALL_DIR/$old_name"
+  done
+  for legacy_init in "$BACKUP"/*.legacy-init; do
+    [ -f "$legacy_init" ] || continue
+    old_name="$(basename "$legacy_init" .legacy-init)"
+    mv "$legacy_init" "/etc/init.d/$old_name"
+    chmod 0755 "/etc/init.d/$old_name"
+    "/etc/init.d/$old_name" enable >/dev/null 2>&1 || true
+    "/etc/init.d/$old_name" start >/dev/null 2>&1 || true
   done
   "$INIT_SCRIPT" restart >/dev/null 2>&1 || true
   exit 1
@@ -233,7 +255,9 @@ chmod 0755 "$BIN"
 chmod 600 "$RELAY_CONFIG"
 
 if [ -n "$PAIR_CODE" ]; then
-  "$BIN" pair --hub "$HUB_URL" --code "$PAIR_CODE" --name "${PRIMARY_ROUTER_NAME:-Ruijie}" --config "$CONFIG" || rollback
+  ROUTER_NAME="${PRIMARY_ROUTER_NAME:-$(hostname 2>/dev/null || echo router)}"
+  [ -n "$ROUTER_NAME" ] || ROUTER_NAME="router"
+  "$BIN" pair --hub "$HUB_URL" --code "$PAIR_CODE" --name "$ROUTER_NAME" --config "$CONFIG" || rollback
 fi
 [ -s "$CONFIG" ] || rollback
 chmod 600 "$CONFIG"

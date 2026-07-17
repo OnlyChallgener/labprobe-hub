@@ -20,7 +20,7 @@ use tokio::time::{sleep, timeout};
 
 mod agent;
 
-const VERSION: &str = "0.2.0";
+const VERSION: &str = "0.2.1";
 const DEFAULT_CONFIG: &str = "/etc/labprobe/relay.json";
 const DEFAULT_SOCKET: &str = "/tmp/labrelay.sock";
 const DEFAULT_STATE: &str = "/tmp/labrelay/state.json";
