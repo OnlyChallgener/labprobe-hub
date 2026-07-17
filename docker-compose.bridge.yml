@@ -1,0 +1,38 @@
+services:
+  labprobe-hub:
+    image: ${LABPROBE_IMAGE:-onlychallgener/labprobe-hub:0.9.0}
+    build:
+      context: .
+      dockerfile: Dockerfile
+    container_name: labprobe-hub
+    restart: unless-stopped
+    ports:
+      - "${PORT:-58443}:${PORT:-58443}"
+    environment:
+      PORT: ${PORT:-58443}
+      TZ: ${TZ:-Asia/Shanghai}
+      CONFIG_PATH: ./config/config.yaml
+      CONFIG_DIR: ./config
+      DATA_DIR: ./data
+      BACKUPS_DIR: ./backups
+      LOGS_DIR: ./logs
+      LOG_LEVEL: ${LOG_LEVEL:-INFO}
+      LOG_RETENTION_DAYS: ${LOG_RETENTION_DAYS:-14}
+      HUB_HOST_IPV4: ${HUB_HOST_IPV4:-}
+      HUB_HOST_IPV6: ${HUB_HOST_IPV6:-}
+      HUB_HOST_MAC: ${HUB_HOST_MAC:-}
+      HUB_ADVERTISE_URL: ${HUB_ADVERTISE_URL:-}
+      HUB_NAME: ${HUB_NAME:-LabProbe Hub}
+      PRIMARY_ROUTER_NAME: ${PRIMARY_ROUTER_NAME:-Ruijie}
+      UPDATE_REPOSITORY_ROOT: ${UPDATE_REPOSITORY_ROOT:-https://lab.net86.dynv6.net:27772}
+      APP_TOKEN: ${APP_TOKEN:-change-app-token}
+      HOOK_TOKEN: ${HOOK_TOKEN:-change-hook-token}
+      NAS_IPV4: ${NAS_IPV4:-}
+      NAS_IPV6: ${NAS_IPV6:-}
+      NAS_MAC: ${NAS_MAC:-}
+      PORTMAP_ROUTER_NAME: ${PORTMAP_ROUTER_NAME:-}
+    volumes:
+      - ./data:/app/data
+      - ./config:/app/config
+      - ./backups:/app/backups
+      - ./logs:/app/logs

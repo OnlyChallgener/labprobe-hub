@@ -1,36 +1,24 @@
 home:
-  name: "LabProbe 家庭网络"
+  name: "LabProbe Hub"
 
 server:
-  # 也可以通过 docker-compose 环境变量 APP_TOKEN / HOOK_TOKEN 覆盖
+  # 新 APP/Agent 使用一次性配对码。以下字段只用于旧版本兼容。
   app_token: "change-app-token"
   hook_token: "change-hook-token"
 
-# DDNS 实际解析检查。第一版建议先只配置 net86.dynv6.net。
-ddns:
-  - name: "NAS / Lucky"
-    domain: "net86.dynv6.net"
-    expect: "nas_ipv6"
-    record_types: ["A", "AAAA"]
-
-# Hub 所在 NAS。用于确保 NAS 设备卡优先采用 Hub 本机实际路由源 IPv6，
-# 路由器邻居表中的地址仅作交叉验证。
-nas:
-  mac: "6C:1F:F7:76:71:04"
-
 router:
   enabled: true
-  name: "Ruijie BE72"
-  # 端口映射 Agent 的稳定标识；需与 install_labrelay.sh 第 3 个参数一致。
-  portmap_id: "BE72Pro"
+  name: "Ruijie"
+  agent_name: "Ruijie"
+  portmap_id: "Ruijie"
   mode: "push"
 
-# 只显示你关注的设备。mac 要写真实 MAC。
+# 只显示明确关注的终端；示例地址均为文档用途。
 watched_devices:
-  - name: "iQOO Neo3"
-    mac: "DA:1F:85:0C:19:FC"
-  - name: "绿联 NAS"
-    mac: "6C:1F:F7:76:71:04"
+  - name: "工作站"
+    mac: "02:00:00:00:00:01"
+  - name: "家庭服务器"
+    mac: "02:00:00:00:00:02"
 
 polling:
   enabled: false
@@ -40,10 +28,15 @@ exit_ip:
   ipv4_url: "https://api64.ipify.org"
   ipv6_url: "https://api64.ipify.org"
 
-# 运营商识别优先级：本地前缀标记 > 运营商/ASN。
-# 不再显示城市 Geo；这里仅用于把自家 IPv6 前缀标记为“家里路由前缀 / 中国联通”。
+ddns:
+  - name: "家庭入口"
+    domain: "hub.example.com"
+    expect: "host_ipv6"
+    record_types: ["A", "AAAA"]
+
+wol:
+  broadcasts:
+    - "192.168.1.255"
+
 geo:
-  local_prefixes:
-    - prefix: "2408:8252:3200:9231::/64"
-      label: "家里路由前缀"
-      operator: "中国联通"
+  local_prefixes: []

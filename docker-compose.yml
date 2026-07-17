@@ -1,18 +1,5 @@
 services:
   labprobe-hub:
-    image: ${DOCKERHUB_USERNAME:-yourname}/labprobe-hub:0.8.3
-    container_name: labprobe-hub
-    network_mode: host
-    restart: unless-stopped
-    environment:
-      - APP_TOKEN=${APP_TOKEN}
-      - HOOK_TOKEN=${HOOK_TOKEN}
-      - NAS_MAC=${NAS_MAC:-}
-      - PORTMAP_ROUTER_NAME=${PORTMAP_ROUTER_NAME:-BE72Pro}
-      - PORT=58443
-      - TZ=Asia/Shanghai
-      - CONFIG_PATH=/app/config/config.yaml
-      - DATA_DIR=/app/data
-    volumes:
-      - /volume1/docker/labprobe-hub/data:/app/data
-      - /volume1/docker/labprobe-hub/config.yaml:/app/config/config.yaml:ro
+    extends:
+      file: docker-compose.host.yml
+      service: labprobe-hub

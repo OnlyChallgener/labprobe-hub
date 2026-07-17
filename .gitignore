@@ -203,6 +203,12 @@ cython_debug/
 # Temporary file for partial code execution
 tempCodeRunnerFile.py
 
+# Local Hub runtime state (mounted into /app by Compose)
+/data/
+/config/
+/backups/
+/logs/
+
 # Ruff stuff:
 .ruff_cache/
 

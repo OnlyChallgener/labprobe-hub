@@ -18,15 +18,23 @@ use tokio::sync::{watch, Mutex, RwLock, Semaphore};
 use tokio::task::JoinHandle;
 use tokio::time::{sleep, timeout};
 
-const VERSION: &str = "0.1.0";
+mod agent;
+
+const VERSION: &str = "0.2.0";
 const DEFAULT_CONFIG: &str = "/etc/labprobe/relay.json";
 const DEFAULT_SOCKET: &str = "/tmp/labrelay.sock";
 const DEFAULT_STATE: &str = "/tmp/labrelay/state.json";
 const DEFAULT_PID: &str = "/tmp/labrelay.pid";
 
-fn default_true() -> bool { true }
-fn default_max_connections() -> u32 { 32 }
-fn default_idle_timeout() -> u64 { 300 }
+fn default_true() -> bool {
+    true
+}
+fn default_max_connections() -> u32 {
+    32
+}
+fn default_idle_timeout() -> u64 {
+    300
+}
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(default, rename_all = "camelCase")]
@@ -101,7 +109,12 @@ impl RuntimeSnapshot {
             id: rule.id.clone(),
             name: rule.name.clone(),
             mode: rule.mode.clone(),
-            state: if is_expired(rule) { "expired" } else { "stopped" }.to_string(),
+            state: if is_expired(rule) {
+                "expired"
+            } else {
+                "stopped"
+            }
+            .to_string(),
             listen: format!("[::]:{}", rule.listen_port),
             resolved_target: String::new(),
             active_connections: 0,
@@ -164,7 +177,13 @@ struct Manager {
 }
 
 impl Manager {
-    async fn load(config_path: PathBuf, state_path: PathBuf, port_min: u16, port_max: u16, lan_if: String) -> Result<Self> {
+    async fn load(
+        config_path: PathBuf,
+        state_path: PathBuf,
+        port_min: u16,
+        port_max: u16,
+        lan_if: String,
+    ) -> Result<Self> {
         let cfg = load_config(&config_path)?;
         let rules = cfg.rules.into_iter().map(|r| (r.id.clone(), r)).collect();
         Ok(Self {
@@ -187,7 +206,11 @@ impl Manager {
     }
 
     async fn start_enabled(&self) {
-        let ids: Vec<String> = self.rules.read().await.values()
+        let ids: Vec<String> = self
+            .rules
+            .read()
+            .await
+            .values()
             .filter(|r| r.enabled && !is_expired(r))
             .map(|r| r.id.clone())
             .collect();
@@ -215,11 +238,18 @@ impl Manager {
     }
 
     async fn start_rule(&self, id: &str) -> Result<Value> {
-        let rule = self.rules.read().await.get(id).cloned().ok_or_else(|| anyhow!("rule not found"))?;
+        let rule = self
+            .rules
+            .read()
+            .await
+            .get(id)
+            .cloned()
+            .ok_or_else(|| anyhow!("rule not found"))?;
         validate_rule(&rule, self.port_min, self.port_max)?;
         self.ensure_port_available(&rule).await?;
         if is_expired(&rule) {
-            self.set_cached_state(&rule, "expired", "rule expired").await;
+            self.set_cached_state(&rule, "expired", "rule expired")
+                .await;
             bail!("rule expired");
         }
         self.stop_runtime(id, true).await;
@@ -227,7 +257,8 @@ impl Manager {
         let listener = match create_ipv6_listener(rule.listen_port) {
             Ok(listener) => listener,
             Err(error) => {
-                self.set_cached_state(&rule, "error", &error.to_string()).await;
+                self.set_cached_state(&rule, "error", &error.to_string())
+                    .await;
                 return Err(error);
             }
         };
@@ -239,17 +270,25 @@ impl Manager {
             mode: rule.mode.clone(),
             state: "starting".to_string(),
             listen: format!("[::]:{}", rule.listen_port),
-            resolved_target: previous.as_ref().map(|x| x.resolved_target.clone()).unwrap_or_default(),
+            resolved_target: previous
+                .as_ref()
+                .map(|x| x.resolved_target.clone())
+                .unwrap_or_default(),
             active_connections: 0,
             total_upload_bytes: previous.as_ref().map(|x| x.total_upload_bytes).unwrap_or(0),
-            total_download_bytes: previous.as_ref().map(|x| x.total_download_bytes).unwrap_or(0),
+            total_download_bytes: previous
+                .as_ref()
+                .map(|x| x.total_download_bytes)
+                .unwrap_or(0),
             started_at: Some(now_epoch()),
             expires_at: rule.expires_at,
             last_resolved_at: None,
             last_error: String::new(),
         };
         let shared = Arc::new(RuntimeShared::new(snapshot));
-        let target = Arc::new(RwLock::new(resolve_rule_target(&rule, &self.lan_if).await.ok()));
+        let target = Arc::new(RwLock::new(
+            resolve_rule_target(&rule, &self.lan_if).await.ok(),
+        ));
         update_target_status(&shared, &rule, target.read().await.clone(), None).await;
 
         let (cancel_tx, cancel_rx) = watch::channel(false);
@@ -258,18 +297,41 @@ impl Manager {
         let rule_task = rule.clone();
         let lan_if = self.lan_if.clone();
         let join = tokio::spawn(async move {
-            run_listener(listener, rule_task, lan_if, target_task, shared_task, cancel_rx).await;
+            run_listener(
+                listener,
+                rule_task,
+                lan_if,
+                target_task,
+                shared_task,
+                cancel_rx,
+            )
+            .await;
         });
-        self.runtimes.lock().await.insert(id.to_string(), RuntimeHandle { cancel: cancel_tx, join, shared });
+        self.runtimes.lock().await.insert(
+            id.to_string(),
+            RuntimeHandle {
+                cancel: cancel_tx,
+                join,
+                shared,
+            },
+        );
         Ok(json!({"ok": true, "id": id, "state": "running"}))
     }
 
     async fn ensure_port_available(&self, rule: &Rule) -> Result<()> {
-        let conflict = self.rules.read().await.values().find(|other| {
-            other.id != rule.id && other.listen_port == rule.listen_port
-        }).cloned();
+        let conflict = self
+            .rules
+            .read()
+            .await
+            .values()
+            .find(|other| other.id != rule.id && other.listen_port == rule.listen_port)
+            .cloned();
         if let Some(other) = conflict {
-            bail!("listen port {} already reserved by {}", rule.listen_port, other.name);
+            bail!(
+                "listen port {} already reserved by {}",
+                rule.listen_port,
+                other.name
+            );
         }
         Ok(())
     }
@@ -299,7 +361,10 @@ impl Manager {
         self.stop_runtime(id, true).await;
         if let Some(rule) = self.rules.read().await.get(id).cloned() {
             let mut cache = self.last_status.write().await;
-            cache.entry(id.to_string()).or_insert_with(|| RuntimeSnapshot::stopped(&rule)).state = "stopped".to_string();
+            cache
+                .entry(id.to_string())
+                .or_insert_with(|| RuntimeSnapshot::stopped(&rule))
+                .state = "stopped".to_string();
         }
         Ok(json!({"ok": true, "id": id, "state": "stopped"}))
     }
@@ -323,7 +388,13 @@ impl Manager {
     }
 
     async fn set_cached_state(&self, rule: &Rule, state: &str, err: &str) {
-        let mut snap = self.last_status.read().await.get(&rule.id).cloned().unwrap_or_else(|| RuntimeSnapshot::stopped(rule));
+        let mut snap = self
+            .last_status
+            .read()
+            .await
+            .get(&rule.id)
+            .cloned()
+            .unwrap_or_else(|| RuntimeSnapshot::stopped(rule));
         snap.state = state.to_string();
         snap.last_error = err.to_string();
         self.last_status.write().await.insert(rule.id.clone(), snap);
@@ -331,7 +402,11 @@ impl Manager {
 
     async fn status_value(&self) -> Value {
         let rules: Vec<Rule> = self.rules.read().await.values().cloned().collect();
-        let runtime_refs: HashMap<String, Arc<RuntimeShared>> = self.runtimes.lock().await.iter()
+        let runtime_refs: HashMap<String, Arc<RuntimeShared>> = self
+            .runtimes
+            .lock()
+            .await
+            .iter()
             .map(|(id, h)| (id.clone(), h.shared.clone()))
             .collect();
         let cached = self.last_status.read().await.clone();
@@ -340,14 +415,22 @@ impl Manager {
             let mut snap = if let Some(shared) = runtime_refs.get(&rule.id) {
                 shared.snapshot().await
             } else {
-                cached.get(&rule.id).cloned().unwrap_or_else(|| RuntimeSnapshot::stopped(&rule))
+                cached
+                    .get(&rule.id)
+                    .cloned()
+                    .unwrap_or_else(|| RuntimeSnapshot::stopped(&rule))
             };
             if is_expired(&rule) && snap.state != "running" {
                 snap.state = "expired".to_string();
             }
             rows.push(json!({"rule": rule, "runtime": snap}));
         }
-        rows.sort_by_key(|v| v.get("rule").and_then(|r| r.get("listenPort")).and_then(Value::as_u64).unwrap_or(0));
+        rows.sort_by_key(|v| {
+            v.get("rule")
+                .and_then(|r| r.get("listenPort"))
+                .and_then(Value::as_u64)
+                .unwrap_or(0)
+        });
         json!({
             "ok": true,
             "version": VERSION,
@@ -371,7 +454,9 @@ fn create_ipv6_listener(port: u16) -> Result<TcpListener> {
     socket.set_only_v6(true)?;
     socket.set_nonblocking(true)?;
     let addr = SocketAddrV6::new(Ipv6Addr::UNSPECIFIED, port, 0, 0);
-    socket.bind(&addr.into()).with_context(|| format!("bind [::]:{}", port))?;
+    socket
+        .bind(&addr.into())
+        .with_context(|| format!("bind [::]:{}", port))?;
     socket.listen(128)?;
     let std_listener: std::net::TcpListener = socket.into();
     Ok(TcpListener::from_std(std_listener)?)
@@ -460,7 +545,12 @@ async fn run_listener(
     }
 }
 
-async fn proxy_connection(mut client: TcpStream, target: SocketAddr, idle_timeout_sec: u64, shared: Arc<RuntimeShared>) -> Result<()> {
+async fn proxy_connection(
+    mut client: TcpStream,
+    target: SocketAddr,
+    idle_timeout_sec: u64,
+    shared: Arc<RuntimeShared>,
+) -> Result<()> {
     client.set_nodelay(true).ok();
     let mut upstream = timeout(Duration::from_secs(8), TcpStream::connect(target))
         .await
@@ -506,7 +596,12 @@ async fn proxy_connection(mut client: TcpStream, target: SocketAddr, idle_timeou
     Ok(())
 }
 
-async fn update_target_status(shared: &Arc<RuntimeShared>, rule: &Rule, target: Option<IpAddr>, error: Option<String>) {
+async fn update_target_status(
+    shared: &Arc<RuntimeShared>,
+    rule: &Rule,
+    target: Option<IpAddr>,
+    error: Option<String>,
+) {
     let mut base = shared.base.write().await;
     if let Some(ip) = target {
         base.resolved_target = format_target(ip, rule.target_port);
@@ -536,7 +631,8 @@ async fn resolve_rule_target(rule: &Rule, lan_if: &str) -> Result<IpAddr> {
         "6to6" if rule.target_mode == "ipv6_suffix" => {
             let rule = rule.clone();
             let lan_if = lan_if.to_string();
-            let ip = tokio::task::spawn_blocking(move || resolve_ipv6_suffix(&rule, &lan_if)).await??;
+            let ip =
+                tokio::task::spawn_blocking(move || resolve_ipv6_suffix(&rule, &lan_if)).await??;
             Ok(ip)
         }
         _ => bail!("unsupported mode/targetMode"),
@@ -546,18 +642,31 @@ async fn resolve_rule_target(rule: &Rule, lan_if: &str) -> Result<IpAddr> {
 fn ensure_target_uses_lan(ip: IpAddr, lan_if: &str) -> Result<()> {
     let text_ip = ip.to_string();
     let mut command = Command::new("ip");
-    if ip.is_ipv6() { command.arg("-6"); }
-    let output = command.args(["route", "get", text_ip.as_str()]).output()
+    if ip.is_ipv6() {
+        command.arg("-6");
+    }
+    let output = command
+        .args(["route", "get", text_ip.as_str()])
+        .output()
         .or_else(|_| {
             let mut fallback = Command::new("/sbin/ip");
-            if ip.is_ipv6() { fallback.arg("-6"); }
+            if ip.is_ipv6() {
+                fallback.arg("-6");
+            }
             fallback.args(["route", "get", text_ip.as_str()]).output()
         })
         .context("run ip route get")?;
-    if !output.status.success() { bail!("target route lookup failed"); }
+    if !output.status.success() {
+        bail!("target route lookup failed");
+    }
     let text = String::from_utf8_lossy(&output.stdout);
     let fields: Vec<&str> = text.split_whitespace().collect();
-    let route_dev = fields.iter().position(|x| *x == "dev").and_then(|i| fields.get(i + 1)).copied().unwrap_or("");
+    let route_dev = fields
+        .iter()
+        .position(|x| *x == "dev")
+        .and_then(|i| fields.get(i + 1))
+        .copied()
+        .unwrap_or("");
     if route_dev != lan_if {
         bail!("target is not routed through {}", lan_if);
     }
@@ -570,26 +679,57 @@ fn resolve_ipv6_suffix(rule: &Rule, lan_if: &str) -> Result<IpAddr> {
     let output = Command::new("ip")
         .args(["-6", "neigh", "show", "dev", lan_if])
         .output()
-        .or_else(|_| Command::new("/sbin/ip").args(["-6", "neigh", "show", "dev", lan_if]).output())
+        .or_else(|_| {
+            Command::new("/sbin/ip")
+                .args(["-6", "neigh", "show", "dev", lan_if])
+                .output()
+        })
         .context("run ip -6 neigh")?;
-    if !output.status.success() { bail!("ip -6 neigh failed"); }
+    if !output.status.success() {
+        bail!("ip -6 neigh failed");
+    }
     let text = String::from_utf8_lossy(&output.stdout);
     let current_prefixes = current_lan_prefixes(lan_if);
     let mut candidates: Vec<(i32, Ipv6Addr, String)> = Vec::new();
     for line in text.lines() {
         let fields: Vec<&str> = line.split_whitespace().collect();
-        if fields.len() < 2 { continue; }
-        let Ok(ip) = Ipv6Addr::from_str(fields[0].split('/').next().unwrap_or("")) else { continue; };
-        if ip.is_loopback() || ip.is_unspecified() || ip.is_multicast() || ip.is_unicast_link_local() { continue; }
+        if fields.len() < 2 {
+            continue;
+        }
+        let Ok(ip) = Ipv6Addr::from_str(fields[0].split('/').next().unwrap_or("")) else {
+            continue;
+        };
+        if ip.is_loopback()
+            || ip.is_unspecified()
+            || ip.is_multicast()
+            || ip.is_unicast_link_local()
+        {
+            continue;
+        }
         let octets = ip.octets();
-        if octets[8..] != suffix[..] { continue; }
-        let mac = fields.iter().position(|x| *x == "lladdr").and_then(|i| fields.get(i + 1)).map(|x| normalize_mac(x)).unwrap_or_default();
-        if !target_mac.is_empty() && mac != target_mac { continue; }
+        if octets[8..] != suffix[..] {
+            continue;
+        }
+        let mac = fields
+            .iter()
+            .position(|x| *x == "lladdr")
+            .and_then(|i| fields.get(i + 1))
+            .map(|x| normalize_mac(x))
+            .unwrap_or_default();
+        if !target_mac.is_empty() && mac != target_mac {
+            continue;
+        }
         let state = fields.last().unwrap_or(&"").to_ascii_uppercase();
-        if state == "FAILED" || state == "INCOMPLETE" { continue; }
+        if state == "FAILED" || state == "INCOMPLETE" {
+            continue;
+        }
         let mut score = 0;
-        if !target_mac.is_empty() && mac == target_mac { score += 100; }
-        if rule.prefer_current_prefix && current_prefixes.iter().any(|p| octets[..8] == p[..]) { score += 30; }
+        if !target_mac.is_empty() && mac == target_mac {
+            score += 100;
+        }
+        if rule.prefer_current_prefix && current_prefixes.iter().any(|p| octets[..8] == p[..]) {
+            score += 30;
+        }
         score += match state.as_str() {
             "REACHABLE" => 30,
             "DELAY" | "PROBE" => 20,
@@ -598,7 +738,9 @@ fn resolve_ipv6_suffix(rule: &Rule, lan_if: &str) -> Result<IpAddr> {
         };
         candidates.push((score, ip, state));
     }
-    if candidates.is_empty() { bail!("no IPv6 neighbor matches suffix/MAC"); }
+    if candidates.is_empty() {
+        bail!("no IPv6 neighbor matches suffix/MAC");
+    }
     candidates.sort_by(|a, b| b.0.cmp(&a.0));
     if target_mac.is_empty() && candidates.len() > 1 && candidates[0].0 == candidates[1].0 {
         bail!("ambiguous suffix: configure target MAC");
@@ -610,17 +752,28 @@ fn current_lan_prefixes(lan_if: &str) -> Vec<[u8; 8]> {
     let output = Command::new("ip")
         .args(["-6", "addr", "show", "dev", lan_if, "scope", "global"])
         .output()
-        .or_else(|_| Command::new("/sbin/ip").args(["-6", "addr", "show", "dev", lan_if, "scope", "global"]).output());
-    let Ok(output) = output else { return Vec::new(); };
+        .or_else(|_| {
+            Command::new("/sbin/ip")
+                .args(["-6", "addr", "show", "dev", lan_if, "scope", "global"])
+                .output()
+        });
+    let Ok(output) = output else {
+        return Vec::new();
+    };
     let text = String::from_utf8_lossy(&output.stdout);
     let mut out = Vec::new();
-    for fields in text.lines().map(|x| x.split_whitespace().collect::<Vec<_>>()) {
+    for fields in text
+        .lines()
+        .map(|x| x.split_whitespace().collect::<Vec<_>>())
+    {
         if let Some(i) = fields.iter().position(|x| *x == "inet6") {
             if let Some(raw) = fields.get(i + 1) {
                 if let Ok(ip) = Ipv6Addr::from_str(raw.split('/').next().unwrap_or("")) {
                     let mut p = [0u8; 8];
                     p.copy_from_slice(&ip.octets()[..8]);
-                    if !out.contains(&p) { out.push(p); }
+                    if !out.contains(&p) {
+                        out.push(p);
+                    }
                 }
             }
         }
@@ -630,11 +783,17 @@ fn current_lan_prefixes(lan_if: &str) -> Vec<[u8; 8]> {
 
 fn suffix_bytes(raw: &str) -> Result<[u8; 8]> {
     let text = raw.trim().trim_matches(['[', ']']);
-    let normalized = if text.contains("::") { text.to_string() } else { format!("::{}", text.trim_start_matches(':')) };
+    let normalized = if text.contains("::") {
+        text.to_string()
+    } else {
+        format!("::{}", text.trim_start_matches(':'))
+    };
     let ip = Ipv6Addr::from_str(&normalized).context("invalid IPv6 suffix")?;
     let mut out = [0u8; 8];
     out.copy_from_slice(&ip.octets()[8..]);
-    if out.iter().all(|b| *b == 0) { bail!("IPv6 suffix must not be all zero"); }
+    if out.iter().all(|b| *b == 0) {
+        bail!("IPv6 suffix must not be all zero");
+    }
     Ok(out)
 }
 
@@ -652,26 +811,54 @@ fn normalize_rule(rule: &mut Rule) {
 }
 
 fn validate_rule(rule: &Rule, port_min: u16, port_max: u16) -> Result<()> {
-    if rule.id.is_empty() || !rule.id.chars().all(|c| c.is_ascii_alphanumeric() || c == '-' || c == '_') { bail!("invalid rule id"); }
-    if rule.name.is_empty() || rule.name.len() > 64 { bail!("invalid rule name"); }
+    if rule.id.is_empty()
+        || !rule
+            .id
+            .chars()
+            .all(|c| c.is_ascii_alphanumeric() || c == '-' || c == '_')
+    {
+        bail!("invalid rule id");
+    }
+    if rule.name.is_empty() || rule.name.len() > 64 {
+        bail!("invalid rule name");
+    }
     if !rule.target_mac.is_empty() {
         let parts: Vec<&str> = rule.target_mac.split(':').collect();
-        if parts.len() != 6 || parts.iter().any(|part| part.len() != 2 || !part.chars().all(|c| c.is_ascii_hexdigit())) {
+        if parts.len() != 6
+            || parts
+                .iter()
+                .any(|part| part.len() != 2 || !part.chars().all(|c| c.is_ascii_hexdigit()))
+        {
             bail!("invalid target MAC");
         }
     }
-    if rule.listen_port < port_min || rule.listen_port > port_max { bail!("listenPort outside allowed range {}-{}", port_min, port_max); }
-    if rule.target_port == 0 { bail!("invalid targetPort"); }
+    if rule.listen_port < port_min || rule.listen_port > port_max {
+        bail!("listenPort outside allowed range {}-{}", port_min, port_max);
+    }
+    if rule.target_port == 0 {
+        bail!("invalid targetPort");
+    }
     if rule.mode == "6to4" {
         let ip = Ipv4Addr::from_str(&rule.target_ipv4).context("invalid targetIpv4")?;
-        if !(ip.is_private() || ip.is_loopback() || ip.is_link_local()) { bail!("target IPv4 must be LAN/private"); }
+        if !(ip.is_private() || ip.is_loopback() || ip.is_link_local()) {
+            bail!("target IPv4 must be LAN/private");
+        }
     } else if rule.mode == "6to6" {
         match rule.target_mode.as_str() {
             "ipv6_full" => {
-                let ip = Ipv6Addr::from_str(strip_brackets(&rule.target_ipv6)).context("invalid targetIpv6")?;
-                if ip.is_loopback() || ip.is_unspecified() || ip.is_multicast() || ip.is_unicast_link_local() { bail!("invalid target IPv6 scope"); }
+                let ip = Ipv6Addr::from_str(strip_brackets(&rule.target_ipv6))
+                    .context("invalid targetIpv6")?;
+                if ip.is_loopback()
+                    || ip.is_unspecified()
+                    || ip.is_multicast()
+                    || ip.is_unicast_link_local()
+                {
+                    bail!("invalid target IPv6 scope");
+                }
             }
-            "ipv6_suffix" => { suffix_bytes(&rule.target_ipv6_suffix)?; }
+            "ipv6_suffix" => {
+                suffix_bytes(&rule.target_ipv6_suffix)?;
+            }
             _ => bail!("targetMode must be ipv6_full or ipv6_suffix"),
         }
     } else {
@@ -680,16 +867,44 @@ fn validate_rule(rule: &Rule, port_min: u16, port_max: u16) -> Result<()> {
     Ok(())
 }
 
-fn is_expired(rule: &Rule) -> bool { rule.expires_at.map(|x| x > 0 && x <= now_epoch()).unwrap_or(false) }
-fn now_epoch() -> u64 { SystemTime::now().duration_since(UNIX_EPOCH).unwrap_or_default().as_secs() }
-fn strip_brackets(v: &str) -> &str { v.trim().trim_start_matches('[').trim_end_matches(']') }
-fn normalize_mac(v: &str) -> String { v.trim().replace('-', ":").to_ascii_lowercase() }
-fn format_target(ip: IpAddr, port: u16) -> String { match ip { IpAddr::V4(v) => format!("{}:{}", v, port), IpAddr::V6(v) => format!("[{}]:{}", v, port) } }
+fn is_expired(rule: &Rule) -> bool {
+    rule.expires_at
+        .map(|x| x > 0 && x <= now_epoch())
+        .unwrap_or(false)
+}
+fn now_epoch() -> u64 {
+    SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .unwrap_or_default()
+        .as_secs()
+}
+fn strip_brackets(v: &str) -> &str {
+    v.trim().trim_start_matches('[').trim_end_matches(']')
+}
+fn normalize_mac(v: &str) -> String {
+    v.trim().replace('-', ":").to_ascii_lowercase()
+}
+fn format_target(ip: IpAddr, port: u16) -> String {
+    match ip {
+        IpAddr::V4(v) => format!("{}:{}", v, port),
+        IpAddr::V6(v) => format!("[{}]:{}", v, port),
+    }
+}
 
 fn load_config(path: &Path) -> Result<ConfigFile> {
-    if !path.exists() { return Ok(ConfigFile { version: 1, rules: Vec::new() }); }
+    if !path.exists() {
+        return Ok(ConfigFile {
+            version: 1,
+            rules: Vec::new(),
+        });
+    }
     let text = fs::read_to_string(path).with_context(|| format!("read {}", path.display()))?;
-    if text.trim().is_empty() { return Ok(ConfigFile { version: 1, rules: Vec::new() }); }
+    if text.trim().is_empty() {
+        return Ok(ConfigFile {
+            version: 1,
+            rules: Vec::new(),
+        });
+    }
     serde_json::from_str(&text).with_context(|| format!("parse {}", path.display()))
 }
 
@@ -699,7 +914,9 @@ fn atomic_json_write<T: Serialize>(path: &Path, data: &T) -> Result<()> {
 }
 
 fn atomic_value_write(path: &Path, value: &Value) -> Result<()> {
-    if let Some(parent) = path.parent() { fs::create_dir_all(parent)?; }
+    if let Some(parent) = path.parent() {
+        fs::create_dir_all(parent)?;
+    }
     let tmp = path.with_extension("tmp");
     fs::write(&tmp, serde_json::to_vec_pretty(value)?)?;
     fs::rename(&tmp, path)?;
@@ -714,21 +931,39 @@ async fn handle_command_fixed(manager: Manager, raw: &str) -> Value {
     let action = v.get("action").and_then(Value::as_str).unwrap_or("");
     let result = match action {
         "status" | "list" => Ok(manager.status_value().await),
-        "upsert" => match serde_json::from_value::<Rule>(v.get("rule").cloned().unwrap_or(Value::Null)) {
-            Ok(rule) => manager.upsert(rule).await,
-            Err(e) => Err(e.into()),
-        },
-        "start" => manager.enable_rule(v.get("id").and_then(Value::as_str).unwrap_or("")).await,
-        "stop" => manager.stop_rule(v.get("id").and_then(Value::as_str).unwrap_or(""), true).await,
-        "delete" => manager.delete_rule(v.get("id").and_then(Value::as_str).unwrap_or("")).await,
+        "upsert" => {
+            match serde_json::from_value::<Rule>(v.get("rule").cloned().unwrap_or(Value::Null)) {
+                Ok(rule) => manager.upsert(rule).await,
+                Err(e) => Err(e.into()),
+            }
+        }
+        "start" => {
+            manager
+                .enable_rule(v.get("id").and_then(Value::as_str).unwrap_or(""))
+                .await
+        }
+        "stop" => {
+            manager
+                .stop_rule(v.get("id").and_then(Value::as_str).unwrap_or(""), true)
+                .await
+        }
+        "delete" => {
+            manager
+                .delete_rule(v.get("id").and_then(Value::as_str).unwrap_or(""))
+                .await
+        }
         _ => Err(anyhow!("unknown action")),
     };
     result.unwrap_or_else(|e| json!({"ok": false, "error": e.to_string()}))
 }
 
 async fn unix_server_fixed(manager: Manager, socket_path: PathBuf) -> Result<()> {
-    if let Some(parent) = socket_path.parent() { tokio::fs::create_dir_all(parent).await?; }
-    if socket_path.exists() { let _ = tokio::fs::remove_file(&socket_path).await; }
+    if let Some(parent) = socket_path.parent() {
+        tokio::fs::create_dir_all(parent).await?;
+    }
+    if socket_path.exists() {
+        let _ = tokio::fs::remove_file(&socket_path).await;
+    }
     let listener = UnixListener::bind(&socket_path)?;
     loop {
         let (stream, _) = listener.accept().await?;
@@ -737,18 +972,23 @@ async fn unix_server_fixed(manager: Manager, socket_path: PathBuf) -> Result<()>
             let (read_half, mut write_half) = stream.into_split();
             let mut reader = TokioBufReader::new(read_half);
             let mut line = String::new();
-            let response = match timeout(Duration::from_secs(5), reader.read_line(&mut line)).await {
-                Ok(Ok(n)) if n > 0 && line.len() <= 128 * 1024 => handle_command_fixed(manager, line.trim()).await,
+            let response = match timeout(Duration::from_secs(5), reader.read_line(&mut line)).await
+            {
+                Ok(Ok(n)) if n > 0 && line.len() <= 128 * 1024 => {
+                    handle_command_fixed(manager, line.trim()).await
+                }
                 Ok(Ok(_)) => json!({"ok": false, "error": "empty command"}),
                 Ok(Err(e)) => json!({"ok": false, "error": e.to_string()}),
                 Err(_) => json!({"ok": false, "error": "command timeout"}),
             };
-            let _ = write_half.write_all(format!("{}\n", response).as_bytes()).await;
+            let _ = write_half
+                .write_all(format!("{}\n", response).as_bytes())
+                .await;
         });
     }
 }
 
-fn ctl_request(socket_path: &Path, request: &Value) -> Result<Value> {
+pub(crate) fn ctl_request(socket_path: &Path, request: &Value) -> Result<Value> {
     let mut stream = std::os::unix::net::UnixStream::connect(socket_path)
         .with_context(|| format!("connect {}", socket_path.display()))?;
     stream.set_read_timeout(Some(Duration::from_secs(8)))?;
@@ -761,33 +1001,57 @@ fn ctl_request(socket_path: &Path, request: &Value) -> Result<Value> {
 
 fn agent_apply(socket_path: &Path, input_path: &Path) -> Result<Value> {
     let root: Value = serde_json::from_slice(&fs::read(input_path)?)?;
-    let commands = root.get("commands").and_then(Value::as_array).cloned().unwrap_or_default();
+    let commands = root
+        .get("commands")
+        .and_then(Value::as_array)
+        .cloned()
+        .unwrap_or_default();
     let mut acks = Vec::new();
     for command in commands {
-        let command_id = command.get("id").and_then(Value::as_str).unwrap_or("").to_string();
+        let command_id = command
+            .get("id")
+            .and_then(Value::as_str)
+            .unwrap_or("")
+            .to_string();
         let action = command.get("action").and_then(Value::as_str).unwrap_or("");
         let payload = command.get("payload").cloned().unwrap_or_else(|| json!({}));
         let local = match action {
-            "upsert" => json!({"action": "upsert", "rule": payload.get("rule").cloned().unwrap_or(Value::Null)}),
-            "start" | "stop" | "delete" => json!({"action": action, "id": payload.get("id").and_then(Value::as_str).unwrap_or("")}),
+            "upsert" => {
+                json!({"action": "upsert", "rule": payload.get("rule").cloned().unwrap_or(Value::Null)})
+            }
+            "start" | "stop" | "delete" => {
+                json!({"action": action, "id": payload.get("id").and_then(Value::as_str).unwrap_or("")})
+            }
             _ => json!({"action": "invalid"}),
         };
-        let result = ctl_request(socket_path, &local).unwrap_or_else(|e| json!({"ok": false, "error": e.to_string()}));
+        let result = ctl_request(socket_path, &local)
+            .unwrap_or_else(|e| json!({"ok": false, "error": e.to_string()}));
         acks.push(json!({"id": command_id, "ok": result.get("ok").and_then(Value::as_bool).unwrap_or(false), "result": result}));
     }
     Ok(json!({"acks": acks, "appliedAt": now_epoch()}))
 }
 
 async fn daemon(args: &[String]) -> Result<()> {
-    let config = PathBuf::from(arg_value(args, "--config").unwrap_or_else(|| DEFAULT_CONFIG.to_string()));
-    let socket = PathBuf::from(arg_value(args, "--socket").unwrap_or_else(|| DEFAULT_SOCKET.to_string()));
-    let state = PathBuf::from(arg_value(args, "--state").unwrap_or_else(|| DEFAULT_STATE.to_string()));
+    let config =
+        PathBuf::from(arg_value(args, "--config").unwrap_or_else(|| DEFAULT_CONFIG.to_string()));
+    let socket =
+        PathBuf::from(arg_value(args, "--socket").unwrap_or_else(|| DEFAULT_SOCKET.to_string()));
+    let state =
+        PathBuf::from(arg_value(args, "--state").unwrap_or_else(|| DEFAULT_STATE.to_string()));
     let pid = PathBuf::from(arg_value(args, "--pid").unwrap_or_else(|| DEFAULT_PID.to_string()));
-    let port_min = arg_value(args, "--port-min").and_then(|x| x.parse().ok()).unwrap_or(20000);
-    let port_max = arg_value(args, "--port-max").and_then(|x| x.parse().ok()).unwrap_or(20020);
+    let port_min = arg_value(args, "--port-min")
+        .and_then(|x| x.parse().ok())
+        .unwrap_or(20000);
+    let port_max = arg_value(args, "--port-max")
+        .and_then(|x| x.parse().ok())
+        .unwrap_or(20020);
     let lan_if = arg_value(args, "--lan-if").unwrap_or_else(|| "br-lan".to_string());
-    if port_min > port_max { bail!("invalid port range"); }
-    if let Some(parent) = pid.parent() { fs::create_dir_all(parent)?; }
+    if port_min > port_max {
+        bail!("invalid port range");
+    }
+    if let Some(parent) = pid.parent() {
+        fs::create_dir_all(parent)?;
+    }
     fs::write(&pid, std::process::id().to_string())?;
 
     let manager = Manager::load(config, state, port_min, port_max, lan_if).await?;
@@ -800,20 +1064,31 @@ async fn daemon(args: &[String]) -> Result<()> {
         }
     });
     let socket_task = tokio::spawn(unix_server_fixed(manager.clone(), socket.clone()));
-    println!("[labrelay] v{} ready socket={} ports={}-{}", VERSION, socket.display(), port_min, port_max);
+    println!(
+        "[labrelay] v{} ready socket={} ports={}-{}",
+        VERSION,
+        socket.display(),
+        port_min,
+        port_max
+    );
     tokio::select! {
         res = socket_task => { res??; }
         _ = tokio::signal::ctrl_c() => {}
     }
     let ids: Vec<String> = manager.rules.read().await.keys().cloned().collect();
-    for id in ids { manager.stop_runtime(&id, false).await; }
+    for id in ids {
+        manager.stop_runtime(&id, false).await;
+    }
     let _ = fs::remove_file(socket);
     let _ = fs::remove_file(pid);
     Ok(())
 }
 
 fn arg_value(args: &[String], key: &str) -> Option<String> {
-    args.iter().position(|x| x == key).and_then(|i| args.get(i + 1)).cloned()
+    args.iter()
+        .position(|x| x == key)
+        .and_then(|i| args.get(i + 1))
+        .cloned()
 }
 
 #[tokio::main(flavor = "multi_thread", worker_threads = 2)]
@@ -822,36 +1097,56 @@ async fn main() -> Result<()> {
     match args.first().map(String::as_str) {
         Some("daemon") => daemon(&args[1..]).await,
         Some("ctl") => {
-            let socket = PathBuf::from(arg_value(&args, "--socket").unwrap_or_else(|| DEFAULT_SOCKET.to_string()));
+            let socket = PathBuf::from(
+                arg_value(&args, "--socket").unwrap_or_else(|| DEFAULT_SOCKET.to_string()),
+            );
             let mut raw: Option<String> = None;
             let mut i = 1usize;
             while i < args.len() {
-                if args[i] == "--socket" { i += 2; continue; }
-                if !args[i].starts_with("--") { raw = Some(args[i].clone()); break; }
+                if args[i] == "--socket" {
+                    i += 2;
+                    continue;
+                }
+                if !args[i].starts_with("--") {
+                    raw = Some(args[i].clone());
+                    break;
+                }
                 i += 1;
             }
-            let raw = raw.or_else(|| {
-                let mut input = String::new();
-                std::io::stdin().read_to_string(&mut input).ok()?;
-                (!input.trim().is_empty()).then_some(input)
-            }).ok_or_else(|| anyhow!("missing JSON command"))?;
+            let raw = raw
+                .or_else(|| {
+                    let mut input = String::new();
+                    std::io::stdin().read_to_string(&mut input).ok()?;
+                    (!input.trim().is_empty()).then_some(input)
+                })
+                .ok_or_else(|| anyhow!("missing JSON command"))?;
             println!("{}", ctl_request(&socket, &serde_json::from_str(&raw)?)?);
             Ok(())
         }
         Some("agent-apply") => {
-            let socket = PathBuf::from(arg_value(&args, "--socket").unwrap_or_else(|| DEFAULT_SOCKET.to_string()));
+            let socket = PathBuf::from(
+                arg_value(&args, "--socket").unwrap_or_else(|| DEFAULT_SOCKET.to_string()),
+            );
             let file = arg_value(&args, "--file").ok_or_else(|| anyhow!("missing --file"))?;
             println!("{}", agent_apply(&socket, Path::new(&file))?);
             Ok(())
         }
-        Some("version") | Some("--version") | Some("-V") => { println!("labrelay {}", VERSION); Ok(()) }
+        Some("agent") => agent::run(&args[1..], false).await,
+        Some("agent-once") => agent::run(&args[1..], true).await,
+        Some("pair") => agent::pair(&args[1..]).await,
+        Some("doctor") => agent::doctor(&args[1..]).await,
+        Some("status") => agent::print_status(&args[1..]),
+        Some("test-hub") => agent::test_hub(&args[1..]).await,
+        Some("version") | Some("--version") | Some("-V") => {
+            println!("labrelay {}", VERSION);
+            Ok(())
+        }
         _ => {
-            eprintln!("Usage:\n  labrelay daemon [--config PATH] [--socket PATH] [--state PATH] [--port-min 20000] [--port-max 20020] [--lan-if br-lan]\n  labrelay ctl '{\"action\":\"status\"}' [--socket PATH]\n  labrelay agent-apply --file commands.json [--socket PATH]\n  labrelay version");
+            eprintln!("Usage:\n  labrelay daemon [--config PATH] [--socket PATH] [--state PATH]\n  labrelay agent|agent-once [--config PATH]\n  labrelay pair --hub URL --code CODE --name NAME [--config PATH]\n  labrelay doctor|status|test-hub [--config PATH]\n  labrelay ctl '{\"action\":\"status\"}' [--socket PATH]\n  labrelay version");
             Ok(())
         }
     }
 }
-
 
 #[cfg(test)]
 mod tests {
@@ -877,7 +1172,7 @@ mod tests {
             mode: "6to4".into(),
             listen_port: 20001,
             target_mode: "ipv4".into(),
-            target_ipv4: "192.168.5.46".into(),
+            target_ipv4: "192.168.1.50".into(),
             target_port: 443,
             ..Rule::default()
         };

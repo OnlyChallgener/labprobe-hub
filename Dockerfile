@@ -1,10 +1,16 @@
 FROM python:3.12-slim
 
+ARG TARGETARCH
+ARG TARGETOS
+
 ENV PYTHONDONTWRITEBYTECODE=1 \
     PYTHONUNBUFFERED=1 \
     PORT=58443 \
-    DATA_DIR=/app/data \
-    CONFIG_PATH=/app/config/config.yaml
+    CONFIG_DIR=./config \
+    DATA_DIR=./data \
+    BACKUPS_DIR=./backups \
+    LOGS_DIR=./logs \
+    CONFIG_PATH=./config/config.yaml
 
 WORKDIR /app
 
@@ -16,7 +22,13 @@ COPY requirements.txt /app/requirements.txt
 RUN pip install --no-cache-dir -r /app/requirements.txt
 
 COPY hub.py /app/hub.py
+COPY labprobe_storage.py /app/labprobe_storage.py
+
+RUN mkdir -p /app/data /app/config /app/backups /app/logs
 
 EXPOSE 58443
+
+HEALTHCHECK --interval=30s --timeout=5s --start-period=20s --retries=3 \
+    CMD curl -fsS "http://127.0.0.1:${PORT}/health" >/dev/null || exit 1
 
 CMD ["python", "/app/hub.py"]

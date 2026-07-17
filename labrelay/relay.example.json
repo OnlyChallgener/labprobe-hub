@@ -8,7 +8,7 @@
       "mode": "6to4",
       "listenPort": 20001,
       "targetMode": "ipv4",
-      "targetIpv4": "192.168.5.46",
+      "targetIpv4": "192.168.1.50",
       "targetIpv6": "",
       "targetIpv6Suffix": "",
       "targetMac": "6c:1f:f7:76:71:04",

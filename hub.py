@@ -7,6 +7,11 @@ import re
 import time
 import threading
 import secrets
+import hmac
+import logging
+import platform
+import sys
+from logging.handlers import TimedRotatingFileHandler
 from datetime import datetime, date
 from pathlib import Path
 from typing import Any, Dict, List, Optional, Tuple
@@ -15,11 +20,19 @@ import yaml
 import requests
 import dns.resolver
 from flask import Flask, request, jsonify
+from labprobe_storage import SQLiteStore
 
-APP_VERSION = "0.8.3"
+APP_VERSION = "0.9.0"
 PORT = int(os.environ.get("PORT", "58443"))
-CONFIG_PATH = Path(os.environ.get("CONFIG_PATH", "/app/config/config.yaml"))
-DATA_DIR = Path(os.environ.get("DATA_DIR", "/app/data"))
+BASE_DIR = Path(os.environ.get("LABPROBE_BASE_DIR", ".")).resolve()
+CONFIG_DIR = Path(os.environ.get("CONFIG_DIR", str(BASE_DIR / "config"))).resolve()
+DATA_DIR = Path(os.environ.get("DATA_DIR", str(BASE_DIR / "data"))).resolve()
+BACKUPS_DIR = Path(os.environ.get("BACKUPS_DIR", str(BASE_DIR / "backups"))).resolve()
+LOGS_DIR = Path(os.environ.get("LOGS_DIR", str(BASE_DIR / "logs"))).resolve()
+CONFIG_PATH = Path(os.environ.get("CONFIG_PATH", str(CONFIG_DIR / "config.yaml"))).resolve()
+DB_PATH = Path(os.environ.get("DATABASE_PATH", str(DATA_DIR / "labprobe.db"))).resolve()
+for directory in (CONFIG_DIR, DATA_DIR, BACKUPS_DIR, LOGS_DIR):
+    directory.mkdir(parents=True, exist_ok=True)
 DATA_DIR.mkdir(parents=True, exist_ok=True)
 
 EVENTS_FILE = DATA_DIR / "events.json"
@@ -34,6 +47,8 @@ PORTMAP_RULES_FILE = DATA_DIR / "portmaps.json"
 PORTMAP_COMMANDS_FILE = DATA_DIR / "portmap_commands.json"
 PORTMAP_ROUTER_STATUS_FILE = DATA_DIR / "portmap_router_status.json"
 PORTMAP_HISTORY_FILE = DATA_DIR / "portmap_history.json"
+AGENT_STATUS_FILE = DATA_DIR / "agent_status.json"
+AGENT_UPDATE_COMMANDS_FILE = DATA_DIR / "agent_update_commands.json"
 NOTES_DIR = DATA_DIR / "notes"
 NOTES_DIR.mkdir(parents=True, exist_ok=True)
 
@@ -43,6 +58,81 @@ DATA_LOCK = threading.RLock()
 REFRESH_LOCK = threading.RLock()
 REFRESH_RUNNING = False
 STATUS_REFRESH_TTL_SEC = int(os.environ.get("STATUS_REFRESH_TTL_SEC", "180"))
+STORE = SQLiteStore(DATA_DIR, BACKUPS_DIR, DB_PATH)
+UPDATE_REPOSITORY_ROOT = os.environ.get("UPDATE_REPOSITORY_ROOT", "https://lab.net86.dynv6.net:27772").rstrip("/")
+AGENT_MANIFEST_URL = f"{UPDATE_REPOSITORY_ROOT}/agent/latest.json"
+AGENT_INSTALLER_URL = f"{UPDATE_REPOSITORY_ROOT}/agent/install.sh"
+AGENT_RELEASE_CACHE: Dict[str, Any] = {"at": 0.0, "data": None}
+
+
+class SecretRedactionFilter(logging.Filter):
+    patterns = [
+        re.compile(r"(?i)(authorization:\s*bearer\s+)[^\s,;]+"),
+        re.compile(r"(?i)(\b(?:token|app_token|hook_token|key)=)[^&\s]+"),
+        re.compile(r"\blp_[A-Za-z0-9_-]{12,}\b"),
+    ]
+
+    @classmethod
+    def redact(cls, value: Any) -> Any:
+        if not isinstance(value, str):
+            return value
+        result = value
+        for pattern in cls.patterns:
+            if pattern.pattern.startswith("\\blp_"):
+                result = pattern.sub("lp_***", result)
+            else:
+                result = pattern.sub(r"\1***", result)
+        return result
+
+    def filter(self, record: logging.LogRecord) -> bool:
+        record.msg = self.redact(record.msg)
+        if isinstance(record.args, tuple):
+            record.args = tuple(self.redact(v) for v in record.args)
+        elif isinstance(record.args, dict):
+            record.args = {k: self.redact(v) for k, v in record.args.items()}
+        return True
+
+
+def configure_logging() -> logging.Logger:
+    level_name = os.environ.get("LOG_LEVEL", "INFO").upper()
+    level = getattr(logging, level_name, logging.INFO)
+    retention = max(1, int(os.environ.get("LOG_RETENTION_DAYS", "14")))
+    logger = logging.getLogger("labprobe")
+    logger.setLevel(level)
+    logger.handlers.clear()
+    formatter = logging.Formatter("%(asctime)s %(levelname)s %(message)s")
+    redactor = SecretRedactionFilter()
+    console = logging.StreamHandler(sys.stdout)
+    console.setFormatter(formatter)
+    console.addFilter(redactor)
+    file_handler = TimedRotatingFileHandler(
+        LOGS_DIR / "hub.log", when="midnight", backupCount=retention, encoding="utf-8", utc=False
+    )
+    file_handler.setFormatter(formatter)
+    file_handler.addFilter(redactor)
+    logger.addHandler(console)
+    logger.addHandler(file_handler)
+    werkzeug_logger = logging.getLogger("werkzeug")
+    werkzeug_logger.setLevel(level)
+    werkzeug_logger.addFilter(redactor)
+    return logger
+
+
+LOGGER = configure_logging()
+MIGRATION_RESULT = STORE.initialize()
+
+
+@app.before_request
+def lock_request_data():
+    # Existing handlers use read/modify/write document operations. Serializing
+    # those short critical sections prevents lost updates while SQLite/WAL still
+    # gives external readers a consistent committed view.
+    DATA_LOCK.acquire()
+
+
+@app.teardown_request
+def unlock_request_data(_error=None):
+    DATA_LOCK.release()
 
 
 
@@ -68,21 +158,17 @@ def time_to_epoch(v: Any) -> float:
 
 def load_json(path: Path, default: Any) -> Any:
     with DATA_LOCK:
-        if not path.exists():
-            return default
         try:
-            return json.loads(path.read_text(encoding="utf-8"))
-        except Exception:
+            return STORE.load(path, default)
+        except Exception as exc:
+            LOGGER.error("database read failed key=%s error=%s", path.name, exc)
             return default
 
 
 def save_json(path: Path, data: Any) -> None:
-    # v0.7.3：原子写入，避免 APP 刷新和路由器推送同时读写时出现半截 JSON / 覆盖。
+    # SQLite 事务同时保存文档和 revision；旧 JSON 仅保留在迁移备份中。
     with DATA_LOCK:
-        path.parent.mkdir(parents=True, exist_ok=True)
-        tmp = path.with_suffix(path.suffix + ".tmp")
-        tmp.write_text(json.dumps(data, ensure_ascii=False, indent=2), encoding="utf-8")
-        os.replace(tmp, path)
+        STORE.save(path, data)
 
 
 def load_config() -> Dict[str, Any]:
@@ -91,7 +177,7 @@ def load_config() -> Dict[str, Any]:
         try:
             cfg = yaml.safe_load(CONFIG_PATH.read_text(encoding="utf-8")) or {}
         except Exception as e:
-            print(f"[LabProbe] config load failed: {e}", flush=True)
+            LOGGER.error("config load failed: %s", e)
             cfg = {}
     return cfg
 
@@ -112,6 +198,41 @@ def get_app_token() -> str:
 
 def get_hook_token() -> str:
     return os.environ.get("HOOK_TOKEN") or cfg_get("server.hook_token", "change-hook-token")
+
+
+def env_compat(primary: str, *legacy: str, default: str = "") -> str:
+    for key in (primary, *legacy):
+        value = str(os.environ.get(key, "") or "").strip()
+        if value:
+            return value
+    return default
+
+
+def hub_name() -> str:
+    return env_compat("HUB_NAME", default=str(cfg_get("home.name", "LabProbe Hub")))
+
+
+def primary_router_name() -> str:
+    return env_compat(
+        "PRIMARY_ROUTER_NAME", "PORTMAP_ROUTER_NAME",
+        default=str(cfg_get("router.name", "Ruijie")),
+    )
+
+
+def host_ipv4() -> str:
+    return env_compat("HUB_HOST_IPV4", "NAS_IPV4", "LABPROBE_NAS_IPV4", "EXIT_IPV4")
+
+
+def host_ipv6() -> str:
+    return env_compat("HUB_HOST_IPV6", "NAS_IPV6", "LABPROBE_NAS_IPV6", "EXIT_IPV6")
+
+
+def host_mac() -> str:
+    return env_compat("HUB_HOST_MAC", "NAS_MAC", "LABPROBE_NAS_MAC")
+
+
+def advertise_url() -> str:
+    return env_compat("HUB_ADVERTISE_URL", default=f"http://127.0.0.1:{PORT}").rstrip("/")
 
 
 def _auth_tokens_from_request() -> List[str]:
@@ -153,29 +274,30 @@ def _auth_tokens_from_request() -> List[str]:
 
 def check_app_token() -> bool:
     app_token = get_app_token()
-    return any(t == app_token for t in _auth_tokens_from_request())
+    return any(hmac.compare_digest(t, app_token) or STORE.authenticate(t, {"app"}) for t in _auth_tokens_from_request())
 
 
 def check_hook_token() -> bool:
     hook_token = get_hook_token()
-    return any(t == hook_token for t in _auth_tokens_from_request())
+    return any(hmac.compare_digest(t, hook_token) or STORE.authenticate(t, {"agent"}) for t in _auth_tokens_from_request())
 
 
 def check_read_token() -> bool:
     allowed = {get_app_token(), get_hook_token()}
-    return any(t in allowed for t in _auth_tokens_from_request())
+    return any(any(hmac.compare_digest(t, legacy) for legacy in allowed) or STORE.authenticate(t, {"app", "agent"}) for t in _auth_tokens_from_request())
 
 
 def add_event(event: Dict[str, Any]) -> Dict[str, Any]:
-    events: List[Dict[str, Any]] = load_json(EVENTS_FILE, [])
-    next_id = int(events[-1].get("id", 0)) + 1 if events else 1
-    event["id"] = next_id
-    event.setdefault("createdAt", now_str())
-    event.setdefault("level", "normal")
-    events.append(event)
-    events = events[-1000:]
-    save_json(EVENTS_FILE, events)
-    return event
+    with DATA_LOCK:
+        events: List[Dict[str, Any]] = load_json(EVENTS_FILE, [])
+        next_id = int(events[-1].get("id", 0)) + 1 if events else 1
+        event["id"] = next_id
+        event.setdefault("createdAt", now_str())
+        event.setdefault("level", "normal")
+        events.append(event)
+        events = events[-1000:]
+        save_json(EVENTS_FILE, events)
+        return event
 
 
 def norm_mac(mac: Optional[str]) -> str:
@@ -461,9 +583,8 @@ def is_public_ip_text(v: Any, ipv6: bool = False) -> bool:
 
 
 def get_manual_nas_ip(ipv6: bool = False) -> str:
-    # 最高优先级：显式手动配置。用于 Docker bridge 无法直接 curl 出 NAS IPv6 的情况。
-    # docker-compose 可写：NAS_IPV6=2409:...:2a79 或 NAS_IPV6=2409:...:2a79/64
-    keys = ["NAS_IPV6", "LABPROBE_NAS_IPV6", "EXIT_IPV6"] if ipv6 else ["NAS_IPV4", "LABPROBE_NAS_IPV4", "EXIT_IPV4"]
+    # 新变量描述 Hub 宿主机；旧 NAS_* 变量继续兼容。
+    keys = ["HUB_HOST_IPV6", "NAS_IPV6", "LABPROBE_NAS_IPV6", "EXIT_IPV6"] if ipv6 else ["HUB_HOST_IPV4", "NAS_IPV4", "LABPROBE_NAS_IPV4", "EXIT_IPV4"]
     for k in keys:
         v = strip_ip_prefix(os.environ.get(k))
         if v and is_public_ip_text(v, ipv6=ipv6):
@@ -1185,7 +1306,7 @@ def local_hub_ipv6_records() -> List[Dict[str, Any]]:
 
 def configured_nas_macs() -> set:
     vals: List[str] = []
-    env_raw = os.environ.get("NAS_MAC") or os.environ.get("LABPROBE_NAS_MAC") or ""
+    env_raw = host_mac()
     if env_raw:
         vals.extend(re.split(r"[\s,;]+", env_raw))
     for key in ["nas.mac", "nas.macs", "nas.device_mac"]:
@@ -1195,14 +1316,6 @@ def configured_nas_macs() -> set:
         elif raw:
             vals.extend(re.split(r"[\s,;]+", str(raw)))
 
-    # Backward-compatible inference for existing configs that only list a
-    # watched device named NAS/绿联 NAS.
-    for item in cfg_get("watched_devices", []) or []:
-        if not isinstance(item, dict):
-            continue
-        label = " ".join(str(item.get(k) or "") for k in ["name", "remark", "devType", "type"]).lower()
-        if "nas" in label or "绿联" in label or "ugreen" in label:
-            vals.append(str(item.get("mac") or ""))
     return {norm_mac(x) for x in vals if norm_mac(x)}
 
 
@@ -1548,6 +1661,11 @@ def build_watched_devices(online_devices: List[Dict[str, Any]]) -> List[Dict[str
 
 def device_snapshot_from_payload(payload: Dict[str, Any]) -> Dict[str, Any]:
     """Normalize ruijie agent device_event payload into the same field names used by /api/devices."""
+    nested = payload.get("device") if isinstance(payload.get("device"), dict) else {}
+    if nested:
+        merged = dict(nested)
+        merged.update({key: value for key, value in payload.items() if key != "device"})
+        payload = merged
     mac = norm_mac(payload.get("mac"))
     name = payload.get("name") or payload.get("devRecommend") or payload.get("hostName") or mac or "未知设备"
     ip = payload.get("ip") or payload.get("userIp") or payload.get("lastIp") or ""
@@ -1717,9 +1835,9 @@ def refresh_ddns_and_exit(state: Dict[str, Any]) -> Dict[str, Any]:
         aaaa = resolve_records(domain, "AAAA") if "AAAA" in (item.get("record_types") or ["A", "AAAA"]) else []
         expect = item.get("expect")
         expected_value = None
-        if expect == "nas_ipv6":
+        if expect in ["host_ipv6", "nas_ipv6"]:
             expected_value = nas_ipv6
-        elif expect == "nas_ipv4":
+        elif expect in ["host_ipv4", "nas_ipv4"]:
             expected_value = nas_ipv4
         elif expect == "router_ipv6":
             expected_value = state.get("router", {}).get("exitIpv6")
@@ -1763,7 +1881,7 @@ def api_router_push():
         state = load_json(STATE_FILE, {})
         state.setdefault("router", {})
         state.setdefault("nas", {})
-        router_name = clean_saved_value(payload.get("router")) or cfg_get("router.name", "Ruijie")
+        router_name = clean_saved_value(payload.get("router")) or primary_router_name()
         wan_items = normalize_ipv6_items(
             payload.get("wan_ipv6_list") or payload.get("wanIpv6List") or payload.get("router_wan6_list") or payload.get("routerWan6List") or payload.get("wan6List"),
             "WAN IPv6",
@@ -1855,10 +1973,7 @@ def api_router_push():
         fake_payload["type"] = mapped
         fake_payload["time"] = event_time
         fake_payload["lastIp"] = payload.get("ip")
-        # 复用同一套设备事件逻辑。
-        with app.test_request_context(json=fake_payload, headers={"X-LabProbe-Token": request.headers.get("X-LabProbe-Token", "")}):
-            # 不能直接复用 token 校验上下文，改为内联最小保存逻辑。
-            pass
+        # 使用下方内联保存逻辑，避免嵌套请求上下文干扰事务锁。
         snap = device_snapshot_from_payload(fake_payload)
         online = mapped == "device_online"
         name = snap.get("name") or snap.get("mac") or "未知设备"
@@ -1888,9 +2003,327 @@ def api_router_push():
     return jsonify({"ok": False, "error": "unknown type"}), 400
 
 
+def configuration_report() -> Dict[str, Any]:
+    errors: List[str] = []
+    warnings: List[str] = []
+    for name, directory in [("data", DATA_DIR), ("config", CONFIG_DIR), ("backups", BACKUPS_DIR), ("logs", LOGS_DIR)]:
+        if not directory.exists() or not os.access(directory, os.W_OK):
+            errors.append(f"{name} directory is not writable: {directory}")
+    if get_app_token() == "change-app-token":
+        warnings.append("legacy APP_TOKEN uses the default placeholder; pair a client or configure APP_TOKEN")
+    if get_hook_token() == "change-hook-token":
+        warnings.append("legacy HOOK_TOKEN uses the default placeholder; pair an agent or configure HOOK_TOKEN")
+    if advertise_url().startswith("http://127."):
+        warnings.append("HUB_ADVERTISE_URL is not configured")
+    return {
+        "ok": not errors,
+        "errors": errors,
+        "warnings": warnings,
+        "directories": {"data": str(DATA_DIR), "config": str(CONFIG_DIR), "backups": str(BACKUPS_DIR), "logs": str(LOGS_DIR)},
+    }
+
+
+def status_document() -> Dict[str, Any]:
+    state = load_json(STATE_FILE, {})
+    state["hub"] = {
+        **(state.get("hub") if isinstance(state.get("hub"), dict) else {}),
+        "name": hub_name(),
+        "version": APP_VERSION,
+        "updatedAt": now_str(),
+        "statusMode": "cache_first",
+        "refreshRunning": REFRESH_RUNNING,
+        "advertiseUrl": advertise_url(),
+    }
+    state["vpnStunAddresses"] = vpn_addresses_list(state)
+    state["vpnAddresses"] = state["vpnStunAddresses"]
+    devices_state = load_json(DEVICES_FILE, {"updatedAt": None})
+    state["devicesUpdatedAt"] = devices_state.get("updatedAt")
+    return state
+
+
+def build_sync_snapshot() -> Dict[str, Any]:
+    # Retry if a writer advances the revision between document reads.
+    for _ in range(3):
+        before = STORE.revision_info()["revision"]
+        state = status_document()
+        devices_state = load_json(DEVICES_FILE, {"online": [], "watched": [], "updatedAt": None})
+        if isinstance(state.get("hub"), dict):
+            state["hub"]["updatedAt"] = state.get("updatedAt") or devices_state.get("updatedAt")
+        archive = load_device_archive()
+        online = [hydrate_device_with_archive(d, archive) for d in (devices_state.get("online", []) or [])]
+        watched = [hydrate_device_with_archive(d, archive) for d in (devices_state.get("watched", []) or [])]
+        events = [e for e in load_json(EVENTS_FILE, []) if not e.get("deleted")]
+        after = STORE.revision_info()["revision"]
+        if before == after:
+            break
+    return {
+        "ok": True,
+        "revision": after,
+        "sequence": after,
+        "generatedAt": now_str(),
+        "status": state,
+        "devices": {
+            "updatedAt": devices_state.get("updatedAt"),
+            "onlineDeviceCount": devices_state.get("onlineDeviceCount", len(online)),
+            "online": online,
+            "watched": watched,
+        },
+        "events": events,
+    }
+
+
+def version_parts(value: Any) -> Tuple[int, ...]:
+    parts = [int(x) for x in re.findall(r"\d+", str(value or ""))]
+    return tuple(parts[:4] or [0])
+
+
+def agent_release_manifest(force: bool = False) -> Dict[str, Any]:
+    now = time.time()
+    cached = AGENT_RELEASE_CACHE.get("data")
+    if not force and isinstance(cached, dict) and now - float(AGENT_RELEASE_CACHE.get("at") or 0) < 600:
+        return cached
+    response = requests.get(AGENT_MANIFEST_URL, timeout=(4, 8), headers={"User-Agent": f"LabProbe-Hub/{APP_VERSION}"})
+    response.raise_for_status()
+    root = response.json()
+    version = clean_saved_value(root.get("versionName") or root.get("version"))
+    binaries = root.get("binaries")
+    if not version or not isinstance(binaries, dict) or not isinstance(binaries.get("arm64"), dict) or not isinstance(binaries.get("amd64"), dict):
+        raise ValueError("agent latest.json is invalid")
+    AGENT_RELEASE_CACHE.update({"at": now, "data": root})
+    return root
+
+
+def agent_status_for(router: str) -> Dict[str, Any]:
+    statuses = load_json(AGENT_STATUS_FILE, {})
+    return statuses.get(router, {}) if isinstance(statuses, dict) and isinstance(statuses.get(router), dict) else {}
+
+
+def latest_agent_command(router: str) -> Dict[str, Any]:
+    data = load_json(AGENT_UPDATE_COMMANDS_FILE, {"commands": []})
+    rows = data.get("commands", []) if isinstance(data, dict) else []
+    return next((row for row in reversed(rows) if isinstance(row, dict) and row.get("router") == router), {})
+
+
+@app.route("/api/agent/update/status", methods=["GET"])
+def api_agent_update_status():
+    if not check_app_token():
+        return jsonify({"ok": False, "error": "unauthorized"}), 401
+    router = clean_saved_value(request.args.get("router")) or primary_router_name()
+    status = agent_status_for(router)
+    command = latest_agent_command(router)
+    try:
+        manifest = agent_release_manifest(force=request.args.get("refresh") == "1")
+        latest = clean_saved_value(manifest.get("versionName") or manifest.get("version"))
+        current = clean_saved_value(status.get("version")) or "未知"
+        available = current != "未知" and version_parts(latest) > version_parts(current)
+        message = clean_saved_value(manifest.get("changelog")) or ("发现新版本" if available else "当前已是最新版本")
+        return jsonify({
+            "ok": True, "router": router, "currentVersion": current, "latestVersion": latest,
+            "updateAvailable": available, "state": command.get("state") or status.get("updateState") or "idle",
+            "message": message, "lastSeenAt": status.get("lastSeenAt", ""),
+            "manifestUrl": AGENT_MANIFEST_URL, "installerUrl": AGENT_INSTALLER_URL,
+        })
+    except Exception as exc:
+        LOGGER.warning("agent manifest check failed: %s", exc)
+        return jsonify({
+            "ok": False, "router": router, "currentVersion": status.get("version", "未知"),
+            "latestVersion": "未知", "updateAvailable": False,
+            "state": command.get("state") or status.get("updateState") or "idle",
+            "message": f"更新仓检查失败：{exc}", "lastSeenAt": status.get("lastSeenAt", ""),
+        }), 502
+
+
+@app.route("/api/agent/update", methods=["POST"])
+def api_agent_update_request():
+    if not check_app_token():
+        return jsonify({"ok": False, "error": "unauthorized"}), 401
+    payload = request.get_json(silent=True) or {}
+    router = clean_saved_value(payload.get("router")) or primary_router_name()
+    try:
+        manifest = agent_release_manifest(force=True)
+    except Exception as exc:
+        return jsonify({"ok": False, "error": "manifest_unavailable", "message": f"更新仓检查失败：{exc}"}), 502
+    target = clean_saved_value(manifest.get("versionName") or manifest.get("version"))
+    command = {
+        "id": secrets.token_hex(12), "router": router, "action": "update", "state": "pending",
+        "targetVersion": target, "repositoryRoot": UPDATE_REPOSITORY_ROOT,
+        "manifestUrl": AGENT_MANIFEST_URL, "installerUrl": AGENT_INSTALLER_URL,
+        "createdAt": now_str(), "updatedAt": now_str(), "message": "等待路由器领取更新指令",
+    }
+    data = load_json(AGENT_UPDATE_COMMANDS_FILE, {"commands": []})
+    commands = data.get("commands", []) if isinstance(data, dict) else []
+    commands.append(command)
+    save_json(AGENT_UPDATE_COMMANDS_FILE, {"commands": commands[-100:]})
+    return jsonify({"ok": True, "commandId": command["id"], "targetVersion": target, "message": "Rust Agent 更新指令已发送"})
+
+
+@app.route("/api/router/agent/commands", methods=["GET"])
+def api_router_agent_commands():
+    if not check_hook_token():
+        return jsonify({"ok": False, "error": "bad agent token"}), 401
+    router = clean_saved_value(request.args.get("router")) or primary_router_name()
+    data = load_json(AGENT_UPDATE_COMMANDS_FILE, {"commands": []})
+    commands = data.get("commands", []) if isinstance(data, dict) else []
+    pending = [row for row in commands if isinstance(row, dict) and row.get("router") == router and row.get("state") == "pending"][:5]
+    return jsonify({"ok": True, "commands": pending, "time": now_str()})
+
+
+@app.route("/api/router/agent/ack", methods=["POST"])
+def api_router_agent_ack():
+    if not check_hook_token():
+        return jsonify({"ok": False, "error": "bad agent token"}), 401
+    payload = request.get_json(silent=True) or {}
+    command_id = clean_saved_value(payload.get("id"))
+    state_value = clean_saved_value(payload.get("state")) or "accepted"
+    if state_value not in {"accepted", "completed", "failed"}:
+        return jsonify({"ok": False, "error": "invalid state"}), 400
+    data = load_json(AGENT_UPDATE_COMMANDS_FILE, {"commands": []})
+    commands = data.get("commands", []) if isinstance(data, dict) else []
+    changed = False
+    for row in commands:
+        if isinstance(row, dict) and row.get("id") == command_id:
+            row.update({"state": state_value, "message": clean_saved_value(payload.get("message")), "updatedAt": now_str()})
+            changed = True
+            break
+    if changed:
+        save_json(AGENT_UPDATE_COMMANDS_FILE, {"commands": commands})
+    return jsonify({"ok": True, "acknowledged": changed})
+
+
+@app.route("/api/router/agent/status", methods=["POST"])
+def api_router_agent_status():
+    if not check_hook_token():
+        return jsonify({"ok": False, "error": "bad agent token"}), 401
+    payload = request.get_json(silent=True) or {}
+    router = clean_saved_value(payload.get("router")) or primary_router_name()
+    status = {
+        "router": router, "version": clean_saved_value(payload.get("version")) or "未知",
+        "architecture": clean_saved_value(payload.get("architecture")),
+        "updateState": clean_saved_value(payload.get("updateState")) or "idle",
+        "message": clean_saved_value(payload.get("message")), "lastSeenAt": now_str(),
+    }
+    statuses = load_json(AGENT_STATUS_FILE, {})
+    if not isinstance(statuses, dict):
+        statuses = {}
+    statuses[router] = status
+    save_json(AGENT_STATUS_FILE, statuses)
+    data = load_json(AGENT_UPDATE_COMMANDS_FILE, {"commands": []})
+    commands = data.get("commands", []) if isinstance(data, dict) else []
+    changed = False
+    for row in commands:
+        if isinstance(row, dict) and row.get("router") == router and row.get("state") == "accepted" and version_parts(status["version"]) >= version_parts(row.get("targetVersion")):
+            row.update({"state": "completed", "message": f"已更新到 {status['version']}", "updatedAt": now_str()})
+            changed = True
+    if changed:
+        save_json(AGENT_UPDATE_COMMANDS_FILE, {"commands": commands})
+    return jsonify({"ok": True, "time": now_str()})
+
+
+@app.route("/.well-known/labprobe", methods=["GET"])
+def labprobe_discovery():
+    return jsonify({
+        "ok": True,
+        "name": hub_name(),
+        "version": APP_VERSION,
+        "advertiseUrl": advertise_url(),
+        "pairEndpoint": "/api/pair",
+        "capabilities": ["snapshot", "revision", "incremental", "client_tokens", "sqlite"],
+    })
+
+
+@app.route("/api/pair", methods=["POST"])
+def api_pair():
+    payload = request.get_json(silent=True) or {}
+    code = str(payload.get("pairingCode") or payload.get("code") or "").strip().upper()
+    role = str(payload.get("clientType") or payload.get("role") or "app").strip().lower()
+    name = str(payload.get("clientName") or payload.get("name") or role).strip()
+    if role not in {"app", "agent"} or not code:
+        return jsonify({"ok": False, "error": "invalid pairing request"}), 400
+    remote = request.remote_addr or "unknown"
+    try:
+        result = STORE.exchange_pairing_code(code, role, name, remote)
+    except PermissionError as exc:
+        message = str(exc)
+        if message.startswith("rate_limited:"):
+            retry_after = int(message.split(":", 1)[1])
+            return jsonify({"ok": False, "error": "rate_limited", "retryAfter": retry_after}), 429
+        return jsonify({"ok": False, "error": "invalid_or_expired_pairing_code"}), 401
+    LOGGER.info("paired client id=%s role=%s name=%s", result["clientId"][:8], role, name[:40])
+    return jsonify({"ok": True, **result, "hubName": hub_name(), "time": now_str()})
+
+
+@app.route("/api/pairing-codes", methods=["POST"])
+def api_create_pairing_code():
+    if not check_app_token():
+        return jsonify({"ok": False, "error": "unauthorized"}), 401
+    payload = request.get_json(silent=True) or {}
+    role = str(payload.get("role") or "agent").lower()
+    if role not in {"app", "agent"}:
+        return jsonify({"ok": False, "error": "role must be app or agent"}), 400
+    code = STORE.create_pairing_code(role, 600)
+    LOGGER.info("new %s pairing code=%s expires=10m", role, code)
+    return jsonify({"ok": True, "role": role, "pairingCode": code, "expiresIn": 600})
+
+
+@app.route("/api/clients", methods=["GET"])
+def api_clients():
+    if not check_app_token():
+        return jsonify({"ok": False, "error": "unauthorized"}), 401
+    return jsonify({"ok": True, "clients": STORE.list_clients()})
+
+
+@app.route("/api/clients/<client_id>", methods=["DELETE"])
+def api_revoke_client(client_id: str):
+    if not check_app_token():
+        return jsonify({"ok": False, "error": "unauthorized"}), 401
+    return jsonify({"ok": True, "revoked": STORE.revoke_client(client_id), "clientId": client_id})
+
+
+@app.route("/api/sync/revision", methods=["GET"])
+def api_sync_revision():
+    if not check_read_token():
+        return jsonify({"ok": False, "error": "unauthorized"}), 401
+    return jsonify({"ok": True, **STORE.revision_info(), "time": now_str()})
+
+
+@app.route("/api/sync/snapshot", methods=["GET"])
+def api_sync_snapshot():
+    if not check_read_token():
+        return jsonify({"ok": False, "error": "unauthorized"}), 401
+    return jsonify(build_sync_snapshot())
+
+
+@app.route("/api/sync/changes", methods=["GET"])
+def api_sync_changes():
+    if not check_read_token():
+        return jsonify({"ok": False, "error": "unauthorized"}), 401
+    try:
+        since = int(request.args.get("since", request.args.get("revision", "0")))
+        limit = int(request.args.get("limit", "500"))
+    except ValueError:
+        return jsonify({"ok": False, "error": "invalid revision or limit"}), 400
+    return jsonify({"ok": True, **STORE.changes_since(since, limit), "time": now_str()})
+
+
 @app.route("/health", methods=["GET"])
 def health():
-    return jsonify({"ok": True, "name": "LabProbe Hub", "version": APP_VERSION, "time": now_str()})
+    try:
+        database = STORE.status()
+        config_check = configuration_report()
+        ok = bool(database.get("ok")) and bool(config_check.get("ok"))
+        database.pop("path", None)
+        return jsonify({
+            "ok": ok,
+            "name": hub_name(),
+            "version": APP_VERSION,
+            "architecture": platform.machine(),
+            "database": database,
+            "configuration": config_check,
+            "time": now_str(),
+        }), (200 if ok else 503)
+    except Exception as exc:
+        LOGGER.error("health check failed: %s", exc)
+        return jsonify({"ok": False, "error": "health_check_failed", "time": now_str()}), 503
 
 
 @app.route("/hook/lucky", methods=["POST", "GET"])
@@ -2035,7 +2468,7 @@ def hook_ruijie_devices():
     state = load_json(STATE_FILE, {})
     state.setdefault("router", {})
     state["router"].update({
-        "name": cfg_get("router.name", "Ruijie"),
+        "name": primary_router_name(),
         "mode": "push",
         "onlineDeviceCount": len(online),
         "total": total,
@@ -2132,7 +2565,7 @@ def hook_ruijie_router():
 
     if wan_v6 and is_public_ipv6(str(wan_v6)):
         state["router"].update({
-            "name": cfg_get("router.name", "Ruijie"),
+            "name": primary_router_name(),
             "wanIpv6": wan_v6,
             "exitIpv6": wan_v6,
             "routerUpdatedAt": now_str(),
@@ -2174,7 +2607,7 @@ def _refresh_status_cache_worker(force: bool = False) -> None:
         state["updatedAt"] = now_str()
         save_json(STATE_FILE, state)
     except Exception as e:
-        print(f"[LabProbe] background refresh failed: {e}", flush=True)
+        LOGGER.error("background refresh failed: %s", e)
     finally:
         with REFRESH_LOCK:
             REFRESH_RUNNING = False
@@ -2198,14 +2631,13 @@ def trigger_status_refresh_if_needed(state: Dict[str, Any], force: bool = False)
 # ---------------------------------------------------------------------------
 
 def _portmap_router_name() -> str:
-    # Use a stable agent identifier, not router.name (which is a display label and
-    # may contain spaces such as "Ruijie BE72"). The router installer defaults to
-    # BE72Pro, so both sides work without changing existing display-name config.
     return (
-        clean_saved_value(os.environ.get("PORTMAP_ROUTER_NAME"))
+        clean_saved_value(os.environ.get("PRIMARY_ROUTER_NAME"))
+        or clean_saved_value(os.environ.get("PORTMAP_ROUTER_NAME"))
         or clean_saved_value(cfg_get("router.portmap_id", ""))
         or clean_saved_value(cfg_get("router.agent_name", ""))
-        or "BE72Pro"
+        or clean_saved_value(cfg_get("router.name", ""))
+        or "Ruijie"
     )
 
 
@@ -2646,22 +3078,10 @@ def api_router_portmap_status():
 def api_status():
     if not check_read_token():
         return jsonify({"ok": False, "error": "unauthorized"}), 401
-    state = load_json(STATE_FILE, {})
+    state = status_document()
     force = request.args.get("refresh", "") in ["1", "true", "yes"]
     # v0.7.3：状态接口只返回缓存，避免外网 curl / DNS 卡住导致 APP 显示“连通但刷新不了”。
     trigger_status_refresh_if_needed(state, force=force)
-    state["hub"] = {
-        **(state.get("hub") if isinstance(state.get("hub"), dict) else {}),
-        "name": "LabProbe Hub",
-        "version": APP_VERSION,
-        "updatedAt": now_str(),
-        "statusMode": "cache_first",
-        "refreshRunning": REFRESH_RUNNING,
-    }
-    state["vpnStunAddresses"] = vpn_addresses_list(state)
-    state["vpnAddresses"] = state["vpnStunAddresses"]
-    devices_state = load_json(DEVICES_FILE, {"updatedAt": None})
-    state["devicesUpdatedAt"] = devices_state.get("updatedAt")
     return jsonify({"ok": True, "data": state})
 
 
@@ -3053,7 +3473,55 @@ def api_daily_list():
     return jsonify({"ok": True, "dates": recent_dates(7)})
 
 
-if __name__ == "__main__":
-    print(f"[LabProbe] Hub v{APP_VERSION} starting on 0.0.0.0:{PORT}", flush=True)
-    print(f"[LabProbe] config={CONFIG_PATH}, data={DATA_DIR}", flush=True)
+def command_line() -> int:
+    args = sys.argv[1:]
+    if args and args[0] in {"doctor", "status"}:
+        result = {
+            "ok": configuration_report()["ok"],
+            "version": APP_VERSION,
+            "architecture": platform.machine(),
+            "database": STORE.status(),
+            "configuration": configuration_report(),
+            "migration": MIGRATION_RESULT,
+        }
+        print(json.dumps(result, ensure_ascii=False, indent=2))
+        return 0 if result["ok"] else 1
+    if args and args[0] == "pairing-code":
+        role = "agent"
+        if "--role" in args:
+            index = args.index("--role")
+            if index + 1 < len(args):
+                role = args[index + 1]
+        if role not in {"app", "agent"}:
+            print("role must be app or agent", file=sys.stderr)
+            return 2
+        code = STORE.create_pairing_code(role, 600)
+        print(f"{role} pairing code: {code} (expires in 10 minutes, one-time)")
+        return 0
+    if args and args[0] == "test-hub":
+        try:
+            response = requests.get(advertise_url() + "/health", timeout=5)
+            print(response.text)
+            return 0 if response.ok else 1
+        except Exception as exc:
+            print(f"test-hub failed: {exc}", file=sys.stderr)
+            return 1
+
+    LOGGER.info("Hub v%s starting architecture=%s listen=0.0.0.0:%s", APP_VERSION, platform.machine(), PORT)
+    LOGGER.info("paths config=%s data=%s backups=%s logs=%s", CONFIG_PATH, DATA_DIR, BACKUPS_DIR, LOGS_DIR)
+    LOGGER.info("database schema=%s status=%s revision=%s", STORE.status()["schemaVersion"], MIGRATION_RESULT.get("status"), STORE.status()["revision"])
+    report = configuration_report()
+    for warning in report["warnings"]:
+        LOGGER.warning("configuration: %s", warning)
+    for error in report["errors"]:
+        LOGGER.error("configuration: %s", error)
+    if not STORE.has_active_client("app"):
+        LOGGER.warning("APP pairing code=%s expires=10m one-time", STORE.create_pairing_code("app", 600))
+    if not STORE.has_active_client("agent"):
+        LOGGER.warning("Agent pairing code=%s expires=10m one-time", STORE.create_pairing_code("agent", 600))
     app.run(host="0.0.0.0", port=PORT)
+    return 0
+
+
+if __name__ == "__main__":
+    raise SystemExit(command_line())
