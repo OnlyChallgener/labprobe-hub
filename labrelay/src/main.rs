@@ -1142,7 +1142,16 @@ async fn main() -> Result<()> {
             Ok(())
         }
         _ => {
-            eprintln!("Usage:\n  labrelay daemon [--config PATH] [--socket PATH] [--state PATH]\n  labrelay agent|agent-once [--config PATH]\n  labrelay pair --hub URL --code CODE --name NAME [--config PATH]\n  labrelay doctor|status|test-hub [--config PATH]\n  labrelay ctl '{\"action\":\"status\"}' [--socket PATH]\n  labrelay version");
+            eprintln!(
+                "{}",
+                r#"Usage:
+  labrelay daemon [--config PATH] [--socket PATH] [--state PATH]
+  labrelay agent|agent-once [--config PATH]
+  labrelay pair --hub URL --code CODE --name NAME [--config PATH]
+  labrelay doctor|status|test-hub [--config PATH]
+  labrelay ctl '{"action":"status"}' [--socket PATH]
+  labrelay version"#
+            );
             Ok(())
         }
     }
