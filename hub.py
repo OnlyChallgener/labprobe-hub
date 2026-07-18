@@ -134,12 +134,23 @@ MIGRATION_RESULT = STORE.initialize()
 class MqttRevisionPublisher:
     """Publish the retained revision signal; HTTP remains the data source of truth."""
 
+    @staticmethod
+    def _timestamp() -> str:
+        # This publisher starts while the module is still loading, so avoid
+        # depending on helpers declared later in the file from callback threads.
+        return datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+
     def __init__(self):
         self.enabled = bool(MQTT_PUBLIC_URL and MQTT_INTERNAL_HOST and MQTT_USERNAME and MQTT_PASSWORD)
         self.connected = False
         self._lock = threading.RLock()
         self._latest_revision = STORE.revision_info()["revision"]
         self._client = None
+        self._last_error = ""
+        self._connected_at = None
+        self._disconnected_at = None
+        self._last_publish_at = None
+        self._last_published_revision = 0
 
     def start(self) -> None:
         if not self.enabled:
@@ -156,19 +167,34 @@ class MqttRevisionPublisher:
         def on_connect(active, _userdata, _flags, reason_code, _properties):
             self.connected = not reason_code.is_failure
             if not self.connected:
+                with self._lock:
+                    self._last_error = f"connect rejected: {reason_code}"
+                    self._disconnected_at = self._timestamp()
                 LOGGER.warning("mqtt connect rejected reason=%s", reason_code)
                 return
+            with self._lock:
+                self._last_error = ""
+                self._connected_at = self._timestamp()
             LOGGER.info("mqtt realtime connected host=%s port=%s topic=%s", MQTT_INTERNAL_HOST, MQTT_INTERNAL_PORT, MQTT_REVISION_TOPIC)
             active.publish(MQTT_AVAILABILITY_TOPIC, payload="online", qos=1, retain=True)
             with self._lock:
                 revision = max(self._latest_revision, STORE.revision_info()["revision"])
                 self._latest_revision = revision
-            active.publish(MQTT_REVISION_TOPIC, json.dumps({"revision": revision}, separators=(",", ":")), qos=1, retain=True)
+            info = active.publish(MQTT_REVISION_TOPIC, json.dumps({"revision": revision}, separators=(",", ":")), qos=1, retain=True)
+            if info.rc == mqtt.MQTT_ERR_SUCCESS:
+                with self._lock:
+                    self._last_publish_at = self._timestamp()
+                    self._last_published_revision = revision
 
         def on_disconnect(_active, _userdata, _flags, reason_code, _properties):
             self.connected = False
+            with self._lock:
+                self._disconnected_at = self._timestamp()
+                self._last_error = "" if not reason_code else str(reason_code)
             if reason_code:
                 LOGGER.warning("mqtt realtime disconnected reason=%s; reconnecting in background", reason_code)
+            else:
+                LOGGER.info("mqtt realtime disconnected cleanly")
 
         client.on_connect = on_connect
         client.on_disconnect = on_disconnect
@@ -192,15 +218,27 @@ class MqttRevisionPublisher:
                 retain=True,
             )
             if info.rc != mqtt.MQTT_ERR_SUCCESS:
+                with self._lock:
+                    self._last_error = f"publish failed rc={info.rc}"
                 LOGGER.warning("mqtt revision publish queued/failed rc=%s revision=%s", info.rc, revision)
+            else:
+                with self._lock:
+                    self._last_publish_at = self._timestamp()
+                    self._last_published_revision = revision
 
     def status(self) -> Dict[str, Any]:
-        return {
-            "enabled": self.enabled,
-            "connected": self.connected,
-            "publicUrlConfigured": bool(MQTT_PUBLIC_URL),
-            "revisionTopic": MQTT_REVISION_TOPIC if self.enabled else "",
-        }
+        with self._lock:
+            return {
+                "enabled": self.enabled,
+                "connected": self.connected,
+                "publicUrlConfigured": bool(MQTT_PUBLIC_URL),
+                "revisionTopic": MQTT_REVISION_TOPIC if self.enabled else "",
+                "connectedAt": self._connected_at,
+                "disconnectedAt": self._disconnected_at,
+                "lastPublishAt": self._last_publish_at,
+                "lastPublishedRevision": self._last_published_revision,
+                "lastError": self._last_error,
+            }
 
 
 MQTT_PUBLISHER = MqttRevisionPublisher()
@@ -2465,6 +2503,7 @@ def health():
             "architecture": platform.machine(),
             "database": database,
             "configuration": config_check,
+            "mqtt": MQTT_PUBLISHER.status(),
             "time": now_str(),
         }), (200 if ok else 503)
     except Exception as exc:

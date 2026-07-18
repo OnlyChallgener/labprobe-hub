@@ -7,6 +7,7 @@ services:
     environment:
       MQTT_USERNAME: ${MQTT_USERNAME:-labprobe}
       MQTT_PASSWORD: ${MQTT_PASSWORD:-change-mqtt-password}
+      MQTT_LOCAL_BIND: 127.0.0.1
     entrypoint:
       - /bin/sh
       - -ec
@@ -14,8 +15,31 @@ services:
         mkdir -p /mosquitto/config/runtime
         rm -f /mosquitto/config/runtime/passwords /mosquitto/config/runtime/passwords.tmp
         mosquitto_passwd -b -c /mosquitto/config/runtime/passwords "$$MQTT_USERNAME" "$$MQTT_PASSWORD"
+        {
+          echo "persistence true"
+          echo "persistence_location /mosquitto/data/"
+          echo "log_dest stdout"
+          echo "log_timestamp true"
+          echo "connection_messages true"
+          echo "log_type error"
+          echo "log_type warning"
+          echo "log_type notice"
+          echo "log_type information"
+          echo ""
+          echo "listener 1883 $$MQTT_LOCAL_BIND"
+          echo "protocol mqtt"
+          echo "allow_anonymous false"
+          echo "password_file /mosquitto/config/runtime/passwords"
+          echo ""
+          echo "listener 9001 0.0.0.0"
+          echo "protocol websockets"
+          echo "allow_anonymous false"
+          echo "password_file /mosquitto/config/runtime/passwords"
+        } > /mosquitto/config/runtime/mosquitto.conf
         chown -R 1883:1883 /mosquitto/config/runtime
         chmod 600 /mosquitto/config/runtime/passwords
+        chmod 644 /mosquitto/config/runtime/mosquitto.conf
+        echo "MQTT configuration generated; connection logging enabled"
     volumes:
       - ./config/mqtt:/mosquitto/config/runtime
 
@@ -30,8 +54,8 @@ services:
     environment:
       MQTT_USERNAME: ${MQTT_USERNAME:-labprobe}
       MQTT_PASSWORD: ${MQTT_PASSWORD:-change-mqtt-password}
+    command: ["mosquitto", "-c", "/mosquitto/config/runtime/mosquitto.conf"]
     volumes:
-      - ./mqtt/mosquitto.host.conf:/mosquitto/config/mosquitto.conf:ro
       - ./config/mqtt:/mosquitto/config/runtime:ro
       - ./data/mqtt:/mosquitto/data
     healthcheck:
