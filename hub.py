@@ -1056,6 +1056,36 @@ def hydrate_watched_list(items: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
     return [hydrate_device_with_archive(d, archive) for d in (items or [])]
 
 
+def archived_offline_devices(
+    online: Optional[List[Dict[str, Any]]] = None,
+    archive: Optional[Dict[str, Dict[str, Any]]] = None,
+) -> List[Dict[str, Any]]:
+    """Return the last known snapshot for devices no longer reported online.
+
+    The Hub keeps one durable snapshot per MAC.  APP-side presentation performs
+    conservative stable-name grouping for privacy/randomized MAC addresses and
+    keeps per-client dismissals local, so deleting a card never destroys history.
+    """
+    archive = archive if archive is not None else load_device_archive()
+    online_macs = {norm_mac(item.get("mac")) for item in (online or []) if norm_mac(item.get("mac"))}
+    rows: List[Dict[str, Any]] = []
+    for mac, snapshot in archive.items():
+        normalized_mac = norm_mac(mac or snapshot.get("mac"))
+        if not normalized_mac or normalized_mac in online_macs:
+            continue
+        item = dict(snapshot)
+        item["mac"] = normalized_mac
+        item["online"] = False
+        item["offlineAt"] = clean_saved_value(item.get("offlineAt")) or clean_saved_value(item.get("archivedAt"))
+        item["lastSeenAt"] = clean_saved_value(item.get("lastSeenAt")) or item["offlineAt"]
+        rows.append(hydrate_device_with_archive(item, archive))
+    rows.sort(
+        key=lambda item: clean_saved_value(item.get("offlineAt") or item.get("lastSeenAt") or item.get("archivedAt")),
+        reverse=True,
+    )
+    return rows[:500]
+
+
 def parse_time_safe(v: Any) -> Optional[datetime]:
     if not v:
         return None
@@ -2199,6 +2229,7 @@ def build_sync_snapshot() -> Dict[str, Any]:
         archive = load_device_archive()
         online = [hydrate_device_with_archive(d, archive) for d in (devices_state.get("online", []) or [])]
         watched = [hydrate_device_with_archive(d, archive) for d in (devices_state.get("watched", []) or [])]
+        offline = archived_offline_devices(online, archive)
         events = [e for e in load_json(EVENTS_FILE, []) if not e.get("deleted")]
         after = STORE.revision_info()["revision"]
         if before == after:
@@ -2213,6 +2244,7 @@ def build_sync_snapshot() -> Dict[str, Any]:
             "updatedAt": devices_state.get("updatedAt"),
             "onlineDeviceCount": devices_state.get("onlineDeviceCount", len(online)),
             "online": online,
+            "offline": offline,
             "watched": watched,
         },
         "events": events,
@@ -3028,7 +3060,11 @@ def _portmap_runtime_map(router_status: Dict[str, Any]) -> Dict[str, Dict[str, A
     for row in status.get("rules", []) if isinstance(status, dict) else []:
         if not isinstance(row, dict):
             continue
-        runtime = row.get("runtime") if isinstance(row.get("runtime"), dict) else {}
+        runtime = dict(row.get("runtime")) if isinstance(row.get("runtime"), dict) else {}
+        for epoch_key in ("startedAt", "expiresAt", "lastResolvedAt"):
+            normalized_epoch = _portmap_epoch(runtime.get(epoch_key))
+            if normalized_epoch is not None:
+                runtime[epoch_key] = normalized_epoch
         rule = row.get("rule") if isinstance(row.get("rule"), dict) else {}
         rid = clean_saved_value(runtime.get("id") or rule.get("id"))
         if rid:
@@ -3326,9 +3362,13 @@ def api_devices():
         return jsonify({"ok": False, "error": "unauthorized"}), 401
     devices = load_json(DEVICES_FILE, {"online": [], "watched": [], "updatedAt": None})
     view = request.args.get("view", "watched")
-    key = view if view in ["online", "watched"] else "watched"
     archive = load_device_archive()
-    items = [hydrate_device_with_archive(d, archive) for d in (devices.get(key, []) or [])]
+    online = [hydrate_device_with_archive(d, archive) for d in (devices.get("online", []) or [])]
+    if view == "offline":
+        items = archived_offline_devices(online, archive)
+    else:
+        key = view if view in ["online", "watched"] else "watched"
+        items = online if key == "online" else [hydrate_device_with_archive(d, archive) for d in (devices.get(key, []) or [])]
     # v0.7.8：online / watched 都在返回前按 MAC 合并 IPv6 邻居归档，避免 Router Agent 已上报但 APP 仍显示 --。
     archive = load_device_archive()
     ipv6_neighbor_count = sum(1 for _, a in archive.items() if normalize_ipv6_list(a.get("ipv6List") or []))
