@@ -12,6 +12,7 @@ services:
       - -ec
       - |
         mkdir -p /mosquitto/config/runtime
+        rm -f /mosquitto/config/runtime/passwords /mosquitto/config/runtime/passwords.tmp
         mosquitto_passwd -b -c /mosquitto/config/runtime/passwords "$$MQTT_USERNAME" "$$MQTT_PASSWORD"
         chown -R 1883:1883 /mosquitto/config/runtime
         chmod 600 /mosquitto/config/runtime/passwords
