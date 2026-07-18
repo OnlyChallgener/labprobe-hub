@@ -1,8 +1,4 @@
 services:
-  mqtt-init:
-    extends:
-      file: docker-compose.host.yml
-      service: mqtt-init
   labprobe-mqtt:
     extends:
       file: docker-compose.host.yml

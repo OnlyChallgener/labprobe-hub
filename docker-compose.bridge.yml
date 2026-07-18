@@ -1,9 +1,9 @@
 services:
-  mqtt-init:
+  labprobe-mqtt:
     image: eclipse-mosquitto:2
-    container_name: labprobe-mqtt-init
+    container_name: labprobe-mqtt
     user: "0:0"
-    restart: "no"
+    restart: unless-stopped
     environment:
       MQTT_USERNAME: ${MQTT_USERNAME:-labprobe}
       MQTT_PASSWORD: ${MQTT_PASSWORD:-change-mqtt-password}
@@ -12,10 +12,11 @@ services:
       - /bin/sh
       - -ec
       - |
-        mkdir -p /mosquitto/config/runtime
+        mkdir -p /mosquitto/config/runtime /mosquitto/data
         rm -f /mosquitto/config/runtime/passwords /mosquitto/config/runtime/passwords.tmp
         mosquitto_passwd -b -c /mosquitto/config/runtime/passwords "$$MQTT_USERNAME" "$$MQTT_PASSWORD"
         {
+          echo "user mosquitto"
           echo "persistence true"
           echo "persistence_location /mosquitto/data/"
           echo "log_dest stdout"
@@ -36,28 +37,15 @@ services:
           echo "allow_anonymous false"
           echo "password_file /mosquitto/config/runtime/passwords"
         } > /mosquitto/config/runtime/mosquitto.conf
-        chown -R 1883:1883 /mosquitto/config/runtime
+        chown -R 1883:1883 /mosquitto/config/runtime /mosquitto/data
         chmod 600 /mosquitto/config/runtime/passwords
         chmod 644 /mosquitto/config/runtime/mosquitto.conf
-        echo "MQTT configuration generated; connection logging enabled"
-    volumes:
-      - ./config/mqtt:/mosquitto/config/runtime
-
-  labprobe-mqtt:
-    image: eclipse-mosquitto:2
-    container_name: labprobe-mqtt
-    restart: unless-stopped
-    depends_on:
-      mqtt-init:
-        condition: service_completed_successfully
-    environment:
-      MQTT_USERNAME: ${MQTT_USERNAME:-labprobe}
-      MQTT_PASSWORD: ${MQTT_PASSWORD:-change-mqtt-password}
-    command: ["mosquitto", "-c", "/mosquitto/config/runtime/mosquitto.conf"]
+        echo "MQTT configuration ready; starting broker"
+        exec mosquitto -c /mosquitto/config/runtime/mosquitto.conf
     ports:
       - "${MQTT_WS_BIND:-0.0.0.0}:${MQTT_WS_PORT:-9001}:9001"
     volumes:
-      - ./config/mqtt:/mosquitto/config/runtime:ro
+      - ./config/mqtt:/mosquitto/config/runtime
       - ./data/mqtt:/mosquitto/data
     healthcheck:
       test: ["CMD-SHELL", "mosquitto_pub -h 127.0.0.1 -p 1883 -u \"$$MQTT_USERNAME\" -P \"$$MQTT_PASSWORD\" -t labprobe/health -m ping -q 1"]
