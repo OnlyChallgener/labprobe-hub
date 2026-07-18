@@ -1,11 +1,55 @@
 services:
+  mqtt-init:
+    image: eclipse-mosquitto:2
+    container_name: labprobe-mqtt-init
+    user: "0:0"
+    restart: "no"
+    environment:
+      MQTT_USERNAME: ${MQTT_USERNAME:-labprobe}
+      MQTT_PASSWORD: ${MQTT_PASSWORD:-change-mqtt-password}
+    entrypoint:
+      - /bin/sh
+      - -ec
+      - |
+        mkdir -p /mosquitto/config/runtime
+        mosquitto_passwd -b -c /mosquitto/config/runtime/passwords "$$MQTT_USERNAME" "$$MQTT_PASSWORD"
+        chown -R 1883:1883 /mosquitto/config/runtime
+        chmod 600 /mosquitto/config/runtime/passwords
+    volumes:
+      - ./config/mqtt:/mosquitto/config/runtime
+
+  labprobe-mqtt:
+    image: eclipse-mosquitto:2
+    container_name: labprobe-mqtt
+    restart: unless-stopped
+    depends_on:
+      mqtt-init:
+        condition: service_completed_successfully
+    environment:
+      MQTT_USERNAME: ${MQTT_USERNAME:-labprobe}
+      MQTT_PASSWORD: ${MQTT_PASSWORD:-change-mqtt-password}
+    ports:
+      - "${MQTT_WS_BIND:-0.0.0.0}:${MQTT_WS_PORT:-9001}:9001"
+    volumes:
+      - ./mqtt/mosquitto.bridge.conf:/mosquitto/config/mosquitto.conf:ro
+      - ./config/mqtt:/mosquitto/config/runtime:ro
+      - ./data/mqtt:/mosquitto/data
+    healthcheck:
+      test: ["CMD-SHELL", "mosquitto_pub -h 127.0.0.1 -p 1883 -u \"$$MQTT_USERNAME\" -P \"$$MQTT_PASSWORD\" -t labprobe/health -m ping -q 1"]
+      interval: 20s
+      timeout: 5s
+      retries: 5
+
   labprobe-hub:
-    image: ${LABPROBE_IMAGE:-onlychallgener/labprobe-hub:0.9.0}
+    image: ${LABPROBE_IMAGE:-onlychallgener/labprobe-hub:latest}
     build:
       context: .
       dockerfile: Dockerfile
     container_name: labprobe-hub
     restart: unless-stopped
+    depends_on:
+      labprobe-mqtt:
+        condition: service_healthy
     ports:
       - "${PORT:-58443}:${PORT:-58443}"
     environment:
@@ -31,6 +75,12 @@ services:
       NAS_IPV6: ${NAS_IPV6:-}
       NAS_MAC: ${NAS_MAC:-}
       PORTMAP_ROUTER_NAME: ${PORTMAP_ROUTER_NAME:-}
+      MQTT_PUBLIC_URL: ${MQTT_PUBLIC_URL:-}
+      MQTT_INTERNAL_HOST: labprobe-mqtt
+      MQTT_INTERNAL_PORT: 1883
+      MQTT_USERNAME: ${MQTT_USERNAME:-labprobe}
+      MQTT_PASSWORD: ${MQTT_PASSWORD:-change-mqtt-password}
+      MQTT_TOPIC_PREFIX: ${MQTT_TOPIC_PREFIX:-labprobe/hub}
     volumes:
       - ./data:/app/data
       - ./config:/app/config

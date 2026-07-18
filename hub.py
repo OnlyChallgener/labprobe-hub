@@ -19,6 +19,7 @@ from typing import Any, Dict, List, Optional, Tuple
 import yaml
 import requests
 import dns.resolver
+import paho.mqtt.client as mqtt
 from flask import Flask, request, jsonify
 from labprobe_storage import SQLiteStore
 
@@ -63,6 +64,14 @@ UPDATE_REPOSITORY_ROOT = (os.environ.get("UPDATE_REPOSITORY_ROOT") or "").strip(
 AGENT_MANIFEST_URL = f"{UPDATE_REPOSITORY_ROOT}/agent/latest.json"
 AGENT_INSTALLER_URL = f"{UPDATE_REPOSITORY_ROOT}/agent/install.sh"
 AGENT_RELEASE_CACHE: Dict[str, Any] = {"at": 0.0, "data": None}
+MQTT_PUBLIC_URL = (os.environ.get("MQTT_PUBLIC_URL") or "").strip()
+MQTT_INTERNAL_HOST = (os.environ.get("MQTT_INTERNAL_HOST") or "127.0.0.1").strip()
+MQTT_INTERNAL_PORT = int(os.environ.get("MQTT_INTERNAL_PORT", "1883"))
+MQTT_USERNAME = (os.environ.get("MQTT_USERNAME") or "labprobe").strip()
+MQTT_PASSWORD = (os.environ.get("MQTT_PASSWORD") or "").strip()
+MQTT_TOPIC_PREFIX = re.sub(r"[^A-Za-z0-9._/-]+", "-", (os.environ.get("MQTT_TOPIC_PREFIX") or "labprobe/hub").strip()).strip("/")
+MQTT_REVISION_TOPIC = f"{MQTT_TOPIC_PREFIX}/sync/revision"
+MQTT_AVAILABILITY_TOPIC = f"{MQTT_TOPIC_PREFIX}/availability"
 
 
 class SecretRedactionFilter(logging.Filter):
@@ -122,6 +131,82 @@ LOGGER = configure_logging()
 MIGRATION_RESULT = STORE.initialize()
 
 
+class MqttRevisionPublisher:
+    """Publish the retained revision signal; HTTP remains the data source of truth."""
+
+    def __init__(self):
+        self.enabled = bool(MQTT_PUBLIC_URL and MQTT_INTERNAL_HOST and MQTT_USERNAME and MQTT_PASSWORD)
+        self.connected = False
+        self._lock = threading.RLock()
+        self._latest_revision = STORE.revision_info()["revision"]
+        self._client = None
+
+    def start(self) -> None:
+        if not self.enabled:
+            LOGGER.info("mqtt realtime disabled; configure MQTT_PUBLIC_URL and MQTT_PASSWORD to enable")
+            return
+        client = mqtt.Client(
+            callback_api_version=mqtt.CallbackAPIVersion.VERSION2,
+            client_id=f"labprobe-hub-{secrets.token_hex(6)}",
+            protocol=mqtt.MQTTv311,
+        )
+        client.username_pw_set(MQTT_USERNAME, MQTT_PASSWORD)
+        client.will_set(MQTT_AVAILABILITY_TOPIC, payload="offline", qos=1, retain=True)
+
+        def on_connect(active, _userdata, _flags, reason_code, _properties):
+            self.connected = not reason_code.is_failure
+            if not self.connected:
+                LOGGER.warning("mqtt connect rejected reason=%s", reason_code)
+                return
+            LOGGER.info("mqtt realtime connected host=%s port=%s topic=%s", MQTT_INTERNAL_HOST, MQTT_INTERNAL_PORT, MQTT_REVISION_TOPIC)
+            active.publish(MQTT_AVAILABILITY_TOPIC, payload="online", qos=1, retain=True)
+            with self._lock:
+                revision = max(self._latest_revision, STORE.revision_info()["revision"])
+                self._latest_revision = revision
+            active.publish(MQTT_REVISION_TOPIC, json.dumps({"revision": revision}, separators=(",", ":")), qos=1, retain=True)
+
+        def on_disconnect(_active, _userdata, _flags, reason_code, _properties):
+            self.connected = False
+            if reason_code:
+                LOGGER.warning("mqtt realtime disconnected reason=%s; reconnecting in background", reason_code)
+
+        client.on_connect = on_connect
+        client.on_disconnect = on_disconnect
+        client.reconnect_delay_set(min_delay=1, max_delay=60)
+        client.connect_async(MQTT_INTERNAL_HOST, MQTT_INTERNAL_PORT, keepalive=25)
+        client.loop_start()
+        self._client = client
+
+    def notify_revision(self, revision: int) -> None:
+        if not self.enabled or revision <= 0:
+            return
+        with self._lock:
+            if revision <= self._latest_revision:
+                return
+            self._latest_revision = revision
+        if self.connected and self._client is not None:
+            info = self._client.publish(
+                MQTT_REVISION_TOPIC,
+                json.dumps({"revision": revision}, separators=(",", ":")),
+                qos=1,
+                retain=True,
+            )
+            if info.rc != mqtt.MQTT_ERR_SUCCESS:
+                LOGGER.warning("mqtt revision publish queued/failed rc=%s revision=%s", info.rc, revision)
+
+    def status(self) -> Dict[str, Any]:
+        return {
+            "enabled": self.enabled,
+            "connected": self.connected,
+            "publicUrlConfigured": bool(MQTT_PUBLIC_URL),
+            "revisionTopic": MQTT_REVISION_TOPIC if self.enabled else "",
+        }
+
+
+MQTT_PUBLISHER = MqttRevisionPublisher()
+MQTT_PUBLISHER.start()
+
+
 @app.before_request
 def lock_request_data():
     # Existing handlers use read/modify/write document operations. Serializing
@@ -168,7 +253,9 @@ def load_json(path: Path, default: Any) -> Any:
 def save_json(path: Path, data: Any) -> None:
     # SQLite 事务同时保存文档和 revision；旧 JSON 仅保留在迁移备份中。
     with DATA_LOCK:
-        STORE.save(path, data)
+        revision = STORE.save(path, data)
+        if path in {STATE_FILE, DEVICES_FILE, EVENTS_FILE}:
+            MQTT_PUBLISHER.notify_revision(revision)
 
 
 def load_config() -> Dict[str, Any]:
@@ -2015,6 +2102,10 @@ def configuration_report() -> Dict[str, Any]:
         warnings.append("legacy HOOK_TOKEN uses the default placeholder; pair an agent or configure HOOK_TOKEN")
     if advertise_url().startswith("http://127."):
         warnings.append("HUB_ADVERTISE_URL is not configured")
+    if MQTT_PUBLIC_URL and not MQTT_PASSWORD:
+        errors.append("MQTT_PUBLIC_URL is configured but MQTT_PASSWORD is empty")
+    if MQTT_PASSWORD == "change-mqtt-password":
+        warnings.append("MQTT_PASSWORD uses the default placeholder")
     return {
         "ok": not errors,
         "errors": errors,
@@ -2029,7 +2120,7 @@ def status_document() -> Dict[str, Any]:
         **(state.get("hub") if isinstance(state.get("hub"), dict) else {}),
         "name": hub_name(),
         "version": APP_VERSION,
-        "updatedAt": now_str(),
+        "updatedAt": state.get("updatedAt"),
         "statusMode": "cache_first",
         "refreshRunning": REFRESH_RUNNING,
         "advertiseUrl": advertise_url(),
@@ -2038,7 +2129,25 @@ def status_document() -> Dict[str, Any]:
     state["vpnAddresses"] = state["vpnStunAddresses"]
     devices_state = load_json(DEVICES_FILE, {"updatedAt": None})
     state["devicesUpdatedAt"] = devices_state.get("updatedAt")
+    if isinstance(state.get("hub"), dict):
+        state["hub"]["updatedAt"] = state.get("updatedAt") or devices_state.get("updatedAt")
     return state
+
+
+def mqtt_client_config(include_secret: bool = True) -> Dict[str, Any]:
+    enabled = bool(MQTT_PUBLIC_URL and MQTT_USERNAME and MQTT_PASSWORD)
+    result = {
+        "enabled": enabled,
+        "publicUrl": MQTT_PUBLIC_URL if enabled else "",
+        "username": MQTT_USERNAME if enabled else "",
+        "revisionTopic": MQTT_REVISION_TOPIC if enabled else "",
+        "availabilityTopic": MQTT_AVAILABILITY_TOPIC if enabled else "",
+        "transport": "wss" if MQTT_PUBLIC_URL.lower().startswith("wss://") else "mqtt",
+        "keepAliveSeconds": 25,
+    }
+    if include_secret:
+        result["password"] = MQTT_PASSWORD if enabled else ""
+    return result
 
 
 def build_sync_snapshot() -> Dict[str, Any]:
@@ -2249,7 +2358,8 @@ def labprobe_discovery():
         "version": APP_VERSION,
         "advertiseUrl": advertise_url(),
         "pairEndpoint": "/api/pair",
-        "capabilities": ["snapshot", "revision", "incremental", "client_tokens", "sqlite"],
+        "capabilities": ["snapshot", "revision", "incremental", "client_tokens", "sqlite", "mqtt_revision"],
+        "mqtt": mqtt_client_config(include_secret=False),
     })
 
 
@@ -2271,7 +2381,14 @@ def api_pair():
             return jsonify({"ok": False, "error": "rate_limited", "retryAfter": retry_after}), 429
         return jsonify({"ok": False, "error": "invalid_or_expired_pairing_code"}), 401
     LOGGER.info("paired client id=%s role=%s name=%s", result["clientId"][:8], role, name[:40])
-    return jsonify({"ok": True, **result, "hubName": hub_name(), "time": now_str()})
+    return jsonify({"ok": True, **result, "hubName": hub_name(), "mqtt": mqtt_client_config(), "time": now_str()})
+
+
+@app.route("/api/mqtt/config", methods=["GET"])
+def api_mqtt_config():
+    if not check_app_token():
+        return jsonify({"ok": False, "error": "unauthorized"}), 401
+    return jsonify({"ok": True, "mqtt": mqtt_client_config(), "time": now_str()})
 
 
 @app.route("/api/pairing-codes", methods=["POST"])
@@ -2324,7 +2441,14 @@ def api_sync_changes():
         limit = int(request.args.get("limit", "500"))
     except ValueError:
         return jsonify({"ok": False, "error": "invalid revision or limit"}), 400
-    return jsonify({"ok": True, **STORE.changes_since(since, limit), "time": now_str()})
+    result = STORE.changes_since(since, limit)
+    canonical_status = None
+    for change in result.get("changes", []):
+        if change.get("entity") == "status" and change.get("operation") != "delete":
+            if canonical_status is None:
+                canonical_status = status_document()
+            change["payload"] = canonical_status
+    return jsonify({"ok": True, **result, "time": now_str()})
 
 
 @app.route("/health", methods=["GET"])
@@ -3533,6 +3657,7 @@ def command_line() -> int:
     LOGGER.info("Hub v%s starting architecture=%s listen=0.0.0.0:%s", APP_VERSION, platform.machine(), PORT)
     LOGGER.info("paths config=%s data=%s backups=%s logs=%s", CONFIG_PATH, DATA_DIR, BACKUPS_DIR, LOGS_DIR)
     LOGGER.info("database schema=%s status=%s revision=%s", STORE.status()["schemaVersion"], MIGRATION_RESULT.get("status"), STORE.status()["revision"])
+    LOGGER.info("mqtt enabled=%s connected=%s public=%s", MQTT_PUBLISHER.enabled, MQTT_PUBLISHER.connected, bool(MQTT_PUBLIC_URL))
     report = configuration_report()
     for warning in report["warnings"]:
         LOGGER.warning("configuration: %s", warning)

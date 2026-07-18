@@ -274,18 +274,39 @@ class SQLiteStore:
         if key == "devices.json":
             old_obj = old if isinstance(old, dict) else {}
             new_obj = new if isinstance(new, dict) else {}
+            old_meta = {
+                "onlineDeviceCount": old_obj.get("onlineDeviceCount", len(old_obj.get("online", []) or [])),
+                "total": old_obj.get("total", 0),
+            }
+            new_meta = {
+                "onlineDeviceCount": new_obj.get("onlineDeviceCount", len(new_obj.get("online", []) or [])),
+                "total": new_obj.get("total", 0),
+            }
+            meta_changes = []
+            if old_meta != new_meta:
+                meta_changes.append(("device_meta", "replace", "devices", new_meta))
             return (
                 self._list_diff("device", old_obj.get("watched", []), new_obj.get("watched", []))
                 + self._list_diff("online_device", old_obj.get("online", []), new_obj.get("online", []))
-                + [("device_meta", "replace", "devices", {
-                    "updatedAt": new_obj.get("updatedAt"),
-                    "onlineDeviceCount": new_obj.get("onlineDeviceCount", 0),
-                    "total": new_obj.get("total", 0),
-                })]
+                + meta_changes
             )
         if key == "events.json":
             return self._list_diff("event", old if isinstance(old, list) else [], new if isinstance(new, list) else [])
         if key == "state.json":
+            def stable_status(value: Any) -> Any:
+                if not isinstance(value, dict):
+                    return value
+                clean = json.loads(json.dumps(value))
+                clean.pop("updatedAt", None)
+                router = clean.get("router")
+                if isinstance(router, dict):
+                    router.pop("devicesUpdatedAt", None)
+                hub = clean.get("hub")
+                if isinstance(hub, dict):
+                    hub.pop("updatedAt", None)
+                return clean
+            if stable_status(old) == stable_status(new):
+                return []
             return [("status", "replace", "status", new)]
         return [("document", "replace", key, new)]
 
