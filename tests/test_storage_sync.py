@@ -7,7 +7,7 @@ from labprobe_storage import SQLiteStore
 
 
 class SQLiteMigrationTests(unittest.TestCase):
-    def test_json_migration_backup_revision_and_pairing(self):
+    def test_json_migration_backup_and_revision(self):
         with tempfile.TemporaryDirectory() as root:
             base = Path(root)
             data = base / "data"
@@ -39,13 +39,6 @@ class SQLiteMigrationTests(unittest.TestCase):
             delta = store.changes_since(0)
             self.assertFalse(delta["fullRequired"])
             self.assertTrue(any(change["entity"] == "device" for change in delta["changes"]))
-
-            code = store.create_pairing_code("app", 600)
-            paired = store.exchange_pairing_code(code, "app", "test phone", "127.0.0.1")
-            self.assertTrue(paired["clientToken"].startswith("lp_"))
-            self.assertTrue(store.authenticate(paired["clientToken"], {"app"}))
-            with self.assertRaises(PermissionError):
-                store.exchange_pairing_code(code, "app", "second phone", "127.0.0.2")
 
 
 if __name__ == "__main__":

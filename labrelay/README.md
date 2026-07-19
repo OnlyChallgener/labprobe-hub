@@ -19,6 +19,16 @@
 - `ip`、`curl`、OpenWrt `procd`
 - 手动放行 WAN6 → 路由器 INPUT TCP 20000–20020
 
+## Agent 配置
+
+LabRelay 直接使用 Hub 的 `HOOK_TOKEN`，不再使用配对码：
+
+```sh
+labrelay configure --hub http://192.168.1.20:58443 --hook-token YOUR_HOOK_TOKEN --name router
+labrelay test-hub
+```
+
+配置文件中的字段名为 `hookToken`，默认路径为 `/etc/labprobe/agent.json`。
 ## 本机测试
 
 ```sh

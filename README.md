@@ -4,6 +4,7 @@ LabProbe Hub 可部署在任意 Linux AMD64/ARM64 宿主机，包括服务器、
 
 版本变化统一记录在 [`CHANGELOG.md`](CHANGELOG.md)。旧 DSM/NAS 部署文档和旧 Shell 采集入口已归档到 Git 历史，请勿用于新安装。
 
+
 ## 运行目录
 
 - `./data`：SQLite 数据库 `labprobe.db`
@@ -12,6 +13,7 @@ LabProbe Hub 可部署在任意 Linux AMD64/ARM64 宿主机，包括服务器、
 - `./logs`：Hub 轮转日志
 
 不再依赖厂商目录、固定 IP 或特定设备名称。
+
 
 ## 配置与 Docker
 
@@ -26,6 +28,8 @@ cp config.example.yaml config/config.yaml
 ```dotenv
 HUB_NAME=LabProbe Hub
 PRIMARY_ROUTER_NAME=
+APP_TOKEN=请改为长随机令牌
+HOOK_TOKEN=请改为另一条长随机令牌
 HUB_ADVERTISE_URL=http://192.168.1.20:58443
 HUB_HOST_IPV4=192.168.1.20
 HUB_HOST_IPV6=
@@ -34,7 +38,7 @@ HUB_HOST_MAC=
 UPDATE_REPOSITORY_ROOT=
 ```
 
-公网反向代理可使用 `https://hub.example.com`。`PRIMARY_ROUTER_NAME` 可留空，Hub 会优先使用 Rust Agent 实际上报的路由器名；旧 `NAS_IPV4`、`NAS_IPV6`、`NAS_MAC`、`APP_TOKEN`、`HOOK_TOKEN` 和 `PORTMAP_ROUTER_NAME` 仍兼容。
+公网反向代理可使用 `https://hub.example.com`。`PRIMARY_ROUTER_NAME` 可留空，Hub 会优先使用 Rust Agent 实际上报的路由器名。旧 `NAS_IPV4`、`NAS_IPV6`、`NAS_MAC` 和 `PORTMAP_ROUTER_NAME` 仍兼容。
 
 Host 网络适合需要局域网广播 WOL 的部署：
 
@@ -50,6 +54,7 @@ docker compose -f docker-compose.bridge.yml up -d --build
 
 CI 使用 Buildx 同时构建 `linux/amd64` 和 `linux/arm64`，容器内置 `/health` HEALTHCHECK。
 
+
 ## JSON 到 SQLite
 
 首次启动会扫描 `./data` 下全部 JSON（包括备注子目录），先复制到 `./backups/json-migration-时间/`，再在事务中写入 `./data/labprobe.db`。写入后校验文档数量并执行 SQLite `integrity_check`；失败会删除未完成的新数据库，旧 JSON 和备份不变。
@@ -62,21 +67,15 @@ docker exec labprobe-hub python /app/hub.py status
 docker exec labprobe-hub python /app/hub.py test-hub
 ```
 
-## 配对与 Token
 
-首次启动日志显示有效期 10 分钟、只能使用一次的 APP 和 Agent 配对码：
+## Token 鉴权
 
-```sh
-docker logs labprobe-hub
-```
+Hub 使用两个必须自行设置的独立令牌：
 
-APP 在原 Token 输入框填写 `APP-123456`，连接时自动换取独立 Client Token并用 Android Keystore保存。Agent 使用 `AGT-123456`。Hub 只保存 Token 哈希，连续错误配对会限流。
+- `APP_TOKEN`：供 Android APP 的管理、状态与同步请求使用。
+- `HOOK_TOKEN`：供 LabRelay、Lucky 和 Webhook 上报及路由器接口使用。
 
-```sh
-docker exec labprobe-hub python /app/hub.py pairing-code --role agent
-```
-
-可通过 `GET /api/clients` 查看客户端、`DELETE /api/clients/{clientId}` 单独吊销。旧 `APP_TOKEN`、`HOOK_TOKEN` 保持兼容。
+在 `.env` 或 `config/config.yaml` 中填写强随机值，重启 Hub 后，在 APP 设置页填写相同的 `APP_TOKEN` 与 `HOOK_TOKEN`；安装 LabRelay 时填写相同的 `HOOK_TOKEN`。Hub 不再生成配对码，也不再签发 Client Token。
 
 ## 同步协议
 
@@ -88,16 +87,17 @@ docker exec labprobe-hub python /app/hub.py pairing-code --role agent
 
 设备、事件和状态与 revision 在同一 SQLite 事务中写入。APP首次、重连、前台恢复、网络切换和每 5 分钟完整校准，其余刷新仅应用增量。
 
+
 ## 锐捷 Rust Agent
 
-在 Hub 创建 Agent 配对码后执行：
+SSH 登录已适配的锐捷路由器后执行：
 
 ```sh
 wget -O /tmp/labprobe-install.sh https://lab.net86.dynv6.net:27772/agent/install.sh \
 && sh /tmp/labprobe-install.sh
 ```
 
-安装器兼容 BusyBox ash，会检测锐捷环境、CPU、空间、Hub和SHA256。下载 Rust 程序时优先使用 `curl --progress-bar --fail --location`，否则使用带默认进度输出的 BusyBox `wget`；不会使用静默参数，并会显示下载完成大小或明确的失败原因。首次安装只询问是否安装、自动发现的Hub是否正确、Agent配对码和最终确认。Rust接管 `dev_sta/user_list` 采集、上线/离线事件、IPv6邻居、端口映射、重试与日志；Shell只负责安装、启动和卸载。
+安装器兼容 BusyBox ash，会检测锐捷环境、CPU、空间、Hub 和 SHA256，并在首次安装或重新配置时要求输入 Hub 的 `HOOK_TOKEN`。也可以预先设置 `HOOK_TOKEN` 与 `HUB_URL` 环境变量。Rust 接管 `dev_sta/user_list` 采集、上线/离线事件、IPv6 邻居、端口映射、重试与日志；Shell 只负责安装、启动和卸载。
 
 ```sh
 labrelay doctor
@@ -105,11 +105,11 @@ labrelay status
 labrelay test-hub
 sh /tmp/labprobe-install.sh upgrade
 sh /tmp/labprobe-install.sh repair
-sh /tmp/labprobe-install.sh re-pair
+sh /tmp/labprobe-install.sh configure
 sh /tmp/labprobe-install.sh uninstall
 ```
 
-Hub通过 `LOG_LEVEL`、`LOG_RETENTION_DAYS` 控制日志级别和保留天数，并自动脱敏 Token。Rust日志默认位于 `/tmp/labprobe/labrelay-agent.log`。
+Hub 通过 `LOG_LEVEL`、`LOG_RETENTION_DAYS` 控制日志级别和保留天数，并自动脱敏 Token。Rust 日志默认位于 `/tmp/labprobe/labrelay-agent.log`。
 
 ## 更新仓与发版文件
 

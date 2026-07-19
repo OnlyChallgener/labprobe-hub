@@ -8,19 +8,15 @@ read during the first migration and are copied to a timestamped backup first.
 
 from __future__ import annotations
 
-import hashlib
-import hmac
 import json
 import os
-import secrets
 import shutil
 import sqlite3
 import threading
-import time
 from contextlib import contextmanager
 from datetime import datetime
 from pathlib import Path
-from typing import Any, Dict, Iterable, List, Optional, Tuple
+from typing import Any, Dict, List, Optional, Tuple
 
 
 SCHEMA_VERSION = 1
@@ -33,13 +29,6 @@ def _json_text(value: Any) -> str:
 def _now() -> str:
     return datetime.now().strftime("%Y-%m-%d %H:%M:%S")
 
-
-def _token_hash(token: str) -> str:
-    return hashlib.sha256(token.encode("utf-8")).hexdigest()
-
-
-def _code_hash(code: str, salt: str) -> str:
-    return hashlib.pbkdf2_hmac("sha256", code.encode("utf-8"), salt.encode("ascii"), 120_000).hex()
 
 
 class SQLiteStore:
@@ -112,33 +101,6 @@ class SQLiteStore:
             );
             CREATE INDEX IF NOT EXISTS idx_revisions_entity_revision
                 ON revisions(entity, revision);
-            CREATE TABLE IF NOT EXISTS clients (
-                id TEXT PRIMARY KEY,
-                name TEXT NOT NULL,
-                role TEXT NOT NULL CHECK(role IN ('app','agent')),
-                token_hash TEXT NOT NULL UNIQUE,
-                created_at TEXT NOT NULL,
-                last_used_at TEXT,
-                revoked_at TEXT
-            );
-            CREATE INDEX IF NOT EXISTS idx_clients_role_active
-                ON clients(role, revoked_at);
-            CREATE TABLE IF NOT EXISTS pairing_codes (
-                id TEXT PRIMARY KEY,
-                role TEXT NOT NULL CHECK(role IN ('app','agent')),
-                code_hash TEXT NOT NULL,
-                salt TEXT NOT NULL,
-                created_at INTEGER NOT NULL,
-                expires_at INTEGER NOT NULL,
-                used_at INTEGER,
-                attempts INTEGER NOT NULL DEFAULT 0
-            );
-            CREATE TABLE IF NOT EXISTS pairing_limits (
-                remote_addr TEXT PRIMARY KEY,
-                failures INTEGER NOT NULL DEFAULT 0,
-                window_started_at INTEGER NOT NULL,
-                blocked_until INTEGER NOT NULL DEFAULT 0
-            );
             """
         )
         row = conn.execute("SELECT MAX(version) AS v FROM schema_migrations").fetchone()
@@ -361,118 +323,6 @@ class SQLiteStore:
             "hasMore": has_more,
             "changes": changes,
         }
-
-    def create_pairing_code(self, role: str, ttl_seconds: int = 600) -> str:
-        if role not in {"app", "agent"}:
-            raise ValueError("invalid pairing role")
-        prefix = "APP" if role == "app" else "AGT"
-        code = f"{prefix}-{secrets.randbelow(1_000_000):06d}"
-        salt = secrets.token_hex(16)
-        now = int(time.time())
-        with self._lock, self.connect() as conn:
-            conn.execute("BEGIN IMMEDIATE")
-            conn.execute("DELETE FROM pairing_codes WHERE role=? AND used_at IS NULL", (role,))
-            conn.execute(
-                "INSERT INTO pairing_codes(id,role,code_hash,salt,created_at,expires_at) VALUES(?,?,?,?,?,?)",
-                (secrets.token_hex(12), role, _code_hash(code, salt), salt, now, now + ttl_seconds),
-            )
-            conn.execute("COMMIT")
-        return code
-
-    def has_active_client(self, role: str) -> bool:
-        with self.connect() as conn:
-            row = conn.execute(
-                "SELECT 1 FROM clients WHERE role=? AND revoked_at IS NULL LIMIT 1", (role,)
-            ).fetchone()
-        return row is not None
-
-    def _pairing_blocked(self, conn: sqlite3.Connection, remote: str, now: int) -> int:
-        row = conn.execute("SELECT blocked_until FROM pairing_limits WHERE remote_addr=?", (remote,)).fetchone()
-        return max(0, int(row["blocked_until"] or 0) - now) if row else 0
-
-    def _pairing_failure(self, conn: sqlite3.Connection, remote: str, now: int) -> None:
-        row = conn.execute("SELECT failures,window_started_at FROM pairing_limits WHERE remote_addr=?", (remote,)).fetchone()
-        failures = 1
-        window = now
-        if row and now - int(row["window_started_at"]) <= 600:
-            failures = int(row["failures"]) + 1
-            window = int(row["window_started_at"])
-        blocked = now + min(900, 60 * (failures - 4)) if failures >= 5 else 0
-        conn.execute(
-            "INSERT INTO pairing_limits(remote_addr,failures,window_started_at,blocked_until) VALUES(?,?,?,?) "
-            "ON CONFLICT(remote_addr) DO UPDATE SET failures=excluded.failures,window_started_at=excluded.window_started_at,blocked_until=excluded.blocked_until",
-            (remote, failures, window, blocked),
-        )
-
-    def exchange_pairing_code(self, code: str, role: str, name: str, remote: str) -> Dict[str, str]:
-        now = int(time.time())
-        with self._lock, self.connect() as conn:
-            conn.execute("BEGIN IMMEDIATE")
-            try:
-                retry_after = self._pairing_blocked(conn, remote, now)
-                if retry_after > 0:
-                    raise PermissionError(f"rate_limited:{retry_after}")
-                rows = conn.execute(
-                    "SELECT * FROM pairing_codes WHERE role=? AND used_at IS NULL AND expires_at>=?",
-                    (role, now),
-                ).fetchall()
-                matched = None
-                for row in rows:
-                    candidate = _code_hash(code.strip().upper(), row["salt"])
-                    if hmac.compare_digest(candidate, row["code_hash"]):
-                        matched = row
-                        break
-                if matched is None:
-                    self._pairing_failure(conn, remote, now)
-                    conn.execute("COMMIT")
-                    raise PermissionError("invalid_or_expired")
-                client_id = secrets.token_hex(12)
-                token = "lp_" + secrets.token_urlsafe(32)
-                conn.execute("UPDATE pairing_codes SET used_at=? WHERE id=?", (now, matched["id"]))
-                conn.execute(
-                    "INSERT INTO clients(id,name,role,token_hash,created_at) VALUES(?,?,?,?,?)",
-                    (client_id, (name.strip() or role)[:80], role, _token_hash(token), _now()),
-                )
-                conn.execute("DELETE FROM pairing_limits WHERE remote_addr=?", (remote,))
-                conn.execute("COMMIT")
-                return {"clientId": client_id, "clientToken": token, "role": role}
-            except PermissionError:
-                raise
-            except Exception:
-                conn.execute("ROLLBACK")
-                raise
-
-    def authenticate(self, token: str, roles: Iterable[str]) -> bool:
-        if not token:
-            return False
-        digest = _token_hash(token)
-        placeholders = ",".join("?" for _ in roles)
-        role_list = list(roles)
-        if not role_list:
-            return False
-        with self._lock, self.connect() as conn:
-            row = conn.execute(
-                f"SELECT id FROM clients WHERE token_hash=? AND role IN ({placeholders}) AND revoked_at IS NULL",
-                [digest, *role_list],
-            ).fetchone()
-            if row:
-                conn.execute("UPDATE clients SET last_used_at=? WHERE id=?", (_now(), row["id"]))
-        return row is not None
-
-    def list_clients(self) -> List[Dict[str, Any]]:
-        with self.connect() as conn:
-            rows = conn.execute(
-                "SELECT id,name,role,created_at,last_used_at,revoked_at FROM clients ORDER BY created_at DESC"
-            ).fetchall()
-        return [dict(row) for row in rows]
-
-    def revoke_client(self, client_id: str) -> bool:
-        with self._lock, self.connect() as conn:
-            cur = conn.execute(
-                "UPDATE clients SET revoked_at=? WHERE id=? AND revoked_at IS NULL",
-                (_now(), client_id),
-            )
-        return cur.rowcount > 0
 
     def status(self) -> Dict[str, Any]:
         info = self.revision_info()

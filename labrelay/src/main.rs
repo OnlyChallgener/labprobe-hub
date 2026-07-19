@@ -1133,7 +1133,7 @@ async fn main() -> Result<()> {
         }
         Some("agent") => agent::run(&args[1..], false).await,
         Some("agent-once") => agent::run(&args[1..], true).await,
-        Some("pair") => agent::pair(&args[1..]).await,
+        Some("configure") => agent::configure(&args[1..]),
         Some("doctor") => agent::doctor(&args[1..]).await,
         Some("status") => agent::print_status(&args[1..]),
         Some("test-hub") => agent::test_hub(&args[1..]).await,
@@ -1147,7 +1147,7 @@ async fn main() -> Result<()> {
                 r#"Usage:
   labrelay daemon [--config PATH] [--socket PATH] [--state PATH]
   labrelay agent|agent-once [--config PATH]
-  labrelay pair --hub URL --code CODE --name NAME [--config PATH]
+  labrelay configure --hub URL --hook-token TOKEN --name NAME [--config PATH]
   labrelay doctor|status|test-hub [--config PATH]
   labrelay ctl '{"action":"status"}' [--socket PATH]
   labrelay version"#

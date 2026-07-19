@@ -399,17 +399,17 @@ def _auth_tokens_from_request() -> List[str]:
 
 def check_app_token() -> bool:
     app_token = get_app_token()
-    return any(hmac.compare_digest(t, app_token) or STORE.authenticate(t, {"app"}) for t in _auth_tokens_from_request())
+    return any(hmac.compare_digest(t, app_token) for t in _auth_tokens_from_request())
 
 
 def check_hook_token() -> bool:
     hook_token = get_hook_token()
-    return any(hmac.compare_digest(t, hook_token) or STORE.authenticate(t, {"agent"}) for t in _auth_tokens_from_request())
+    return any(hmac.compare_digest(t, hook_token) for t in _auth_tokens_from_request())
 
 
 def check_read_token() -> bool:
     allowed = {get_app_token(), get_hook_token()}
-    return any(any(hmac.compare_digest(t, legacy) for legacy in allowed) or STORE.authenticate(t, {"app", "agent"}) for t in _auth_tokens_from_request())
+    return any(any(hmac.compare_digest(t, token) for token in allowed) for t in _auth_tokens_from_request())
 
 
 def add_event(event: Dict[str, Any]) -> Dict[str, Any]:
@@ -2165,9 +2165,9 @@ def configuration_report() -> Dict[str, Any]:
         if not directory.exists() or not os.access(directory, os.W_OK):
             errors.append(f"{name} directory is not writable: {directory}")
     if get_app_token() == "change-app-token":
-        warnings.append("legacy APP_TOKEN uses the default placeholder; pair a client or configure APP_TOKEN")
+        warnings.append("APP_TOKEN uses the default placeholder; configure APP_TOKEN")
     if get_hook_token() == "change-hook-token":
-        warnings.append("legacy HOOK_TOKEN uses the default placeholder; pair an agent or configure HOOK_TOKEN")
+        warnings.append("HOOK_TOKEN uses the default placeholder; configure HOOK_TOKEN")
     if advertise_url().startswith("http://127."):
         warnings.append("HUB_ADVERTISE_URL is not configured")
     if MQTT_PUBLIC_URL and not MQTT_PASSWORD:
@@ -2427,31 +2427,9 @@ def labprobe_discovery():
         "name": hub_name(),
         "version": APP_VERSION,
         "advertiseUrl": advertise_url(),
-        "pairEndpoint": "/api/pair",
-        "capabilities": ["snapshot", "revision", "incremental", "client_tokens", "sqlite", "mqtt_revision"],
+        "capabilities": ["snapshot", "revision", "incremental", "token_auth", "sqlite", "mqtt_revision"],
         "mqtt": mqtt_client_config(include_secret=False),
     })
-
-
-@app.route("/api/pair", methods=["POST"])
-def api_pair():
-    payload = request.get_json(silent=True) or {}
-    code = str(payload.get("pairingCode") or payload.get("code") or "").strip().upper()
-    role = str(payload.get("clientType") or payload.get("role") or "app").strip().lower()
-    name = str(payload.get("clientName") or payload.get("name") or role).strip()
-    if role not in {"app", "agent"} or not code:
-        return jsonify({"ok": False, "error": "invalid pairing request"}), 400
-    remote = request.remote_addr or "unknown"
-    try:
-        result = STORE.exchange_pairing_code(code, role, name, remote)
-    except PermissionError as exc:
-        message = str(exc)
-        if message.startswith("rate_limited:"):
-            retry_after = int(message.split(":", 1)[1])
-            return jsonify({"ok": False, "error": "rate_limited", "retryAfter": retry_after}), 429
-        return jsonify({"ok": False, "error": "invalid_or_expired_pairing_code"}), 401
-    LOGGER.info("paired client id=%s role=%s name=%s", result["clientId"][:8], role, name[:40])
-    return jsonify({"ok": True, **result, "hubName": hub_name(), "mqtt": mqtt_client_config(), "time": now_str()})
 
 
 @app.route("/api/mqtt/config", methods=["GET"])
@@ -2459,33 +2437,6 @@ def api_mqtt_config():
     if not check_app_token():
         return jsonify({"ok": False, "error": "unauthorized"}), 401
     return jsonify({"ok": True, "mqtt": mqtt_client_config(), "time": now_str()})
-
-
-@app.route("/api/pairing-codes", methods=["POST"])
-def api_create_pairing_code():
-    if not check_app_token():
-        return jsonify({"ok": False, "error": "unauthorized"}), 401
-    payload = request.get_json(silent=True) or {}
-    role = str(payload.get("role") or "agent").lower()
-    if role not in {"app", "agent"}:
-        return jsonify({"ok": False, "error": "role must be app or agent"}), 400
-    code = STORE.create_pairing_code(role, 600)
-    LOGGER.info("new %s pairing code=%s expires=10m", role, code)
-    return jsonify({"ok": True, "role": role, "pairingCode": code, "expiresIn": 600})
-
-
-@app.route("/api/clients", methods=["GET"])
-def api_clients():
-    if not check_app_token():
-        return jsonify({"ok": False, "error": "unauthorized"}), 401
-    return jsonify({"ok": True, "clients": STORE.list_clients()})
-
-
-@app.route("/api/clients/<client_id>", methods=["DELETE"])
-def api_revoke_client(client_id: str):
-    if not check_app_token():
-        return jsonify({"ok": False, "error": "unauthorized"}), 401
-    return jsonify({"ok": True, "revoked": STORE.revoke_client(client_id), "clientId": client_id})
 
 
 @app.route("/api/sync/revision", methods=["GET"])
@@ -3712,18 +3663,6 @@ def command_line() -> int:
         }
         print(json.dumps(result, ensure_ascii=False, indent=2))
         return 0 if result["ok"] else 1
-    if args and args[0] == "pairing-code":
-        role = "agent"
-        if "--role" in args:
-            index = args.index("--role")
-            if index + 1 < len(args):
-                role = args[index + 1]
-        if role not in {"app", "agent"}:
-            print("role must be app or agent", file=sys.stderr)
-            return 2
-        code = STORE.create_pairing_code(role, 600)
-        print(f"{role} pairing code: {code} (expires in 10 minutes, one-time)")
-        return 0
     if args and args[0] == "test-hub":
         try:
             response = requests.get(advertise_url() + "/health", timeout=5)
@@ -3742,10 +3681,6 @@ def command_line() -> int:
         LOGGER.warning("configuration: %s", warning)
     for error in report["errors"]:
         LOGGER.error("configuration: %s", error)
-    if not STORE.has_active_client("app"):
-        LOGGER.warning("APP pairing code=%s expires=10m one-time", STORE.create_pairing_code("app", 600))
-    if not STORE.has_active_client("agent"):
-        LOGGER.warning("Agent pairing code=%s expires=10m one-time", STORE.create_pairing_code("agent", 600))
     app.run(host="0.0.0.0", port=PORT)
     return 0
 

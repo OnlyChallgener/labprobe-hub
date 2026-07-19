@@ -1,5 +1,5 @@
 use anyhow::{anyhow, bail, Context, Result};
-use reqwest::{Client, StatusCode};
+use reqwest::Client;
 use serde::{Deserialize, Serialize};
 use serde_json::{json, Map, Value};
 use std::collections::BTreeMap;
@@ -22,7 +22,7 @@ const DEFAULT_AGENT_LOG: &str = "/tmp/labprobe/labrelay-agent.log";
 pub struct AgentConfig {
     pub version: u32,
     pub hub_url: String,
-    pub client_token: String,
+    pub hook_token: String,
     pub router_name: String,
     pub interval_seconds: u64,
     pub status_interval_seconds: u64,
@@ -36,7 +36,7 @@ impl Default for AgentConfig {
         Self {
             version: 1,
             hub_url: String::new(),
-            client_token: String::new(),
+            hook_token: String::new(),
             router_name: "router".into(),
             interval_seconds: 15,
             status_interval_seconds: 15,
@@ -85,8 +85,8 @@ fn load_config(path: &Path) -> Result<AgentConfig> {
     if config.hub_url.trim().is_empty() {
         bail!("Hub URL is empty");
     }
-    if config.client_token.trim().is_empty() {
-        bail!("client token is empty; re-pair the agent");
+    if config.hook_token.trim().is_empty() {
+        bail!("HOOK_TOKEN is empty; configure the agent");
     }
     Ok(config)
 }
@@ -132,7 +132,7 @@ fn log_line(config: &AgentConfig, level: &str, message: &str) {
         "{} {} {}\n",
         now_epoch(),
         level,
-        redact(message, &config.client_token)
+        redact(message, &config.hook_token)
     );
     if let Ok(mut file) = fs::OpenOptions::new().create(true).append(true).open(path) {
         use std::io::Write;
@@ -159,7 +159,7 @@ async fn post_json(
     for attempt in 0..3u64 {
         match client
             .post(&url)
-            .header("X-LabProbe-Token", &config.client_token)
+            .header("X-LabProbe-Token", &config.hook_token)
             .json(body)
             .send()
             .await
@@ -187,7 +187,7 @@ async fn get_json(client: &Client, config: &AgentConfig, path: &str) -> Result<V
     let url = format!("{}{}", config.hub_url.trim_end_matches('/'), path);
     let response = client
         .get(url)
-        .header("X-LabProbe-Token", &config.client_token)
+        .header("X-LabProbe-Token", &config.hook_token)
         .send()
         .await?;
     let status = response.status();
@@ -595,7 +595,7 @@ pub async fn run(args: &[String], once: bool) -> Result<()> {
     log_line(&config, "INFO", "Rust agent started");
     loop {
         if let Err(error) = agent_cycle(&client, &config, &mut state).await {
-            state.last_error = redact(&format!("{:#}", error), &config.client_token);
+            state.last_error = redact(&format!("{:#}", error), &config.hook_token);
             log_line(&config, "ERROR", &state.last_error);
         }
         save_json(&state_path, &state)?;
@@ -610,51 +610,28 @@ pub async fn run(args: &[String], once: bool) -> Result<()> {
     }
 }
 
-pub async fn pair(args: &[String]) -> Result<()> {
+pub fn configure(args: &[String]) -> Result<()> {
     let hub = arg_value(args, "--hub")
         .ok_or_else(|| anyhow!("missing --hub"))?
         .trim_end_matches('/')
         .to_string();
-    let code = arg_value(args, "--code").ok_or_else(|| anyhow!("missing --code"))?;
+    let hook_token = arg_value(args, "--hook-token")
+        .ok_or_else(|| anyhow!("missing --hook-token"))?;
+    if hook_token.trim().is_empty() {
+        bail!("HOOK_TOKEN is empty");
+    }
     let name = arg_value(args, "--name").unwrap_or_else(|| "router".into());
     let path = config_path(args);
-    let response = http_client()?
-        .post(format!("{}/api/pair", hub))
-        .json(&json!({"pairingCode":code,"clientType":"agent","clientName":name}))
-        .send()
-        .await?;
-    let status = response.status();
-    let root: Value = response.json().await.context("parse pairing response")?;
-    if status != StatusCode::OK {
-        bail!(
-            "pairing failed: {}",
-            root.get("error")
-                .and_then(Value::as_str)
-                .unwrap_or("unknown")
-        );
-    }
-    let token = root
-        .get("clientToken")
-        .and_then(Value::as_str)
-        .ok_or_else(|| anyhow!("missing client token"))?;
     let mut config = if path.exists() {
         serde_json::from_slice::<AgentConfig>(&fs::read(&path)?).unwrap_or_default()
     } else {
         AgentConfig::default()
     };
     config.hub_url = hub;
-    config.client_token = token.to_string();
+    config.hook_token = hook_token.trim().to_string();
     config.router_name = name;
     save_json(&path, &config)?;
-    println!(
-        "paired agent id={}",
-        root.get("clientId")
-            .and_then(Value::as_str)
-            .unwrap_or("")
-            .chars()
-            .take(8)
-            .collect::<String>()
-    );
+    println!("agent configuration saved");
     Ok(())
 }
 

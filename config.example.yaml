@@ -2,13 +2,13 @@ home:
   name: "LabProbe Hub"
 
 server:
-  # 新 APP/Agent 使用一次性配对码。以下字段只用于旧版本兼容。
+  # APP 使用 app_token；LabRelay、Lucky 与 Webhook 使用 hook_token。
   app_token: "change-app-token"
   hook_token: "change-hook-token"
 
 router:
   enabled: true
-  # Optional display name. Leave blank to use the name reported by the paired Agent.
+  # Optional display name. Leave blank to use the name reported by LabRelay.
   name: ""
   agent_name: ""
   portmap_id: ""

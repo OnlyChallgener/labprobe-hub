@@ -17,8 +17,8 @@ AGENT_BASE="${UPDATE_ROOT%/}/agent"
 NONINTERACTIVE="${LABPROBE_NONINTERACTIVE:-0}"
 
 case "$ACTION" in
-  install|upgrade|repair|re-pair|uninstall) ;;
-  *) echo "[LabProbe] ERROR: 不支持的操作：$ACTION（可用：install/upgrade/repair/re-pair/uninstall）" >&2; exit 1 ;;
+  install|upgrade|repair|configure|uninstall) ;;
+  *) echo "[LabProbe] ERROR: 不支持的操作：$ACTION（可用：install/upgrade/repair/configure/uninstall）" >&2; exit 1 ;;
 esac
 
 say() { echo "[LabProbe] $*"; }
@@ -236,10 +236,12 @@ discover_hub
 say "自动发现 Hub：$HUB_URL"
 ask_yes "自动发现的 Hub 是否正确？[Y/n]" Y || fail "已取消；请设置 HUB_URL 后重试"
 
-PAIR_CODE=""
-if [ "$ACTION" = "install" ] || [ "$ACTION" = "re-pair" ] || [ ! -s "$CONFIG" ]; then
-  printf "请输入路由器配对码："; read PAIR_CODE || PAIR_CODE=""
-  [ -n "$PAIR_CODE" ] || fail "配对码不能为空"
+HOOK_TOKEN_INPUT="${HOOK_TOKEN:-}"
+if [ "$ACTION" = "install" ] || [ "$ACTION" = "configure" ] || ! grep -q '"hookToken"[[:space:]]*:' "$CONFIG" 2>/dev/null; then
+  if [ -z "$HOOK_TOKEN_INPUT" ]; then
+    printf "请输入 Hub HOOK_TOKEN："; read HOOK_TOKEN_INPUT || HOOK_TOKEN_INPUT=""
+  fi
+  [ -n "$HOOK_TOKEN_INPUT" ] || fail "HOOK_TOKEN 不能为空"
 fi
 
 say "架构=$ARCH，Hub=$HUB_URL，将安装采集、事件、IPv6、端口映射、重试、日志和开机自启"
@@ -254,10 +256,10 @@ chmod 0755 "$BIN"
 [ -f "$RELAY_CONFIG" ] || echo '{"version":1,"rules":[]}' >"$RELAY_CONFIG"
 chmod 600 "$RELAY_CONFIG"
 
-if [ -n "$PAIR_CODE" ]; then
+if [ -n "$HOOK_TOKEN_INPUT" ]; then
   ROUTER_NAME="${PRIMARY_ROUTER_NAME:-$(hostname 2>/dev/null || echo router)}"
   [ -n "$ROUTER_NAME" ] || ROUTER_NAME="router"
-  "$BIN" pair --hub "$HUB_URL" --code "$PAIR_CODE" --name "$ROUTER_NAME" --config "$CONFIG" || rollback
+  "$BIN" configure --hub "$HUB_URL" --hook-token "$HOOK_TOKEN_INPUT" --name "$ROUTER_NAME" --config "$CONFIG" || rollback
 fi
 [ -s "$CONFIG" ] || rollback
 chmod 600 "$CONFIG"
