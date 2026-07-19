@@ -1,4 +1,4 @@
-# LabRelay v0.1.0
+# LabRelay v0.2.2
 
 面向 LabProbe / 极客网探的轻量 Rust 四层 TCP 反代服务。
 
@@ -21,7 +21,7 @@
 
 ## Agent 配置
 
-LabRelay 直接使用 Hub 的 `HOOK_TOKEN`，不再使用配对码：
+LabRelay 直接使用 Hub 的 `HOOK_TOKEN`：
 
 ```sh
 labrelay configure --hub http://192.168.1.20:58443 --hook-token YOUR_HOOK_TOKEN --name router
@@ -38,4 +38,4 @@ cargo run -- ctl --socket /tmp/labrelay-test.sock '{"action":"status"}'
 
 ## 编译 BE72 静态程序
 
-GitHub Actions 运行 `Build LabRelay Router Binary`，下载 `labrelay-router-aarch64-v0.1.0`。
+GitHub Actions 运行 `Build LabRelay Router Binary`，下载 `labrelay-linux-arm64（v0.2.2）`。

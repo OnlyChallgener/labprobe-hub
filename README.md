@@ -1,4 +1,4 @@
-# LabProbe Hub 0.9
+# LabProbe Hub 0.9.1
 
 LabProbe Hub 可部署在任意 Linux AMD64/ARM64 宿主机，包括服务器、小主机、NAS 和软路由。Hub 使用 SQLite 保存数据；已适配锐捷路由器上的 Rust Agent 继续以 `dev_sta/user_list` 为核心数据源。
 
@@ -119,8 +119,8 @@ Hub 从统一的 `UPDATE_REPOSITORY_ROOT` 读取 Rust `latest.json`，APP 评分
 
 ```sh
 python scripts/build_update_bundle.py \
-  --app-apk LabProbeApp.apk --app-version-name 0.10.1 --app-version-code 128 \
-  --agent-arm64 labrelay-linux-arm64 --agent-version 0.2.1 \
+  --app-apk LabProbeApp.apk --app-version-name 0.10.4 --app-version-code 132 \
+  --agent-arm64 labrelay-linux-arm64 --agent-version 0.2.2 \
   --output update-bundle
 ```
 
