@@ -141,6 +141,15 @@ backup_old() {
   if [ -f "$INIT_SCRIPT" ]; then HAD_OLD_INIT=1; cp "$INIT_SCRIPT" "$BACKUP/init.labprobe" 2>/dev/null || fail "备份旧开机脚本失败"; fi
 }
 
+prune_backups() {
+  # Keep exactly the backup created for the current install/upgrade.
+  for dir in "$INSTALL_DIR"/backups/*; do
+    [ -d "$dir" ] || continue
+    [ "$dir" = "$BACKUP" ] && continue
+    rm -rf "$dir"
+  done
+}
+
 cleanup_legacy() {
   crontab -l >/tmp/labprobe-cron.old 2>/dev/null || true
   grep -v '/etc/labprobe/.*\(push_devices\|push_router_wan6\|watch_devices\|ruijie_push_to_labprobe\|labrelay_agent\)\.sh' /tmp/labprobe-cron.old >/tmp/labprobe-cron.new 2>/dev/null || true
@@ -249,6 +258,7 @@ ask_yes "确认安装？[Y/n]" Y || exit 0
 
 mkdir -p "$INSTALL_DIR/backups" /tmp/labprobe
 backup_old
+prune_backups
 download_binary
 [ -x "$INIT_SCRIPT" ] && "$INIT_SCRIPT" stop >/dev/null 2>&1 || true
 cp "$TMP_BIN" "$BIN" || rollback

@@ -18,7 +18,7 @@ def main() -> int:
     parser = argparse.ArgumentParser()
     parser.add_argument("--database", default="/app/data/labprobe.db")
     parser.add_argument("--backup-dir", default="/app/backups")
-    parser.add_argument("--keep-revisions", type=int, default=5000)
+    parser.add_argument("--keep-revisions", type=int, default=1500)
     parser.add_argument("--vacuum", action="store_true")
     args = parser.parse_args()
 
@@ -49,6 +49,9 @@ def main() -> int:
         source.execute("VACUUM")
     count = int(source.execute("SELECT COUNT(*) FROM revisions").fetchone()[0])
     source.close()
+
+    for old in sorted(backup_dir.glob("labprobe-pre-repair-*.db"), reverse=True)[1:]:
+        old.unlink(missing_ok=True)
 
     print(f"backup={backup}")
     print(f"revisions={count}")

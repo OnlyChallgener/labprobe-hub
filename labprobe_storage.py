@@ -45,9 +45,11 @@ NON_REVISION_DOCUMENTS = frozenset({
     "router_dashboard.json",
 })
 
-REVISION_MAX_ROWS = _env_int("REVISION_MAX_ROWS", 5000, 500)
-REVISION_MAX_AGE_DAYS = _env_int("REVISION_MAX_AGE_DAYS", 7, 1)
+REVISION_MAX_ROWS = _env_int("REVISION_MAX_ROWS", 1500, 500)
+REVISION_MAX_AGE_DAYS = _env_int("REVISION_MAX_AGE_DAYS", 2, 1)
 REVISION_PRUNE_INTERVAL_SEC = _env_int("REVISION_PRUNE_INTERVAL_SEC", 300, 30)
+WAL_CHECKPOINT_INTERVAL_SEC = _env_int("WAL_CHECKPOINT_INTERVAL_SEC", 900, 60)
+SQLITE_JOURNAL_SIZE_LIMIT = _env_int("SQLITE_JOURNAL_SIZE_LIMIT", 4 * 1024 * 1024, 1024 * 1024)
 
 # Fields that change every sample but do not represent a device identity,
 # connection or user-visible configuration change.
@@ -86,6 +88,7 @@ class SQLiteStore:
         self._lock = threading.RLock()
         self.migration_result: Dict[str, Any] = {}
         self._last_revision_prune_at = 0.0
+        self._last_checkpoint_at = 0.0
 
     @contextmanager
     def connect(self):
@@ -93,6 +96,8 @@ class SQLiteStore:
         conn.row_factory = sqlite3.Row
         conn.execute("PRAGMA foreign_keys=ON")
         conn.execute("PRAGMA busy_timeout=15000")
+        conn.execute(f"PRAGMA journal_size_limit={SQLITE_JOURNAL_SIZE_LIMIT}")
+        conn.execute("PRAGMA temp_store=MEMORY")
         try:
             yield conn
         finally:
@@ -253,6 +258,24 @@ class SQLiteStore:
             and not key.lower().startswith("flow")
         }
 
+    @staticmethod
+    def _revision_device_payload(item: Any) -> Any:
+        """Drop bulky diagnostics from revision rows while keeping the current card state."""
+        if not isinstance(item, dict):
+            return item
+        blocked = {
+            "raw", "rawData", "debug", "debugInfo", "ipv6Candidates", "ipv6Records",
+            "packetSamples", "history", "samples", "scanResults",
+        }
+        clean: Dict[str, Any] = {}
+        for key, value in item.items():
+            if key in blocked:
+                continue
+            if isinstance(value, str) and len(value) > 4096:
+                continue
+            clean[key] = value
+        return clean
+
     @classmethod
     def _stable_status(cls, value: Any, *, root: bool = True) -> Any:
         if isinstance(value, list):
@@ -283,7 +306,7 @@ class SQLiteStore:
             previous = old_map.get(key)
             if previous is None or self._stable_device(previous) != self._stable_device(value):
                 operation = "delete" if bool(value.get("deleted")) else "upsert"
-                changes.append((entity, operation, key, None if operation == "delete" else value))
+                changes.append((entity, operation, key, None if operation == "delete" else self._revision_device_payload(value)))
         for key in old_map.keys() - new_map.keys():
             changes.append((entity, "delete", key, None))
         return changes
@@ -330,6 +353,12 @@ class SQLiteStore:
                     )
                 self._prune_revisions(conn)
                 conn.execute("COMMIT")
+                now = time.monotonic()
+                if now - self._last_checkpoint_at >= WAL_CHECKPOINT_INTERVAL_SEC:
+                    try:
+                        conn.execute("PRAGMA wal_checkpoint(TRUNCATE)")
+                    finally:
+                        self._last_checkpoint_at = now
                 return self.current_revision(conn)
             except Exception:
                 conn.execute("ROLLBACK")
@@ -379,7 +408,7 @@ class SQLiteStore:
         if key == "state.json":
             if self._stable_status(old) == self._stable_status(new):
                 return []
-            return [("status", "replace", "status", new)]
+            return [("status", "replace", "status", self._stable_status(new))]
         return [("document", "replace", key, new)]
 
     @staticmethod
@@ -439,10 +468,20 @@ class SQLiteStore:
         with self.connect() as conn:
             schema = int(conn.execute("SELECT COALESCE(MAX(version),0) FROM schema_migrations").fetchone()[0])
             documents = int(conn.execute("SELECT COUNT(*) FROM documents").fetchone()[0])
+            revision_rows = int(conn.execute("SELECT COUNT(*) FROM revisions").fetchone()[0])
+            document_bytes = int(conn.execute("SELECT COALESCE(SUM(LENGTH(value_json)),0) FROM documents").fetchone()[0])
+        db_bytes = self.db_path.stat().st_size if self.db_path.exists() else 0
+        wal_path = Path(str(self.db_path) + "-wal")
+        shm_path = Path(str(self.db_path) + "-shm")
         return {
             **info,
             "schemaVersion": schema,
             "documents": documents,
+            "documentBytes": document_bytes,
+            "revisionRows": revision_rows,
+            "databaseBytes": db_bytes,
+            "walBytes": wal_path.stat().st_size if wal_path.exists() else 0,
+            "shmBytes": shm_path.stat().st_size if shm_path.exists() else 0,
             "revisionRetention": {
                 "maxRows": REVISION_MAX_ROWS,
                 "maxAgeDays": REVISION_MAX_AGE_DAYS,

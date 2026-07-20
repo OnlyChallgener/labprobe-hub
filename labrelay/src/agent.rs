@@ -59,8 +59,8 @@ struct AgentState {
     devices: BTreeMap<String, Value>,
     pending_events: Vec<Value>,
     last_success_at: u64,
-    last_status_log_at: u64,
     last_error: String,
+    last_logged_errors: BTreeMap<String, u64>,
     last_command_at: u64,
     update_state: String,
     update_message: String,
@@ -68,6 +68,7 @@ struct AgentState {
     last_dashboard_details_at: u64,
     last_dashboard_network_at: u64,
     last_dashboard_refresh_nonce: u64,
+    last_credentials_refresh_nonce: u64,
 }
 
 fn now_epoch() -> u64 {
@@ -90,8 +91,11 @@ fn config_path(args: &[String]) -> PathBuf {
 
 fn load_config(path: &Path) -> Result<AgentConfig> {
     let text = fs::read_to_string(path).with_context(|| format!("read {}", path.display()))?;
-    let config: AgentConfig =
+    let mut config: AgentConfig =
         serde_json::from_str(&text).with_context(|| format!("parse {}", path.display()))?;
+    // Runtime state and logs are intentionally volatile to avoid router flash wear.
+    config.state_path = DEFAULT_AGENT_STATE.into();
+    config.log_path = DEFAULT_AGENT_LOG.into();
     if config.hub_url.trim().is_empty() {
         bail!("Hub URL is empty");
     }
@@ -130,10 +134,12 @@ fn redact(value: &str, token: &str) -> String {
 fn log_line(config: &AgentConfig, level: &str, message: &str) {
     let path = Path::new(&config.log_path);
     if fs::metadata(path)
-        .map(|x| x.len() > 1_000_000)
+        .map(|x| x.len() >= 256 * 1024)
         .unwrap_or(false)
     {
-        let _ = fs::rename(path, path.with_extension("log.1"));
+        let rotated = path.with_extension("log.1");
+        let _ = fs::remove_file(&rotated);
+        let _ = fs::rename(path, rotated);
     }
     if let Some(parent) = path.parent() {
         let _ = fs::create_dir_all(parent);
@@ -148,6 +154,21 @@ fn log_line(config: &AgentConfig, level: &str, message: &str) {
         use std::io::Write;
         let _ = file.write_all(line.as_bytes());
     }
+}
+
+fn log_limited(config: &AgentConfig, state: &mut AgentState, level: &str, key: &str, message: &str) {
+    let now = now_epoch();
+    if state
+        .last_logged_errors
+        .get(key)
+        .map(|last| now.saturating_sub(*last) < 300)
+        .unwrap_or(false)
+    {
+        return;
+    }
+    state.last_logged_errors.insert(key.to_string(), now);
+    state.last_logged_errors.retain(|_, last| now.saturating_sub(*last) < 86_400);
+    log_line(config, level, message);
 }
 
 fn http_client() -> Result<Client> {
@@ -416,6 +437,13 @@ fn router_model() -> String {
         .unwrap_or_default()
 }
 
+fn first_count_by_keys(root: &Value, keys: &[&str]) -> u64 {
+    keys.iter()
+        .map(|key| number(root.get(*key)) as u64)
+        .find(|value| *value > 0)
+        .unwrap_or(0)
+}
+
 fn telemetry_from_fast(fast: &Value, online_devices: usize) -> Value {
     let wan = object_path(fast, &["wan_stat", "wans"])
         .or_else(|| object_path(fast, &["wan_stat", "wan"]))
@@ -437,39 +465,282 @@ fn telemetry_from_fast(fast: &Value, online_devices: usize) -> Value {
             "downloadBps": (download_raw * 8.0) as u64
         },
         "connections": {
-            "ipv4": number(wan.get("ipv4_connection_count")) as u64,
-            "ipv6": number(wan.get("ipv6_connection_count")) as u64,
-            "flow": number(wan.get("flow_cnt")) as u64,
-            "cps": number(wan.get("cps")) as u64
+            "ipv4": first_count_by_keys(wan, &[
+                "ipv4_connection_count", "ipv4_session_count", "ipv4_sessions",
+                "v4_connection_count", "v4_session_count", "session_ipv4"
+            ]),
+            "ipv6": first_count_by_keys(wan, &[
+                "ipv6_connection_count", "ipv6_session_count", "ipv6_sessions",
+                "v6_connection_count", "v6_session_count", "session_ipv6"
+            ]),
+            "flow": first_count_by_keys(wan, &["flow_cnt", "flow_count", "session_count"]),
+            "cps": first_count_by_keys(wan, &["cps", "connections_per_second"])
         }
     })
 }
 
-fn details_from_slow(slow: &Value, network: Option<&Value>) -> Value {
-    let ports = object_path(slow, &["port_status", "List"])
+fn csv_values(value: Option<&Value>) -> Value {
+    let items = value
+        .and_then(Value::as_str)
+        .unwrap_or("")
+        .split(',')
+        .map(str::trim)
+        .filter(|item| !item.is_empty())
+        .map(|item| Value::String(item.to_string()))
+        .collect::<Vec<_>>();
+    Value::Array(items)
+}
+
+fn first_array_object<'a>(root: &'a Value, key: &str) -> Option<&'a Value> {
+    root.get(key)?.as_array()?.iter().find(|item| item.is_object())
+}
+
+fn meaningful(value: &Value) -> bool {
+    match value {
+        Value::Null => false,
+        Value::String(text) => !text.trim().is_empty(),
+        Value::Array(items) => !items.is_empty(),
+        Value::Object(map) => !map.is_empty(),
+        _ => true,
+    }
+}
+
+fn insert_meaningful(map: &mut Map<String, Value>, key: &str, value: Value) {
+    if meaningful(&value) {
+        map.insert(key.to_string(), value);
+    }
+}
+
+fn value_text(value: Option<&Value>) -> String {
+    match value {
+        Some(Value::String(text)) => text.trim().to_string(),
+        Some(Value::Number(number)) => number.to_string(),
+        Some(Value::Bool(flag)) => flag.to_string(),
+        _ => String::new(),
+    }
+}
+
+fn first_text_by_keys(root: &Value, keys: &[&str]) -> String {
+    match root {
+        Value::Object(map) => {
+            for key in keys {
+                if let Some(value) = map.get(*key) {
+                    let text = value_text(Some(value));
+                    if !text.is_empty() {
+                        return text;
+                    }
+                }
+            }
+            for child in map.values() {
+                let text = first_text_by_keys(child, keys);
+                if !text.is_empty() {
+                    return text;
+                }
+            }
+            String::new()
+        }
+        Value::Array(items) => items
+            .iter()
+            .find_map(|child| {
+                let text = first_text_by_keys(child, keys);
+                if text.is_empty() { None } else { Some(text) }
+            })
+            .unwrap_or_default(),
+        _ => String::new(),
+    }
+}
+
+fn normalized_interface_name(value: &str) -> String {
+    let lower = value.trim().to_ascii_lowercase();
+    if lower == "wan" || lower == "wan0" {
+        "WAN".into()
+    } else if lower.starts_with("wan") {
+        lower.to_ascii_uppercase()
+    } else {
+        value.trim().to_string()
+    }
+}
+
+fn wan_interface_display(network: &Value) -> String {
+    let mut names = Vec::<String>::new();
+    if let Some(items) = network.get("wan").and_then(Value::as_array) {
+        for item in items {
+            let raw = value_text(item.get("name").or_else(|| item.get("intf_name")).or_else(|| item.get("ifname")));
+            let name = normalized_interface_name(&raw);
+            if name.is_empty() {
+                continue;
+            }
+            let status = value_text(item.get("enable").or_else(|| item.get("enabled")).or_else(|| item.get("status"))).to_ascii_lowercase();
+            let configured = name == "WAN"
+                || matches!(status.as_str(), "1" | "true" | "on" | "up" | "connected")
+                || !first_text_by_keys(item, &["username", "account", "ipaddr", "ip", "gateway"]).is_empty();
+            if configured && !names.contains(&name) {
+                names.push(name);
+            }
+        }
+    }
+    if names.is_empty() {
+        names.push("WAN".into());
+    }
+    names.join(" / ")
+}
+
+fn details_from_sources(
+    slow: Option<&Value>,
+    network: Option<&Value>,
+    ipinfo: Option<&Value>,
+    ap_list: Option<&Value>,
+) -> Value {
+    let mut details = Map::new();
+
+    let ports = slow
+        .and_then(|root| object_path(root, &["port_status", "List"]))
         .cloned()
-        .unwrap_or_else(|| json!([]));
-    let wireless = slow.get("wireless").cloned().unwrap_or_else(|| json!({}));
-    let lan_ip = ports
-        .as_array()
+        .or_else(|| network.and_then(|root| root.get("ports").cloned()));
+    if let Some(value) = ports.as_ref().filter(|value| meaningful(value)) {
+        details.insert("ports".into(), value.clone());
+    }
+
+    if let Some(wireless) = slow.and_then(|root| root.get("wireless")).filter(|value| meaningful(value)) {
+        details.insert("wireless".into(), wireless.clone());
+    }
+    if let Some(network) = network {
+        let clean = sanitize_config_value(network);
+        if meaningful(&clean) {
+            details.insert("network".into(), clean);
+        }
+    }
+
+    let network_lan = network.and_then(|root| first_array_object(root, "lan"));
+    let network_wan = network.and_then(|root| first_array_object(root, "wan"));
+    let lan_ip_from_port = ports
+        .as_ref()
+        .and_then(Value::as_array)
         .and_then(|items| items.iter().find(|item| item.get("name").and_then(Value::as_str) == Some("LAN")))
         .and_then(|item| item.get("ipaddr"))
         .and_then(Value::as_str)
         .unwrap_or("");
-    json!({
-        "identity": {
-            "hostname": slow.get("hostname").and_then(Value::as_str).unwrap_or(""),
-            "model": router_model()
-        },
-        "wan": {
-            "ipv4": slow.get("wan_ip").and_then(Value::as_str).unwrap_or(""),
-            "status": slow.get("status").and_then(Value::as_str).unwrap_or("")
-        },
-        "lan": {"ipv4": lan_ip},
-        "wireless": wireless,
-        "ports": ports,
-        "network": network.map(sanitize_config_value).unwrap_or_else(|| json!({}))
-    })
+
+    if network_lan.is_some() || !lan_ip_from_port.trim().is_empty() {
+        let mut lan = Map::new();
+        let lan_ip = network_lan
+            .and_then(|item| item.get("ipaddr"))
+            .and_then(Value::as_str)
+            .filter(|value| !value.trim().is_empty())
+            .unwrap_or(lan_ip_from_port);
+        insert_meaningful(&mut lan, "ipv4", Value::String(lan_ip.to_string()));
+        if let Some(item) = network_lan {
+            let lan_mac = first_text_by_keys(item, &["mac", "macaddr", "macAddress", "hwaddr"]);
+            insert_meaningful(&mut lan, "mac", Value::String(lan_mac));
+            insert_meaningful(&mut lan, "netmask", item.get("netmask").cloned().unwrap_or(Value::Null));
+            insert_meaningful(
+                &mut lan,
+                "vlanId",
+                item.get("vlanid").or_else(|| item.get("vlanId")).cloned().unwrap_or(Value::Null),
+            );
+            insert_meaningful(
+                &mut lan,
+                "dhcpLease",
+                item.get("leasetime").or_else(|| item.get("leaseTime")).cloned().unwrap_or(Value::Null),
+            );
+        }
+        if let Some(item) = network_wan {
+            insert_meaningful(
+                &mut lan,
+                "uplink",
+                item.get("name").or_else(|| item.get("intf_name")).cloned().unwrap_or(Value::Null),
+            );
+        }
+        if !lan.is_empty() {
+            details.insert("lan".into(), Value::Object(lan));
+        }
+    }
+
+    let wan_info = ipinfo.and_then(|root| root.get("wan"));
+    if wan_info.is_some() || slow.and_then(|root| root.get("wan_ip")).is_some() {
+        let mut wan = Map::new();
+        let wan_ipv4 = wan_info
+            .and_then(|item| item.get("ip"))
+            .and_then(Value::as_str)
+            .filter(|value| !value.trim().is_empty())
+            .or_else(|| slow.and_then(|root| root.get("wan_ip")).and_then(Value::as_str))
+            .unwrap_or("");
+        insert_meaningful(&mut wan, "ipv4", Value::String(wan_ipv4.to_string()));
+        if let Some(item) = wan_info {
+            insert_meaningful(&mut wan, "gateway", item.get("gateway").cloned().unwrap_or(Value::Null));
+            insert_meaningful(&mut wan, "netmask", item.get("mask").cloned().unwrap_or(Value::Null));
+            insert_meaningful(&mut wan, "proto", item.get("proto").cloned().unwrap_or(Value::Null));
+            insert_meaningful(&mut wan, "mtu", item.get("mtu").cloned().unwrap_or(Value::Null));
+            insert_meaningful(&mut wan, "dnsServers", csv_values(item.get("dnsList")));
+        } else if let Some(item) = network_wan {
+            insert_meaningful(&mut wan, "proto", item.get("proto").cloned().unwrap_or(Value::Null));
+            insert_meaningful(&mut wan, "mtu", item.get("mtu").cloned().unwrap_or(Value::Null));
+        }
+        if let Some(network_root) = network {
+            insert_meaningful(
+                &mut wan,
+                "interfaceDisplay",
+                Value::String(wan_interface_display(network_root)),
+            );
+            let operator = first_text_by_keys(
+                network_root,
+                &["operator", "isp", "ispName", "service", "serviceName", "carrier", "provider"],
+            );
+            insert_meaningful(&mut wan, "operator", Value::String(operator));
+        }
+        if let Some(status) = slow.and_then(|root| root.get("status")) {
+            insert_meaningful(&mut wan, "status", status.clone());
+        }
+        if !wan.is_empty() {
+            details.insert("wan".into(), Value::Object(wan));
+        }
+    }
+
+    let ap = ap_list.and_then(|root| first_array_object(root, "list"));
+    if let Some(item) = ap {
+        let mut ap_out = Map::new();
+        insert_meaningful(&mut ap_out, "networkName", item.get("networkName").cloned().unwrap_or(Value::Null));
+        insert_meaningful(&mut ap_out, "hostName", item.get("hostName").cloned().unwrap_or(Value::Null));
+        insert_meaningful(
+            &mut ap_out,
+            "model",
+            item.get("devModel").or_else(|| item.get("deviceType")).cloned().unwrap_or(Value::Null),
+        );
+        insert_meaningful(&mut ap_out, "managementIp", item.get("ip").cloned().unwrap_or(Value::Null));
+        insert_meaningful(&mut ap_out, "status", item.get("status").cloned().unwrap_or(Value::Null));
+        insert_meaningful(&mut ap_out, "bands", csv_values(item.get("band")));
+        insert_meaningful(&mut ap_out, "channels", csv_values(item.get("channel")));
+        insert_meaningful(&mut ap_out, "stationCount", item.get("staNum").cloned().unwrap_or(Value::Null));
+        insert_meaningful(&mut ap_out, "software", item.get("software").cloned().unwrap_or(Value::Null));
+        insert_meaningful(&mut ap_out, "serialNumber", item.get("serialNumber").cloned().unwrap_or(Value::Null));
+        insert_meaningful(&mut ap_out, "mac", item.get("mac").cloned().unwrap_or(Value::Null));
+        if !ap_out.is_empty() {
+            details.insert("ap".into(), Value::Object(ap_out));
+        }
+    }
+
+    let ap_hostname = ap
+        .and_then(|item| item.get("hostName"))
+        .and_then(Value::as_str)
+        .filter(|value| !value.trim().is_empty())
+        .or_else(|| slow.and_then(|root| root.get("hostname")).and_then(Value::as_str));
+    let ap_model = ap
+        .and_then(|item| item.get("devModel").or_else(|| item.get("deviceType")))
+        .and_then(Value::as_str)
+        .filter(|value| !value.trim().is_empty());
+    if ap_hostname.is_some() || ap_model.is_some() || slow.is_some() {
+        let mut identity = Map::new();
+        if let Some(hostname) = ap_hostname {
+            insert_meaningful(&mut identity, "hostname", Value::String(hostname.to_string()));
+        }
+        let model = ap_model.map(str::to_string).unwrap_or_else(router_model);
+        insert_meaningful(&mut identity, "model", Value::String(model));
+        if !identity.is_empty() {
+            details.insert("identity".into(), Value::Object(identity));
+        }
+    }
+
+    Value::Object(details)
 }
 
 fn collect_dashboard_payload(
@@ -498,13 +769,23 @@ fn collect_dashboard_payload(
             >= config.dashboard_network_interval_seconds.clamp(30, 600);
 
     let mut slow_value = None;
+    let mut ipinfo_value = None;
+    let mut ap_list_value = None;
     if details_due {
         match command_json("dev_sta", &["get", "-m", "ws_sysinfo", r#"{"get":"slow"}"#]) {
-            Ok(value) => {
-                state.last_dashboard_details_at = now;
-                slow_value = Some(value);
-            }
-            Err(error) => log_line(config, "WARN", &format!("router slow telemetry skipped: {:#}", error)),
+            Ok(value) => slow_value = Some(value),
+            Err(error) => log_limited(config, state, "WARN", "router-slow", &format!("router slow telemetry skipped: {:#}", error)),
+        }
+        match command_json("dev_sta", &["get", "-m", "ipinfo", "{}"]) {
+            Ok(value) => ipinfo_value = Some(value),
+            Err(error) => log_limited(config, state, "WARN", "router-ipinfo", &format!("router ipinfo skipped: {:#}", error)),
+        }
+        match command_json("dev_sta", &["get", "-m", "ap_list", "{}"]) {
+            Ok(value) => ap_list_value = Some(value),
+            Err(error) => log_limited(config, state, "WARN", "router-ap-list", &format!("router ap_list skipped: {:#}", error)),
+        }
+        if slow_value.is_some() || ipinfo_value.is_some() || ap_list_value.is_some() {
+            state.last_dashboard_details_at = now;
         }
     }
     let mut network_value = None;
@@ -514,15 +795,16 @@ fn collect_dashboard_payload(
                 state.last_dashboard_network_at = now;
                 network_value = Some(value);
             }
-            Err(error) => log_line(config, "WARN", &format!("router network config skipped: {:#}", error)),
+            Err(error) => log_limited(config, state, "WARN", "router-network", &format!("router network config skipped: {:#}", error)),
         }
     }
-    if let Some(slow) = slow_value.as_ref() {
-        payload["details"] = details_from_slow(slow, network_value.as_ref());
-        payload["detailsAt"] = json!(now);
-        payload["detailsEpoch"] = json!(now);
-    } else if let Some(network) = network_value.as_ref() {
-        payload["details"] = json!({"network": sanitize_config_value(network)});
+    if slow_value.is_some() || network_value.is_some() || ipinfo_value.is_some() || ap_list_value.is_some() {
+        payload["details"] = details_from_sources(
+            slow_value.as_ref(),
+            network_value.as_ref(),
+            ipinfo_value.as_ref(),
+            ap_list_value.as_ref(),
+        );
         payload["detailsAt"] = json!(now);
         payload["detailsEpoch"] = json!(now);
     }
@@ -530,6 +812,40 @@ fn collect_dashboard_payload(
         payload["refreshNonce"] = json!(refresh_nonce);
     }
     Ok(payload)
+}
+
+fn collect_router_credentials(config: &AgentConfig, refresh_nonce: u64) -> Result<Value> {
+    let network = command_json("dev_config", &["get", "-m", "network", "{}"]) ?;
+    let wan_scope = network.get("wan").unwrap_or(&network);
+    let lan_scope = network.get("lan").unwrap_or(&network);
+    let username = first_text_by_keys(
+        wan_scope,
+        &["username", "userName", "user_name", "account", "pppoeUser", "pppoe_username", "pppoe_account", "broadbandAccount", "user"],
+    );
+    let password = first_text_by_keys(
+        wan_scope,
+        &["password", "passwd", "pwd", "pppoePassword", "pppoe_password", "pppoe_passwd", "broadbandPassword"],
+    );
+    let lan_mac = first_text_by_keys(lan_scope, &["mac", "macaddr", "macAddress", "hwaddr"]);
+    Ok(json!({
+        "router": config.router_name,
+        "lanMac": lan_mac,
+        "username": username,
+        "password": password,
+        "refreshNonce": refresh_nonce,
+    }))
+}
+
+async fn sync_router_credentials(
+    client: &Client,
+    config: &AgentConfig,
+    state: &mut AgentState,
+    refresh_nonce: u64,
+) -> Result<()> {
+    let payload = collect_router_credentials(config, refresh_nonce)?;
+    post_json(client, config, "/api/router/dashboard/credentials/push", &payload).await?;
+    state.last_credentials_refresh_nonce = refresh_nonce;
+    Ok(())
 }
 
 async fn sync_router_dashboard(client: &Client, config: &AgentConfig, state: &mut AgentState, force: bool) -> Result<()> {
@@ -540,6 +856,13 @@ async fn sync_router_dashboard(client: &Client, config: &AgentConfig, state: &mu
         let full = collect_dashboard_payload(config, state, true, requested)?;
         post_json(client, config, "/api/router/dashboard/push", &full).await?;
         state.last_dashboard_refresh_nonce = requested;
+    }
+    let credentials_requested = response
+        .get("credentialsRefreshNonce")
+        .and_then(Value::as_u64)
+        .unwrap_or(0);
+    if credentials_requested > state.last_credentials_refresh_nonce {
+        sync_router_credentials(client, config, state, credentials_requested).await?;
     }
     Ok(())
 }
@@ -679,9 +1002,11 @@ async fn flush_device_events(client: &Client, config: &AgentConfig, state: &mut 
         if let Err(error) = post_json(client, config, "/api/router/push", &body).await {
             let event = body.get("event").and_then(Value::as_str).unwrap_or("device");
             let mac = body.get("mac").and_then(Value::as_str).unwrap_or("");
-            log_line(
+            log_limited(
                 config,
+                state,
                 "WARN",
+                "event-retry",
                 &format!("{} event queued for retry mac={} error={:#}", event, mac, error),
             );
             retry.push(body);
@@ -760,12 +1085,12 @@ async fn sync_portmaps(
 
 async fn agent_cycle(client: &Client, config: &AgentConfig, state: &mut AgentState) -> Result<()> {
     if let Err(error) = report_agent_status(client, config, state).await {
-        log_line(config, "WARN", &format!("agent status report skipped: {:#}", error));
+        log_limited(config, state, "WARN", "agent-status", &format!("agent status report skipped: {:#}", error));
     }
     match sync_agent_update(client, config, state).await {
         Ok(true) => return Ok(()),
         Ok(false) => {}
-        Err(error) => log_line(config, "WARN", &format!("agent update check skipped: {:#}", error)),
+        Err(error) => log_limited(config, state, "WARN", "agent-update-check", &format!("agent update check skipped: {:#}", error)),
     }
     let user_list = collect_user_list()?;
     let mut current = BTreeMap::new();
@@ -775,26 +1100,9 @@ async fn agent_cycle(client: &Client, config: &AgentConfig, state: &mut AgentSta
     flush_device_events(client, config, state).await;
     post_json(client, config, "/api/router/push", &router_snapshot(config)).await?;
     sync_portmaps(client, config, state).await?;
-    let now = now_epoch();
-    state.last_success_at = now;
-    state.last_error.clear();
+    state.last_success_at = now_epoch();
     state.update_state = "idle".into();
     state.update_message.clear();
-    if state.last_status_log_at == 0
-        || now.saturating_sub(state.last_status_log_at)
-            >= config.status_interval_seconds.clamp(60, 600)
-    {
-        log_line(
-            config,
-            "INFO",
-            &format!(
-                "sync ok: devices={} pending_events={}",
-                state.devices.len(),
-                state.pending_events.len()
-            ),
-        );
-        state.last_status_log_at = now;
-    }
     Ok(())
 }
 
@@ -807,11 +1115,12 @@ pub async fn run(args: &[String], once: bool) -> Result<()> {
     log_line(&config, "INFO", "Rust agent started");
     loop {
         let now = now_epoch();
+        let was_unhealthy = !state.last_error.is_empty();
         let mut errors = Vec::new();
         if once || last_agent_cycle_at == 0 || now.saturating_sub(last_agent_cycle_at) >= config.interval_seconds.clamp(5, 300) {
             if let Err(error) = agent_cycle(&client, &config, &mut state).await {
                 let text = redact(&format!("{:#}", error), &config.hook_token);
-                log_line(&config, "ERROR", &text);
+                log_limited(&config, &mut state, "ERROR", "agent-cycle", &text);
                 errors.push(text);
             }
             last_agent_cycle_at = now;
@@ -823,11 +1132,14 @@ pub async fn run(args: &[String], once: bool) -> Result<()> {
         if dashboard_due {
             if let Err(error) = sync_router_dashboard(&client, &config, &mut state, once).await {
                 let text = redact(&format!("router dashboard: {:#}", error), &config.hook_token);
-                log_line(&config, "WARN", &text);
+                log_limited(&config, &mut state, "WARN", "router-dashboard", &text);
                 errors.push(text);
             }
         }
         if errors.is_empty() {
+            if was_unhealthy {
+                log_line(&config, "INFO", "sync recovered");
+            }
             state.last_error.clear();
             state.last_success_at = now_epoch();
         } else {
@@ -861,6 +1173,8 @@ pub fn configure(args: &[String]) -> Result<()> {
     config.hub_url = hub;
     config.hook_token = hook_token.trim().to_string();
     config.router_name = name;
+    config.state_path = DEFAULT_AGENT_STATE.into();
+    config.log_path = DEFAULT_AGENT_LOG.into();
     save_json(&path, &config)?;
     println!("agent configuration saved");
     Ok(())
