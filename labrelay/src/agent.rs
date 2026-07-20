@@ -437,13 +437,6 @@ fn router_model() -> String {
         .unwrap_or_default()
 }
 
-fn first_count_by_keys(root: &Value, keys: &[&str]) -> u64 {
-    keys.iter()
-        .map(|key| number(root.get(*key)) as u64)
-        .find(|value| *value > 0)
-        .unwrap_or(0)
-}
-
 fn telemetry_from_fast(fast: &Value, online_devices: usize) -> Value {
     let wan = object_path(fast, &["wan_stat", "wans"])
         .or_else(|| object_path(fast, &["wan_stat", "wan"]))
@@ -465,16 +458,10 @@ fn telemetry_from_fast(fast: &Value, online_devices: usize) -> Value {
             "downloadBps": (download_raw * 8.0) as u64
         },
         "connections": {
-            "ipv4": first_count_by_keys(wan, &[
-                "ipv4_connection_count", "ipv4_session_count", "ipv4_sessions",
-                "v4_connection_count", "v4_session_count", "session_ipv4"
-            ]),
-            "ipv6": first_count_by_keys(wan, &[
-                "ipv6_connection_count", "ipv6_session_count", "ipv6_sessions",
-                "v6_connection_count", "v6_session_count", "session_ipv6"
-            ]),
-            "flow": first_count_by_keys(wan, &["flow_cnt", "flow_count", "session_count"]),
-            "cps": first_count_by_keys(wan, &["cps", "connections_per_second"])
+            "ipv4": number(wan.get("ipv4_connection_count")) as u64,
+            "ipv6": number(wan.get("ipv6_connection_count")) as u64,
+            "flow": number(wan.get("flow_cnt")) as u64,
+            "cps": number(wan.get("cps")) as u64
         }
     })
 }
@@ -684,7 +671,7 @@ fn details_from_sources(
             );
             let operator = first_text_by_keys(
                 network_root,
-                &["operator", "isp", "ispName", "service", "serviceName", "carrier", "provider"],
+                &["operator", "isp", "ispName", "serviceName", "carrier", "provider"],
             );
             insert_meaningful(&mut wan, "operator", Value::String(operator));
         }

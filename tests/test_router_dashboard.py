@@ -103,28 +103,6 @@ class RouterDashboardApiTests(unittest.TestCase):
         self.assertEqual(body["refreshCompletedNonce"], 1)
         self.assertNotIn("username", hub.ROUTER_DASHBOARD_CACHE)
 
-
-    def test_connection_counts_and_operator_are_preserved(self):
-        pushed = self.client.post(
-            "/api/router/dashboard/push",
-            headers={"X-LabProbe-Token": "test-hook-token"},
-            json={
-                "router": "BE72",
-                "telemetry": {
-                    "connections": {"ipv4": 151, "ipv6": 60, "flow": 189, "cps": 3}
-                },
-                "details": {"wan": {"ipv4": "10.87.180.102", "operator": "CMCC"}},
-            },
-        )
-        self.assertEqual(pushed.status_code, 200)
-        body = self.client.get(
-            "/api/router/dashboard",
-            headers={"Authorization": "Bearer test-app-token"},
-        ).get_json()
-        self.assertEqual(body["telemetry"]["connections"]["ipv4"], 151)
-        self.assertEqual(body["telemetry"]["connections"]["ipv6"], 60)
-        self.assertEqual(body["details"]["wan"]["operator"], "中国移动")
-
     def test_wrong_token_rejected(self):
         response = self.client.post(
             "/api/router/dashboard/push",

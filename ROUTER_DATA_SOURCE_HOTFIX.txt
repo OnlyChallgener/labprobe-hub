@@ -1,0 +1,18 @@
+LabRelay 路由器仪表盘数据源热修复（Hub 0.9.4 / LabRelay 0.2.5）
+
+新增采集：
+- dev_sta get -m ipinfo '{}'
+- dev_sta get -m ap_list '{}'
+
+保留采集：
+- dev_sta get -m ws_sysinfo '{"get":"fast"}'
+- dev_sta get -m ws_sysinfo '{"get":"slow"}'
+- dev_config get -m network '{}'
+
+归一化输出：
+- details.wan：来自 ipinfo
+- details.ap：来自 ap_list
+- details.lan / details.network：来自 dev_config network
+- details.ports：来自 ws_sysinfo slow，失败时回退 network.ports
+
+Hub Python 接口不变；需要重新构建并更新路由器上的 LabRelay 二进制，APP 才能收到新的 details.wan / details.ap。
