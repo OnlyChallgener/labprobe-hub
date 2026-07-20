@@ -26,6 +26,9 @@ pub struct AgentConfig {
     pub router_name: String,
     pub interval_seconds: u64,
     pub status_interval_seconds: u64,
+    pub dashboard_interval_seconds: u64,
+    pub dashboard_details_interval_seconds: u64,
+    pub dashboard_network_interval_seconds: u64,
     pub relay_socket: String,
     pub state_path: String,
     pub log_path: String,
@@ -40,6 +43,9 @@ impl Default for AgentConfig {
             router_name: "router".into(),
             interval_seconds: 15,
             status_interval_seconds: 15,
+            dashboard_interval_seconds: 2,
+            dashboard_details_interval_seconds: 30,
+            dashboard_network_interval_seconds: 60,
             relay_socket: "/tmp/labrelay.sock".into(),
             state_path: DEFAULT_AGENT_STATE.into(),
             log_path: DEFAULT_AGENT_LOG.into(),
@@ -58,6 +64,10 @@ struct AgentState {
     last_command_at: u64,
     update_state: String,
     update_message: String,
+    last_dashboard_fast_at: u64,
+    last_dashboard_details_at: u64,
+    last_dashboard_network_at: u64,
+    last_dashboard_refresh_nonce: u64,
 }
 
 fn now_epoch() -> u64 {
@@ -333,6 +343,207 @@ fn command_output(program: &str, args: &[&str]) -> Result<String> {
     Ok(String::from_utf8_lossy(&output.stdout).to_string())
 }
 
+
+fn command_json(program: &str, args: &[&str]) -> Result<Value> {
+    let raw = command_output(program, args)?;
+    if raw.trim().is_empty() {
+        bail!("{} returned empty JSON", program);
+    }
+    let root: Value = serde_json::from_str(raw.trim())
+        .with_context(|| format!("parse {} JSON", program))?;
+    if let Some(code) = root.get("rcode").and_then(Value::as_str) {
+        if code != "00000000" {
+            bail!("{} returned rcode {}", program, code);
+        }
+    }
+    if root.get("message").and_then(Value::as_str) == Some("success") {
+        return Ok(root.get("data").cloned().unwrap_or(Value::Null));
+    }
+    Ok(root)
+}
+
+fn number(value: Option<&Value>) -> f64 {
+    match value {
+        Some(Value::Number(v)) => v.as_f64().unwrap_or(0.0),
+        Some(Value::String(v)) => v.trim().trim_end_matches('%').parse::<f64>().unwrap_or(0.0),
+        _ => 0.0,
+    }
+}
+
+fn object_path<'a>(root: &'a Value, path: &[&str]) -> Option<&'a Value> {
+    let mut current = root;
+    for key in path {
+        current = current.get(*key)?;
+    }
+    Some(current)
+}
+
+fn sanitize_config_value(value: &Value) -> Value {
+    match value {
+        Value::Object(map) => {
+            let mut clean = Map::new();
+            for (key, child) in map {
+                let lower = key.to_ascii_lowercase();
+                if ["password", "passwd", "pwd", "secret", "token", "privatekey", "private_key", "username", "account"]
+                    .iter()
+                    .any(|needle| lower.contains(needle))
+                {
+                    continue;
+                }
+                clean.insert(key.clone(), sanitize_config_value(child));
+            }
+            Value::Object(clean)
+        }
+        Value::Array(items) => Value::Array(items.iter().map(sanitize_config_value).collect()),
+        _ => value.clone(),
+    }
+}
+
+fn router_model() -> String {
+    for path in ["/tmp/sysinfo/model", "/etc/board.json"] {
+        if path.ends_with("model") {
+            if let Ok(text) = fs::read_to_string(path) {
+                let value = text.trim();
+                if !value.is_empty() {
+                    return value.to_string();
+                }
+            }
+        }
+    }
+    command_json("ubus", &["call", "system", "board"])
+        .ok()
+        .and_then(|root| root.get("model").and_then(Value::as_str).map(str::to_string))
+        .unwrap_or_default()
+}
+
+fn telemetry_from_fast(fast: &Value, online_devices: usize) -> Value {
+    let wan = object_path(fast, &["wan_stat", "wans"])
+        .or_else(|| object_path(fast, &["wan_stat", "wan"]))
+        .unwrap_or(&Value::Null);
+    let upload_raw = number(wan.get("up"));
+    let download_raw = number(wan.get("down"));
+    json!({
+        "cpuPercent": number(fast.get("cpu_usage")).max(number(fast.get("cpuutil"))),
+        "memoryPercent": number(fast.get("memutil")),
+        "temperatureC": number(fast.get("temp")),
+        "temperature2gC": number(fast.get("temp_2g")),
+        "temperature5gC": number(fast.get("temp_5g")),
+        "uptimeSeconds": number(fast.get("runtime")) as u64,
+        "onlineDeviceCount": online_devices,
+        "wan": {
+            "uploadRaw": upload_raw,
+            "downloadRaw": download_raw,
+            "uploadBps": (upload_raw * 8.0) as u64,
+            "downloadBps": (download_raw * 8.0) as u64
+        },
+        "connections": {
+            "ipv4": number(wan.get("ipv4_connection_count")) as u64,
+            "ipv6": number(wan.get("ipv6_connection_count")) as u64,
+            "flow": number(wan.get("flow_cnt")) as u64,
+            "cps": number(wan.get("cps")) as u64
+        }
+    })
+}
+
+fn details_from_slow(slow: &Value, network: Option<&Value>) -> Value {
+    let ports = object_path(slow, &["port_status", "List"])
+        .cloned()
+        .unwrap_or_else(|| json!([]));
+    let wireless = slow.get("wireless").cloned().unwrap_or_else(|| json!({}));
+    let lan_ip = ports
+        .as_array()
+        .and_then(|items| items.iter().find(|item| item.get("name").and_then(Value::as_str) == Some("LAN")))
+        .and_then(|item| item.get("ipaddr"))
+        .and_then(Value::as_str)
+        .unwrap_or("");
+    json!({
+        "identity": {
+            "hostname": slow.get("hostname").and_then(Value::as_str).unwrap_or(""),
+            "model": router_model()
+        },
+        "wan": {
+            "ipv4": slow.get("wan_ip").and_then(Value::as_str).unwrap_or(""),
+            "status": slow.get("status").and_then(Value::as_str).unwrap_or("")
+        },
+        "lan": {"ipv4": lan_ip},
+        "wireless": wireless,
+        "ports": ports,
+        "network": network.map(sanitize_config_value).unwrap_or_else(|| json!({}))
+    })
+}
+
+fn collect_dashboard_payload(
+    config: &AgentConfig,
+    state: &mut AgentState,
+    force_details: bool,
+    refresh_nonce: u64,
+) -> Result<Value> {
+    let now = now_epoch();
+    let fast = command_json("dev_sta", &["get", "-m", "ws_sysinfo", r#"{"get":"fast"}"#])?;
+    state.last_dashboard_fast_at = now;
+    let mut payload = json!({
+        "router": config.router_name,
+        "telemetryAt": now,
+        "telemetryEpoch": now,
+        "telemetry": telemetry_from_fast(&fast, state.devices.len())
+    });
+
+    let details_due = force_details
+        || state.last_dashboard_details_at == 0
+        || now.saturating_sub(state.last_dashboard_details_at)
+            >= config.dashboard_details_interval_seconds.clamp(15, 300);
+    let network_due = force_details
+        || state.last_dashboard_network_at == 0
+        || now.saturating_sub(state.last_dashboard_network_at)
+            >= config.dashboard_network_interval_seconds.clamp(30, 600);
+
+    let mut slow_value = None;
+    if details_due {
+        match command_json("dev_sta", &["get", "-m", "ws_sysinfo", r#"{"get":"slow"}"#]) {
+            Ok(value) => {
+                state.last_dashboard_details_at = now;
+                slow_value = Some(value);
+            }
+            Err(error) => log_line(config, "WARN", &format!("router slow telemetry skipped: {:#}", error)),
+        }
+    }
+    let mut network_value = None;
+    if network_due {
+        match command_json("dev_config", &["get", "-m", "network", "{}"] ) {
+            Ok(value) => {
+                state.last_dashboard_network_at = now;
+                network_value = Some(value);
+            }
+            Err(error) => log_line(config, "WARN", &format!("router network config skipped: {:#}", error)),
+        }
+    }
+    if let Some(slow) = slow_value.as_ref() {
+        payload["details"] = details_from_slow(slow, network_value.as_ref());
+        payload["detailsAt"] = json!(now);
+        payload["detailsEpoch"] = json!(now);
+    } else if let Some(network) = network_value.as_ref() {
+        payload["details"] = json!({"network": sanitize_config_value(network)});
+        payload["detailsAt"] = json!(now);
+        payload["detailsEpoch"] = json!(now);
+    }
+    if refresh_nonce > 0 {
+        payload["refreshNonce"] = json!(refresh_nonce);
+    }
+    Ok(payload)
+}
+
+async fn sync_router_dashboard(client: &Client, config: &AgentConfig, state: &mut AgentState, force: bool) -> Result<()> {
+    let payload = collect_dashboard_payload(config, state, force, if force { state.last_dashboard_refresh_nonce } else { 0 })?;
+    let response = post_json(client, config, "/api/router/dashboard/push", &payload).await?;
+    let requested = response.get("refreshNonce").and_then(Value::as_u64).unwrap_or(0);
+    if requested > state.last_dashboard_refresh_nonce {
+        let full = collect_dashboard_payload(config, state, true, requested)?;
+        post_json(client, config, "/api/router/dashboard/push", &full).await?;
+        state.last_dashboard_refresh_nonce = requested;
+    }
+    Ok(())
+}
+
 fn collect_user_list() -> Result<Value> {
     let raw = command_output(
         "dev_sta",
@@ -592,21 +803,41 @@ pub async fn run(args: &[String], once: bool) -> Result<()> {
     let state_path = PathBuf::from(&config.state_path);
     let mut state = load_state(&state_path);
     let client = http_client()?;
+    let mut last_agent_cycle_at = 0u64;
     log_line(&config, "INFO", "Rust agent started");
     loop {
-        if let Err(error) = agent_cycle(&client, &config, &mut state).await {
-            state.last_error = redact(&format!("{:#}", error), &config.hook_token);
-            log_line(&config, "ERROR", &state.last_error);
+        let now = now_epoch();
+        let mut errors = Vec::new();
+        if once || last_agent_cycle_at == 0 || now.saturating_sub(last_agent_cycle_at) >= config.interval_seconds.clamp(5, 300) {
+            if let Err(error) = agent_cycle(&client, &config, &mut state).await {
+                let text = redact(&format!("{:#}", error), &config.hook_token);
+                log_line(&config, "ERROR", &text);
+                errors.push(text);
+            }
+            last_agent_cycle_at = now;
+        }
+        let dashboard_due = once
+            || state.last_dashboard_fast_at == 0
+            || now.saturating_sub(state.last_dashboard_fast_at)
+                >= config.dashboard_interval_seconds.clamp(2, 30);
+        if dashboard_due {
+            if let Err(error) = sync_router_dashboard(&client, &config, &mut state, once).await {
+                let text = redact(&format!("router dashboard: {:#}", error), &config.hook_token);
+                log_line(&config, "WARN", &text);
+                errors.push(text);
+            }
+        }
+        if errors.is_empty() {
+            state.last_error.clear();
+            state.last_success_at = now_epoch();
+        } else {
+            state.last_error = errors.join(" | ");
         }
         save_json(&state_path, &state)?;
         if once {
-            return if state.last_error.is_empty() {
-                Ok(())
-            } else {
-                Err(anyhow!(state.last_error))
-            };
-        };
-        sleep(Duration::from_secs(config.interval_seconds.clamp(5, 300))).await;
+            return if state.last_error.is_empty() { Ok(()) } else { Err(anyhow!(state.last_error)) };
+        }
+        sleep(Duration::from_secs(1)).await;
     }
 }
 

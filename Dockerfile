@@ -23,8 +23,10 @@ RUN pip install --no-cache-dir -r /app/requirements.txt
 
 COPY hub.py /app/hub.py
 COPY labprobe_storage.py /app/labprobe_storage.py
+COPY scripts/repair_storage.py /app/scripts/repair_storage.py
 
-RUN mkdir -p /app/data /app/config /app/backups /app/logs
+RUN mkdir -p /app/data /app/config /app/backups /app/logs /app/scripts \
+    && chmod 755 /app/scripts/repair_storage.py
 
 EXPOSE 58443
 

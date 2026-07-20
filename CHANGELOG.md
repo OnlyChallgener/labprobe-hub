@@ -1,5 +1,20 @@
 # LabProbe 变更记录
 
+## 0.9.3 / LabRelay 0.2.4
+
+- 修复 SQLite `revisions` 无界增长：高频缓存文档不再复制整份 JSON 到增量历史。
+- 设备 RSSI、流量、在线时长等采样字段不再触发永久 revision；IP、在线状态、名称等有效变化仍会同步。
+- `state.json` 忽略时间戳和内嵌设备采样，仅在真实状态变化时产生 revision。
+- revision 默认最多保留 5000 条且不超过 7 天，旧客户端自动回退完整同步。
+- 保留端口映射历史和路由器仪表盘功能，但高频数据只保存最新状态，不再造成数据库爆炸。
+
+## 0.9.2 / LabRelay 0.2.3
+
+- 新增路由器状态仪表盘数据链路：实时 CPU、内存、温度、WAN 速率与在线设备数。
+- LabRelay 分频采集 `ws_sysinfo fast/slow`、`dev_config network`，网络配置按敏感字段白名单脱敏。
+- Hub 增加路由器仪表盘内存缓存、HTTP 接口和 MQTT retained 主题，避免高频写入 SQLite。
+- 支持 APP 手动刷新请求，由 Relay 在下一次实时上报中领取并完成完整采集。
+
 ## 0.9.x（当前开发分支）
 
 - Hub 改为通用 Linux AMD64/ARM64 部署，并统一相对数据目录。

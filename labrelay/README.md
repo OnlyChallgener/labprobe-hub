@@ -1,4 +1,4 @@
-# LabRelay v0.2.2
+# LabRelay v0.2.4
 
 面向 LabProbe / 极客网探的轻量 Rust 四层 TCP 反代服务。
 
@@ -38,4 +38,4 @@ cargo run -- ctl --socket /tmp/labrelay-test.sock '{"action":"status"}'
 
 ## 编译 BE72 静态程序
 
-GitHub Actions 运行 `Build LabRelay Router Binary`，下载 `labrelay-linux-arm64（v0.2.2）`。
+GitHub Actions 运行 `Build LabRelay Router Binary`，下载 `labrelay-linux-arm64（v0.2.4）`。

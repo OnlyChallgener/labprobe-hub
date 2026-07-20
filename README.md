@@ -1,4 +1,4 @@
-# LabProbe Hub 0.9.1
+# LabProbe Hub 0.9.3
 
 LabProbe Hub 可部署在任意 Linux AMD64/ARM64 宿主机，包括服务器、小主机、NAS 和软路由。Hub 使用 SQLite 保存数据；已适配锐捷路由器上的 Rust Agent 继续以 `dev_sta/user_list` 为核心数据源。
 
@@ -61,11 +61,21 @@ CI 使用 Buildx 同时构建 `linux/amd64` 和 `linux/arm64`，容器内置 `/h
 
 迁移后旧 JSON 不再写入，只作为只读恢复材料。数据库启用 WAL、外键、事务、忙等待、schema version 和索引。
 
+从 Hub 0.9.3 起，SQLite 增量历史采用有界保留：默认最多 5000 条且不超过 7 天。`device_archive.json`、端口运行状态、端口历史、Agent 状态、每日在线采样、地理缓存和路由器仪表盘等高频文档只保存最新值，不再将整份 JSON 复制进 `revisions`。设备 RSSI、流量和在线时长变化也不会单独创建永久 revision；APP 每 5 分钟完整校准，revision 被裁剪时会自动执行完整同步。可通过 `REVISION_MAX_ROWS`、`REVISION_MAX_AGE_DAYS` 和 `REVISION_PRUNE_INTERVAL_SEC` 调整保留策略。
+
 ```sh
 docker exec labprobe-hub python /app/hub.py doctor
 docker exec labprobe-hub python /app/hub.py status
 docker exec labprobe-hub python /app/hub.py test-hub
 ```
+
+旧版本数据库曾因无界 revision 膨胀时，应先停止 Hub，再执行一次压缩维护：
+
+```sh
+docker exec labprobe-hub python /app/scripts/repair_storage.py --vacuum
+```
+
+脚本会先在 `/app/backups` 创建 SQLite 在线备份，再仅裁剪旧 revision 并压缩数据库；当前设备、备注、关注、事件和端口映射文档不会删除。数据库已正常且体积较小时无需反复执行。
 
 
 ## Token 鉴权
@@ -75,7 +85,7 @@ Hub 使用两个必须自行设置的独立令牌：
 - `APP_TOKEN`：供 Android APP 的管理、状态与同步请求使用。
 - `HOOK_TOKEN`：供 LabRelay、Lucky 和 Webhook 上报及路由器接口使用。
 
-在 `.env` 或 `config/config.yaml` 中填写强随机值，重启 Hub 后，在 APP 设置页填写相同的 `APP_TOKEN` 与 `HOOK_TOKEN`；安装 LabRelay 时填写相同的 `HOOK_TOKEN`。Hub 不再生成配对码，也不再签发 Client Token。
+在 `.env` 或 `config/config.yaml` 中填写强随机值，重启 Hub 后，APP 只填写相同的 `APP_TOKEN`；安装 LabRelay 时填写相同的 `HOOK_TOKEN`。
 
 ## 同步协议
 
@@ -119,8 +129,8 @@ Hub 从统一的 `UPDATE_REPOSITORY_ROOT` 读取 Rust `latest.json`，APP 评分
 
 ```sh
 python scripts/build_update_bundle.py \
-  --app-apk LabProbeApp.apk --app-version-name 0.10.4 --app-version-code 132 \
-  --agent-arm64 labrelay-linux-arm64 --agent-version 0.2.2 \
+  --app-apk LabProbeApp.apk --app-version-name 0.10.5 --app-version-code 133 \
+  --agent-arm64 labrelay-linux-arm64 --agent-version 0.2.4 \
   --output update-bundle
 ```
 

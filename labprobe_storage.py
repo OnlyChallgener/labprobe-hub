@@ -13,13 +13,60 @@ import os
 import shutil
 import sqlite3
 import threading
+import time
 from contextlib import contextmanager
 from datetime import datetime
 from pathlib import Path
-from typing import Any, Dict, List, Optional, Tuple
+from typing import Any, Dict, Iterable, List, Optional, Tuple
 
 
 SCHEMA_VERSION = 1
+
+
+def _env_int(name: str, default: int, minimum: int) -> int:
+    try:
+        return max(minimum, int(os.environ.get(name, str(default))))
+    except (TypeError, ValueError):
+        return default
+
+
+# Runtime/cache documents are authoritative only in their latest form. Keeping a
+# complete copy in every revision caused multi-GB growth when a large JSON
+# document changed once per minute.
+NON_REVISION_DOCUMENTS = frozenset({
+    "device_archive.json",
+    "portmap_history.json",
+    "portmap_router_status.json",
+    "portmap_commands.json",
+    "agent_status.json",
+    "agent_update_commands.json",
+    "daily_online.json",
+    "geo_cache.json",
+    "router_dashboard.json",
+})
+
+REVISION_MAX_ROWS = _env_int("REVISION_MAX_ROWS", 5000, 500)
+REVISION_MAX_AGE_DAYS = _env_int("REVISION_MAX_AGE_DAYS", 7, 1)
+REVISION_PRUNE_INTERVAL_SEC = _env_int("REVISION_PRUNE_INTERVAL_SEC", 300, 30)
+
+# Fields that change every sample but do not represent a device identity,
+# connection or user-visible configuration change.
+VOLATILE_DEVICE_KEYS = frozenset({
+    "raw", "rssi", "rxrate", "txrate", "channel", "activeTime",
+    "activeTimeSec", "onlinetime", "onlineDurationText",
+    "todayOnlineDurationSec", "todayOnlineDurationText", "todayOnlineDate",
+    "lastSeenAt", "trafficUpdatedAt", "trafficDate", "trafficText",
+    "flowUp", "flowDown", "flow_cnt", "up", "down", "dailyUp",
+    "dailyDown", "todayUpload", "todayDownload", "totalUpload",
+    "totalDownload", "dailyUpBytes", "dailyDownBytes", "upBytes",
+    "downBytes", "todayTraffic", "realtimeTraffic", "awake", "psm",
+})
+
+VOLATILE_STATUS_KEYS = frozenset({
+    "updatedAt", "devicesUpdatedAt", "backgroundRefreshedAt",
+    "routerLastCheckAt", "routerUpdatedAt", "lastSeenAt",
+    "trafficUpdatedAt", "ipv6UpdatedAt", "receivedAt", "receivedEpoch",
+})
 
 
 def _json_text(value: Any) -> str:
@@ -38,6 +85,7 @@ class SQLiteStore:
         self.db_path = (db_path or (self.data_dir / "labprobe.db")).resolve()
         self._lock = threading.RLock()
         self.migration_result: Dict[str, Any] = {}
+        self._last_revision_prune_at = 0.0
 
     @contextmanager
     def connect(self):
@@ -58,6 +106,7 @@ class SQLiteStore:
             with self._lock, self.connect() as conn:
                 conn.execute("PRAGMA journal_mode=WAL")
                 conn.execute("PRAGMA synchronous=FULL")
+                conn.execute("PRAGMA wal_autocheckpoint=1000")
                 self._create_schema(conn)
             if not existed:
                 self.migration_result = self._migrate_json_once()
@@ -69,6 +118,10 @@ class SQLiteStore:
                         "INSERT INTO revisions(entity,operation,entity_key,payload_json,created_at) VALUES(?,?,?,?,?)",
                         ("system", "baseline", "database", None, _now()),
                     )
+            with self._lock, self.connect() as conn:
+                conn.execute("BEGIN IMMEDIATE")
+                self._prune_revisions(conn, force=True)
+                conn.execute("COMMIT")
             self.integrity_check()
             return self.migration_result
         except Exception:
@@ -188,6 +241,72 @@ class SQLiteStore:
         except Exception:
             return default
 
+    @staticmethod
+    def _stable_device(item: Any) -> Any:
+        if not isinstance(item, dict):
+            return item
+        return {
+            key: value
+            for key, value in item.items()
+            if key not in VOLATILE_DEVICE_KEYS
+            and not key.lower().endswith("bytes")
+            and not key.lower().startswith("flow")
+        }
+
+    @classmethod
+    def _stable_status(cls, value: Any, *, root: bool = True) -> Any:
+        if isinstance(value, list):
+            return [cls._stable_status(item, root=False) for item in value]
+        if not isinstance(value, dict):
+            return value
+        clean: Dict[str, Any] = {}
+        for key, child in value.items():
+            # Device lists have their own revision entities. Embedding their
+            # signal/traffic counters in the status revision duplicated data.
+            if root and key == "devices":
+                continue
+            if key in VOLATILE_STATUS_KEYS or key.endswith("UpdatedAt") or key.endswith("RefreshedAt"):
+                continue
+            clean[key] = cls._stable_status(child, root=False)
+        return clean
+
+    def _list_diff_stable(
+        self,
+        entity: str,
+        old: Iterable[Any],
+        new: Iterable[Any],
+    ) -> List[Tuple[str, str, str, Any]]:
+        old_map = {self._row_key(x, str(i)): x for i, x in enumerate(old or []) if isinstance(x, dict)}
+        new_map = {self._row_key(x, str(i)): x for i, x in enumerate(new or []) if isinstance(x, dict)}
+        changes: List[Tuple[str, str, str, Any]] = []
+        for key, value in new_map.items():
+            previous = old_map.get(key)
+            if previous is None or self._stable_device(previous) != self._stable_device(value):
+                operation = "delete" if bool(value.get("deleted")) else "upsert"
+                changes.append((entity, operation, key, None if operation == "delete" else value))
+        for key in old_map.keys() - new_map.keys():
+            changes.append((entity, "delete", key, None))
+        return changes
+
+    def _prune_revisions(self, conn: sqlite3.Connection, force: bool = False) -> None:
+        now = time.monotonic()
+        if not force and now - self._last_revision_prune_at < REVISION_PRUNE_INTERVAL_SEC:
+            return
+        # Remove revisions outside the time window first.
+        conn.execute(
+            "DELETE FROM revisions WHERE created_at < datetime('now','localtime', ?)",
+            (f"-{REVISION_MAX_AGE_DAYS} days",),
+        )
+        # Then enforce a hard row cap. Deleted pages are reused by SQLite, so the
+        # file remains bounded without running an expensive VACUUM during normal use.
+        cutoff = conn.execute(
+            "SELECT revision FROM revisions ORDER BY revision DESC LIMIT 1 OFFSET ?",
+            (REVISION_MAX_ROWS - 1,),
+        ).fetchone()
+        if cutoff is not None:
+            conn.execute("DELETE FROM revisions WHERE revision < ?", (int(cutoff["revision"]),))
+        self._last_revision_prune_at = now
+
     def save(self, path: Path, value: Any) -> int:
         key = self.document_key(path)
         with self._lock, self.connect() as conn:
@@ -209,6 +328,7 @@ class SQLiteStore:
                         "INSERT INTO revisions(entity,operation,entity_key,payload_json,created_at) VALUES(?,?,?,?,?)",
                         (entity, operation, entity_key, None if payload is None else _json_text(payload), _now()),
                     )
+                self._prune_revisions(conn)
                 conn.execute("COMMIT")
                 return self.current_revision(conn)
             except Exception:
@@ -233,6 +353,8 @@ class SQLiteStore:
         return changes
 
     def _changes_for_document(self, key: str, old: Any, new: Any) -> List[Tuple[str, str, str, Any]]:
+        if key in NON_REVISION_DOCUMENTS:
+            return []
         if key == "devices.json":
             old_obj = old if isinstance(old, dict) else {}
             new_obj = new if isinstance(new, dict) else {}
@@ -248,26 +370,14 @@ class SQLiteStore:
             if old_meta != new_meta:
                 meta_changes.append(("device_meta", "replace", "devices", new_meta))
             return (
-                self._list_diff("device", old_obj.get("watched", []), new_obj.get("watched", []))
-                + self._list_diff("online_device", old_obj.get("online", []), new_obj.get("online", []))
+                self._list_diff_stable("device", old_obj.get("watched", []), new_obj.get("watched", []))
+                + self._list_diff_stable("online_device", old_obj.get("online", []), new_obj.get("online", []))
                 + meta_changes
             )
         if key == "events.json":
             return self._list_diff("event", old if isinstance(old, list) else [], new if isinstance(new, list) else [])
         if key == "state.json":
-            def stable_status(value: Any) -> Any:
-                if not isinstance(value, dict):
-                    return value
-                clean = json.loads(json.dumps(value))
-                clean.pop("updatedAt", None)
-                router = clean.get("router")
-                if isinstance(router, dict):
-                    router.pop("devicesUpdatedAt", None)
-                hub = clean.get("hub")
-                if isinstance(hub, dict):
-                    hub.pop("updatedAt", None)
-                return clean
-            if stable_status(old) == stable_status(new):
+            if self._stable_status(old) == self._stable_status(new):
                 return []
             return [("status", "replace", "status", new)]
         return [("document", "replace", key, new)]
@@ -329,4 +439,14 @@ class SQLiteStore:
         with self.connect() as conn:
             schema = int(conn.execute("SELECT COALESCE(MAX(version),0) FROM schema_migrations").fetchone()[0])
             documents = int(conn.execute("SELECT COUNT(*) FROM documents").fetchone()[0])
-        return {**info, "schemaVersion": schema, "documents": documents, "path": str(self.db_path), "ok": True}
+        return {
+            **info,
+            "schemaVersion": schema,
+            "documents": documents,
+            "revisionRetention": {
+                "maxRows": REVISION_MAX_ROWS,
+                "maxAgeDays": REVISION_MAX_AGE_DAYS,
+            },
+            "path": str(self.db_path),
+            "ok": True,
+        }

@@ -20,10 +20,10 @@ import yaml
 import requests
 import dns.resolver
 import paho.mqtt.client as mqtt
-from flask import Flask, request, jsonify
+from flask import Flask, request, jsonify, g
 from labprobe_storage import SQLiteStore
 
-APP_VERSION = "0.9.1"
+APP_VERSION = "0.9.3"
 PORT = int(os.environ.get("PORT", "58443"))
 BASE_DIR = Path(os.environ.get("LABPROBE_BASE_DIR", ".")).resolve()
 CONFIG_DIR = Path(os.environ.get("CONFIG_DIR", str(BASE_DIR / "config"))).resolve()
@@ -50,12 +50,14 @@ PORTMAP_ROUTER_STATUS_FILE = DATA_DIR / "portmap_router_status.json"
 PORTMAP_HISTORY_FILE = DATA_DIR / "portmap_history.json"
 AGENT_STATUS_FILE = DATA_DIR / "agent_status.json"
 AGENT_UPDATE_COMMANDS_FILE = DATA_DIR / "agent_update_commands.json"
+ROUTER_DASHBOARD_FILE = DATA_DIR / "router_dashboard.json"
 NOTES_DIR = DATA_DIR / "notes"
 NOTES_DIR.mkdir(parents=True, exist_ok=True)
 
 app = Flask(__name__)
 
 DATA_LOCK = threading.RLock()
+ROUTER_DASHBOARD_LOCK = threading.RLock()
 REFRESH_LOCK = threading.RLock()
 REFRESH_RUNNING = False
 STATUS_REFRESH_TTL_SEC = int(os.environ.get("STATUS_REFRESH_TTL_SEC", "180"))
@@ -72,6 +74,7 @@ MQTT_PASSWORD = (os.environ.get("MQTT_PASSWORD") or "").strip()
 MQTT_TOPIC_PREFIX = re.sub(r"[^A-Za-z0-9._/-]+", "-", (os.environ.get("MQTT_TOPIC_PREFIX") or "labprobe/hub").strip()).strip("/")
 MQTT_REVISION_TOPIC = f"{MQTT_TOPIC_PREFIX}/sync/revision"
 MQTT_AVAILABILITY_TOPIC = f"{MQTT_TOPIC_PREFIX}/availability"
+MQTT_ROUTER_DASHBOARD_TOPIC = f"{MQTT_TOPIC_PREFIX}/router/dashboard"
 
 
 class SecretRedactionFilter(logging.Filter):
@@ -131,8 +134,23 @@ LOGGER = configure_logging()
 MIGRATION_RESULT = STORE.initialize()
 
 
+def _load_router_dashboard_cache() -> Dict[str, Any]:
+    try:
+        if ROUTER_DASHBOARD_FILE.exists():
+            value = json.loads(ROUTER_DASHBOARD_FILE.read_text(encoding="utf-8"))
+            return value if isinstance(value, dict) else {}
+    except Exception as exc:
+        LOGGER.warning("router dashboard cache load failed: %s", exc)
+    return {}
+
+
+ROUTER_DASHBOARD_CACHE: Dict[str, Any] = _load_router_dashboard_cache()
+ROUTER_DASHBOARD_LAST_PERSIST_AT = 0.0
+ROUTER_DASHBOARD_REFRESH_NONCE = int(ROUTER_DASHBOARD_CACHE.get("refreshNonce") or 0)
+
+
 class MqttRevisionPublisher:
-    """Publish the retained revision signal; HTTP remains the data source of truth."""
+    """Publish retained revision and router dashboard signals; HTTP remains authoritative."""
 
     @staticmethod
     def _timestamp() -> str:
@@ -151,6 +169,7 @@ class MqttRevisionPublisher:
         self._disconnected_at = None
         self._last_publish_at = None
         self._last_published_revision = 0
+        self._latest_dashboard: Dict[str, Any] = dict(ROUTER_DASHBOARD_CACHE)
 
     def start(self) -> None:
         if not self.enabled:
@@ -185,6 +204,15 @@ class MqttRevisionPublisher:
                 with self._lock:
                     self._last_publish_at = self._timestamp()
                     self._last_published_revision = revision
+            with self._lock:
+                dashboard = dict(self._latest_dashboard)
+            if dashboard:
+                active.publish(
+                    MQTT_ROUTER_DASHBOARD_TOPIC,
+                    json.dumps(dashboard, ensure_ascii=False, separators=(",", ":")),
+                    qos=0,
+                    retain=True,
+                )
 
         def on_disconnect(_active, _userdata, _flags, reason_code, _properties):
             self.connected = False
@@ -226,6 +254,22 @@ class MqttRevisionPublisher:
                     self._last_publish_at = self._timestamp()
                     self._last_published_revision = revision
 
+    def publish_dashboard(self, payload: Dict[str, Any]) -> None:
+        if not isinstance(payload, dict) or not payload:
+            return
+        with self._lock:
+            self._latest_dashboard = dict(payload)
+        if self.enabled and self.connected and self._client is not None:
+            info = self._client.publish(
+                MQTT_ROUTER_DASHBOARD_TOPIC,
+                json.dumps(payload, ensure_ascii=False, separators=(",", ":")),
+                qos=0,
+                retain=True,
+            )
+            if info.rc != mqtt.MQTT_ERR_SUCCESS:
+                with self._lock:
+                    self._last_error = f"dashboard publish failed rc={info.rc}"
+
     def status(self) -> Dict[str, Any]:
         with self._lock:
             return {
@@ -233,6 +277,7 @@ class MqttRevisionPublisher:
                 "connected": self.connected,
                 "publicUrlConfigured": bool(MQTT_PUBLIC_URL),
                 "revisionTopic": MQTT_REVISION_TOPIC if self.enabled else "",
+                "dashboardTopic": MQTT_ROUTER_DASHBOARD_TOPIC if self.enabled else "",
                 "connectedAt": self._connected_at,
                 "disconnectedAt": self._disconnected_at,
                 "lastPublishAt": self._last_publish_at,
@@ -247,15 +292,19 @@ MQTT_PUBLISHER.start()
 
 @app.before_request
 def lock_request_data():
-    # Existing handlers use read/modify/write document operations. Serializing
-    # those short critical sections prevents lost updates while SQLite/WAL still
-    # gives external readers a consistent committed view.
+    # High-frequency router telemetry uses a dedicated in-memory lock and must not
+    # block SQLite-backed device/event synchronization.
+    if request.path.startswith("/api/router/dashboard"):
+        g.data_lock_acquired = False
+        return
     DATA_LOCK.acquire()
+    g.data_lock_acquired = True
 
 
 @app.teardown_request
 def unlock_request_data(_error=None):
-    DATA_LOCK.release()
+    if getattr(g, "data_lock_acquired", False):
+        DATA_LOCK.release()
 
 
 
@@ -2210,6 +2259,7 @@ def mqtt_client_config(include_secret: bool = True) -> Dict[str, Any]:
         "username": MQTT_USERNAME if enabled else "",
         "revisionTopic": MQTT_REVISION_TOPIC if enabled else "",
         "availabilityTopic": MQTT_AVAILABILITY_TOPIC if enabled else "",
+        "dashboardTopic": MQTT_ROUTER_DASHBOARD_TOPIC if enabled else "",
         "transport": "wss" if MQTT_PUBLIC_URL.lower().startswith("wss://") else "mqtt",
         "keepAliveSeconds": 25,
     }
@@ -2420,6 +2470,121 @@ def api_router_agent_status():
     return jsonify({"ok": True, "time": now_str()})
 
 
+
+def _dashboard_number(value: Any, default: float = 0.0) -> float:
+    try:
+        return float(value)
+    except (TypeError, ValueError):
+        return default
+
+
+def _dashboard_epoch(value: Any) -> float:
+    try:
+        return float(value)
+    except (TypeError, ValueError):
+        return 0.0
+
+
+def _deep_merge_dict(current: Dict[str, Any], update: Dict[str, Any]) -> Dict[str, Any]:
+    result = dict(current)
+    for key, value in update.items():
+        if isinstance(value, dict) and isinstance(result.get(key), dict):
+            result[key] = _deep_merge_dict(result[key], value)
+        else:
+            result[key] = value
+    return result
+
+
+def _router_dashboard_public() -> Dict[str, Any]:
+    with ROUTER_DASHBOARD_LOCK:
+        result = json.loads(json.dumps(ROUTER_DASHBOARD_CACHE, ensure_ascii=False)) if ROUTER_DASHBOARD_CACHE else {}
+        refresh_nonce = ROUTER_DASHBOARD_REFRESH_NONCE
+    now = time.time()
+    telemetry_at = _dashboard_epoch(result.get("telemetryEpoch"))
+    details_at = _dashboard_epoch(result.get("detailsEpoch"))
+    last_seen = max(telemetry_at, details_at, _dashboard_epoch(result.get("receivedEpoch")))
+    result.update({
+        "ok": True,
+        "online": bool(last_seen and now - last_seen <= 45),
+        "telemetryStale": not telemetry_at or now - telemetry_at > 8,
+        "detailsStale": not details_at or now - details_at > 120,
+        "refreshNonce": refresh_nonce,
+        "serverTime": now_str(),
+    })
+    return result
+
+
+def _persist_router_dashboard_if_due(force: bool = False) -> None:
+    global ROUTER_DASHBOARD_LAST_PERSIST_AT
+    now = time.time()
+    if not force and now - ROUTER_DASHBOARD_LAST_PERSIST_AT < 60:
+        return
+    with ROUTER_DASHBOARD_LOCK:
+        payload = dict(ROUTER_DASHBOARD_CACHE)
+    try:
+        tmp = ROUTER_DASHBOARD_FILE.with_suffix(".tmp")
+        tmp.write_text(json.dumps(payload, ensure_ascii=False, indent=2), encoding="utf-8")
+        tmp.replace(ROUTER_DASHBOARD_FILE)
+        ROUTER_DASHBOARD_LAST_PERSIST_AT = now
+    except Exception as exc:
+        LOGGER.warning("router dashboard cache persist failed: %s", exc)
+
+
+@app.route("/api/router/dashboard/push", methods=["POST"])
+def api_router_dashboard_push():
+    if not check_hook_token():
+        return jsonify({"ok": False, "error": "bad agent token"}), 401
+    payload = request.get_json(silent=True) or {}
+    if not isinstance(payload, dict):
+        return jsonify({"ok": False, "error": "invalid payload"}), 400
+    now_epoch = time.time()
+    router_name = clean_saved_value(payload.get("router")) or primary_router_name() or "router"
+    with ROUTER_DASHBOARD_LOCK:
+        ROUTER_DASHBOARD_CACHE["router"] = router_name
+        ROUTER_DASHBOARD_CACHE["receivedAt"] = now_str()
+        ROUTER_DASHBOARD_CACHE["receivedEpoch"] = now_epoch
+        telemetry = payload.get("telemetry")
+        if isinstance(telemetry, dict):
+            ROUTER_DASHBOARD_CACHE["telemetry"] = telemetry
+            ROUTER_DASHBOARD_CACHE["telemetryAt"] = now_str()
+            ROUTER_DASHBOARD_CACHE["telemetryEpoch"] = _dashboard_epoch(payload.get("telemetryEpoch")) or now_epoch
+        details = payload.get("details")
+        if isinstance(details, dict):
+            existing_details = ROUTER_DASHBOARD_CACHE.get("details") if isinstance(ROUTER_DASHBOARD_CACHE.get("details"), dict) else {}
+            ROUTER_DASHBOARD_CACHE["details"] = _deep_merge_dict(existing_details, details)
+            ROUTER_DASHBOARD_CACHE["detailsAt"] = now_str()
+            ROUTER_DASHBOARD_CACHE["detailsEpoch"] = _dashboard_epoch(payload.get("detailsEpoch")) or now_epoch
+        completed = int(_dashboard_number(payload.get("refreshNonce"), 0))
+        if completed > int(_dashboard_number(ROUTER_DASHBOARD_CACHE.get("refreshCompletedNonce"), 0)):
+            ROUTER_DASHBOARD_CACHE["refreshCompletedNonce"] = completed
+            ROUTER_DASHBOARD_CACHE["refreshCompletedAt"] = now_str()
+        public = _router_dashboard_public()
+        refresh_nonce = ROUTER_DASHBOARD_REFRESH_NONCE
+    _persist_router_dashboard_if_due()
+    MQTT_PUBLISHER.publish_dashboard(public)
+    return jsonify({"ok": True, "time": now_str(), "refreshNonce": refresh_nonce})
+
+
+@app.route("/api/router/dashboard", methods=["GET"])
+def api_router_dashboard():
+    if not check_read_token():
+        return jsonify({"ok": False, "error": "unauthorized"}), 401
+    return jsonify(_router_dashboard_public())
+
+
+@app.route("/api/router/dashboard/refresh", methods=["POST"])
+def api_router_dashboard_refresh():
+    global ROUTER_DASHBOARD_REFRESH_NONCE
+    if not check_app_token():
+        return jsonify({"ok": False, "error": "unauthorized"}), 401
+    with ROUTER_DASHBOARD_LOCK:
+        ROUTER_DASHBOARD_REFRESH_NONCE += 1
+        ROUTER_DASHBOARD_CACHE["refreshNonce"] = ROUTER_DASHBOARD_REFRESH_NONCE
+        ROUTER_DASHBOARD_CACHE["refreshRequestedAt"] = now_str()
+        nonce = ROUTER_DASHBOARD_REFRESH_NONCE
+    return jsonify({"ok": True, "refreshNonce": nonce, "message": "refresh queued", "time": now_str()})
+
+
 @app.route("/.well-known/labprobe", methods=["GET"])
 def labprobe_discovery():
     return jsonify({
@@ -2427,7 +2592,7 @@ def labprobe_discovery():
         "name": hub_name(),
         "version": APP_VERSION,
         "advertiseUrl": advertise_url(),
-        "capabilities": ["snapshot", "revision", "incremental", "token_auth", "sqlite", "mqtt_revision"],
+        "capabilities": ["snapshot", "revision", "incremental", "token_auth", "sqlite", "mqtt_revision", "router_dashboard"],
         "mqtt": mqtt_client_config(include_secret=False),
     })
 
