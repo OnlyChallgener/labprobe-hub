@@ -26,7 +26,7 @@ Hub 直接更新原有接口：
 
 Hub 只开放白名单业务接口，不开放任意 `method/module` 代理。路由器密码 AES-GCM 加密保存在 `config/router_eweb.json`；sid/stok 只保存在内存，不返回 APP，也不写普通日志。
 
-## Docker 部署（推荐 host 网络）
+## Docker 部署（使用 bridge 网络）
 
 ```bash
 git fetch origin
@@ -52,9 +52,11 @@ ROUTER_CONFIG_KEY=请使用长随机字符串
 启动：
 
 ```bash
-docker compose -f docker-compose.host.yml up -d --build
+docker compose -f docker-compose.bridge.yml up -d --build
 docker logs -f labprobe-hub
 ```
+
+bridge 模式下容器通常可以直接访问局域网路由器 `192.168.5.1`，不需要使用宿主机网络。若自定义 Docker 防火墙，请确保容器允许访问路由器管理地址。
 
 测试：
 
