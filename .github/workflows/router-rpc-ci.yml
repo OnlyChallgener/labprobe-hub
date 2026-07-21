@@ -25,7 +25,13 @@ jobs:
       - name: Compile Python
         run: python -m py_compile hub.py hub_entry.py router_rpc.py labprobe_storage.py
       - name: Unit tests
-        run: pytest -q tests/test_router_rpc.py
+        shell: bash
+        run: |
+          set +e
+          pytest -vv --tb=short tests/test_router_rpc.py > /tmp/pytest.log 2>&1
+          STATUS=$?
+          tail -n 100 /tmp/pytest.log
+          exit $STATUS
       - name: Build Docker image
         run: docker build -t labprobe-hub:router-rpc-ci .
       - name: Verify Relay manifest
