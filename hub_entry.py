@@ -1,7 +1,8 @@
-"""LabProbe Hub entrypoint with the Ruijie router-control blueprint enabled."""
+"""LabProbe Hub entrypoint with direct Ruijie router control enabled."""
 from pathlib import Path
 
 import hub
+from router_compat import install_router_rpc_compat
 from router_rpc import create_router_blueprint
 
 HUB_VERSION = "0.9.8"
@@ -13,6 +14,7 @@ hub.app.register_blueprint(
         config_dir=Path(hub.CONFIG_DIR),
     )
 )
+install_router_rpc_compat(hub)
 
 if __name__ == "__main__":
     raise SystemExit(hub.command_line())
