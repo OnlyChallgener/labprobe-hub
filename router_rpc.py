@@ -172,7 +172,7 @@ class EncryptedRouterConfigStore:
 @dataclass
 class RouterSession:
     sid: str = ""
-    auth: str = ""
+    auth_token: str = ""
     serial_number: str = ""
     obtained_at: float = 0.0
     session_seconds: int = 3600
@@ -181,8 +181,8 @@ class RouterSession:
     def valid_locally(self) -> bool:
         # The Hub owns the browser session. Renew it before fewer than five
         # minutes remain, rather than letting a dashboard request race an
-        # expiring BE72 eWeb SID.
-        return bool(self.sid and self.auth) and time.time() - self.obtained_at < max(60, self.session_seconds - 300)
+        # expiring BE72 eWeb auth token.
+        return bool(self.auth_token) and time.time() - self.obtained_at < max(60, self.session_seconds - 300)
 
 
 class RouterSessionCache:
@@ -376,7 +376,7 @@ class RuijieRouterClient:
 
             candidates: List[requests.Response] = list(response.history) + [response]
             sid = str(auth_data.get("sid") or "").strip()
-            auth = str(auth_data.get("token") or auth_data.get("auth") or "").strip()
+            auth_token = str(auth_data.get("token") or auth_data.get("auth_token") or auth_data.get("auth") or "").strip()
             serial = str(auth_data.get("sn") or auth_data.get("serialNumber") or "").strip()
             session_seconds = _safe_int(
                 auth_data.get("sessiontime") or auth_data.get("sessionTime"),
@@ -385,8 +385,8 @@ class RuijieRouterClient:
                 7200,
             )
             for item in candidates:
-                auth = (
-                    auth
+                auth_token = (
+                    auth_token
                     or self._extract_token(item.url, "auth")
                     or self._extract_token(item.headers.get("Location", ""), "auth")
                     or self._extract_token(item.text or "", "token")
@@ -399,13 +399,13 @@ class RuijieRouterClient:
             if serial:
                 sid = sid or str(response_cookies.get(serial) or "").strip()
 
-            if not sid or not auth:
+            if not auth_token:
                 self.clear_session()
                 raise RouterRpcError("路由器登录失败，请检查管理密码", "LOGIN_FAILED", 401)
 
             self.session = RouterSession(
                 sid=sid,
-                auth=auth,
+                auth_token=auth_token,
                 serial_number=serial,
                 obtained_at=time.time(),
                 session_seconds=session_seconds,
@@ -426,13 +426,13 @@ class RuijieRouterClient:
     def _post_api(self, api_path: str, payload: Dict[str, Any], retry_auth: bool = True) -> Any:
         session = self.login()
         cfg = self.config
-        auth_token = session.auth
+        auth_token = session.auth_token
         url = cfg["address"] + f"/cgi-bin/luci/api/{api_path}?auth={auth_token}"
         safe_url = cfg["address"] + f"/cgi-bin/luci/api/{api_path}?auth=<redacted>"
         self.logger.debug(
-            "router eweb rpc request method=POST url=%s auth_present=%s",
-            safe_url,
+            "router eweb rpc request auth=%s url=%s",
             bool(auth_token),
+            safe_url,
         )
         wire = _wire_json(payload)
         try:

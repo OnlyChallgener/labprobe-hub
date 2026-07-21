@@ -65,13 +65,13 @@ class ReliableRuijieRouterClient(RuijieRouterClient):
         session = self.login()
         cfg = self.config
         wire = _wire_json(payload)
-        auth_token = session.auth
+        auth_token = session.auth_token
         url = cfg["address"] + f"/cgi-bin/luci/api/{api_path}?auth={auth_token}"
         safe_url = cfg["address"] + f"/cgi-bin/luci/api/{api_path}?auth=<redacted>"
         self.logger.debug(
-            "router eweb rpc request method=POST url=%s auth_present=%s",
-            safe_url,
+            "router eweb rpc request auth=%s url=%s",
             bool(auth_token),
+            safe_url,
         )
 
         try:
@@ -95,7 +95,7 @@ class ReliableRuijieRouterClient(RuijieRouterClient):
         if response.status_code in {401, 403}:
             config_key = self._session_cache_key(cfg)
             self.logger.warning(
-                "router eweb rpc auth rejected api=%s final_status=%s request_url=%s cookie_names=%s auth_present=%s",
+                "router eweb rpc auth rejected api=%s final_status=%s request_url=%s cookie_names=%s auth=%s",
                 api_path,
                 response.status_code,
                 safe_url,

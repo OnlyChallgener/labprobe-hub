@@ -65,7 +65,7 @@ def test_ttl_cache_clear_prefix():
 def test_local_session_timeout_keeps_fresh_sid(tmp_path: Path, monkeypatch):
     monkeypatch.setenv("APP_TOKEN", "test-app-token")
     client = StableRuijieRouterClient(EncryptedRouterConfigStore(tmp_path), _Logger())
-    client.session = RouterSession(sid="sid-123", auth="auth-123", obtained_at=time.time(), session_seconds=3600)
+    client.session = RouterSession(sid="sid-123", auth_token="auth-123", obtained_at=time.time(), session_seconds=3600)
 
     client._set_session_time(7200)
 
@@ -79,7 +79,7 @@ def test_reyee_browser_session_cookies_are_sent_to_rpc(tmp_path: Path, monkeypat
     client = StableRuijieRouterClient(EncryptedRouterConfigStore(tmp_path), _Logger())
     session = RouterSession(
         sid="cdb9f2a4c034f59d01b6990c977a59f1",
-        auth="auth-token",
+        auth_token="auth-token",
         serial_number="G1TD8RX039025",
         obtained_at=time.time(),
         session_seconds=3600,
@@ -108,7 +108,7 @@ def test_global_session_and_cookies_are_reused_across_clients(tmp_path: Path, mo
         first.http.cookies.set("router-cookie", "cookie-value", path="/cgi-bin/luci")
         first.session = RouterSession(
             sid="sid-shared",
-            auth="token-shared",
+            auth_token="token-shared",
             serial_number="G1TD8RX039025",
             obtained_at=time.time(),
             session_seconds=3600,
@@ -120,7 +120,7 @@ def test_global_session_and_cookies_are_reused_across_clients(tmp_path: Path, mo
 
         assert first.login_lock is second.login_lock
         assert restored.sid == "sid-shared"
-        assert restored.auth == "token-shared"
+        assert restored.auth_token == "token-shared"
         cookies = {cookie.name: cookie.value for cookie in second.http.cookies}
         assert cookies["router-cookie"] == "cookie-value"
         assert cookies["SN"] == "G1TD8RX039025"
@@ -187,7 +187,7 @@ def test_concurrent_callers_perform_one_real_login(tmp_path: Path, monkeypatch):
         GLOBAL_ROUTER_SESSION_CACHE.clear()
 
 
-def test_rpc_uses_login_token_as_auth_query(tmp_path: Path, monkeypatch):
+def test_eweb_apis_use_login_auth_token_query(tmp_path: Path, monkeypatch):
     monkeypatch.setenv("APP_TOKEN", "test-app-token")
     store = EncryptedRouterConfigStore(tmp_path)
     store.save("192.168.5.1", "router-password", 3600)
@@ -195,7 +195,7 @@ def test_rpc_uses_login_token_as_auth_query(tmp_path: Path, monkeypatch):
     client = StableRuijieRouterClient(store, _Logger())
     client.session = RouterSession(
         sid="sid-cookie",
-        auth="auth-token",
+        auth_token="auth-token",
         serial_number="G1TD8RX039025",
         obtained_at=time.time(),
         session_seconds=3600,
@@ -215,8 +215,13 @@ def test_rpc_uses_login_token_as_auth_query(tmp_path: Path, monkeypatch):
     monkeypatch.setattr(client.http, "post", fake_post)
     try:
         client.rpc("acConfig.get", "network_group", no_parse=True)
-        assert requested_urls == ["http://192.168.5.1/cgi-bin/luci/api/cmd?auth=auth-token"]
-        assert ";stok=" not in requested_urls[0]
+        client._post_api("common", {"method": "getSessiontime"})
+        client._post_api("system", {"method": "get"})
+        assert requested_urls == [
+            "http://192.168.5.1/cgi-bin/luci/api/cmd?auth=auth-token",
+            "http://192.168.5.1/cgi-bin/luci/api/common?auth=auth-token",
+            "http://192.168.5.1/cgi-bin/luci/api/system?auth=auth-token",
+        ]
     finally:
         GLOBAL_ROUTER_SESSION_CACHE.clear()
 
@@ -242,7 +247,7 @@ def test_repeated_403_backoff_suppresses_new_login(tmp_path: Path, monkeypatch):
 
 
 def test_session_refreshes_before_five_minutes_remain():
-    session = RouterSession(sid="sid-123", auth="auth-123", obtained_at=time.time() - 3200, session_seconds=3600)
+    session = RouterSession(auth_token="auth-123", obtained_at=time.time() - 3200, session_seconds=3600)
     assert session.valid_locally
 
     session.obtained_at = time.time() - 3301
