@@ -1,7 +1,20 @@
 import base64
+import time
 from pathlib import Path
 
-from router_rpc import EncryptedRouterConfigStore, TinyTtlCache, gibberish_aes_encrypt
+from router_rpc import EncryptedRouterConfigStore, RouterSession, TinyTtlCache, gibberish_aes_encrypt
+from router_rpc_v010 import StableRuijieRouterClient
+
+
+class _Logger:
+    def debug(self, *args, **kwargs):
+        pass
+
+    def info(self, *args, **kwargs):
+        pass
+
+    def warning(self, *args, **kwargs):
+        pass
 
 
 def test_gibberish_aes_envelope():
@@ -34,3 +47,15 @@ def test_ttl_cache_clear_prefix():
     cache.clear("fire")
     assert cache.get("firewall", 60) is None
     assert cache.get("upnp", 60) == {"ok": True}
+
+
+def test_local_session_timeout_keeps_fresh_sid(tmp_path: Path, monkeypatch):
+    monkeypatch.setenv("APP_TOKEN", "test-app-token")
+    client = StableRuijieRouterClient(EncryptedRouterConfigStore(tmp_path), _Logger())
+    client.session = RouterSession(sid="sid-123", obtained_at=time.time(), session_seconds=3600)
+
+    client._set_session_time(7200)
+
+    assert client.session.sid == "sid-123"
+    assert client.session.session_seconds == 7200
+    assert client.session.valid_locally
