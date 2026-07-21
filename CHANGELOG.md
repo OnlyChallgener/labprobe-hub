@@ -1,5 +1,11 @@
 # LabProbe 变更记录
 
+## 0.9.7 / LabRelay 0.2.8
+
+- LabRelay 每小时执行一次 `df -h /overlay`，优先上报可写 Overlay 分区的真实磁盘利用率。
+- 磁盘采集失败时保留上一次有效值，并按小时重试，避免高频执行 SSH/系统命令。
+- 配合 APP v0.10.10 build140 增加 SSH 执行记录三级页面及可选命令文本复制。
+
 ## 0.9.6 / LabRelay 0.2.7
 
 - LabRelay 从 `ws_sysinfo fast` 归一化磁盘/存储利用率并随路由器实时状态上报。

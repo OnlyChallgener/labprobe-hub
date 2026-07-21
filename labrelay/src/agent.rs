@@ -67,6 +67,8 @@ struct AgentState {
     last_dashboard_fast_at: u64,
     last_dashboard_details_at: u64,
     last_dashboard_network_at: u64,
+    last_storage_check_at: u64,
+    storage_percent: Option<f64>,
     last_dashboard_refresh_nonce: u64,
     last_credentials_refresh_nonce: u64,
 }
@@ -739,7 +741,32 @@ fn storage_percent_from_fast(fast: &Value) -> f64 {
     -1.0
 }
 
-fn telemetry_from_fast(fast: &Value, online_devices: usize) -> Value {
+fn parse_storage_percent_from_df(raw: &str) -> Option<f64> {
+    raw.lines().rev().find_map(|line| {
+        let columns: Vec<&str> = line.split_whitespace().collect();
+        if columns.len() < 5 {
+            return None;
+        }
+        let mount = columns.last().copied().unwrap_or_default();
+        if mount != "/overlay" && mount != "/" {
+            return None;
+        }
+        columns
+            .iter()
+            .find(|value| value.ends_with('%'))
+            .and_then(|value| value.trim_end_matches('%').parse::<f64>().ok())
+            .filter(|value| (0.0..=100.0).contains(value))
+    })
+}
+
+fn storage_percent_from_df() -> Result<f64> {
+    let raw = command_output("df", &["-h", "/overlay"])
+        .or_else(|_| command_output("df", &["-h"]))?;
+    parse_storage_percent_from_df(&raw)
+        .ok_or_else(|| anyhow!("df returned no writable overlay usage"))
+}
+
+fn telemetry_from_fast(fast: &Value, online_devices: usize, cached_storage_percent: Option<f64>) -> Value {
     let wan_primary = object_path(fast, &["wan_stat", "wan"]).unwrap_or(&Value::Null);
     let wan = object_path(fast, &["wan_stat", "wans"])
         .or_else(|| object_path(fast, &["wan_stat", "wan"]))
@@ -761,7 +788,7 @@ fn telemetry_from_fast(fast: &Value, online_devices: usize) -> Value {
     json!({
         "cpuPercent": number(fast.get("cpu_usage")).max(number(fast.get("cpuutil"))),
         "memoryPercent": number(fast.get("memutil")),
-        "storagePercent": storage_percent_from_fast(fast),
+        "storagePercent": cached_storage_percent.unwrap_or_else(|| storage_percent_from_fast(fast)),
         "temperatureC": number(fast.get("temp")),
         "temperature2gC": number(fast.get("temp_2g")),
         "temperature5gC": number(fast.get("temp_5g")),
@@ -1112,13 +1139,29 @@ fn collect_dashboard_payload(
     refresh_nonce: u64,
 ) -> Result<Value> {
     let now = now_epoch();
+    let storage_due = state.last_storage_check_at == 0
+        || now.saturating_sub(state.last_storage_check_at) >= 3_600;
+    if storage_due {
+        state.last_storage_check_at = now;
+        match storage_percent_from_df() {
+            Ok(value) => state.storage_percent = Some(value),
+            Err(error) => log_limited(
+                config,
+                state,
+                "WARN",
+                "router-storage",
+                &format!("router storage telemetry skipped: {:#}", error),
+            ),
+        }
+    }
+
     let fast = command_json("dev_sta", &["get", "-m", "ws_sysinfo", r#"{"get":"fast"}"#])?;
     state.last_dashboard_fast_at = now;
     let mut payload = json!({
         "router": config.router_name,
         "telemetryAt": now,
         "telemetryEpoch": now,
-        "telemetry": telemetry_from_fast(&fast, state.devices.len())
+        "telemetry": telemetry_from_fast(&fast, state.devices.len(), state.storage_percent)
     });
 
     let details_due = force_details
