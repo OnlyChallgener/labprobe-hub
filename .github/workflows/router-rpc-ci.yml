@@ -32,6 +32,12 @@ jobs:
           STATUS=$?
           tail -n 100 /tmp/pytest.log
           exit $STATUS
+      - name: Upload pytest log
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: router-rpc-pytest-log
+          path: /tmp/pytest.log
       - name: Build Docker image
         run: docker build -t labprobe-hub:router-rpc-ci .
       - name: Verify Relay manifest
