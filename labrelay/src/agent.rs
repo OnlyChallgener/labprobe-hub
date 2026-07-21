@@ -438,11 +438,24 @@ fn router_model() -> String {
 }
 
 fn telemetry_from_fast(fast: &Value, online_devices: usize) -> Value {
+    let wan_primary = object_path(fast, &["wan_stat", "wan"]).unwrap_or(&Value::Null);
     let wan = object_path(fast, &["wan_stat", "wans"])
         .or_else(|| object_path(fast, &["wan_stat", "wan"]))
         .unwrap_or(&Value::Null);
     let upload_raw = number(wan.get("up"));
     let download_raw = number(wan.get("down"));
+    let total_upload_primary = first_number_by_keys(wan_primary, &["total_up", "total_upload", "totalTxBytes"]);
+    let total_download_primary = first_number_by_keys(wan_primary, &["total_down", "total_download", "totalRxBytes"]);
+    let total_upload = if total_upload_primary > 0.0 {
+        total_upload_primary
+    } else {
+        first_number_by_keys(wan, &["total_up", "total_upload", "totalTxBytes"])
+    };
+    let total_download = if total_download_primary > 0.0 {
+        total_download_primary
+    } else {
+        first_number_by_keys(wan, &["total_down", "total_download", "totalRxBytes"])
+    };
     json!({
         "cpuPercent": number(fast.get("cpu_usage")).max(number(fast.get("cpuutil"))),
         "memoryPercent": number(fast.get("memutil")),
@@ -455,13 +468,39 @@ fn telemetry_from_fast(fast: &Value, online_devices: usize) -> Value {
             "uploadRaw": upload_raw,
             "downloadRaw": download_raw,
             "uploadBps": (upload_raw * 8.0) as u64,
-            "downloadBps": (download_raw * 8.0) as u64
+            "downloadBps": (download_raw * 8.0) as u64,
+            "totalUploadBytes": total_upload as u64,
+            "totalDownloadBytes": total_download as u64
         },
         "connections": {
-            "ipv4": number(wan.get("ipv4_connection_count")) as u64,
-            "ipv6": number(wan.get("ipv6_connection_count")) as u64,
-            "flow": number(wan.get("flow_cnt")) as u64,
-            "cps": number(wan.get("cps")) as u64
+            "ipv4": first_number_by_keys(
+                wan,
+                &[
+                    "ipv4_connection_count",
+                    "ipv4_session_count",
+                    "ipv4_connections",
+                    "ipv4_sessions",
+                    "v4_connection_count",
+                    "v4_session_count",
+                    "connection_ipv4",
+                    "session_ipv4"
+                ],
+            ) as u64,
+            "ipv6": first_number_by_keys(
+                wan,
+                &[
+                    "ipv6_connection_count",
+                    "ipv6_session_count",
+                    "ipv6_connections",
+                    "ipv6_sessions",
+                    "v6_connection_count",
+                    "v6_session_count",
+                    "connection_ipv6",
+                    "session_ipv6"
+                ],
+            ) as u64,
+            "flow": first_number_by_keys(wan, &["flow_cnt", "flow_count", "flows"]) as u64,
+            "cps": first_number_by_keys(wan, &["cps", "connections_per_second"]) as u64
         }
     })
 }
@@ -534,6 +573,34 @@ fn first_text_by_keys(root: &Value, keys: &[&str]) -> String {
             })
             .unwrap_or_default(),
         _ => String::new(),
+    }
+}
+
+fn first_number_by_keys(root: &Value, keys: &[&str]) -> f64 {
+    match root {
+        Value::Object(map) => {
+            for key in keys {
+                if let Some(value) = map.get(*key) {
+                    let parsed = number(Some(value));
+                    if parsed > 0.0 || matches!(value, Value::Number(_) | Value::String(_)) {
+                        return parsed;
+                    }
+                }
+            }
+            for child in map.values() {
+                let parsed = first_number_by_keys(child, keys);
+                if parsed > 0.0 {
+                    return parsed;
+                }
+            }
+            0.0
+        }
+        Value::Array(items) => items
+            .iter()
+            .map(|child| first_number_by_keys(child, keys))
+            .find(|value| *value > 0.0)
+            .unwrap_or(0.0),
+        _ => 0.0,
     }
 }
 
@@ -695,8 +762,11 @@ fn details_from_sources(
         );
         insert_meaningful(&mut ap_out, "managementIp", item.get("ip").cloned().unwrap_or(Value::Null));
         insert_meaningful(&mut ap_out, "status", item.get("status").cloned().unwrap_or(Value::Null));
+        insert_meaningful(&mut ap_out, "workMode", item.get("forwardMode").cloned().unwrap_or(Value::Null));
+        insert_meaningful(&mut ap_out, "relayMode", item.get("relayMode").cloned().unwrap_or(Value::Null));
         insert_meaningful(&mut ap_out, "bands", csv_values(item.get("band")));
         insert_meaningful(&mut ap_out, "channels", csv_values(item.get("channel")));
+        insert_meaningful(&mut ap_out, "channelUtilization", csv_values(item.get("chutil")));
         insert_meaningful(&mut ap_out, "stationCount", item.get("staNum").cloned().unwrap_or(Value::Null));
         insert_meaningful(&mut ap_out, "software", item.get("software").cloned().unwrap_or(Value::Null));
         insert_meaningful(&mut ap_out, "serialNumber", item.get("serialNumber").cloned().unwrap_or(Value::Null));

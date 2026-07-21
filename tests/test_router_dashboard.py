@@ -1,6 +1,7 @@
 import os
 import tempfile
 import unittest
+from unittest import mock
 from pathlib import Path
 
 
@@ -28,15 +29,35 @@ class RouterDashboardApiTests(unittest.TestCase):
             hub.ROUTER_CREDENTIALS_REFRESH_NONCE = 0
 
     def test_push_read_and_refresh(self):
-        pushed = self.client.post(
-            "/api/router/dashboard/push",
-            headers={"X-LabProbe-Token": "test-hook-token"},
-            json={
-                "router": "BE72",
-                "telemetry": {"cpuPercent": 4, "onlineDeviceCount": 9},
-                "details": {"wan": {"ipv4": "10.0.0.2"}, "ports": []},
-            },
-        )
+        with mock.patch.object(hub, "_cached_hub_exit_ipv4", return_value=""), \
+             mock.patch.object(hub, "_schedule_dashboard_operator_probe", return_value=None):
+            pushed = self.client.post(
+                "/api/router/dashboard/push",
+                headers={"X-LabProbe-Token": "test-hook-token"},
+                json={
+                    "router": "BE72",
+                    "telemetry": {
+                        "cpuPercent": 4,
+                        "onlineDeviceCount": 9,
+                        "wan": {
+                            "uploadBps": 8442450,
+                            "downloadBps": 5016360,
+                            "totalUploadBytes": 30749142999,
+                            "totalDownloadBytes": 78239897230,
+                        },
+                        "connections": {"ipv4": 151, "ipv6": 60},
+                    },
+                    "details": {
+                        "wan": {"ipv4": "10.0.0.2", "dnsServers": ["111.8.14.18", "211.142.211.124"]},
+                        "ap": {
+                            "workMode": "ROUTER",
+                            "relayMode": "none",
+                            "channelUtilization": ["56", "8"],
+                        },
+                        "ports": [],
+                    },
+                },
+            )
         self.assertEqual(pushed.status_code, 200)
 
         read = self.client.get(
@@ -47,7 +68,14 @@ class RouterDashboardApiTests(unittest.TestCase):
         body = read.get_json()
         self.assertEqual(body["router"], "BE72")
         self.assertEqual(body["telemetry"]["onlineDeviceCount"], 9)
+        self.assertEqual(body["telemetry"]["connections"]["ipv4"], 151)
+        self.assertEqual(body["telemetry"]["connections"]["ipv6"], 60)
+        self.assertEqual(body["telemetry"]["wan"]["totalUploadBytes"], 30749142999)
+        self.assertEqual(body["telemetry"]["wan"]["totalDownloadBytes"], 78239897230)
         self.assertEqual(body["details"]["wan"]["ipv4"], "10.0.0.2")
+        self.assertEqual(body["details"]["wan"]["dnsServers"], ["111.8.14.18", "211.142.211.124"])
+        self.assertEqual(body["details"]["ap"]["workMode"], "ROUTER")
+        self.assertEqual(body["details"]["ap"]["channelUtilization"], ["56", "8"])
 
         refresh = self.client.post(
             "/api/router/dashboard/refresh",
@@ -69,6 +97,29 @@ class RouterDashboardApiTests(unittest.TestCase):
         ).get_json()
         self.assertEqual(body["refreshCompletedNonce"], 1)
 
+
+
+    def test_operator_uses_hub_public_ipv4(self):
+        with mock.patch.object(hub, "_cached_hub_exit_ipv4", return_value="8.8.8.8"), \
+             mock.patch.object(hub, "_operator_for_dashboard_ip", return_value="测试运营商"):
+            pushed = self.client.post(
+                "/api/router/dashboard/push",
+                headers={"X-LabProbe-Token": "test-hook-token"},
+                json={
+                    "router": "BE72",
+                    "details": {"wan": {"ipv4": "10.87.180.102", "operator": "路由器上报值"}},
+                },
+            )
+        self.assertEqual(pushed.status_code, 200)
+        body = self.client.get(
+            "/api/router/dashboard",
+            headers={"Authorization": "Bearer test-app-token"},
+        ).get_json()
+        wan = body["details"]["wan"]
+        self.assertEqual(wan["ipv4"], "10.87.180.102")
+        self.assertEqual(wan["publicIpv4"], "8.8.8.8")
+        self.assertEqual(wan["operatorCheckedIp"], "8.8.8.8")
+        self.assertEqual(wan["operator"], "测试运营商")
 
     def test_credentials_are_memory_only_and_expire(self):
         refresh = self.client.post(

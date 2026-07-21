@@ -1,12 +1,12 @@
 # LabProbe 变更记录
 
-## 0.9.4 / LabRelay 0.2.5
+## 0.9.5 / LabRelay 0.2.6
 
 - 路由器状态页 WAN、网络配置和 AP 信息改为固定四卡片布局，并修复背景图层与网口视觉。
 - WAN 运营商由 LabRelay/Hub 识别；新增 WAN/WAN1 接口显示、LAN MAC 与按需读取的宽带账号密码。
 - LabRelay 日志仅写 `/tmp`，单文件 256 KB、只保留一份轮换；取消周期性成功日志并加入同类错误 5 分钟限频。
 - Hub 抑制 fast telemetry、raw/debug 大字段和无意义 revision，缩短 revision 保留并定期截断 WAL。
-- Hub 版本提升至 0.9.4，LabRelay 版本提升至 0.2.5。
+- Hub 版本提升至 0.9.5，LabRelay 版本提升至 0.2.6。
 
 ## 0.9.3 / LabRelay 0.2.4
 

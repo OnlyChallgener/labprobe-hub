@@ -1,4 +1,4 @@
-LabRelay 路由器仪表盘数据源热修复（Hub 0.9.4 / LabRelay 0.2.5）
+LabRelay 路由器仪表盘数据源热修复（Hub 0.9.5 / LabRelay 0.2.6）
 
 新增采集：
 - dev_sta get -m ipinfo '{}'

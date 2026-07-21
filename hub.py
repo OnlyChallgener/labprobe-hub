@@ -23,7 +23,7 @@ import paho.mqtt.client as mqtt
 from flask import Flask, request, jsonify, g
 from labprobe_storage import SQLiteStore
 
-APP_VERSION = "0.9.4"
+APP_VERSION = "0.9.5"
 PORT = int(os.environ.get("PORT", "58443"))
 BASE_DIR = Path(os.environ.get("LABPROBE_BASE_DIR", ".")).resolve()
 CONFIG_DIR = Path(os.environ.get("CONFIG_DIR", str(BASE_DIR / "config"))).resolve()
@@ -154,6 +154,8 @@ def _load_router_dashboard_cache() -> Dict[str, Any]:
 ROUTER_DASHBOARD_CACHE: Dict[str, Any] = _load_router_dashboard_cache()
 ROUTER_DASHBOARD_LAST_PERSIST_AT = 0.0
 ROUTER_DASHBOARD_REFRESH_NONCE = int(ROUTER_DASHBOARD_CACHE.get("refreshNonce") or 0)
+ROUTER_OPERATOR_PROBE_LOCK = threading.Lock()
+ROUTER_OPERATOR_PROBE_LAST_AT = 0.0
 # Broadband credentials are intentionally memory-only: never persisted, revised, backed up or published to MQTT.
 ROUTER_CREDENTIALS_CACHE: Dict[str, Any] = {}
 ROUTER_CREDENTIALS_REFRESH_NONCE = 0
@@ -2536,6 +2538,72 @@ def _operator_for_dashboard_ip(ip: str) -> str:
         return ""
 
 
+def _cached_hub_exit_ipv4() -> str:
+    """Use the public IPv4 detected by Hub/NAS, never the router's private PPPoE address."""
+    state = load_json(STATE_FILE, {})
+    nas = state.get("nas") if isinstance(state.get("nas"), dict) else {}
+    candidates = [
+        nas.get("exitIpv4"),
+        nas.get("exit_ipv4"),
+        get_manual_nas_ip(False),
+    ]
+    for candidate in candidates:
+        value = strip_ip_prefix(candidate)
+        if is_public_ip_text(value, ipv6=False):
+            return value
+    return ""
+
+
+def _store_dashboard_operator(public_ip: str, operator: str) -> None:
+    if not public_ip:
+        return
+    with ROUTER_DASHBOARD_LOCK:
+        details = ROUTER_DASHBOARD_CACHE.get("details")
+        if not isinstance(details, dict):
+            details = {}
+        wan = details.get("wan")
+        if not isinstance(wan, dict):
+            wan = {}
+        wan["operatorCheckedIp"] = public_ip
+        wan["operatorCheckedEpoch"] = time.time()
+        wan["publicIpv4"] = public_ip
+        wan["operatorSource"] = "hub_exit_ipv4"
+        if operator:
+            wan["operator"] = operator
+        else:
+            wan.pop("operator", None)
+        details["wan"] = wan
+        ROUTER_DASHBOARD_CACHE["details"] = details
+
+
+def _schedule_dashboard_operator_probe() -> None:
+    """Probe Hub's IPv4 exit in background, at most once every five minutes."""
+    global ROUTER_OPERATOR_PROBE_LAST_AT
+    now = time.time()
+    if now - ROUTER_OPERATOR_PROBE_LAST_AT < 300:
+        return
+    if not ROUTER_OPERATOR_PROBE_LOCK.acquire(blocking=False):
+        return
+    ROUTER_OPERATOR_PROBE_LAST_AT = now
+
+    def worker() -> None:
+        try:
+            public_ip = _cached_hub_exit_ipv4() or clean_saved_value(get_exit_ip(False))
+            if not is_public_ip_text(public_ip, ipv6=False):
+                return
+            operator = _operator_for_dashboard_ip(public_ip)
+            _store_dashboard_operator(public_ip, operator)
+            public = _router_dashboard_public()
+            _persist_router_dashboard_if_due(force=True)
+            MQTT_PUBLISHER.publish_dashboard(public)
+        except Exception as exc:
+            LOGGER.warning("router operator background probe failed: %s", exc)
+        finally:
+            ROUTER_OPERATOR_PROBE_LOCK.release()
+
+    threading.Thread(target=worker, name="router-operator-probe", daemon=True).start()
+
+
 def _router_dashboard_public() -> Dict[str, Any]:
     with ROUTER_DASHBOARD_LOCK:
         result = json.loads(json.dumps(ROUTER_DASHBOARD_CACHE, ensure_ascii=False)) if ROUTER_DASHBOARD_CACHE else {}
@@ -2591,18 +2659,27 @@ def api_router_dashboard_push():
         return jsonify({"ok": False, "error": "invalid payload"}), 400
     now_epoch = time.time()
     router_name = clean_saved_value(payload.get("router")) or primary_router_name() or "router"
-    incoming_details = payload.get("details") if isinstance(payload.get("details"), dict) else {}
-    incoming_wan = incoming_details.get("wan") if isinstance(incoming_details.get("wan"), dict) else {}
-    incoming_wan_ip = clean_saved_value(incoming_wan.get("ipv4"))
-    incoming_operator = operator_from_text(None, clean_saved_value(incoming_wan.get("operator")))
+    hub_exit_ipv4 = _cached_hub_exit_ipv4()
     operator_checked_ip = ""
+    operator_checked_epoch = 0.0
+    cached_operator = ""
     with ROUTER_DASHBOARD_LOCK:
         cached_details = ROUTER_DASHBOARD_CACHE.get("details") if isinstance(ROUTER_DASHBOARD_CACHE.get("details"), dict) else {}
         cached_wan = cached_details.get("wan") if isinstance(cached_details.get("wan"), dict) else {}
         operator_checked_ip = clean_saved_value(cached_wan.get("operatorCheckedIp"))
-    resolved_operator = incoming_operator
-    if incoming_wan_ip and not resolved_operator and operator_checked_ip != incoming_wan_ip:
-        resolved_operator = _operator_for_dashboard_ip(incoming_wan_ip)
+        operator_checked_epoch = _dashboard_epoch(cached_wan.get("operatorCheckedEpoch"))
+        cached_operator = clean_saved_value(cached_wan.get("operator"))
+    resolved_operator = cached_operator
+    if hub_exit_ipv4:
+        needs_operator_lookup = (
+            operator_checked_ip != hub_exit_ipv4
+            or not cached_operator
+            or time.time() - operator_checked_epoch > 21600
+        )
+        if needs_operator_lookup:
+            resolved_operator = _operator_for_dashboard_ip(hub_exit_ipv4)
+    else:
+        _schedule_dashboard_operator_probe()
     with ROUTER_DASHBOARD_LOCK:
         ROUTER_DASHBOARD_CACHE["router"] = router_name
         ROUTER_DASHBOARD_CACHE["receivedAt"] = now_str()
@@ -2618,10 +2695,16 @@ def api_router_dashboard_push():
             ROUTER_DASHBOARD_CACHE["details"] = _deep_merge_dict(existing_details, details)
             merged_details = ROUTER_DASHBOARD_CACHE.get("details") if isinstance(ROUTER_DASHBOARD_CACHE.get("details"), dict) else {}
             merged_wan = merged_details.get("wan") if isinstance(merged_details.get("wan"), dict) else {}
-            if incoming_wan_ip:
-                merged_wan["operatorCheckedIp"] = incoming_wan_ip
-            if resolved_operator:
-                merged_wan["operator"] = resolved_operator
+            if hub_exit_ipv4:
+                merged_wan["operatorCheckedIp"] = hub_exit_ipv4
+                merged_wan["operatorCheckedEpoch"] = time.time()
+                merged_wan["publicIpv4"] = hub_exit_ipv4
+                merged_wan["operatorSource"] = "hub_exit_ipv4"
+            if hub_exit_ipv4:
+                if resolved_operator:
+                    merged_wan["operator"] = resolved_operator
+                else:
+                    merged_wan.pop("operator", None)
             if merged_wan:
                 merged_details["wan"] = merged_wan
                 ROUTER_DASHBOARD_CACHE["details"] = merged_details
