@@ -461,18 +461,52 @@ class RuijieRouterClient:
 
     def dashboard(self, force: bool = False) -> Dict[str, Any]:
         def load() -> Dict[str, Any]:
-            result = self.batch([
-                {"method": "devSta.get", "module": "ws_sysinfo", "data": {"get": "static"}},
-                {"method": "devSta.get", "module": "ws_sysinfo", "data": {"get": "slow"}},
-                {"method": "devSta.get", "module": "ws_sysinfo", "data": {"get": "fast"}},
-                {"method": "devSta.get", "module": "ipinfo"},
-                {"method": "devConfig.get", "module": "network"},
-                {"method": "devSta.get", "module": "ap_list"},
-                {"method": "devSta.get", "module": "port_status"},
+            def optional(loader: Callable[[], Any], fallback: Any) -> Any:
+                try:
+                    return loader()
+                except RouterRpcError as exc:
+                    self.logger.debug("router dashboard optional RPC failed: %s", exc)
+                    return fallback
+
+            overview = self.batch([
+                {"method": "acConfig.get", "module": "network_group", "noParse": True},
+                {"method": "devSta.get", "module": "ap_list", "noParse": True},
+                {"method": "devSta.get", "module": "esw_neighbor", "noParse": True},
+                {
+                    "method": "devSta.get",
+                    "module": "neighbor",
+                    "noParse": True,
+                    "data": {"product": "GW_RGOS"},
+                },
             ])
-            values = result if isinstance(result, list) else []
-            keys = ["static", "slow", "fast", "ipinfo", "network", "apList", "portStatus"]
-            return {**{key: values[i] if i < len(values) else None for i, key in enumerate(keys)}, "updatedAt": int(time.time())}
+            overview_values = overview if isinstance(overview, list) else []
+
+            network = optional(lambda: self.rpc("devConfig.get", "network"), {})
+            wan = optional(lambda: self.batch([
+                {"method": "devSta.get", "module": "ipinfo", "noParse": True},
+                {"method": "devSta.get", "module": "networkConnect", "data": {"ifname": "list"}},
+            ]), [])
+            wan_values = wan if isinstance(wan, list) else []
+            wireless = optional(lambda: self.batch([
+                {"method": "acConfig.get", "module": "wireless"},
+                {"method": "devSta.get", "module": "rcgame"},
+            ]), [])
+            wireless_values = wireless if isinstance(wireless, list) else []
+            port_status = optional(lambda: self.rpc("devSta.get", "port_status"), {})
+
+            return {
+                "networkGroup": overview_values[0] if len(overview_values) > 0 else None,
+                "apList": overview_values[1] if len(overview_values) > 1 else None,
+                "eswNeighbor": overview_values[2] if len(overview_values) > 2 else None,
+                "neighbor": overview_values[3] if len(overview_values) > 3 else None,
+                "network": network,
+                "ipinfo": wan_values[0] if len(wan_values) > 0 else None,
+                "networkConnect": wan_values[1] if len(wan_values) > 1 else None,
+                "wireless": wireless_values[0] if len(wireless_values) > 0 else None,
+                "rcgame": wireless_values[1] if len(wireless_values) > 1 else None,
+                "portStatus": port_status,
+                "updatedAt": int(time.time()),
+            }
         return self.cached("dashboard", 3.0, load, force)
 
     def firewall(self, force: bool = False) -> Dict[str, Any]:

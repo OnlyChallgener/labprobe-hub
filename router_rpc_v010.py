@@ -97,7 +97,7 @@ class StableRuijieRouterClient(v099.ReliableRuijieRouterClient):
         configured = bool(cfg.get("address") and cfg.get("password"))
         if probe and configured:
             try:
-                self.rpc("devSta.get", "ws_sysinfo", {"get": "fast"})
+                self.rpc("acConfig.get", "network_group", no_parse=True)
             except Exception:
                 # The precise error is already retained by _mark_failure().
                 pass

@@ -261,16 +261,25 @@ class RouterRpcCompatibilitySync:
         fast = _unwrap(raw.get("fast")) or {}
         ipinfo = _unwrap(raw.get("ipinfo")) or {}
         network = _unwrap(raw.get("network")) or {}
+        network_group = _unwrap(raw.get("networkGroup")) or {}
+        network_connect = _unwrap(raw.get("networkConnect")) or {}
+        wireless_config = _unwrap(raw.get("wireless")) or {}
+        rcgame = _unwrap(raw.get("rcgame")) or {}
         ap_raw = _unwrap(raw.get("apList")) or {}
         port_raw = _unwrap(raw.get("portStatus")) or {}
 
-        wan_stat = _dict(fast, "wan_stat", "wanStat")
+        wan_stat = _dict(fast, "wan_stat", "wanStat") or _dict(network_connect, "wan_stat", "wanStat")
         aggregate = _dict(wan_stat, "wans") or _dict(wan_stat, "wan") or wan_stat
-        wan_info = _dict(ipinfo, "wan", "WAN") or (_list(ipinfo, "list") or [{}])[0]
+        wan_info = (
+            _dict(ipinfo, "wan", "WAN")
+            or (_list(ipinfo, "list") or [{}])[0]
+            or _dict(network_connect, "wan", "WAN")
+            or (network_connect if isinstance(network_connect, dict) else {})
+        )
         if not isinstance(wan_info, dict):
             wan_info = {}
-        network_lan = _select_network_row(network, "lan")
-        network_wan = _select_network_row(network, "wan")
+        network_lan = _select_network_row(network, "lan") or _select_network_row(network_group, "lan")
+        network_wan = _select_network_row(network, "wan") or _select_network_row(network_group, "wan")
 
         ap_rows = _list(ap_raw, "list", "apList", "aps")
         ap = next((row for row in ap_rows if isinstance(row, dict)), ap_raw if isinstance(ap_raw, dict) else {})
@@ -278,7 +287,14 @@ class RouterRpcCompatibilitySync:
             ap = {}
         port_rows = [row for row in _list(port_raw, "list", "ports", "portList") if isinstance(row, dict)]
 
-        identity_source = {**(static if isinstance(static, dict) else {}), **(slow if isinstance(slow, dict) else {}), **ap}
+        identity_source = {
+            **(static if isinstance(static, dict) else {}),
+            **(slow if isinstance(slow, dict) else {}),
+            **(network_group if isinstance(network_group, dict) else {}),
+            **(wireless_config if isinstance(wireless_config, dict) else {}),
+            **(rcgame if isinstance(rcgame, dict) else {}),
+            **ap,
+        }
         hostname = _clean(ap.get("hostName") or _first(identity_source, "hostname", "hostName", "deviceAliasName"))
         model = _clean(ap.get("devModel") or ap.get("deviceType") or ap.get("product") or _first(identity_source, "model", "devModel", "deviceType"))
         serial = _clean(ap.get("serialNumber") or _first(identity_source, "serialNumber", "sn"))
@@ -405,6 +421,10 @@ class RouterRpcCompatibilitySync:
                 "ap": ap_details,
                 "wireless": previous_wireless,
                 "network": network,
+                "networkGroup": network_group,
+                "networkConnect": network_connect,
+                "wirelessConfig": wireless_config,
+                "rcgame": rcgame,
                 "ports": port_rows,
             },
         }

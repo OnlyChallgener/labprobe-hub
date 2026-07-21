@@ -157,7 +157,7 @@ class ReliableRuijieRouterClient(RuijieRouterClient):
         configured = bool(cfg.get("address") and cfg.get("password"))
         if probe and configured:
             try:
-                self.rpc("devSta.get", "ws_sysinfo", {"get": "fast"})
+                self.rpc("acConfig.get", "network_group", no_parse=True)
             except Exception:
                 pass
         now = time.time()
@@ -186,7 +186,7 @@ def _start_keepalive(client: ReliableRuijieRouterClient, logger: Any) -> None:
             sleep_seconds = max(30, min(180, int(cfg.get("sessionSeconds", 3600)) // 4))
             if cfg.get("address") and cfg.get("password"):
                 try:
-                    client.rpc("devSta.get", "ws_sysinfo", {"get": "fast"})
+                    client.rpc("acConfig.get", "network_group", no_parse=True)
                 except RouterNotConfigured:
                     pass
                 except Exception as exc:
@@ -273,13 +273,13 @@ def create_router_blueprint_v099(check_app_token: Callable[[], bool], logger: An
         client.clear_session()
         if bool(body.get("test", True)):
             client.login(force=True)
-            client.rpc("devSta.get", "ws_sysinfo", {"get": "fast"})
+            client.rpc("acConfig.get", "network_group", no_parse=True)
         return jsonify(config_response(include_secret=True, probe=False))
 
     @bp.post("/session/test")
     def test_session():
         client.login(force=True)
-        client.rpc("devSta.get", "ws_sysinfo", {"get": "fast"})
+        client.rpc("acConfig.get", "network_group", no_parse=True)
         return jsonify(config_response(False, False))
 
     @bp.post("/session/logout")
