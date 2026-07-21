@@ -23,7 +23,7 @@ jobs:
           python -m pip install --upgrade pip
           pip install -r requirements.txt pytest
       - name: Compile Python
-        run: python -m py_compile hub.py hub_entry.py router_rpc.py labprobe_storage.py
+        run: python -m py_compile hub.py hub_entry.py router_rpc.py router_compat.py labprobe_storage.py
       - name: Unit tests
         shell: bash
         run: |
