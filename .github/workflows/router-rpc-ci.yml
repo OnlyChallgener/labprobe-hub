@@ -20,7 +20,7 @@ jobs:
           python -m pip install --upgrade pip
           pip install -r requirements.txt pytest
       - name: Compile Python
-        run: python -m py_compile hub.py hub_entry.py router_rpc.py router_rpc_v099.py router_compat.py labprobe_storage.py
+        run: python -m py_compile hub.py hub_entry.py router_rpc.py router_rpc_v099.py router_rpc_v010.py router_compat.py labprobe_storage.py
       - name: Unit tests
         shell: bash
         run: |
@@ -39,5 +39,5 @@ jobs:
         run: docker build -t labprobe-hub:router-rpc-ci .
       - name: Verify versions
         run: |
-          grep -q 'HUB_VERSION = "0.9.9"' hub_entry.py
+          grep -q 'HUB_VERSION = "0.9.10"' hub_entry.py
           grep -q 'version = "0.2.9"' labrelay/Cargo.toml
