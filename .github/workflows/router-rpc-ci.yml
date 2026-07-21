@@ -1,14 +1,11 @@
 name: Router RPC CI
 
 on:
-  push:
-    branches:
-      - codex/router-rpc-v098-relay-v029
-  pull_request:
-    branches:
-      - codex/router-dashboard-storage-v093
-      - main
   workflow_dispatch:
+
+concurrency:
+  group: router-rpc-ci-${{ github.ref }}
+  cancel-in-progress: true
 
 jobs:
   test:
@@ -23,7 +20,7 @@ jobs:
           python -m pip install --upgrade pip
           pip install -r requirements.txt pytest
       - name: Compile Python
-        run: python -m py_compile hub.py hub_entry.py router_rpc.py router_compat.py labprobe_storage.py
+        run: python -m py_compile hub.py hub_entry.py router_rpc.py router_rpc_v099.py router_compat.py labprobe_storage.py
       - name: Unit tests
         shell: bash
         run: |
@@ -40,5 +37,7 @@ jobs:
           path: /tmp/pytest.log
       - name: Build Docker image
         run: docker build -t labprobe-hub:router-rpc-ci .
-      - name: Verify Relay manifest
-        run: grep -q 'version = "0.2.9"' labrelay/Cargo.toml
+      - name: Verify versions
+        run: |
+          grep -q 'HUB_VERSION = "0.9.9"' hub_entry.py
+          grep -q 'version = "0.2.9"' labrelay/Cargo.toml
