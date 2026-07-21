@@ -211,6 +211,36 @@ def create_router_blueprint_v099(check_app_token: Callable[[], bool], logger: An
     @bp.get("/config")
     def get_config():
         return jsonify(config_response(request.args.get("includeSecret") == "1", request.args.get("probe") == "1"))
+    @bp.get("/status")
+    def get_status():
+        """Return an App-safe Hub status without exposing eWeb session details."""
+        state = client.status(probe=False)
+        configured = bool(state.get("configured"))
+        connected = bool(state.get("connected"))
+        error_code = str(state.get("lastErrorCode") or "")
+        error_message = str(state.get("lastError") or "")
+        if connected:
+            status = "ready"
+            message = "Hub is connected to the router"
+        elif not configured:
+            status = "no_router_data"
+            error_code = "HUB_NO_ROUTER_DATA"
+            message = "Hub is online, but router data has not been configured"
+        elif error_code:
+            status = "router_login_failed"
+            message = error_message or "Hub could not log in to the router"
+        else:
+            status = "no_router_data"
+            error_code = "HUB_NO_ROUTER_DATA"
+            message = "Hub is online and waiting for router data"
+        return jsonify({
+            "ok": True,
+            "state": status,
+            "connected": connected,
+            "message": message,
+            "errorCode": error_code,
+            "lastSuccessAt": int(state.get("lastSuccessAt") or 0),
+        })
 
     @bp.put("/config")
     def put_config():

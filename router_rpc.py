@@ -178,7 +178,10 @@ class RouterSession:
 
     @property
     def valid_locally(self) -> bool:
-        return bool(self.sid) and time.time() - self.obtained_at < max(60, self.session_seconds - 45)
+        # The Hub owns the browser session. Renew it before fewer than five
+        # minutes remain, rather than letting a dashboard request race an
+        # expiring BE72 eWeb SID.
+        return bool(self.sid) and time.time() - self.obtained_at < max(60, self.session_seconds - 300)
 
 
 class TinyTtlCache:

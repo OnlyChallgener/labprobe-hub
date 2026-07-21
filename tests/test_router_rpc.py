@@ -3,9 +3,10 @@ import time
 from pathlib import Path
 
 import requests
+from flask import Flask, request
 
 from router_rpc import EncryptedRouterConfigStore, RouterSession, TinyTtlCache, gibberish_aes_encrypt
-from router_rpc_v010 import StableRuijieRouterClient
+from router_rpc_v010 import StableRuijieRouterClient, create_router_blueprint_v010
 
 
 class _Logger:
@@ -84,3 +85,34 @@ def test_reyee_browser_session_cookies_are_sent_to_rpc(tmp_path: Path, monkeypat
 
     assert "SN=G1TD8RX039025" in cookie
     assert "G1TD8RX039025=cdb9f2a4c034f59d01b6990c977a59f1" in cookie
+
+
+def test_session_refreshes_before_five_minutes_remain():
+    session = RouterSession(sid="sid-123", obtained_at=time.time() - 3200, session_seconds=3600)
+    assert session.valid_locally
+
+    session.obtained_at = time.time() - 3301
+    assert not session.valid_locally
+
+
+def test_hub_router_status_hides_eweb_credentials_and_session(tmp_path: Path, monkeypatch):
+    monkeypatch.setenv("APP_TOKEN", "test-app-token")
+    app = Flask(__name__)
+    app.register_blueprint(
+        create_router_blueprint_v010(
+            check_app_token=lambda: request.headers.get("Authorization") == "Bearer test-app-token",
+            logger=_Logger(),
+            config_dir=tmp_path,
+        )
+    )
+
+    response = app.test_client().get("/api/router/status", headers={"Authorization": "Bearer test-app-token"})
+
+    assert response.status_code == 200
+    payload = response.get_json()
+    assert payload["state"] == "no_router_data"
+    assert payload["errorCode"] == "HUB_NO_ROUTER_DATA"
+    assert "password" not in payload
+    assert "address" not in payload
+    assert "sessionActive" not in payload
+    assert "sessionRemainingSeconds" not in payload
