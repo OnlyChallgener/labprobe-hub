@@ -1,7 +1,7 @@
 """Ruijie eWeb RPC adapter for LabProbe Hub.
 
 Only exposes a strict product-level whitelist. The Android client never sees
-router credentials, sid/stok, or arbitrary RPC method names.
+router credentials, sid/auth tokens, or arbitrary RPC method names.
 """
 from __future__ import annotations
 
@@ -27,6 +27,7 @@ HUB_ROUTER_API_VERSION = "1.0"
 DEFAULT_ROUTER_URL = "http://192.168.5.1"
 LOGIN_AES_PASSWORD = "RjYkhwzx$2018!"
 REQUEST_SIGN_SECRET = "Web@Rj$2020!"
+AUTH_RETRY_BACKOFF_SECONDS = 60
 
 
 class RouterRpcError(RuntimeError):
@@ -171,7 +172,7 @@ class EncryptedRouterConfigStore:
 @dataclass
 class RouterSession:
     sid: str = ""
-    stok: str = ""
+    auth: str = ""
     serial_number: str = ""
     obtained_at: float = 0.0
     session_seconds: int = 3600
@@ -181,7 +182,61 @@ class RouterSession:
         # The Hub owns the browser session. Renew it before fewer than five
         # minutes remain, rather than letting a dashboard request race an
         # expiring BE72 eWeb SID.
-        return bool(self.sid) and time.time() - self.obtained_at < max(60, self.session_seconds - 300)
+        return bool(self.sid and self.auth) and time.time() - self.obtained_at < max(60, self.session_seconds - 300)
+
+
+class RouterSessionCache:
+    """Process-wide eWeb session and cookie cache shared by every Hub caller."""
+
+    def __init__(self):
+        self.login_lock = threading.RLock()
+        self._config_key = ""
+        self._session = RouterSession()
+        self._cookies = requests.cookies.RequestsCookieJar()
+        self._blocked_config_key = ""
+        self._blocked_until = 0.0
+
+    def peek(self, config_key: str) -> RouterSession:
+        with self.login_lock:
+            return self._session if config_key == self._config_key else RouterSession()
+
+    def restore(self, config_key: str, http: requests.Session) -> RouterSession:
+        with self.login_lock:
+            http.cookies.clear()
+            if config_key != self._config_key:
+                return RouterSession()
+            http.cookies.update(self._cookies)
+            return self._session
+
+    def save(self, config_key: str, session: RouterSession, cookies: Any) -> None:
+        with self.login_lock:
+            self._config_key = config_key
+            self._session = session
+            self._cookies = cookies.copy()
+            self._blocked_config_key = ""
+            self._blocked_until = 0.0
+
+    def block_login(self, config_key: str, seconds: int = AUTH_RETRY_BACKOFF_SECONDS) -> None:
+        with self.login_lock:
+            self._blocked_config_key = config_key
+            self._blocked_until = time.time() + max(1, seconds)
+
+    def retry_after(self, config_key: str) -> int:
+        with self.login_lock:
+            if config_key != self._blocked_config_key:
+                return 0
+            return max(0, int(self._blocked_until - time.time() + 0.999))
+
+    def clear(self) -> None:
+        with self.login_lock:
+            self._config_key = ""
+            self._session = RouterSession()
+            self._cookies = requests.cookies.RequestsCookieJar()
+            self._blocked_config_key = ""
+            self._blocked_until = 0.0
+
+
+GLOBAL_ROUTER_SESSION_CACHE = RouterSessionCache()
 
 
 class TinyTtlCache:
@@ -221,8 +276,7 @@ class RuijieRouterClient:
             "Accept": "application/json, text/plain, */*",
             "User-Agent": "LabProbe-Hub/0.9.8",
         })
-        self.session = RouterSession()
-        self.login_lock = threading.RLock()
+        self.login_lock = GLOBAL_ROUTER_SESSION_CACHE.login_lock
         self.write_lock = threading.RLock()
         self.cache = TinyTtlCache()
 
@@ -230,9 +284,32 @@ class RuijieRouterClient:
     def config(self) -> Dict[str, Any]:
         return self.store.load()
 
+    def _session_cache_key(self, cfg: Optional[Dict[str, Any]] = None) -> str:
+        cfg = cfg or self.config
+        identity = "\0".join([
+            str(cfg.get("address") or ""),
+            str(cfg.get("password") or ""),
+            str(bool(cfg.get("verifyTls", False))),
+        ])
+        return hashlib.sha256(identity.encode("utf-8")).hexdigest()
+
+    @property
+    def session(self) -> RouterSession:
+        return GLOBAL_ROUTER_SESSION_CACHE.peek(self._session_cache_key())
+
+    @session.setter
+    def session(self, value: RouterSession) -> None:
+        GLOBAL_ROUTER_SESSION_CACHE.save(self._session_cache_key(), value, self.http.cookies)
+
+    def _save_session_cookies(self, cfg: Optional[Dict[str, Any]] = None) -> None:
+        cfg = cfg or self.config
+        config_key = self._session_cache_key(cfg)
+        session = GLOBAL_ROUTER_SESSION_CACHE.peek(config_key)
+        GLOBAL_ROUTER_SESSION_CACHE.save(config_key, session, self.http.cookies)
+
     def clear_session(self) -> None:
         with self.login_lock:
-            self.session = RouterSession()
+            GLOBAL_ROUTER_SESSION_CACHE.clear()
             self.http.cookies.clear()
 
     @staticmethod
@@ -241,6 +318,7 @@ class RuijieRouterClient:
             rf"\bvar\s+{re.escape(name)}\s*=\s*['\"]([^'\"]+)['\"]",
             rf"\b{name}\s*[:=]\s*['\"]([^'\"]+)['\"]",
             rf";{re.escape(name)}=([A-Za-z0-9]+)",
+            rf"[?&]{re.escape(name)}=([^&#\s]+)",
         ]
         for pattern in patterns:
             found = re.search(pattern, text or "", re.I)
@@ -255,9 +333,14 @@ class RuijieRouterClient:
 
     def login(self, force: bool = False) -> RouterSession:
         with self.login_lock:
-            if not force and self.session.valid_locally:
-                return self.session
             cfg = self.config
+            config_key = self._session_cache_key(cfg)
+            retry_after = GLOBAL_ROUTER_SESSION_CACHE.retry_after(config_key)
+            if not force and retry_after > 0:
+                raise RouterAuthExpired(f"Router auth retry paused for {retry_after}s")
+            cached_session = GLOBAL_ROUTER_SESSION_CACHE.restore(config_key, self.http)
+            if not force and cached_session.valid_locally:
+                return cached_session
             if not cfg.get("address") or not cfg.get("password"):
                 raise RouterNotConfigured()
             self.http.cookies.clear()
@@ -292,9 +375,8 @@ class RuijieRouterClient:
                 pass
 
             candidates: List[requests.Response] = list(response.history) + [response]
-            page_text = response.text or ""
             sid = str(auth_data.get("sid") or "").strip()
-            stok = str(auth_data.get("token") or auth_data.get("stok") or "").strip()
+            auth = str(auth_data.get("token") or auth_data.get("auth") or "").strip()
             serial = str(auth_data.get("sn") or auth_data.get("serialNumber") or "").strip()
             session_seconds = _safe_int(
                 auth_data.get("sessiontime") or auth_data.get("sessionTime"),
@@ -303,41 +385,33 @@ class RuijieRouterClient:
                 7200,
             )
             for item in candidates:
-                stok = stok or self._extract_token(item.url, "stok")
-                stok = stok or self._extract_token(item.headers.get("Location", ""), "stok")
-                stok = stok or self._extract_token(item.text or "", "stok")
+                auth = (
+                    auth
+                    or self._extract_token(item.url, "auth")
+                    or self._extract_token(item.headers.get("Location", ""), "auth")
+                    or self._extract_token(item.text or "", "token")
+                )
+                sid = sid or self._extract_token(item.text or "", "sid")
+                serial = serial or self._extract_token(item.text or "", "sn")
 
-            root_urls = []
-            if stok:
-                root_urls.append(cfg["address"] + f"/cgi-bin/luci/;stok={stok}")
-            root_urls.append(cfg["address"] + "/cgi-bin/luci/")
-            for url in root_urls:
-                try:
-                    page = self.http.get(url, timeout=(4, 10), verify=cfg["verifyTls"], allow_redirects=True)
-                except requests.RequestException:
-                    continue
-                page_text = page.text or ""
-                if self._looks_like_login_page(page_text):
-                    continue
-                stok = stok or self._extract_token(page.url, "stok") or self._extract_token(page_text, "stok")
-                sid = sid or self._extract_token(page_text, "sid")
-                serial = serial or self._extract_token(page_text, "sn")
-                session_seconds = _safe_int(self._extract_token(page_text, "sessiontime"), session_seconds, 600, 7200)
-                if sid:
-                    break
+            response_cookies = {cookie.name: cookie.value for cookie in self.http.cookies}
+            serial = serial or str(response_cookies.get("SN") or "").strip()
+            if serial:
+                sid = sid or str(response_cookies.get(serial) or "").strip()
 
-            if not sid:
+            if not sid or not auth:
                 self.clear_session()
                 raise RouterRpcError("路由器登录失败，请检查管理密码", "LOGIN_FAILED", 401)
 
             self.session = RouterSession(
                 sid=sid,
-                stok=stok,
+                auth=auth,
                 serial_number=serial,
                 obtained_at=time.time(),
                 session_seconds=session_seconds,
             )
             self._set_session_time(cfg["sessionSeconds"])
+            self._save_session_cookies(cfg)
             self.logger.info("router eweb login ok address=%s sn=%s session=%ss", cfg["address"], serial or "unknown", cfg["sessionSeconds"])
             return self.session
 
@@ -352,8 +426,14 @@ class RuijieRouterClient:
     def _post_api(self, api_path: str, payload: Dict[str, Any], retry_auth: bool = True) -> Any:
         session = self.login()
         cfg = self.config
-        auth_token = session.stok or session.sid
+        auth_token = session.auth
         url = cfg["address"] + f"/cgi-bin/luci/api/{api_path}?auth={auth_token}"
+        safe_url = cfg["address"] + f"/cgi-bin/luci/api/{api_path}?auth=<redacted>"
+        self.logger.debug(
+            "router eweb rpc request method=POST url=%s auth_present=%s",
+            safe_url,
+            bool(auth_token),
+        )
         wire = _wire_json(payload)
         try:
             response = self.http.post(
@@ -368,9 +448,16 @@ class RuijieRouterClient:
         except requests.RequestException as exc:
             raise RouterRpcError(f"路由器请求失败：{exc}", "ROUTER_UNREACHABLE", 502) from exc
         if response.status_code in {401, 403}:
-            self.clear_session()
+            config_key = self._session_cache_key(cfg)
+            with self.login_lock:
+                current_session_failed = self.session is session
+                if current_session_failed:
+                    self.clear_session()
+                    if retry_auth:
+                        self.login(force=True)
+                    else:
+                        GLOBAL_ROUTER_SESSION_CACHE.block_login(config_key)
             if retry_auth:
-                self.login(force=True)
                 return self._post_api(api_path, payload, retry_auth=False)
             raise RouterAuthExpired()
         if response.status_code >= 400:
@@ -379,8 +466,11 @@ class RuijieRouterClient:
             root = response.json()
         except ValueError as exc:
             if self._looks_like_login_page(response.text):
-                self.clear_session()
-                raise RouterAuthExpired() from exc
+                raise RouterRpcError(
+                    "Router returned a login page without HTTP 401/403",
+                    "RPC_INVALID_RESPONSE",
+                    502,
+                ) from exc
             raise RouterRpcError("路由器返回了无法解析的数据", "RPC_INVALID_RESPONSE", 502) from exc
         if isinstance(root, dict) and root.get("error"):
             message = root["error"].get("message") if isinstance(root["error"], dict) else str(root["error"])
@@ -610,7 +700,7 @@ def create_router_blueprint(check_app_token: Callable[[], bool], logger: Any, co
         cfg = store.save(address, password, seconds, bool(body.get("verifyTls", False)))
         client.clear_session()
         if bool(body.get("test", True)):
-            client.login(force=True)
+            client.login()
         return jsonify({
             "ok": True,
             "address": cfg["address"],
@@ -622,7 +712,7 @@ def create_router_blueprint(check_app_token: Callable[[], bool], logger: Any, co
 
     @bp.post("/session/test")
     def test_session():
-        session = client.login(force=True)
+        session = client.login()
         return jsonify({"ok": True, "serialNumber": session.serial_number, "sessionSeconds": session.session_seconds})
 
     @bp.post("/session/logout")

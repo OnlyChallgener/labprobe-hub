@@ -67,10 +67,7 @@ class StableRuijieRouterClient(v099.ReliableRuijieRouterClient):
             cookies[serial] = sid
         if cookies:
             headers["Cookie"] = "; ".join(f"{name}={value}" for name, value in cookies.items())
-        if session.stok:
-            headers["Referer"] = f"{self.config['address']}/cgi-bin/luci/;stok={session.stok}/"
-        else:
-            headers["Referer"] = f"{self.config['address']}/cgi-bin/luci/"
+        headers["Referer"] = f"{self.config['address']}/cgi-bin/luci/"
         return headers
 
     def login(self, force: bool = False) -> RouterSession:
@@ -78,6 +75,7 @@ class StableRuijieRouterClient(v099.ReliableRuijieRouterClient):
         # Reinstall on every access so a cookie-jar clear or replacement cannot
         # leave a locally valid SID without the browser cookies required by RPC.
         self._install_browser_session_cookies(session)
+        self._save_session_cookies()
         return session
 
     def _set_session_time(self, seconds: int) -> None:

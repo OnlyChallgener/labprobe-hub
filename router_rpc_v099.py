@@ -1,6 +1,6 @@
 """Reliable Ruijie/Reyee router RPC runtime for LabProbe Hub 0.9.9.
 
-Adds dual-path RPC compatibility, persistent connection status, background
+Adds token-authenticated RPC, persistent connection status, background
 session keepalive, and an APP-facing config response that can restore the
 user-entered password for masked/eye-toggle display.
 """
@@ -18,6 +18,7 @@ from router_rpc import (
     DEFAULT_ROUTER_URL,
     HUB_ROUTER_API_VERSION,
     EncryptedRouterConfigStore,
+    GLOBAL_ROUTER_SESSION_CACHE,
     RouterAuthExpired,
     RouterController,
     RouterNotConfigured,
@@ -64,93 +65,84 @@ class ReliableRuijieRouterClient(RuijieRouterClient):
         session = self.login()
         cfg = self.config
         wire = _wire_json(payload)
+        auth_token = session.auth
+        url = cfg["address"] + f"/cgi-bin/luci/api/{api_path}?auth={auth_token}"
+        safe_url = cfg["address"] + f"/cgi-bin/luci/api/{api_path}?auth=<redacted>"
+        self.logger.debug(
+            "router eweb rpc request method=POST url=%s auth_present=%s",
+            safe_url,
+            bool(auth_token),
+        )
 
-        # The captured BE72 eWeb frontend sends RPCs to the normalized API path
-        # with auth=<login data.token>. Older builds can still fall back to SID.
-        auth_token = session.stok or session.sid
-        paths = []
-        paths.append(f"/cgi-bin/luci/api/{api_path}?auth={auth_token}")
-        paths.extend([
-            f"/cgi-bin/luci//api/{api_path}?auth={auth_token}",
-        ])
-        if session.stok:
-            paths.append(f"/cgi-bin/luci/;stok={session.stok}/api/{api_path}?auth={auth_token}")
-        last_404 = None
-        for index, path in enumerate(paths):
-            url = cfg["address"] + path
-            try:
-                response = self.http.post(
-                    url,
-                    data=wire.encode("utf-8"),
-                    headers=self._headers_for(payload, session),
-                    timeout=(4, 15),
-                    verify=cfg["verifyTls"],
-                    allow_redirects=True,
-                )
-            except requests.Timeout as exc:
-                error = RouterRpcError("路由器响应超时", "RPC_TIMEOUT", 504)
-                self._mark_failure(error)
-                raise error from exc
-            except requests.RequestException as exc:
-                error = RouterRpcError(f"路由器请求失败：{exc}", "ROUTER_UNREACHABLE", 502)
-                self._mark_failure(error)
-                raise error from exc
+        try:
+            response = self.http.post(
+                url,
+                data=wire.encode("utf-8"),
+                headers=self._headers_for(payload, session),
+                timeout=(4, 15),
+                verify=cfg["verifyTls"],
+                allow_redirects=True,
+            )
+        except requests.Timeout as exc:
+            error = RouterRpcError("Router RPC timed out", "RPC_TIMEOUT", 504)
+            self._mark_failure(error)
+            raise error from exc
+        except requests.RequestException as exc:
+            error = RouterRpcError(f"Router RPC request failed: {exc}", "ROUTER_UNREACHABLE", 502)
+            self._mark_failure(error)
+            raise error from exc
 
-            if response.status_code == 404:
-                last_404 = response
-                if index < len(paths) - 1:
-                    continue
-                break
-            if response.status_code in {401, 403} or self._looks_like_login_page(response.text):
-                if index < len(paths) - 1:
-                    continue
-                self.logger.warning(
-                    "router eweb rpc auth rejected api=%s variants=%s final_status=%s redirected=%s cookie_names=%s stok=%s",
-                    api_path,
-                    len(paths),
-                    response.status_code,
-                    bool(response.history),
-                    sorted({cookie.name for cookie in self.http.cookies}),
-                    bool(session.stok),
-                )
-                with self.login_lock:
-                    current_session_failed = self.session is session
-                    if current_session_failed:
-                        self.clear_session()
-                        if retry_auth:
-                            self.login(force=True)
-                if retry_auth:
-                    return self._post_api(api_path, payload, retry_auth=False)
-                error = RouterAuthExpired()
-                self._mark_failure(error)
-                raise error
-            if response.status_code >= 400:
-                error = RouterRpcError(f"路由器返回 HTTP {response.status_code}", "RPC_HTTP_ERROR", 502)
-                self._mark_failure(error)
-                raise error
-            try:
-                root = response.json()
-            except ValueError as exc:
-                if self._looks_like_login_page(response.text):
+        if response.status_code in {401, 403}:
+            config_key = self._session_cache_key(cfg)
+            self.logger.warning(
+                "router eweb rpc auth rejected api=%s final_status=%s request_url=%s cookie_names=%s auth_present=%s",
+                api_path,
+                response.status_code,
+                safe_url,
+                sorted({cookie.name for cookie in self.http.cookies}),
+                bool(auth_token),
+            )
+            with self.login_lock:
+                current_session_failed = self.session is session
+                if current_session_failed:
                     self.clear_session()
-                    error = RouterAuthExpired()
-                    self._mark_failure(error)
-                    raise error from exc
-                error = RouterRpcError("路由器返回了无法解析的数据", "RPC_INVALID_RESPONSE", 502)
-                self._mark_failure(error)
-                raise error from exc
-            if isinstance(root, dict) and root.get("error"):
-                message = root["error"].get("message") if isinstance(root["error"], dict) else str(root["error"])
-                error = RouterRpcError(message or "路由器拒绝了操作", "RPC_REJECTED", 409)
-                self._mark_failure(error)
-                raise error
-            self._mark_success()
-            return root.get("data") if isinstance(root, dict) and "data" in root else root
+                    if retry_auth:
+                        self.login(force=True)
+                    else:
+                        GLOBAL_ROUTER_SESSION_CACHE.block_login(config_key)
+            if retry_auth:
+                return self._post_api(api_path, payload, retry_auth=False)
+            error = RouterAuthExpired()
+            self._mark_failure(error)
+            raise error
 
-        status = last_404.status_code if last_404 is not None else 404
-        error = RouterRpcError(f"路由器 RPC 路径不可用（HTTP {status}）", "RPC_PATH_NOT_FOUND", 502)
-        self._mark_failure(error)
-        raise error
+        if response.status_code >= 400:
+            error = RouterRpcError(
+                f"Router returned HTTP {response.status_code}",
+                "RPC_HTTP_ERROR",
+                502,
+            )
+            self._mark_failure(error)
+            raise error
+        try:
+            root = response.json()
+        except ValueError as exc:
+            error = RouterRpcError(
+                "Router returned a login page without HTTP 401/403"
+                if self._looks_like_login_page(response.text)
+                else "Router returned an invalid RPC response",
+                "RPC_INVALID_RESPONSE",
+                502,
+            )
+            self._mark_failure(error)
+            raise error from exc
+        if isinstance(root, dict) and root.get("error"):
+            message = root["error"].get("message") if isinstance(root["error"], dict) else str(root["error"])
+            error = RouterRpcError(message or "Router rejected the RPC operation", "RPC_REJECTED", 409)
+            self._mark_failure(error)
+            raise error
+        self._mark_success()
+        return root.get("data") if isinstance(root, dict) and "data" in root else root
 
     def status(self, probe: bool = False) -> Dict[str, Any]:
         cfg = self.config
@@ -272,13 +264,13 @@ def create_router_blueprint_v099(check_app_token: Callable[[], bool], logger: An
         store.save(address, password, seconds, bool(body.get("verifyTls", False)))
         client.clear_session()
         if bool(body.get("test", True)):
-            client.login(force=True)
+            client.login()
             client.rpc("acConfig.get", "network_group", no_parse=True)
         return jsonify(config_response(include_secret=True, probe=False))
 
     @bp.post("/session/test")
     def test_session():
-        client.login(force=True)
+        client.login()
         client.rpc("acConfig.get", "network_group", no_parse=True)
         return jsonify(config_response(False, False))
 
