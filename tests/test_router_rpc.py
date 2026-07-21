@@ -19,6 +19,11 @@ from router_rpc import (
 from router_rpc_v010 import StableRuijieRouterClient, create_router_blueprint_v010
 
 
+def _eweb_login_html() -> str:
+    wrapped_key = gibberish_aes_encrypt("dynamic-page-key", "eweb")
+    return f"var k = GibberishAES.dec('{wrapped_key}', 'eweb')"
+
+
 class _Logger:
     def debug(self, *args, **kwargs):
         pass
@@ -31,7 +36,7 @@ class _Logger:
 
 
 def test_gibberish_aes_envelope():
-    raw = base64.b64decode(gibberish_aes_encrypt("secret"))
+    raw = base64.b64decode(gibberish_aes_encrypt("secret", "page-key"))
     assert raw.startswith(b"Salted__")
     assert len(raw) > 24
 
@@ -65,7 +70,7 @@ def test_ttl_cache_clear_prefix():
 def test_local_session_timeout_keeps_fresh_sid(tmp_path: Path, monkeypatch):
     monkeypatch.setenv("APP_TOKEN", "test-app-token")
     client = StableRuijieRouterClient(EncryptedRouterConfigStore(tmp_path), _Logger())
-    client.session = RouterSession(sid="sid-123", auth_token="auth-123", obtained_at=time.time(), session_seconds=3600)
+    client.session = RouterSession(sid="sid-123", eweb_token="token-123", obtained_at=time.time(), session_seconds=3600)
 
     client._set_session_time(7200)
 
@@ -79,7 +84,7 @@ def test_reyee_browser_session_cookies_are_sent_to_rpc(tmp_path: Path, monkeypat
     client = StableRuijieRouterClient(EncryptedRouterConfigStore(tmp_path), _Logger())
     session = RouterSession(
         sid="cdb9f2a4c034f59d01b6990c977a59f1",
-        auth_token="auth-token",
+        eweb_token="token-value",
         serial_number="G1TD8RX039025",
         obtained_at=time.time(),
         session_seconds=3600,
@@ -89,7 +94,7 @@ def test_reyee_browser_session_cookies_are_sent_to_rpc(tmp_path: Path, monkeypat
     prepared = client.http.prepare_request(
         requests.Request(
             "POST",
-            "http://192.168.5.1/cgi-bin/luci/api/cmd?auth=auth-token",
+            "http://192.168.5.1/cgi-bin/luci/;stok=token-value/api/cmd",
         )
     )
     cookie = prepared.headers.get("Cookie", "")
@@ -108,7 +113,7 @@ def test_global_session_and_cookies_are_reused_across_clients(tmp_path: Path, mo
         first.http.cookies.set("router-cookie", "cookie-value", path="/cgi-bin/luci")
         first.session = RouterSession(
             sid="sid-shared",
-            auth_token="token-shared",
+            eweb_token="token-shared",
             serial_number="G1TD8RX039025",
             obtained_at=time.time(),
             session_seconds=3600,
@@ -120,7 +125,7 @@ def test_global_session_and_cookies_are_reused_across_clients(tmp_path: Path, mo
 
         assert first.login_lock is second.login_lock
         assert restored.sid == "sid-shared"
-        assert restored.auth_token == "token-shared"
+        assert restored.eweb_token == "token-shared"
         cookies = {cookie.name: cookie.value for cookie in second.http.cookies}
         assert cookies["router-cookie"] == "cookie-value"
         assert cookies["SN"] == "G1TD8RX039025"
@@ -161,6 +166,7 @@ def test_concurrent_callers_perform_one_real_login(tmp_path: Path, monkeypatch):
         with count_lock:
             login_count += 1
         return response({
+            "code": 0,
             "data": {
                 "sid": "sid-once",
                 "token": "token-once",
@@ -170,7 +176,9 @@ def test_concurrent_callers_perform_one_real_login(tmp_path: Path, monkeypatch):
         }, url)
 
     def fake_get(url, *args, **kwargs):
-        return response({}, url)
+        result = response({}, url)
+        result._content = _eweb_login_html().encode("utf-8")
+        return result
 
     for client in clients:
         monkeypatch.setattr(client.http, "post", fake_post)
@@ -187,7 +195,71 @@ def test_concurrent_callers_perform_one_real_login(tmp_path: Path, monkeypatch):
         GLOBAL_ROUTER_SESSION_CACHE.clear()
 
 
-def test_eweb_apis_use_login_auth_token_query(tmp_path: Path, monkeypatch):
+def test_login_once_then_reuses_eweb_token_for_repeated_devsta_get(tmp_path: Path, monkeypatch):
+    monkeypatch.setenv("APP_TOKEN", "test-app-token")
+    store = EncryptedRouterConfigStore(tmp_path)
+    store.save("192.168.5.1", "router-password", 3600)
+    GLOBAL_ROUTER_SESSION_CACHE.clear()
+    login_urls = []
+    entry_urls = []
+    cmd_urls = []
+
+    class CountingLogger(_Logger):
+        def __init__(self):
+            self.login_messages = []
+
+        def info(self, message, *args, **kwargs):
+            if message.startswith("router eweb login ok"):
+                self.login_messages.append(message % args)
+
+    logger = CountingLogger()
+    client = StableRuijieRouterClient(store, logger)
+
+    def response(payload, url):
+        result = requests.Response()
+        result.status_code = 200
+        result.url = url
+        result.headers["Content-Type"] = "application/json"
+        result._content = json.dumps(payload).encode("utf-8")
+        return result
+
+    def fake_post(url, *args, **kwargs):
+        if url == "http://192.168.5.1/cgi-bin/luci/api/auth":
+            login_urls.append(url)
+            return response({
+                "code": 0,
+                "data": {
+                    "sid": "sid-once",
+                    "sn": "G1TD8RX039025",
+                    "token": "token-once",
+                    "sessiontime": 3600,
+                }
+            }, url)
+        cmd_urls.append(url)
+        return response({"data": {"list": []}}, url)
+
+    def fake_get(url, *args, **kwargs):
+        entry_urls.append(url)
+        result = response({}, url)
+        result._content = _eweb_login_html().encode("utf-8")
+        return result
+
+    monkeypatch.setattr(client.http, "post", fake_post)
+    monkeypatch.setattr(client.http, "get", fake_get)
+    try:
+        for _ in range(3):
+            client.rpc("devSta.get", "user_list", {"devType": "all"}, no_parse=True)
+        assert login_urls == ["http://192.168.5.1/cgi-bin/luci/api/auth"]
+        assert len(entry_urls) == 1
+        assert entry_urls[0].startswith("http://192.168.5.1/cgi-bin/luci/?stamp=")
+        assert cmd_urls == ["http://192.168.5.1/cgi-bin/luci/;stok=token-once/api/cmd"] * 3
+        assert client.session.eweb_token == "token-once"
+        assert len(logger.login_messages) == 1
+        assert "token=True" in logger.login_messages[0]
+    finally:
+        GLOBAL_ROUTER_SESSION_CACHE.clear()
+
+def test_cmd_403_relogs_once_and_saves_new_dynamic_eweb_token(tmp_path: Path, monkeypatch):
     monkeypatch.setenv("APP_TOKEN", "test-app-token")
     store = EncryptedRouterConfigStore(tmp_path)
     store.save("192.168.5.1", "router-password", 3600)
@@ -195,7 +267,69 @@ def test_eweb_apis_use_login_auth_token_query(tmp_path: Path, monkeypatch):
     client = StableRuijieRouterClient(store, _Logger())
     client.session = RouterSession(
         sid="sid-cookie",
-        auth_token="auth-token",
+        eweb_token="token-old",
+        serial_number="G1TD8RX039025",
+        obtained_at=time.time(),
+        session_seconds=3600,
+    )
+    client._install_browser_session_cookies(client.session)
+    client._save_session_cookies()
+    post_urls = []
+    entry_urls = []
+
+    def rpc_response(status, url, payload=None):
+        result = requests.Response()
+        result.status_code = status
+        result.url = url
+        result.headers["Content-Type"] = "application/json"
+        result._content = json.dumps(payload or {"data": {}}).encode("utf-8")
+        return result
+
+    def fake_post(url, *args, **kwargs):
+        post_urls.append(url)
+        if url.endswith("/cgi-bin/luci/api/auth"):
+            return rpc_response(200, url, {
+                "code": 0,
+                "data": {
+                    "sid": "sid-new",
+                    "token": "token-new",
+                    "sn": "G1TD8RX039025",
+                    "sessiontime": 3600,
+                }
+            })
+        return rpc_response(403 if ";stok=token-old/" in url else 200, url)
+
+    def fake_get(url, *args, **kwargs):
+        entry_urls.append(url)
+        result = rpc_response(200, url)
+        result._content = _eweb_login_html().encode("utf-8")
+        return result
+
+    monkeypatch.setattr(client.http, "post", fake_post)
+    monkeypatch.setattr(client.http, "get", fake_get)
+    try:
+        client.rpc("devSta.get", "user_list", {"devType": "all"}, no_parse=True)
+        assert post_urls == [
+            "http://192.168.5.1/cgi-bin/luci/;stok=token-old/api/cmd",
+            "http://192.168.5.1/cgi-bin/luci/api/auth",
+            "http://192.168.5.1/cgi-bin/luci/;stok=token-new/api/cmd",
+        ]
+        assert len(entry_urls) == 1
+        assert entry_urls[0].startswith("http://192.168.5.1/cgi-bin/luci/?stamp=")
+        assert client.session.eweb_token == "token-new"
+        assert client.session.sid == "sid-new"
+    finally:
+        GLOBAL_ROUTER_SESSION_CACHE.clear()
+
+def test_eweb_apis_use_login_token_path(tmp_path: Path, monkeypatch):
+    monkeypatch.setenv("APP_TOKEN", "test-app-token")
+    store = EncryptedRouterConfigStore(tmp_path)
+    store.save("192.168.5.1", "router-password", 3600)
+    GLOBAL_ROUTER_SESSION_CACHE.clear()
+    client = StableRuijieRouterClient(store, _Logger())
+    client.session = RouterSession(
+        sid="sid-cookie",
+        eweb_token="token-value",
         serial_number="G1TD8RX039025",
         obtained_at=time.time(),
         session_seconds=3600,
@@ -218,9 +352,9 @@ def test_eweb_apis_use_login_auth_token_query(tmp_path: Path, monkeypatch):
         client._post_api("common", {"method": "getSessiontime"})
         client._post_api("system", {"method": "get"})
         assert requested_urls == [
-            "http://192.168.5.1/cgi-bin/luci/api/cmd?auth=auth-token",
-            "http://192.168.5.1/cgi-bin/luci/api/common?auth=auth-token",
-            "http://192.168.5.1/cgi-bin/luci/api/system?auth=auth-token",
+            "http://192.168.5.1/cgi-bin/luci/;stok=token-value/api/cmd",
+            "http://192.168.5.1/cgi-bin/luci/;stok=token-value/api/common",
+            "http://192.168.5.1/cgi-bin/luci/;stok=token-value/api/system",
         ]
     finally:
         GLOBAL_ROUTER_SESSION_CACHE.clear()
@@ -247,7 +381,7 @@ def test_repeated_403_backoff_suppresses_new_login(tmp_path: Path, monkeypatch):
 
 
 def test_session_refreshes_before_five_minutes_remain():
-    session = RouterSession(auth_token="auth-123", obtained_at=time.time() - 3200, session_seconds=3600)
+    session = RouterSession(eweb_token="token-123", obtained_at=time.time() - 3200, session_seconds=3600)
     assert session.valid_locally
 
     session.obtained_at = time.time() - 3301

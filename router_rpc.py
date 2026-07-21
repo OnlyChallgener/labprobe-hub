@@ -16,16 +16,15 @@ import time
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Any, Callable, Dict, Iterable, List, Optional, Tuple
-from urllib.parse import urlparse
+from urllib.parse import quote, urlparse
 
 import requests
 from Crypto.Cipher import AES
-from Crypto.Util.Padding import pad
+from Crypto.Util.Padding import pad, unpad
 from flask import Blueprint, jsonify, request
 
 HUB_ROUTER_API_VERSION = "1.0"
 DEFAULT_ROUTER_URL = "http://192.168.5.1"
-LOGIN_AES_PASSWORD = "RjYkhwzx$2018!"
 REQUEST_SIGN_SECRET = "Web@Rj$2020!"
 AUTH_RETRY_BACKOFF_SECONDS = 60
 
@@ -76,12 +75,23 @@ def _evp_bytes_to_key(password: bytes, salt: bytes, key_len: int = 32, iv_len: i
     return material[:key_len], material[key_len:key_len + iv_len]
 
 
-def gibberish_aes_encrypt(plain_text: str, password: str = LOGIN_AES_PASSWORD) -> str:
+def gibberish_aes_encrypt(plain_text: str, password: str) -> str:
     """Compatible with GibberishAES.enc/OpenSSL salted AES-256-CBC."""
     salt = secrets.token_bytes(8)
     key, iv = _evp_bytes_to_key(password.encode("utf-8"), salt)
     encrypted = AES.new(key, AES.MODE_CBC, iv).encrypt(pad(plain_text.encode("utf-8"), AES.block_size))
     return base64.b64encode(b"Salted__" + salt + encrypted).decode("ascii")
+
+
+def gibberish_aes_decrypt(cipher_text: str, password: str) -> str:
+    """Decrypt a GibberishAES/OpenSSL salted AES-256-CBC value."""
+    payload = base64.b64decode(cipher_text)
+    if len(payload) < 17 or not payload.startswith(b"Salted__"):
+        raise ValueError("Invalid OpenSSL salted payload")
+    salt = payload[8:16]
+    key, iv = _evp_bytes_to_key(password.encode("utf-8"), salt)
+    plain = AES.new(key, AES.MODE_CBC, iv).decrypt(payload[16:])
+    return unpad(plain, AES.block_size).decode("utf-8")
 
 
 def _stable_json(value: Any) -> str:
@@ -172,7 +182,7 @@ class EncryptedRouterConfigStore:
 @dataclass
 class RouterSession:
     sid: str = ""
-    auth_token: str = ""
+    eweb_token: Optional[str] = None
     serial_number: str = ""
     obtained_at: float = 0.0
     session_seconds: int = 3600
@@ -181,8 +191,8 @@ class RouterSession:
     def valid_locally(self) -> bool:
         # The Hub owns the browser session. Renew it before fewer than five
         # minutes remain, rather than letting a dashboard request race an
-        # expiring BE72 eWeb auth token.
-        return bool(self.auth_token) and time.time() - self.obtained_at < max(60, self.session_seconds - 300)
+        # expiring BE72 eWeb login token.
+        return bool(self.eweb_token) and time.time() - self.obtained_at < max(60, self.session_seconds - 300)
 
 
 class RouterSessionCache:
@@ -313,23 +323,38 @@ class RuijieRouterClient:
             self.http.cookies.clear()
 
     @staticmethod
-    def _extract_token(text: str, name: str) -> str:
-        patterns = [
-            rf"\bvar\s+{re.escape(name)}\s*=\s*['\"]([^'\"]+)['\"]",
-            rf"\b{name}\s*[:=]\s*['\"]([^'\"]+)['\"]",
-            rf";{re.escape(name)}=([A-Za-z0-9]+)",
-            rf"[?&]{re.escape(name)}=([^&#\s]+)",
-        ]
-        for pattern in patterns:
-            found = re.search(pattern, text or "", re.I)
-            if found:
-                return found.group(1).strip()
-        return ""
-
-    @staticmethod
     def _looks_like_login_page(text: str) -> bool:
         low = (text or "").lower()
         return 'id="password"' in low and 'id="login"' in low and "api/auth" in low
+
+    @staticmethod
+    def _extract_login_password_key(page_html: str) -> str:
+        match = re.search(
+            r"GibberishAES\.dec\(\s*['\"]([^'\"]+)['\"]\s*,\s*['\"]eweb['\"]\s*\)",
+            page_html or "",
+            re.I,
+        )
+        if not match:
+            raise RouterRpcError("路由器登录页缺少动态加密参数", "LOGIN_FAILED", 502)
+        try:
+            return gibberish_aes_decrypt(match.group(1), "eweb")
+        except (ValueError, UnicodeError) as exc:
+            raise RouterRpcError("路由器登录页动态加密参数无效", "LOGIN_FAILED", 502) from exc
+
+    def _relogin_after_auth_rejection(self, failed_session: RouterSession) -> RouterSession:
+        """Replace an expired dynamic token once, using the stored router password."""
+        with self.login_lock:
+            current_session = self.session
+            if current_session is not failed_session and current_session.valid_locally:
+                return current_session
+            cfg = self.config
+            config_key = self._session_cache_key(cfg)
+            self.clear_session()
+            try:
+                return self.login(force=True)
+            except Exception:
+                GLOBAL_ROUTER_SESSION_CACHE.block_login(config_key)
+                raise
 
     def login(self, force: bool = False) -> RouterSession:
         with self.login_lock:
@@ -344,11 +369,30 @@ class RuijieRouterClient:
             if not cfg.get("address") or not cfg.get("password"):
                 raise RouterNotConfigured()
             self.http.cookies.clear()
+            stamp_url = cfg["address"] + f"/cgi-bin/luci/?stamp={int(time.time() * 1000)}"
+            try:
+                entry_response = self.http.get(
+                    stamp_url,
+                    timeout=(4, 10),
+                    verify=cfg["verifyTls"],
+                    allow_redirects=True,
+                )
+            except requests.RequestException as exc:
+                raise RouterRpcError(f"无法连接路由器：{exc}", "ROUTER_UNREACHABLE", 502) from exc
+            if entry_response.status_code >= 400:
+                raise RouterRpcError(
+                    f"路由器登录入口返回 HTTP {entry_response.status_code}",
+                    "LOGIN_FAILED",
+                    502,
+                )
+            login_time = str(int(time.time()))
+            password_key = self._extract_login_password_key(entry_response.text)
+            encrypted_password = gibberish_aes_encrypt(str(cfg["password"]), password_key)
             body = {
                 "method": "login",
                 "params": {
-                    "password": gibberish_aes_encrypt(str(cfg["password"])),
-                    "time": str(int(time.time())),
+                    "password": encrypted_password,
+                    "time": login_time,
                     "encry": True,
                     "limit": False,
                     "setInit": False,
@@ -361,58 +405,58 @@ class RuijieRouterClient:
                     timeout=(4, 10),
                     verify=cfg["verifyTls"],
                     allow_redirects=True,
+                    headers={"Referer": entry_response.url},
                 )
             except requests.RequestException as exc:
                 raise RouterRpcError(f"无法连接路由器：{exc}", "ROUTER_UNREACHABLE", 502) from exc
 
-            auth_data: Dict[str, Any] = {}
+            auth_root: Any = {}
             try:
                 auth_root = response.json()
-                if isinstance(auth_root, dict):
-                    nested = auth_root.get("data")
-                    auth_data = nested if isinstance(nested, dict) else auth_root
             except ValueError:
                 pass
 
-            candidates: List[requests.Response] = list(response.history) + [response]
-            sid = str(auth_data.get("sid") or "").strip()
-            auth_token = str(auth_data.get("token") or auth_data.get("auth_token") or auth_data.get("auth") or "").strip()
-            serial = str(auth_data.get("sn") or auth_data.get("serialNumber") or "").strip()
+            auth_data = auth_root.get("data") if isinstance(auth_root, dict) else None
+            login_ok = (
+                isinstance(auth_root, dict)
+                and auth_root.get("code") == 0
+                and isinstance(auth_data, dict)
+            )
+            eweb_token = str(auth_data.get("token") or "").strip() if login_ok else ""
+            sid = str(auth_data.get("sid") or "").strip() if login_ok else ""
+            serial = str(auth_data.get("sn") or "").strip() if login_ok else ""
             session_seconds = _safe_int(
-                auth_data.get("sessiontime") or auth_data.get("sessionTime"),
+                auth_data.get("sessiontime") or auth_data.get("sessionTime") if login_ok else None,
                 cfg["sessionSeconds"],
                 600,
                 7200,
             )
-            for item in candidates:
-                auth_token = (
-                    auth_token
-                    or self._extract_token(item.url, "auth")
-                    or self._extract_token(item.headers.get("Location", ""), "auth")
-                    or self._extract_token(item.text or "", "token")
-                )
-                sid = sid or self._extract_token(item.text or "", "sid")
-                serial = serial or self._extract_token(item.text or "", "sn")
 
             response_cookies = {cookie.name: cookie.value for cookie in self.http.cookies}
             serial = serial or str(response_cookies.get("SN") or "").strip()
             if serial:
                 sid = sid or str(response_cookies.get(serial) or "").strip()
 
-            if not auth_token:
+            if not eweb_token:
                 self.clear_session()
                 raise RouterRpcError("路由器登录失败，请检查管理密码", "LOGIN_FAILED", 401)
 
             self.session = RouterSession(
                 sid=sid,
-                auth_token=auth_token,
+                eweb_token=eweb_token,
                 serial_number=serial,
                 obtained_at=time.time(),
                 session_seconds=session_seconds,
             )
             self._set_session_time(cfg["sessionSeconds"])
             self._save_session_cookies(cfg)
-            self.logger.info("router eweb login ok address=%s sn=%s session=%ss", cfg["address"], serial or "unknown", cfg["sessionSeconds"])
+            self.logger.info(
+                "router eweb login ok token=%s address=%s sn=%s session=%ss",
+                bool(self.session.eweb_token),
+                cfg["address"],
+                serial or "unknown",
+                cfg["sessionSeconds"],
+            )
             return self.session
 
     def _headers_for(self, payload: Dict[str, Any], session: Optional[RouterSession] = None) -> Dict[str, str]:
@@ -423,15 +467,16 @@ class RuijieRouterClient:
             "Contents-Accept": hashlib.md5((REQUEST_SIGN_SECRET + wire).encode("utf-8")).hexdigest(),
         }
 
-    def _post_api(self, api_path: str, payload: Dict[str, Any], retry_auth: bool = True) -> Any:
+    def _post_api(self, api_path: str, payload: Dict[str, Any], retry_token: bool = True) -> Any:
         session = self.login()
         cfg = self.config
-        auth_token = session.auth_token
-        url = cfg["address"] + f"/cgi-bin/luci/api/{api_path}?auth={auth_token}"
-        safe_url = cfg["address"] + f"/cgi-bin/luci/api/{api_path}?auth=<redacted>"
+        eweb_token = session.eweb_token
+        encoded_token = quote(eweb_token or "", safe="")
+        url = cfg["address"] + f"/cgi-bin/luci/;stok={encoded_token}/api/{api_path}"
+        safe_url = cfg["address"] + f"/cgi-bin/luci/;stok=<redacted>/api/{api_path}"
         self.logger.debug(
-            "router eweb rpc request auth=%s url=%s",
-            bool(auth_token),
+            "router eweb rpc request token_exists=%s request_url=%s",
+            bool(eweb_token),
             safe_url,
         )
         wire = _wire_json(payload)
@@ -449,16 +494,20 @@ class RuijieRouterClient:
             raise RouterRpcError(f"路由器请求失败：{exc}", "ROUTER_UNREACHABLE", 502) from exc
         if response.status_code in {401, 403}:
             config_key = self._session_cache_key(cfg)
+            token_request = "/;stok=" in url
+            self.logger.warning(
+                "router eweb rpc token rejected api=%s final_status=%s token_request=%s",
+                api_path,
+                response.status_code,
+                token_request,
+            )
+            if retry_token:
+                self._relogin_after_auth_rejection(session)
+                return self._post_api(api_path, payload, retry_token=False)
             with self.login_lock:
-                current_session_failed = self.session is session
-                if current_session_failed:
+                if self.session is session:
                     self.clear_session()
-                    if retry_auth:
-                        self.login(force=True)
-                    else:
-                        GLOBAL_ROUTER_SESSION_CACHE.block_login(config_key)
-            if retry_auth:
-                return self._post_api(api_path, payload, retry_auth=False)
+                    GLOBAL_ROUTER_SESSION_CACHE.block_login(config_key)
             raise RouterAuthExpired()
         if response.status_code >= 400:
             raise RouterRpcError(f"路由器返回 HTTP {response.status_code}", "RPC_HTTP_ERROR", 502)
@@ -480,7 +529,7 @@ class RuijieRouterClient:
     def _set_session_time(self, seconds: int) -> None:
         seconds = _safe_int(seconds, 3600, 600, 7200)
         try:
-            self._post_api("common", {"method": "setSessionTime", "params": {"sessiontime": str(seconds)}}, retry_auth=False)
+            self._post_api("common", {"method": "setSessionTime", "params": {"sessiontime": str(seconds)}}, retry_token=False)
             self.session.session_seconds = seconds
             self.session.obtained_at = time.time()
         except Exception as exc:
@@ -489,7 +538,7 @@ class RuijieRouterClient:
     def logout(self) -> None:
         if self.session.sid:
             try:
-                self._post_api("common", {"method": "logout", "params": {}}, retry_auth=False)
+                self._post_api("common", {"method": "logout", "params": {}}, retry_token=False)
             except Exception:
                 pass
         self.clear_session()

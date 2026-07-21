@@ -1,4 +1,4 @@
-"""Stable Ruijie/Reyee router RPC runtime for LabProbe Hub 0.9.11.
+"""Stable Ruijie/Reyee router RPC runtime for LabProbe Hub 0.9.12.
 
 This compatibility layer fixes two firmware-specific eWeb session problems:
 
@@ -7,7 +7,7 @@ This compatibility layer fixes two firmware-specific eWeb session problems:
   ``/cgi-bin/luci`` before issuing authenticated RPC requests.
 
 Hub tracks the requested lifetime locally, recreates the browser cookies after
-login, and keeps the existing automatic 401/403 re-login path.
+login, and replaces the dynamic eWeb token only after expiry or 401/403.
 """
 from __future__ import annotations
 
@@ -21,7 +21,7 @@ from router_rpc import EncryptedRouterConfigStore, RouterSession, _safe_int
 
 
 class StableRuijieRouterClient(v099.ReliableRuijieRouterClient):
-    """0.9.11 client with browser-compatible session persistence."""
+    """0.9.12 client with browser-compatible session persistence."""
 
     CONNECTION_ERROR_CODES = {
         "AUTH_EXPIRED",
@@ -35,7 +35,7 @@ class StableRuijieRouterClient(v099.ReliableRuijieRouterClient):
 
     def __init__(self, store: EncryptedRouterConfigStore, logger: Any):
         super().__init__(store, logger)
-        self.http.headers["User-Agent"] = "LabProbe-Hub/0.9.11"
+        self.http.headers["User-Agent"] = "LabProbe-Hub/0.9.12"
 
     def _install_browser_session_cookies(self, session: RouterSession) -> None:
         """Mirror the cookies written by the Reyee eWeb JavaScript client.
@@ -45,7 +45,7 @@ class StableRuijieRouterClient(v099.ReliableRuijieRouterClient):
             Cookie.set("SN", serial)
             Cookie.set(serial, sid, {path: "/cgi-bin/luci"})
 
-        The RPC URL must use ``auth=<token>`` from the login response, while
+        The RPC URL uses ``;stok=<data.token>/api/...`` from the login response, while
         the cookies still carry the serial-number SID pair.
         """
         serial = (session.serial_number or "").strip()
@@ -71,12 +71,13 @@ class StableRuijieRouterClient(v099.ReliableRuijieRouterClient):
         return headers
 
     def login(self, force: bool = False) -> RouterSession:
-        session = super().login(force=force)
-        # Reinstall on every access so a cookie-jar clear or replacement cannot
-        # leave a locally valid SID without the browser cookies required by RPC.
-        self._install_browser_session_cookies(session)
-        self._save_session_cookies()
-        return session
+        with self.login_lock:
+            session = super().login(force=force)
+            # Reinstall on every access so a cookie-jar clear or replacement cannot
+            # leave a locally valid SID without the browser cookies required by RPC.
+            self._install_browser_session_cookies(session)
+            self._save_session_cookies()
+            return session
 
     def _set_session_time(self, seconds: int) -> None:
         """Track the requested lifetime locally without invalidating a new SID.
@@ -133,7 +134,7 @@ def create_router_blueprint_v010(
     logger: Any,
     config_dir: Path,
 ) -> Blueprint:
-    """Reuse the 0.9.9 whitelist routes with the 0.9.11 stable client."""
+    """Reuse the 0.9.9 whitelist routes with the 0.9.12 stable client."""
     original_client = v099.ReliableRuijieRouterClient
     v099.ReliableRuijieRouterClient = StableRuijieRouterClient
     try:

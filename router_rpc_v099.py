@@ -10,6 +10,7 @@ import threading
 import time
 from pathlib import Path
 from typing import Any, Callable, Dict
+from urllib.parse import quote
 
 import requests
 from flask import Blueprint, jsonify, request
@@ -61,16 +62,17 @@ class ReliableRuijieRouterClient(RuijieRouterClient):
             self._mark_failure(exc)
             raise
 
-    def _post_api(self, api_path: str, payload: Dict[str, Any], retry_auth: bool = True) -> Any:
+    def _post_api(self, api_path: str, payload: Dict[str, Any], retry_token: bool = True) -> Any:
         session = self.login()
         cfg = self.config
         wire = _wire_json(payload)
-        auth_token = session.auth_token
-        url = cfg["address"] + f"/cgi-bin/luci/api/{api_path}?auth={auth_token}"
-        safe_url = cfg["address"] + f"/cgi-bin/luci/api/{api_path}?auth=<redacted>"
+        eweb_token = session.eweb_token
+        encoded_token = quote(eweb_token or "", safe="")
+        url = cfg["address"] + f"/cgi-bin/luci/;stok={encoded_token}/api/{api_path}"
+        safe_url = cfg["address"] + f"/cgi-bin/luci/;stok=<redacted>/api/{api_path}"
         self.logger.debug(
-            "router eweb rpc request auth=%s url=%s",
-            bool(auth_token),
+            "router eweb rpc request token_exists=%s request_url=%s",
+            bool(eweb_token),
             safe_url,
         )
 
@@ -94,24 +96,20 @@ class ReliableRuijieRouterClient(RuijieRouterClient):
 
         if response.status_code in {401, 403}:
             config_key = self._session_cache_key(cfg)
+            token_request = "/;stok=" in url
             self.logger.warning(
-                "router eweb rpc auth rejected api=%s final_status=%s request_url=%s cookie_names=%s auth=%s",
+                "router eweb rpc token rejected api=%s final_status=%s token_request=%s",
                 api_path,
                 response.status_code,
-                safe_url,
-                sorted({cookie.name for cookie in self.http.cookies}),
-                bool(auth_token),
+                token_request,
             )
+            if retry_token:
+                self._relogin_after_auth_rejection(session)
+                return self._post_api(api_path, payload, retry_token=False)
             with self.login_lock:
-                current_session_failed = self.session is session
-                if current_session_failed:
+                if self.session is session:
                     self.clear_session()
-                    if retry_auth:
-                        self.login(force=True)
-                    else:
-                        GLOBAL_ROUTER_SESSION_CACHE.block_login(config_key)
-            if retry_auth:
-                return self._post_api(api_path, payload, retry_auth=False)
+                    GLOBAL_ROUTER_SESSION_CACHE.block_login(config_key)
             error = RouterAuthExpired()
             self._mark_failure(error)
             raise error
