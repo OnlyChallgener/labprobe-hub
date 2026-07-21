@@ -1,9 +1,13 @@
-"""Stable Ruijie/Reyee router RPC runtime for LabProbe Hub 0.9.10.
+"""Stable Ruijie/Reyee router RPC runtime for LabProbe Hub 0.9.11.
 
-This compatibility layer fixes the eWeb login loop seen on firmware that rejects
-setSessionTime immediately after authentication. Session duration is tracked by
-Hub locally; a real RPC is still used to verify the login, and HTTP 401/403 is
-handled by the existing automatic re-login path.
+This compatibility layer fixes two firmware-specific eWeb session problems:
+
+* some builds reject ``common/setSessionTime`` immediately after login;
+* the browser stores ``SN=<serial>`` and ``<serial>=<sid>`` cookies under
+  ``/cgi-bin/luci`` before issuing authenticated RPC requests.
+
+Hub tracks the requested lifetime locally, recreates the browser cookies after
+login, and keeps the existing automatic 401/403 re-login path.
 """
 from __future__ import annotations
 
@@ -13,11 +17,11 @@ from typing import Any, Callable, Dict
 
 import router_rpc_v099 as v099
 from flask import Blueprint
-from router_rpc import EncryptedRouterConfigStore, _safe_int
+from router_rpc import EncryptedRouterConfigStore, RouterSession, _safe_int
 
 
 class StableRuijieRouterClient(v099.ReliableRuijieRouterClient):
-    """0.9.10 client with non-destructive session timeout tracking."""
+    """0.9.11 client with browser-compatible session persistence."""
 
     CONNECTION_ERROR_CODES = {
         "AUTH_EXPIRED",
@@ -31,16 +35,41 @@ class StableRuijieRouterClient(v099.ReliableRuijieRouterClient):
 
     def __init__(self, store: EncryptedRouterConfigStore, logger: Any):
         super().__init__(store, logger)
-        self.http.headers["User-Agent"] = "LabProbe-Hub/0.9.10"
+        self.http.headers["User-Agent"] = "LabProbe-Hub/0.9.11"
+
+    def _install_browser_session_cookies(self, session: RouterSession) -> None:
+        """Mirror the cookies written by the Reyee eWeb JavaScript client.
+
+        The bundled eWeb frontend performs the equivalent of::
+
+            Cookie.set("SN", serial)
+            Cookie.set(serial, sid, {path: "/cgi-bin/luci"})
+
+        Supplying ``auth=<sid>`` alone is not accepted by this firmware. Without
+        both cookies every command returns 401 even though the HTML contains a
+        fresh SID and the login appears successful.
+        """
+        serial = (session.serial_number or "").strip()
+        sid = (session.sid or "").strip()
+        if not serial or not sid:
+            return
+        cookie_path = "/cgi-bin/luci"
+        self.http.cookies.set("SN", serial, path=cookie_path)
+        self.http.cookies.set(serial, sid, path=cookie_path)
+
+    def login(self, force: bool = False) -> RouterSession:
+        session = super().login(force=force)
+        # Reinstall on every access so a cookie-jar clear or replacement cannot
+        # leave a locally valid SID without the browser cookies required by RPC.
+        self._install_browser_session_cookies(session)
+        return session
 
     def _set_session_time(self, seconds: int) -> None:
         """Track the requested lifetime locally without invalidating a new SID.
 
         Some ReyeeOS builds return 401 for common/setSessionTime even though the
-        newly issued SID is valid for cmd RPC calls. The old implementation
-        cleared that SID, producing an endless login -> setSessionTime -> 401
-        loop. Hub keepalive and automatic 401/403 re-login make a remote timeout
-        write unnecessary.
+        newly issued SID is valid for cmd RPC calls. Hub keepalive and automatic
+        401/403 re-login make a remote timeout write unnecessary.
         """
         seconds = _safe_int(seconds, 3600, 600, 7200)
         self.session.session_seconds = seconds
@@ -90,7 +119,7 @@ def create_router_blueprint_v010(
     logger: Any,
     config_dir: Path,
 ) -> Blueprint:
-    """Reuse the 0.9.9 whitelist routes with the 0.9.10 stable client."""
+    """Reuse the 0.9.9 whitelist routes with the 0.9.11 stable client."""
     original_client = v099.ReliableRuijieRouterClient
     v099.ReliableRuijieRouterClient = StableRuijieRouterClient
     try:
