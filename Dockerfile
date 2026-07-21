@@ -24,6 +24,7 @@ RUN pip install --no-cache-dir -r /app/requirements.txt
 COPY hub.py /app/hub.py
 COPY hub_entry.py /app/hub_entry.py
 COPY router_rpc.py /app/router_rpc.py
+COPY router_compat.py /app/router_compat.py
 COPY labprobe_storage.py /app/labprobe_storage.py
 COPY scripts/repair_storage.py /app/scripts/repair_storage.py
 
