@@ -95,10 +95,23 @@ class ReliableRuijieRouterClient(RuijieRouterClient):
                 self._mark_failure(error)
                 raise error from exc
 
-            if response.status_code == 404 and index == 0:
+            if response.status_code == 404:
                 last_404 = response
-                continue
-            if response.status_code in {401, 403}:
+                if index < len(paths) - 1:
+                    continue
+                break
+            if response.status_code in {401, 403} or self._looks_like_login_page(response.text):
+                if index < len(paths) - 1:
+                    continue
+                self.logger.warning(
+                    "router eweb rpc auth rejected api=%s variants=%s final_status=%s redirected=%s cookie_names=%s stok=%s",
+                    api_path,
+                    len(paths),
+                    response.status_code,
+                    bool(response.history),
+                    sorted({cookie.name for cookie in self.http.cookies}),
+                    bool(session.stok),
+                )
                 with self.login_lock:
                     current_session_failed = self.session is session
                     if current_session_failed:

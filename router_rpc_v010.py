@@ -62,8 +62,12 @@ class StableRuijieRouterClient(v099.ReliableRuijieRouterClient):
         session = session or self.session
         serial = (session.serial_number or "").strip()
         sid = (session.sid or "").strip()
+        cookies = {cookie.name: cookie.value for cookie in self.http.cookies}
         if serial and sid:
-            headers["Cookie"] = f"SN={serial}; {serial}={sid}"
+            cookies["SN"] = serial
+            cookies[serial] = sid
+        if cookies:
+            headers["Cookie"] = "; ".join(f"{name}={value}" for name, value in cookies.items())
         if session.stok:
             headers["Referer"] = f"{self.config['address']}/cgi-bin/luci/;stok={session.stok}/"
         else:
