@@ -26,7 +26,7 @@ class RouterDashboardApiTests(unittest.TestCase):
             hub.ROUTER_DASHBOARD_REFRESH_NONCE = 0
         with hub.ROUTER_CREDENTIALS_LOCK:
             hub.ROUTER_CREDENTIALS_CACHE.clear()
-            hub.ROUTER_CREDENTIALS_REFRESH_NONCE = 0
+            hub.ROUTER_CREDENTIALS_REFRESH_NONCE = 1000
 
     def test_push_read_and_refresh(self):
         with mock.patch.object(hub, "_cached_hub_exit_ipv4", return_value=""), \
@@ -38,6 +38,7 @@ class RouterDashboardApiTests(unittest.TestCase):
                     "router": "BE72",
                     "telemetry": {
                         "cpuPercent": 4,
+                        "storagePercent": 37.5,
                         "onlineDeviceCount": 9,
                         "wan": {
                             "uploadBps": 8442450,
@@ -68,6 +69,7 @@ class RouterDashboardApiTests(unittest.TestCase):
         body = read.get_json()
         self.assertEqual(body["router"], "BE72")
         self.assertEqual(body["telemetry"]["onlineDeviceCount"], 9)
+        self.assertEqual(body["telemetry"]["storagePercent"], 37.5)
         self.assertEqual(body["telemetry"]["connections"]["ipv4"], 151)
         self.assertEqual(body["telemetry"]["connections"]["ipv6"], 60)
         self.assertEqual(body["telemetry"]["wan"]["totalUploadBytes"], 30749142999)
@@ -128,7 +130,7 @@ class RouterDashboardApiTests(unittest.TestCase):
             json={},
         )
         self.assertEqual(refresh.status_code, 200)
-        self.assertEqual(refresh.get_json()["refreshNonce"], 1)
+        self.assertEqual(refresh.get_json()["refreshNonce"], 1001)
 
         push = self.client.post(
             "/api/router/dashboard/credentials/push",
@@ -138,7 +140,7 @@ class RouterDashboardApiTests(unittest.TestCase):
                 "lanMac": "00:11:22:33:44:55",
                 "username": "pppoe-user",
                 "password": "pppoe-pass",
-                "refreshNonce": 1,
+                "refreshNonce": 1001,
             },
         )
         self.assertEqual(push.status_code, 200)
@@ -151,8 +153,56 @@ class RouterDashboardApiTests(unittest.TestCase):
         self.assertFalse(body["stale"])
         self.assertEqual(body["username"], "pppoe-user")
         self.assertEqual(body["password"], "pppoe-pass")
-        self.assertEqual(body["refreshCompletedNonce"], 1)
+        self.assertEqual(body["refreshCompletedNonce"], 1001)
         self.assertNotIn("username", hub.ROUTER_DASHBOARD_CACHE)
+
+
+    def test_agent_cleanup_command_round_trip(self):
+        hub.save_json(hub.AGENT_UPDATE_COMMANDS_FILE, {"commands": []})
+        created = self.client.post(
+            "/api/agent/cleanup",
+            headers={"Authorization": "Bearer test-app-token"},
+            json={},
+        )
+        self.assertEqual(created.status_code, 200)
+        created_body = created.get_json()
+        command_id = created_body["commandId"]
+        router = created_body["router"]
+
+        pending = self.client.get(
+            f"/api/router/agent/commands?router={router}",
+            headers={"X-LabProbe-Token": "test-hook-token"},
+        )
+        self.assertEqual(pending.status_code, 200)
+        self.assertEqual(pending.get_json()["commands"][0]["action"], "cleanup")
+
+        acknowledged = self.client.post(
+            "/api/router/agent/ack",
+            headers={"X-LabProbe-Token": "test-hook-token"},
+            json={
+                "id": command_id,
+                "state": "completed",
+                "message": "清理完成，回收 12.0 KB",
+                "result": {
+                    "cleanedItems": [{"name": "Agent 备份", "count": 2, "bytes": 12288}],
+                    "reclaimedBytes": 12288,
+                    "reclaimedText": "12.0 KB",
+                    "errors": [],
+                },
+            },
+        )
+        self.assertEqual(acknowledged.status_code, 200)
+        self.assertTrue(acknowledged.get_json()["acknowledged"])
+
+        status = self.client.get(
+            f"/api/agent/cleanup/status?commandId={command_id}",
+            headers={"Authorization": "Bearer test-app-token"},
+        )
+        self.assertEqual(status.status_code, 200)
+        status_body = status.get_json()
+        self.assertEqual(status_body["state"], "completed")
+        self.assertEqual(status_body["reclaimedBytes"], 12288)
+        self.assertEqual(status_body["cleanedItems"][0]["name"], "Agent 备份")
 
     def test_wrong_token_rejected(self):
         response = self.client.post(

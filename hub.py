@@ -23,7 +23,7 @@ import paho.mqtt.client as mqtt
 from flask import Flask, request, jsonify, g
 from labprobe_storage import SQLiteStore
 
-APP_VERSION = "0.9.5"
+APP_VERSION = "0.9.6"
 PORT = int(os.environ.get("PORT", "58443"))
 BASE_DIR = Path(os.environ.get("LABPROBE_BASE_DIR", ".")).resolve()
 CONFIG_DIR = Path(os.environ.get("CONFIG_DIR", str(BASE_DIR / "config"))).resolve()
@@ -158,7 +158,8 @@ ROUTER_OPERATOR_PROBE_LOCK = threading.Lock()
 ROUTER_OPERATOR_PROBE_LAST_AT = 0.0
 # Broadband credentials are intentionally memory-only: never persisted, revised, backed up or published to MQTT.
 ROUTER_CREDENTIALS_CACHE: Dict[str, Any] = {}
-ROUTER_CREDENTIALS_REFRESH_NONCE = 0
+# Start from an epoch-based nonce so Hub restarts cannot collide with Relay's last acknowledged nonce.
+ROUTER_CREDENTIALS_REFRESH_NONCE = int(time.time() * 1000)
 ROUTER_CREDENTIALS_LOCK = threading.RLock()
 ROUTER_CREDENTIALS_TTL_SEC = max(30, int(os.environ.get("ROUTER_CREDENTIALS_TTL_SEC", "120")))
 
@@ -2381,10 +2382,35 @@ def resolve_agent_router(preferred: str) -> str:
     return online[0][0] if online else preferred
 
 
-def latest_agent_command(router: str) -> Dict[str, Any]:
+def latest_agent_command(router: str, action: str = "update") -> Dict[str, Any]:
     data = load_json(AGENT_UPDATE_COMMANDS_FILE, {"commands": []})
     rows = data.get("commands", []) if isinstance(data, dict) else []
-    return next((row for row in reversed(rows) if isinstance(row, dict) and row.get("router") == router), {})
+    return next(
+        (
+            row
+            for row in reversed(rows)
+            if isinstance(row, dict)
+            and row.get("router") == router
+            and (not action or row.get("action") == action)
+        ),
+        {},
+    )
+
+
+def agent_command_by_id(command_id: str, router: str = "", action: str = "") -> Dict[str, Any]:
+    data = load_json(AGENT_UPDATE_COMMANDS_FILE, {"commands": []})
+    rows = data.get("commands", []) if isinstance(data, dict) else []
+    return next(
+        (
+            row
+            for row in reversed(rows)
+            if isinstance(row, dict)
+            and row.get("id") == command_id
+            and (not router or row.get("router") == router)
+            and (not action or row.get("action") == action)
+        ),
+        {},
+    )
 
 
 @app.route("/api/agent/update/status", methods=["GET"])
@@ -2393,7 +2419,7 @@ def api_agent_update_status():
         return jsonify({"ok": False, "error": "unauthorized"}), 401
     router = resolve_agent_router(clean_saved_value(request.args.get("router")) or primary_router_name()) or "router"
     status = agent_status_for(router)
-    command = latest_agent_command(router)
+    command = latest_agent_command(router, "update")
     try:
         manifest = agent_release_manifest(force=request.args.get("refresh") == "1")
         latest = clean_saved_value(manifest.get("versionName") or manifest.get("version"))
@@ -2440,6 +2466,64 @@ def api_agent_update_request():
     return jsonify({"ok": True, "commandId": command["id"], "targetVersion": target, "message": "Rust Agent 更新指令已发送"})
 
 
+@app.route("/api/agent/cleanup", methods=["POST"])
+def api_agent_cleanup_request():
+    if not check_app_token():
+        return jsonify({"ok": False, "error": "unauthorized"}), 401
+    payload = request.get_json(silent=True) or {}
+    router = resolve_agent_router(clean_saved_value(payload.get("router")) or primary_router_name()) or "router"
+    command = {
+        "id": secrets.token_hex(12),
+        "router": router,
+        "action": "cleanup",
+        "state": "pending",
+        "createdAt": now_str(),
+        "updatedAt": now_str(),
+        "message": "等待路由器清理 Agent 备份和临时日志",
+        "result": {},
+    }
+    data = load_json(AGENT_UPDATE_COMMANDS_FILE, {"commands": []})
+    commands = data.get("commands", []) if isinstance(data, dict) else []
+    commands.append(command)
+    save_json(AGENT_UPDATE_COMMANDS_FILE, {"commands": commands[-100:]})
+    return jsonify({
+        "ok": True,
+        "commandId": command["id"],
+        "router": router,
+        "state": command["state"],
+        "message": "清理指令已发送",
+    })
+
+
+@app.route("/api/agent/cleanup/status", methods=["GET"])
+def api_agent_cleanup_status():
+    if not check_app_token():
+        return jsonify({"ok": False, "error": "unauthorized"}), 401
+    router = resolve_agent_router(clean_saved_value(request.args.get("router")) or primary_router_name()) or "router"
+    command_id = clean_saved_value(request.args.get("commandId"))
+    command = (
+        agent_command_by_id(command_id, router, "cleanup")
+        if command_id
+        else latest_agent_command(router, "cleanup")
+    )
+    if not command:
+        return jsonify({"ok": False, "state": "missing", "message": "未找到清理任务"}), 404
+    result = command.get("result") if isinstance(command.get("result"), dict) else {}
+    return jsonify({
+        "ok": True,
+        "commandId": command.get("id", ""),
+        "router": router,
+        "state": command.get("state", "pending"),
+        "message": command.get("message", ""),
+        "cleanedItems": result.get("cleanedItems", []),
+        "reclaimedBytes": to_int(result.get("reclaimedBytes"), 0),
+        "reclaimedText": clean_saved_value(result.get("reclaimedText")),
+        "errors": result.get("errors", []),
+        "createdAt": command.get("createdAt", ""),
+        "updatedAt": command.get("updatedAt", ""),
+    })
+
+
 @app.route("/api/router/agent/commands", methods=["GET"])
 def api_router_agent_commands():
     if not check_hook_token():
@@ -2465,7 +2549,14 @@ def api_router_agent_ack():
     changed = False
     for row in commands:
         if isinstance(row, dict) and row.get("id") == command_id:
-            row.update({"state": state_value, "message": clean_saved_value(payload.get("message")), "updatedAt": now_str()})
+            update = {
+                "state": state_value,
+                "message": clean_saved_value(payload.get("message")),
+                "updatedAt": now_str(),
+            }
+            if isinstance(payload.get("result"), dict):
+                update["result"] = payload.get("result")
+            row.update(update)
             changed = True
             break
     if changed:
@@ -2494,7 +2585,13 @@ def api_router_agent_status():
     commands = data.get("commands", []) if isinstance(data, dict) else []
     changed = False
     for row in commands:
-        if isinstance(row, dict) and row.get("router") == router and row.get("state") == "accepted" and version_parts(status["version"]) >= version_parts(row.get("targetVersion")):
+        if (
+            isinstance(row, dict)
+            and row.get("router") == router
+            and row.get("action") == "update"
+            and row.get("state") == "accepted"
+            and version_parts(status["version"]) >= version_parts(row.get("targetVersion"))
+        ):
             row.update({"state": "completed", "message": f"已更新到 {status['version']}", "updatedAt": now_str()})
             changed = True
     if changed:

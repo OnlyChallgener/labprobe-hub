@@ -266,6 +266,174 @@ async fn acknowledge_agent_command(
     .await;
 }
 
+async fn acknowledge_agent_command_result(
+    client: &Client,
+    config: &AgentConfig,
+    id: &str,
+    state: &str,
+    message: &str,
+    result: &Value,
+) {
+    let _ = post_json(
+        client,
+        config,
+        "/api/router/agent/ack",
+        &json!({"id": id, "state": state, "message": message, "result": result}),
+    )
+    .await;
+}
+
+fn path_size(path: &Path) -> u64 {
+    let metadata = match fs::symlink_metadata(path) {
+        Ok(value) => value,
+        Err(_) => return 0,
+    };
+    if metadata.file_type().is_symlink() || metadata.is_file() {
+        return metadata.len();
+    }
+    if !metadata.is_dir() {
+        return 0;
+    }
+    fs::read_dir(path)
+        .ok()
+        .into_iter()
+        .flat_map(|rows| rows.filter_map(|row| row.ok()))
+        .map(|row| path_size(&row.path()))
+        .sum()
+}
+
+fn remove_cleanup_path(path: &Path) -> Result<u64> {
+    if !path.exists() {
+        return Ok(0);
+    }
+    let bytes = path_size(path);
+    let metadata = fs::symlink_metadata(path)?;
+    if metadata.is_dir() && !metadata.file_type().is_symlink() {
+        fs::remove_dir_all(path)?;
+    } else {
+        fs::remove_file(path)?;
+    }
+    Ok(bytes)
+}
+
+fn readable_bytes(bytes: u64) -> String {
+    const KB: f64 = 1024.0;
+    const MB: f64 = 1024.0 * KB;
+    const GB: f64 = 1024.0 * MB;
+    let value = bytes as f64;
+    if value >= GB {
+        format!("{:.2} GB", value / GB)
+    } else if value >= MB {
+        format!("{:.2} MB", value / MB)
+    } else if value >= KB {
+        format!("{:.1} KB", value / KB)
+    } else {
+        format!("{} B", bytes)
+    }
+}
+
+fn cleanup_agent_files() -> Result<Value> {
+    let mut cleaned_items = Vec::new();
+    let mut reclaimed_bytes = 0u64;
+    let mut errors = Vec::new();
+
+    let backup_root = Path::new("/etc/labprobe/backups");
+    let mut backup_count = 0u64;
+    let mut backup_bytes = 0u64;
+    if let Ok(entries) = fs::read_dir(backup_root) {
+        for entry in entries.filter_map(|row| row.ok()) {
+            let path = entry.path();
+            match remove_cleanup_path(&path) {
+                Ok(bytes) => {
+                    backup_count += 1;
+                    backup_bytes = backup_bytes.saturating_add(bytes);
+                }
+                Err(error) => errors.push(format!("{}: {}", path.display(), error)),
+            }
+        }
+    }
+    if backup_count > 0 {
+        reclaimed_bytes = reclaimed_bytes.saturating_add(backup_bytes);
+        cleaned_items.push(json!({
+            "name": "Agent 备份",
+            "count": backup_count,
+            "bytes": backup_bytes,
+        }));
+    }
+
+    let log_root = Path::new("/tmp/labprobe");
+    let mut log_count = 0u64;
+    let mut log_bytes = 0u64;
+    if let Ok(entries) = fs::read_dir(log_root) {
+        for entry in entries.filter_map(|row| row.ok()) {
+            let path = entry.path();
+            let name = entry.file_name().to_string_lossy().to_string();
+            let removable = name.ends_with(".log")
+                || name.contains(".log.")
+                || name.ends_with(".old")
+                || name.ends_with(".tmp");
+            if !removable {
+                continue;
+            }
+            match remove_cleanup_path(&path) {
+                Ok(bytes) => {
+                    log_count += 1;
+                    log_bytes = log_bytes.saturating_add(bytes);
+                }
+                Err(error) => errors.push(format!("{}: {}", path.display(), error)),
+            }
+        }
+    }
+    if log_count > 0 {
+        reclaimed_bytes = reclaimed_bytes.saturating_add(log_bytes);
+        cleaned_items.push(json!({
+            "name": "更新与运行日志",
+            "count": log_count,
+            "bytes": log_bytes,
+        }));
+    }
+
+    let temp_paths = [
+        "/tmp/labprobe-install.sh",
+        "/tmp/labrelay.new",
+        "/tmp/labrelay.new.sha256",
+        "/tmp/labprobe-discovery.json",
+        "/tmp/labprobe-found-hub",
+        "/tmp/labprobe-cron.old",
+        "/tmp/labprobe-cron.new",
+    ];
+    let mut temp_count = 0u64;
+    let mut temp_bytes = 0u64;
+    for raw in temp_paths {
+        let path = Path::new(raw);
+        if !path.exists() {
+            continue;
+        }
+        match remove_cleanup_path(path) {
+            Ok(bytes) => {
+                temp_count += 1;
+                temp_bytes = temp_bytes.saturating_add(bytes);
+            }
+            Err(error) => errors.push(format!("{}: {}", path.display(), error)),
+        }
+    }
+    if temp_count > 0 {
+        reclaimed_bytes = reclaimed_bytes.saturating_add(temp_bytes);
+        cleaned_items.push(json!({
+            "name": "临时安装文件",
+            "count": temp_count,
+            "bytes": temp_bytes,
+        }));
+    }
+
+    Ok(json!({
+        "cleanedItems": cleaned_items,
+        "reclaimedBytes": reclaimed_bytes,
+        "reclaimedText": readable_bytes(reclaimed_bytes),
+        "errors": errors,
+    }))
+}
+
 async fn sync_agent_update(client: &Client, config: &AgentConfig, state: &mut AgentState) -> Result<bool> {
     let router = url_encode(&config.router_name);
     let root = get_json(
@@ -280,10 +448,48 @@ async fn sync_agent_update(client: &Client, config: &AgentConfig, state: &mut Ag
         .cloned()
         .unwrap_or_default();
     for command in commands {
-        if command.get("action").and_then(Value::as_str) != Some("update") {
+        let action = command.get("action").and_then(Value::as_str).unwrap_or("");
+        let id = command.get("id").and_then(Value::as_str).unwrap_or("");
+        if action == "cleanup" {
+            if id.is_empty() {
+                continue;
+            }
+            acknowledge_agent_command(client, config, id, "accepted", "路由器已领取清理指令").await;
+            match cleanup_agent_files() {
+                Ok(result) => {
+                    let reclaimed = result
+                        .get("reclaimedText")
+                        .and_then(Value::as_str)
+                        .unwrap_or("0 B");
+                    let message = format!("清理完成，回收 {}", reclaimed);
+                    acknowledge_agent_command_result(
+                        client,
+                        config,
+                        id,
+                        "completed",
+                        &message,
+                        &result,
+                    )
+                    .await;
+                    state.update_state = "cleanup_completed".into();
+                    state.update_message = message;
+                }
+                Err(error) => {
+                    acknowledge_agent_command(
+                        client,
+                        config,
+                        id,
+                        "failed",
+                        &format!("清理失败：{}", error),
+                    )
+                    .await;
+                }
+            }
             continue;
         }
-        let id = command.get("id").and_then(Value::as_str).unwrap_or("");
+        if action != "update" {
+            continue;
+        }
         let repository_root = command
             .get("repositoryRoot")
             .and_then(Value::as_str)
@@ -437,6 +643,102 @@ fn router_model() -> String {
         .unwrap_or_default()
 }
 
+fn first_optional_number_by_keys(root: &Value, keys: &[&str]) -> Option<f64> {
+    match root {
+        Value::Object(map) => {
+            for key in keys {
+                if let Some(value) = map.get(*key) {
+                    if matches!(value, Value::Number(_) | Value::String(_)) {
+                        return Some(number(Some(value)));
+                    }
+                }
+            }
+            map.values().find_map(|child| first_optional_number_by_keys(child, keys))
+        }
+        Value::Array(items) => items.iter().find_map(|child| first_optional_number_by_keys(child, keys)),
+        _ => None,
+    }
+}
+
+fn storage_percent_from_fast(fast: &Value) -> f64 {
+    let direct_keys = [
+        "diskutil",
+        "disk_util",
+        "diskUsage",
+        "disk_usage",
+        "diskUsagePercent",
+        "disk_usage_percent",
+        "diskPercent",
+        "storageutil",
+        "storage_util",
+        "storageUsage",
+        "storage_usage",
+        "storagePercent",
+        "flashutil",
+        "flash_util",
+        "flashUsage",
+        "flash_usage",
+        "romutil",
+        "rom_util",
+        "romUsage",
+        "rom_usage",
+        "rootfsutil",
+        "rootfs_util",
+        "rootfsUsage",
+        "rootfs_usage",
+    ];
+    if let Some(value) = first_optional_number_by_keys(fast, &direct_keys) {
+        if (0.0..=100.0).contains(&value) {
+            return value;
+        }
+    }
+
+    let total = first_optional_number_by_keys(
+        fast,
+        &[
+            "disk_total_kb",
+            "storage_total_kb",
+            "flash_total_kb",
+            "rom_total_kb",
+            "rootfs_total_kb",
+            "diskTotalKb",
+            "storageTotalKb",
+        ],
+    )
+    .unwrap_or(0.0);
+    if total > 0.0 {
+        if let Some(used) = first_optional_number_by_keys(
+            fast,
+            &[
+                "disk_used_kb",
+                "storage_used_kb",
+                "flash_used_kb",
+                "rom_used_kb",
+                "rootfs_used_kb",
+                "diskUsedKb",
+                "storageUsedKb",
+            ],
+        ) {
+            return (used / total * 100.0).clamp(0.0, 100.0);
+        }
+        if let Some(free) = first_optional_number_by_keys(
+            fast,
+            &[
+                "disk_free_kb",
+                "storage_free_kb",
+                "flash_free_kb",
+                "rom_free_kb",
+                "rootfs_free_kb",
+                "diskFreeKb",
+                "storageFreeKb",
+            ],
+        ) {
+            return ((total - free) / total * 100.0).clamp(0.0, 100.0);
+        }
+    }
+    -1.0
+}
+
 fn telemetry_from_fast(fast: &Value, online_devices: usize) -> Value {
     let wan_primary = object_path(fast, &["wan_stat", "wan"]).unwrap_or(&Value::Null);
     let wan = object_path(fast, &["wan_stat", "wans"])
@@ -459,6 +761,7 @@ fn telemetry_from_fast(fast: &Value, online_devices: usize) -> Value {
     json!({
         "cpuPercent": number(fast.get("cpu_usage")).max(number(fast.get("cpuutil"))),
         "memoryPercent": number(fast.get("memutil")),
+        "storagePercent": storage_percent_from_fast(fast),
         "temperatureC": number(fast.get("temp")),
         "temperature2gC": number(fast.get("temp_2g")),
         "temperature5gC": number(fast.get("temp_5g")),
@@ -704,6 +1007,8 @@ fn details_from_sources(
                 "uplink",
                 item.get("name").or_else(|| item.get("intf_name")).cloned().unwrap_or(Value::Null),
             );
+            let broadband_remark = first_text_by_keys(item, &["service", "serviceName"]);
+            insert_meaningful(&mut lan, "broadbandRemark", Value::String(broadband_remark));
         }
         if !lan.is_empty() {
             details.insert("lan".into(), Value::Object(lan));

@@ -1,7 +1,16 @@
 # LabProbe 变更记录
 
+## 0.9.6 / LabRelay 0.2.7
+
+- LabRelay 从 `ws_sysinfo fast` 归一化磁盘/存储利用率并随路由器实时状态上报。
+- 配合 APP v0.10.9 build139 发布，统一提升 Hub 与 LabRelay 版本号。
+- 本次 Hub 与 LabRelay 不改变采集、存储、清理、更新或推送逻辑。
+
 ## 0.9.5 / LabRelay 0.2.6
 
+- 新增 Agent 一键清理指令链路：APP 经 Hub 下发，LabRelay 清理 `/etc/labprobe/backups`、非必要 `/tmp` 日志和失效安装临时文件。
+- 清理结果回传已删除分类、项目数量、异常项和回收空间；配置、当前程序和状态数据不会被删除。
+- 修复 Agent 状态上报可能误将清理任务按更新任务提前完成的问题。
 - 路由器状态页 WAN、网络配置和 AP 信息改为固定四卡片布局，并修复背景图层与网口视觉。
 - WAN 运营商由 LabRelay/Hub 识别；新增 WAN/WAN1 接口显示、LAN MAC 与按需读取的宽带账号密码。
 - LabRelay 日志仅写 `/tmp`，单文件 256 KB、只保留一份轮换；取消周期性成功日志并加入同类错误 5 分钟限频。
@@ -36,3 +45,6 @@
 ## 0.7.x–0.8.x（历史版本）
 
 早期 DSM/NAS 专用部署说明、逐版本发布记录和 Shell 采集方案已合并归档。为避免继续误用旧入口，仓库不再保留这些分散文件；完整历史仍可从 Git 提交记录查看。
+
+- Hub 0.9.5 hotfix: credentials refresh nonce now starts from epoch milliseconds, preventing a Hub restart from reusing a nonce already acknowledged by LabRelay.
+- LabRelay 0.2.6 exposes `network.wan[].service` as `details.lan.broadbandRemark`; credentials remain memory-only.
