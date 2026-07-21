@@ -45,9 +45,8 @@ class StableRuijieRouterClient(v099.ReliableRuijieRouterClient):
             Cookie.set("SN", serial)
             Cookie.set(serial, sid, {path: "/cgi-bin/luci"})
 
-        Supplying ``auth=<sid>`` alone is not accepted by this firmware. Without
-        both cookies every command returns 401 even though the HTML contains a
-        fresh SID and the login appears successful.
+        The RPC URL must use ``auth=<token>`` from the login response, while
+        the cookies still carry the serial-number SID pair.
         """
         serial = (session.serial_number or "").strip()
         sid = (session.sid or "").strip()

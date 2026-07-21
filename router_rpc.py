@@ -282,9 +282,26 @@ class RuijieRouterClient:
             except requests.RequestException as exc:
                 raise RouterRpcError(f"无法连接路由器：{exc}", "ROUTER_UNREACHABLE", 502) from exc
 
+            auth_data: Dict[str, Any] = {}
+            try:
+                auth_root = response.json()
+                if isinstance(auth_root, dict):
+                    nested = auth_root.get("data")
+                    auth_data = nested if isinstance(nested, dict) else auth_root
+            except ValueError:
+                pass
+
             candidates: List[requests.Response] = list(response.history) + [response]
-            stok = ""
             page_text = response.text or ""
+            sid = str(auth_data.get("sid") or "").strip()
+            stok = str(auth_data.get("token") or auth_data.get("stok") or "").strip()
+            serial = str(auth_data.get("sn") or auth_data.get("serialNumber") or "").strip()
+            session_seconds = _safe_int(
+                auth_data.get("sessiontime") or auth_data.get("sessionTime"),
+                cfg["sessionSeconds"],
+                600,
+                7200,
+            )
             for item in candidates:
                 stok = stok or self._extract_token(item.url, "stok")
                 stok = stok or self._extract_token(item.headers.get("Location", ""), "stok")
@@ -294,23 +311,22 @@ class RuijieRouterClient:
             if stok:
                 root_urls.append(cfg["address"] + f"/cgi-bin/luci/;stok={stok}")
             root_urls.append(cfg["address"] + "/cgi-bin/luci/")
-            sid = self._extract_token(page_text, "sid")
-            serial = self._extract_token(page_text, "sn")
-            session_seconds = _safe_int(self._extract_token(page_text, "sessiontime"), cfg["sessionSeconds"], 600, 7200)
             for url in root_urls:
-                if sid:
-                    break
                 try:
                     page = self.http.get(url, timeout=(4, 10), verify=cfg["verifyTls"], allow_redirects=True)
                 except requests.RequestException:
                     continue
                 page_text = page.text or ""
+                if self._looks_like_login_page(page_text):
+                    continue
                 stok = stok or self._extract_token(page.url, "stok") or self._extract_token(page_text, "stok")
-                sid = self._extract_token(page_text, "sid")
-                serial = self._extract_token(page_text, "sn")
-                session_seconds = _safe_int(self._extract_token(page_text, "sessiontime"), cfg["sessionSeconds"], 600, 7200)
+                sid = sid or self._extract_token(page_text, "sid")
+                serial = serial or self._extract_token(page_text, "sn")
+                session_seconds = _safe_int(self._extract_token(page_text, "sessiontime"), session_seconds, 600, 7200)
+                if sid:
+                    break
 
-            if not sid or self._looks_like_login_page(page_text):
+            if not sid:
                 self.clear_session()
                 raise RouterRpcError("路由器登录失败，请检查管理密码", "LOGIN_FAILED", 401)
 
@@ -336,7 +352,8 @@ class RuijieRouterClient:
     def _post_api(self, api_path: str, payload: Dict[str, Any], retry_auth: bool = True) -> Any:
         session = self.login()
         cfg = self.config
-        url = cfg["address"] + f"/cgi-bin/luci/api/{api_path}?auth={session.sid}"
+        auth_token = session.stok or session.sid
+        url = cfg["address"] + f"/cgi-bin/luci/api/{api_path}?auth={auth_token}"
         wire = _wire_json(payload)
         try:
             response = self.http.post(

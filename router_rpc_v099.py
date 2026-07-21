@@ -65,15 +65,16 @@ class ReliableRuijieRouterClient(RuijieRouterClient):
         cfg = self.config
         wire = _wire_json(payload)
 
-        # Most captured firmwares use /luci//api/cmd. Some accept the normalized
-        # single slash. Try the real browser path first and keep a safe fallback.
+        # The captured BE72 eWeb frontend sends RPCs to the normalized API path
+        # with auth=<login data.token>. Older builds can still fall back to SID.
+        auth_token = session.stok or session.sid
         paths = []
-        if session.stok:
-            paths.append(f"/cgi-bin/luci/;stok={session.stok}/api/{api_path}?auth={session.sid}")
+        paths.append(f"/cgi-bin/luci/api/{api_path}?auth={auth_token}")
         paths.extend([
-            f"/cgi-bin/luci//api/{api_path}?auth={session.sid}",
-            f"/cgi-bin/luci/api/{api_path}?auth={session.sid}",
+            f"/cgi-bin/luci//api/{api_path}?auth={auth_token}",
         ])
+        if session.stok:
+            paths.append(f"/cgi-bin/luci/;stok={session.stok}/api/{api_path}?auth={auth_token}")
         last_404 = None
         for index, path in enumerate(paths):
             url = cfg["address"] + path
