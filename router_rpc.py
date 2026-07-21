@@ -325,7 +325,7 @@ class RuijieRouterClient:
             self.logger.info("router eweb login ok address=%s sn=%s session=%ss", cfg["address"], serial or "unknown", cfg["sessionSeconds"])
             return self.session
 
-    def _headers_for(self, payload: Dict[str, Any]) -> Dict[str, str]:
+    def _headers_for(self, payload: Dict[str, Any], session: Optional[RouterSession] = None) -> Dict[str, str]:
         stable = _stable_json(payload)
         wire = _wire_json(payload)
         return {

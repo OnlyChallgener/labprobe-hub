@@ -13,7 +13,7 @@ from __future__ import annotations
 
 import time
 from pathlib import Path
-from typing import Any, Callable, Dict
+from typing import Any, Callable, Dict, Optional
 
 import router_rpc_v099 as v099
 from flask import Blueprint
@@ -56,6 +56,19 @@ class StableRuijieRouterClient(v099.ReliableRuijieRouterClient):
         cookie_path = "/cgi-bin/luci"
         self.http.cookies.set("SN", serial, path=cookie_path)
         self.http.cookies.set(serial, sid, path=cookie_path)
+
+    def _headers_for(self, payload: Dict[str, Any], session: Optional[RouterSession] = None) -> Dict[str, str]:
+        headers = super()._headers_for(payload, session)
+        session = session or self.session
+        serial = (session.serial_number or "").strip()
+        sid = (session.sid or "").strip()
+        if serial and sid:
+            headers["Cookie"] = f"SN={serial}; {serial}={sid}"
+        if session.stok:
+            headers["Referer"] = f"{self.config['address']}/cgi-bin/luci/;stok={session.stok}/"
+        else:
+            headers["Referer"] = f"{self.config['address']}/cgi-bin/luci/"
+        return headers
 
     def login(self, force: bool = False) -> RouterSession:
         session = super().login(force=force)

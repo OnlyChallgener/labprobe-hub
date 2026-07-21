@@ -67,10 +67,13 @@ class ReliableRuijieRouterClient(RuijieRouterClient):
 
         # Most captured firmwares use /luci//api/cmd. Some accept the normalized
         # single slash. Try the real browser path first and keep a safe fallback.
-        paths = (
+        paths = []
+        if session.stok:
+            paths.append(f"/cgi-bin/luci/;stok={session.stok}/api/{api_path}?auth={session.sid}")
+        paths.extend([
             f"/cgi-bin/luci//api/{api_path}?auth={session.sid}",
             f"/cgi-bin/luci/api/{api_path}?auth={session.sid}",
-        )
+        ])
         last_404 = None
         for index, path in enumerate(paths):
             url = cfg["address"] + path
@@ -78,7 +81,7 @@ class ReliableRuijieRouterClient(RuijieRouterClient):
                 response = self.http.post(
                     url,
                     data=wire.encode("utf-8"),
-                    headers=self._headers_for(payload),
+                    headers=self._headers_for(payload, session),
                     timeout=(4, 15),
                     verify=cfg["verifyTls"],
                     allow_redirects=True,
@@ -96,9 +99,13 @@ class ReliableRuijieRouterClient(RuijieRouterClient):
                 last_404 = response
                 continue
             if response.status_code in {401, 403}:
-                self.clear_session()
+                with self.login_lock:
+                    current_session_failed = self.session is session
+                    if current_session_failed:
+                        self.clear_session()
+                        if retry_auth:
+                            self.login(force=True)
                 if retry_auth:
-                    self.login(force=True)
                     return self._post_api(api_path, payload, retry_auth=False)
                 error = RouterAuthExpired()
                 self._mark_failure(error)
