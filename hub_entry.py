@@ -3,12 +3,12 @@ from pathlib import Path
 
 import hub
 from router_compat import install_router_rpc_compat
-from router_rpc import create_router_blueprint
+from router_rpc_v099 import create_router_blueprint_v099
 
-HUB_VERSION = "0.9.8"
+HUB_VERSION = "0.9.9"
 hub.APP_VERSION = HUB_VERSION
 hub.app.register_blueprint(
-    create_router_blueprint(
+    create_router_blueprint_v099(
         check_app_token=hub.check_app_token,
         logger=hub.LOGGER,
         config_dir=Path(hub.CONFIG_DIR),
