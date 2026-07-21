@@ -28,7 +28,7 @@ jobs:
         shell: bash
         run: |
           set +e
-          pytest -vv --tb=short tests/test_router_rpc.py > /tmp/pytest.log 2>&1
+          PYTHONPATH=. pytest -vv --tb=short tests/test_router_rpc.py > /tmp/pytest.log 2>&1
           STATUS=$?
           tail -n 100 /tmp/pytest.log
           exit $STATUS
