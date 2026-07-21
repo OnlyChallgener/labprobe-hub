@@ -2,6 +2,8 @@ import base64
 import time
 from pathlib import Path
 
+import requests
+
 from router_rpc import EncryptedRouterConfigStore, RouterSession, TinyTtlCache, gibberish_aes_encrypt
 from router_rpc_v010 import StableRuijieRouterClient
 
@@ -59,3 +61,26 @@ def test_local_session_timeout_keeps_fresh_sid(tmp_path: Path, monkeypatch):
     assert client.session.sid == "sid-123"
     assert client.session.session_seconds == 7200
     assert client.session.valid_locally
+
+
+def test_reyee_browser_session_cookies_are_sent_to_rpc(tmp_path: Path, monkeypatch):
+    monkeypatch.setenv("APP_TOKEN", "test-app-token")
+    client = StableRuijieRouterClient(EncryptedRouterConfigStore(tmp_path), _Logger())
+    session = RouterSession(
+        sid="cdb9f2a4c034f59d01b6990c977a59f1",
+        serial_number="G1TD8RX039025",
+        obtained_at=time.time(),
+        session_seconds=3600,
+    )
+
+    client._install_browser_session_cookies(session)
+    prepared = client.http.prepare_request(
+        requests.Request(
+            "POST",
+            "http://192.168.5.1/cgi-bin/luci//api/cmd?auth=cdb9f2a4c034f59d01b6990c977a59f1",
+        )
+    )
+    cookie = prepared.headers.get("Cookie", "")
+
+    assert "SN=G1TD8RX039025" in cookie
+    assert "G1TD8RX039025=cdb9f2a4c034f59d01b6990c977a59f1" in cookie
