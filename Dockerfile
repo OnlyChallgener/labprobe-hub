@@ -22,6 +22,8 @@ COPY requirements.txt /app/requirements.txt
 RUN pip install --no-cache-dir -r /app/requirements.txt
 
 COPY hub.py /app/hub.py
+COPY hub_entry.py /app/hub_entry.py
+COPY router_rpc.py /app/router_rpc.py
 COPY labprobe_storage.py /app/labprobe_storage.py
 COPY scripts/repair_storage.py /app/scripts/repair_storage.py
 
@@ -33,4 +35,4 @@ EXPOSE 58443
 HEALTHCHECK --interval=30s --timeout=5s --start-period=20s --retries=3 \
     CMD curl -fsS "http://127.0.0.1:${PORT}/health" >/dev/null || exit 1
 
-CMD ["python", "/app/hub.py"]
+CMD ["python", "/app/hub_entry.py"]
