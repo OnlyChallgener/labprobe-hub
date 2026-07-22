@@ -2,12 +2,12 @@
 
 ## 0.9.12 / LabRelay 0.2.9
 
-- 新增 Docker 内置 Playwright Chromium 登录器，使用真实 Reyee eWeb 页面填写管理密码并建立浏览器会话。
-- 路由器 RPC 改为在同一浏览器上下文内执行，自动复用 Cookie、token、sid、sn 与页面初始化状态。
-- 浏览器会话失效时只自动重新登录一次，避免此前每 3 秒重复登录和持续 403 循环。
-- 浏览器对象由专用单线程持有，兼容 Flask 多线程请求并统一串行执行路由器读写操作。
-- 默认启用 `ROUTER_BROWSER_AUTH_MODE=required`；可改为 `preferred` 使用浏览器失败后直连回退，或改为 `off` 完全关闭。
-- Hub 版本更新至 0.9.12；APP 与 LabRelay 版本不变。
+- 路由器 eWeb 登录改为直接 HTTP 会话：先读取 `/cgi-bin/luci/` 中的动态 GibberishAES 密钥，再加密管理密码并调用 `/cgi-bin/luci/api/auth`。
+- 登录成功后在 Hub 内存中缓存 `sid`、Cookie、token、sn 与登录时间；后续业务接口统一使用 `?auth=<sid>` 并复用同一个 `requests.Session`。
+- 同时兼容 `password/limit/setInit` 与 `username/pwd/isCheckReadAgreement` 两种登录参数格式，适配不同 ReyeeOS/eWeb 固件。
+- 只有收到 401/403、登录页重定向或本地会话到期时才串行重新登录一次，避免高频轮询导致重复登录和持续 403。
+- 删除 Playwright、Chromium、Firefox、Selenium 与独立 `router-browser` 容器，Hub 恢复轻量 AMD64/ARM64 镜像。
+- Hub 版本保持 0.9.12；APP 与 LabRelay 版本不变。
 
 ## 0.9.7 / LabRelay 0.2.8
 
@@ -24,7 +24,7 @@
 ## 0.9.5 / LabRelay 0.2.6
 
 - 新增 Agent 一键清理指令链路：APP 经 Hub 下发，LabRelay 清理 `/etc/labprobe/backups`、非必要 `/tmp` 日志和失效安装临时文件。
-- 清理结果回传已删除分类、项目数量、异常项和回收空间；配置、当前程序和状态数据不会被删除。
+- 清理结果回传已删除分类、项目数量、异常项和回收空间；配置、当前程序和状态数据不会删除。
 - 修复 Agent 状态上报可能误将清理任务按更新任务提前完成的问题。
 - 路由器状态页 WAN、网络配置和 AP 信息改为固定四卡片布局，并修复背景图层与网口视觉。
 - WAN 运营商由 LabRelay/Hub 识别；新增 WAN/WAN1 接口显示、LAN MAC 与按需读取的宽带账号密码。
