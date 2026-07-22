@@ -1,5 +1,15 @@
 # LabProbe 变更记录
 
+## 0.9.13 / LabRelay 0.2.9
+
+- 新增锐捷 eWeb 原生 `/ws` WebSocket 长连接，直接接收 `static`、`slow`、`fast`、`recent_wan` 与 `daily_wan` 数据。
+- 路由器实时 CPU、内存、温度、运行时间、WAN 速率、连接数、端口和无线电状态改由 WebSocket 主动推送，减少高频 CMD 轮询。
+- WebSocket 连接后自动发送 `get_recent_wan`、`get_daily_wan`、`ping`，并每 10 秒发送 `keepalive`；断线后指数退避自动重连。
+- CMD 继续负责终端列表、无线配置、DDNS、防火墙、端口映射等查询和控制；仪表盘配置默认每 30 秒校准一次。
+- 合并 `acConfig.get / wireless` 与 WebSocket 无线实时状态，避免 WebSocket 空 `ssidList` 覆盖真实 Wi-Fi 名称。
+- 兼容 WebSocket `port_status.List`、2.4G/5G 实时信道与利用率，并继续保留 HTTP/CMD 作为断线兜底。
+- Hub 版本提升至 0.9.13；镜像继续保持轻量 AMD64/ARM64 双架构，不引入浏览器内核。
+
 ## 0.9.12 / LabRelay 0.2.9
 
 - 路由器 eWeb 登录改为直接 HTTP 会话：先读取 `/cgi-bin/luci/` 中的动态 GibberishAES 密钥，再加密管理密码并调用 `/cgi-bin/luci/api/auth`。
