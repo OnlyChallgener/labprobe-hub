@@ -1,4 +1,4 @@
-FROM python:3.12-slim
+FROM python:3.12-slim-bookworm
 
 ARG TARGETARCH
 ARG TARGETOS
@@ -10,7 +10,10 @@ ENV PYTHONDONTWRITEBYTECODE=1 \
     DATA_DIR=./data \
     BACKUPS_DIR=./backups \
     LOGS_DIR=./logs \
-    CONFIG_PATH=./config/config.yaml
+    CONFIG_PATH=./config/config.yaml \
+    PLAYWRIGHT_BROWSERS_PATH=/ms-playwright \
+    ROUTER_BROWSER_AUTH_MODE=required \
+    ROUTER_BROWSER_HEADLESS=true
 
 WORKDIR /app
 
@@ -19,7 +22,9 @@ RUN apt-get update \
     && rm -rf /var/lib/apt/lists/*
 
 COPY requirements.txt /app/requirements.txt
-RUN pip install --no-cache-dir -r /app/requirements.txt
+RUN pip install --no-cache-dir -r /app/requirements.txt \
+    && python -m playwright install --with-deps chromium \
+    && rm -rf /var/lib/apt/lists/* /root/.cache/pip
 
 COPY hub.py /app/hub.py
 COPY hub_entry.py /app/hub_entry.py
@@ -35,7 +40,7 @@ RUN mkdir -p /app/data /app/config /app/backups /app/logs /app/scripts \
 
 EXPOSE 58443
 
-HEALTHCHECK --interval=30s --timeout=5s --start-period=20s --retries=3 \
+HEALTHCHECK --interval=30s --timeout=5s --start-period=40s --retries=3 \
     CMD curl -fsS "http://127.0.0.1:${PORT}/health" >/dev/null || exit 1
 
 CMD ["python", "/app/hub_entry.py"]
