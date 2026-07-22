@@ -19,8 +19,6 @@ RUN apt-get update \
         ca-certificates \
         curl \
         firefox-esr \
-        fonts-noto-cjk \
-        fonts-liberation \
     && case "${TARGETARCH}" in \
          amd64) GECKO_ARCH="linux64" ;; \
          arm64) GECKO_ARCH="linux-aarch64" ;; \
