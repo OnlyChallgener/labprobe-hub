@@ -29,6 +29,7 @@ COPY router_rpc_v099.py /app/router_rpc_v099.py
 COPY router_rpc_v010.py /app/router_rpc_v010.py
 COPY router_developer_flow_patch.py /app/router_developer_flow_patch.py
 COPY router_http_developer_transport_patch.py /app/router_http_developer_transport_patch.py
+COPY router_be72_auth_patch.py /app/router_be72_auth_patch.py
 COPY router_compat.py /app/router_compat.py
 COPY labprobe_storage.py /app/labprobe_storage.py
 COPY scripts/repair_storage.py /app/scripts/repair_storage.py
@@ -41,6 +42,7 @@ RUN python -m py_compile \
         /app/router_rpc_v010.py \
         /app/router_developer_flow_patch.py \
         /app/router_http_developer_transport_patch.py \
+        /app/router_be72_auth_patch.py \
         /app/router_compat.py \
         /app/labprobe_storage.py \
     && mkdir -p /app/data /app/config /app/backups /app/logs /app/scripts \
