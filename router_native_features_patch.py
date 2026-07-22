@@ -7,7 +7,7 @@ router login or WebSocket connection is created.
 from __future__ import annotations
 
 import time
-from typing import Any, Callable, Dict, Tuple
+from typing import Any, Callable, Dict
 
 from flask import Blueprint, jsonify, request
 
@@ -24,8 +24,11 @@ def normalize_nat_request(body: Dict[str, Any]) -> Dict[str, Any]:
     host = str(body.get("host") or DEFAULT_STUN_HOST).strip()
     if not host or len(host) > 253 or any(ch.isspace() for ch in host):
         raise RouterRpcError("STUN服务器地址无效", "INVALID_STUN_HOST", 400)
+    raw_port = body.get("port", 3478)
+    if raw_port is None or str(raw_port).strip() == "":
+        raw_port = 3478
     try:
-        port = int(body.get("port") or 3478)
+        port = int(raw_port)
     except (TypeError, ValueError) as exc:
         raise RouterRpcError("STUN端口无效", "INVALID_STUN_PORT", 400) from exc
     if not 1 <= port <= 65535:
