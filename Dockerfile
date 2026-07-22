@@ -35,7 +35,15 @@ COPY router_compat.py /app/router_compat.py
 COPY labprobe_storage.py /app/labprobe_storage.py
 COPY scripts/repair_storage.py /app/scripts/repair_storage.py
 
-RUN mkdir -p /app/data /app/config /app/backups /app/logs /app/scripts \
+RUN python -m py_compile \
+        /app/hub.py \
+        /app/hub_entry.py \
+        /app/router_rpc.py \
+        /app/router_rpc_v099.py \
+        /app/router_rpc_v010.py \
+        /app/router_compat.py \
+        /app/labprobe_storage.py \
+    && mkdir -p /app/data /app/config /app/backups /app/logs /app/scripts \
     && chmod 755 /app/scripts/repair_storage.py
 
 EXPOSE 58443
