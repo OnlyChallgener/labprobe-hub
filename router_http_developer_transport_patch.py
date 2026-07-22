@@ -1,9 +1,10 @@
 """HTTP transport correction for the developer-supplied Reyee eWeb flow.
 
-The BE72 Pro management page is only reachable over plain HTTP on the user's
-LAN.  Keep the developer's exact authentication sequence (dynamic AES key,
-username=admin, pwd payload, sid + first Set-Cookie), but preserve the scheme
-and port from ROUTER_EWEB_URL instead of forcing HTTPS/443.
+BE72 Pro is reachable over plain HTTP.  Enter the configured root URL, allow the
+router to generate its own ``/cgi-bin/luci/?stamp=...`` redirect, and extract the
+per-page GibberishAES key when the firmware exposes it.  Some BE72 builds keep
+the key outside the returned HTML; those builds use the already proven Reyee
+legacy AES password for the same ``/api/auth`` request.
 """
 from __future__ import annotations
 
@@ -14,7 +15,7 @@ from urllib.parse import urlparse
 import requests
 
 import router_developer_flow_patch as developer_flow
-from router_rpc import RouterNotConfigured, RouterRpcError
+from router_rpc import LOGIN_AES_PASSWORD, RouterNotConfigured, RouterRpcError
 
 
 _KEY_PATTERNS = (
@@ -53,16 +54,15 @@ def _extract_key(text: str) -> str:
 
 
 def _fetch_login_key_http(self: Any, cfg: Dict[str, Any]) -> str:
-    """Fetch the real HTTP login page and extract the developer AES key."""
+    """Fetch the real HTTP login page and return its dynamic or BE72 key."""
     base = _configured_base(cfg.get("address", ""))
     if not base:
         raise RouterNotConfigured()
 
-    # First enter the root address so the router can generate its own
-    # /cgi-bin/luci/?stamp=... URL.  Keep the direct LuCI URL as a fallback.
     urls = (base + "/", base + "/cgi-bin/luci/")
     last_status = 0
     last_url = ""
+    fetched_ok = False
     for url in urls:
         try:
             response = self.http.get(
@@ -83,6 +83,7 @@ def _fetch_login_key_http(self: Any, cfg: Dict[str, Any]) -> str:
         last_url = str(response.url or url)
         if response.status_code >= 400:
             continue
+        fetched_ok = True
         key = _extract_key(response.text)
         if key:
             self.logger.info(
@@ -92,9 +93,16 @@ def _fetch_login_key_http(self: Any, cfg: Dict[str, Any]) -> str:
             )
             return key
 
+    if fetched_ok:
+        self.logger.info(
+            "router eweb HTTP login page has no inline AES key; using BE72 compatible key login_url=%s",
+            last_url,
+        )
+        return LOGIN_AES_PASSWORD
+
     raise RouterRpcError(
-        f"Could not find GibberishAES key in the HTTP login HTML (status={last_status}, url={last_url})",
-        "LOGIN_KEY_NOT_FOUND",
+        f"Router HTTP login page was unavailable (status={last_status}, url={last_url})",
+        "RPC_HTTP_ERROR",
         502,
     )
 
