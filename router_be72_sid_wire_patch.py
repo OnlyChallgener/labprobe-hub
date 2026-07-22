@@ -13,6 +13,7 @@ as an operation error instead of repeatedly logging into the router.
 """
 from __future__ import annotations
 
+import hashlib
 from typing import Any, Dict, List, Tuple
 
 import requests
@@ -23,6 +24,7 @@ from router_http_developer_transport_patch import _configured_base
 from router_rpc import (
     AUTH_RETRY_BACKOFF_SECONDS,
     GLOBAL_ROUTER_SESSION_CACHE,
+    REQUEST_SIGN_SECRET,
     RouterAuthExpired,
     RouterRpcError,
     RouterSession,
@@ -41,20 +43,39 @@ def _session_cookie(session: RouterSession) -> str:
     return f"{serial}={sid}" if serial and sid else ""
 
 
+def _eweb_byte_length(text: str) -> int:
+    """Match the front-end helper used by Object(_.i)(c.data)."""
+    total = 0
+    for char in text:
+        codepoint = ord(char)
+        if codepoint <= 0xFF:
+            total += 1
+        elif codepoint <= 0xFFFF:
+            total += 3
+        else:
+            total += 4
+    return total
+
+
+def _md5(value: str) -> str:
+    return hashlib.md5(value.encode("utf-8")).hexdigest()
+
+
 def _headers_for_api(
-    self: Any,
     api_path: str,
-    payload: Dict[str, Any],
+    wire: str,
     session: RouterSession,
 ) -> Dict[str, str]:
     headers = {"Content-Type": "application/json;charset=UTF-8"}
 
-    # The browser adds these headers only to the protected cmd RPC family.
-    # RuijieRouterClient._headers_for implements the captured formulas:
-    #   Content-Accept  = MD5("Web@Rj$2020!" + canonical request data)
-    #   Contents-Accept = MD5("Web@Rj$2020!" + wire request data)
+    # Exact front-end formulas captured from the Reyee bundle:
+    #   Content-Accept  = MD5("Web@Rj$2020!" + byteLength(JSON body))
+    #   Contents-Accept = MD5("Web@Rj$2020!" + JSON body)
     if api_path == "cmd":
-        headers.update(self._headers_for(payload, session))
+        headers["Content-Accept"] = _md5(
+            REQUEST_SIGN_SECRET + str(_eweb_byte_length(wire))
+        )
+        headers["Contents-Accept"] = _md5(REQUEST_SIGN_SECRET + wire)
 
     cookie = _session_cookie(session)
     if cookie:
@@ -74,7 +95,7 @@ def _raw_api_call_browser_path(
     base = _configured_base(cfg.get("address", ""))
     wire = _wire_json(payload)
     session = self.session
-    headers = _headers_for_api(self, api_path, payload, session)
+    headers = _headers_for_api(api_path, wire, session)
     try:
         response = self.http.post(
             base + f"/cgi-bin/luci/api/{api_path}?auth={credential}",
@@ -125,7 +146,7 @@ def _post_api(
     response, root = _raw_api_call_browser_path(self, cfg, sid, "", api_path, payload)
 
     if response.status_code in {401, 403}:
-        # cmd has a separate signature layer.  Prove whether the login session is
+        # cmd has a separate signature layer. Prove whether the login session is
         # still valid before throwing it away and causing another router login.
         if api_path == "cmd":
             probe_response, probe_root = _raw_api_call_browser_path(
