@@ -39,5 +39,5 @@ jobs:
       - name: Compile and test
         working-directory: ${{ github.workspace }}
         run: |
-          python -m py_compile hub.py hub_entry.py labprobe_storage.py router_rpc.py router_rpc_v099.py router_rpc_v010.py router_developer_flow_patch.py router_http_developer_transport_patch.py router_be72_auth_patch.py router_be72_sid_wire_patch.py router_native_features_patch.py router_ws_patch.py router_compat.py
+          python -m py_compile hub.py hub_entry.py labprobe_storage.py router_rpc.py router_rpc_v099.py router_rpc_v010.py router_developer_flow_patch.py router_http_developer_transport_patch.py router_be72_auth_patch.py router_be72_sid_wire_patch.py router_native_features_patch.py router_ws_patch.py router_compat.py router_realtime_stability_patch.py
           python -m pytest -q
