@@ -8,13 +8,15 @@ from router_compat import install_router_rpc_compat
 from router_developer_flow_patch import install_router_developer_flow_patch
 from router_http_developer_transport_patch import install_router_http_developer_transport_patch
 from router_rpc_v010 import create_router_blueprint_v010
+from router_ws_patch import install_router_ws_patch
 
-HUB_VERSION = "0.9.12"
+HUB_VERSION = "0.9.13"
 hub.APP_VERSION = HUB_VERSION
 install_router_http_developer_transport_patch()
 install_router_developer_flow_patch()
 install_router_be72_auth_patch()
 install_router_be72_sid_wire_patch()
+install_router_ws_patch()
 hub.app.register_blueprint(
     create_router_blueprint_v010(
         check_app_token=hub.check_app_token,
