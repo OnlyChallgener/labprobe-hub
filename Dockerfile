@@ -31,6 +31,7 @@ COPY router_developer_flow_patch.py /app/router_developer_flow_patch.py
 COPY router_http_developer_transport_patch.py /app/router_http_developer_transport_patch.py
 COPY router_be72_auth_patch.py /app/router_be72_auth_patch.py
 COPY router_be72_sid_wire_patch.py /app/router_be72_sid_wire_patch.py
+COPY router_native_features_patch.py /app/router_native_features_patch.py
 COPY router_ws_patch.py /app/router_ws_patch.py
 COPY router_compat.py /app/router_compat.py
 COPY labprobe_storage.py /app/labprobe_storage.py
@@ -46,6 +47,7 @@ RUN python -m py_compile \
         /app/router_http_developer_transport_patch.py \
         /app/router_be72_auth_patch.py \
         /app/router_be72_sid_wire_patch.py \
+        /app/router_native_features_patch.py \
         /app/router_ws_patch.py \
         /app/router_compat.py \
         /app/labprobe_storage.py \
