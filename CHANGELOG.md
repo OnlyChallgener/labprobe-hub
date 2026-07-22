@@ -1,5 +1,13 @@
 # LabProbe 变更记录
 
+## 0.9.14 / LabRelay 0.2.9
+
+- 新增路由器原生 NAT 诊断接口，支持 RFC 3489、RFC 5780、WAN/WAN1、可选 STUN 服务器与检测结果轮询。
+- 新增 ReyeeOS Beta 在线版本检查接口，读取当前版本和可用固件列表；在实际安装负载确认前不执行升级。
+- NAT 诊断与 Beta 检查复用现有 eWeb SID、Cookie 和 CMD 签名链路，不创建第二套登录会话。
+- APP 路由器状态页可每约 2 秒读取 Hub 内存中的最新 WebSocket 快照；配置类 CMD 仍保持低频校准。
+- Hub 版本提升至 0.9.14；LabRelay 继续使用 0.2.9，无需更新。
+
 ## 0.9.13 / LabRelay 0.2.9
 
 - 新增锐捷 eWeb 原生 `/ws` WebSocket 长连接，直接接收 `static`、`slow`、`fast`、`recent_wan` 与 `daily_wan` 数据。
