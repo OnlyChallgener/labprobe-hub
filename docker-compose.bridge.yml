@@ -53,33 +53,6 @@ services:
       timeout: 5s
       retries: 5
 
-  router-browser:
-    image: ${ROUTER_BROWSER_IMAGE:-onlychallgener/labprobe-router-browser:latest}
-    build:
-      context: ./router_browser_service
-      dockerfile: Dockerfile
-    container_name: router-browser
-    restart: unless-stopped
-    shm_size: "512m"
-    environment:
-      TZ: ${TZ:-Asia/Shanghai}
-      PORT: 4445
-      BIND_HOST: 0.0.0.0
-      LOG_LEVEL: ${LOG_LEVEL:-INFO}
-      LOGS_DIR: /app/logs
-      ROUTER_BROWSER_HEADLESS: ${ROUTER_BROWSER_HEADLESS:-true}
-      ROUTER_BROWSER_LOGIN_TIMEOUT_MS: ${ROUTER_BROWSER_LOGIN_TIMEOUT_MS:-30000}
-      ROUTER_BROWSER_ACTION_TIMEOUT_MS: ${ROUTER_BROWSER_ACTION_TIMEOUT_MS:-15000}
-      ROUTER_BROWSER_TOKEN: ${ROUTER_BROWSER_TOKEN:-change-router-browser-token}
-    volumes:
-      - ./logs/router-browser:/app/logs
-    healthcheck:
-      test: ["CMD-SHELL", "curl -fsS http://127.0.0.1:4445/health >/dev/null || exit 1"]
-      interval: 20s
-      timeout: 5s
-      start_period: 30s
-      retries: 5
-
   labprobe-hub:
     image: ${LABPROBE_IMAGE:-onlychallgener/labprobe-hub:latest}
     build:
@@ -89,8 +62,6 @@ services:
     restart: unless-stopped
     depends_on:
       labprobe-mqtt:
-        condition: service_healthy
-      router-browser:
         condition: service_healthy
     ports:
       - "${PORT:-58443}:${PORT:-58443}"
@@ -128,11 +99,6 @@ services:
       ROUTER_DASHBOARD_POLL_SEC: ${ROUTER_DASHBOARD_POLL_SEC:-3}
       ROUTER_DEVICE_POLL_SEC: ${ROUTER_DEVICE_POLL_SEC:-5}
       ROUTER_CONFIG_KEY: ${ROUTER_CONFIG_KEY:-}
-      ROUTER_BROWSER_AUTH_MODE: required
-      ROUTER_BROWSER_REMOTE_URL: http://router-browser:4445
-      ROUTER_BROWSER_TOKEN: ${ROUTER_BROWSER_TOKEN:-change-router-browser-token}
-      ROUTER_BROWSER_LOGIN_TIMEOUT_MS: ${ROUTER_BROWSER_LOGIN_TIMEOUT_MS:-30000}
-      ROUTER_BROWSER_ACTION_TIMEOUT_MS: ${ROUTER_BROWSER_ACTION_TIMEOUT_MS:-15000}
       MQTT_PUBLIC_URL: ${MQTT_PUBLIC_URL:-}
       MQTT_INTERNAL_HOST: labprobe-mqtt
       MQTT_INTERNAL_PORT: 1883
