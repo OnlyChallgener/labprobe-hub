@@ -1,4 +1,4 @@
-from router_ws_patch import _first_ssid, _merge_wireless, _normalized_ports
+from router_ws_patch import _config_poll_seconds, _first_ssid, _merge_wireless, _normalized_ports
 
 
 def test_empty_realtime_ssid_list_does_not_erase_configured_ssids():
@@ -36,3 +36,10 @@ def test_uppercase_port_list_is_normalized_for_app():
     assert ports[0]["panel_name"] == "WAN"
     assert ports[1]["status"] == "off"
     assert ports[1]["panel_name"] == "LAN5/GAME"
+
+
+def test_config_poll_interval_has_safe_floor(monkeypatch):
+    monkeypatch.setenv("ROUTER_CONFIG_POLL_SEC", "3")
+    assert _config_poll_seconds() == 10.0
+    monkeypatch.setenv("ROUTER_CONFIG_POLL_SEC", "45")
+    assert _config_poll_seconds() == 45.0
