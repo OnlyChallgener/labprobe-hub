@@ -36,14 +36,3 @@ jobs:
           tags: |
             ${{ secrets.DOCKERHUB_USERNAME }}/labprobe-hub:latest
             ${{ secrets.DOCKERHUB_USERNAME }}/labprobe-hub:0.9.12
-
-      - name: Build and Push Router Browser
-        uses: docker/build-push-action@v6
-        with:
-          context: ./router_browser_service
-          file: ./router_browser_service/Dockerfile
-          push: true
-          platforms: linux/amd64,linux/arm64
-          tags: |
-            ${{ secrets.DOCKERHUB_USERNAME }}/labprobe-router-browser:latest
-            ${{ secrets.DOCKERHUB_USERNAME }}/labprobe-router-browser:0.1.0
