@@ -32,6 +32,7 @@ COPY router_rpc.py /app/router_rpc.py
 COPY router_rpc_v099.py /app/router_rpc_v099.py
 COPY router_rpc_v010.py /app/router_rpc_v010.py
 COPY router_browser_timeout_patch.py /app/router_browser_timeout_patch.py
+COPY router_browser_locator_patch.py /app/router_browser_locator_patch.py
 COPY router_compat.py /app/router_compat.py
 COPY labprobe_storage.py /app/labprobe_storage.py
 COPY scripts/repair_storage.py /app/scripts/repair_storage.py
@@ -43,6 +44,7 @@ RUN python -m py_compile \
         /app/router_rpc_v099.py \
         /app/router_rpc_v010.py \
         /app/router_browser_timeout_patch.py \
+        /app/router_browser_locator_patch.py \
         /app/router_compat.py \
         /app/labprobe_storage.py \
     && mkdir -p /app/data /app/config /app/backups /app/logs /app/scripts \
