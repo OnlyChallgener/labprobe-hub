@@ -1,5 +1,14 @@
 # LabProbe 变更记录
 
+## 0.9.12 / LabRelay 0.2.9
+
+- 新增 Docker 内置 Playwright Chromium 登录器，使用真实 Reyee eWeb 页面填写管理密码并建立浏览器会话。
+- 路由器 RPC 改为在同一浏览器上下文内执行，自动复用 Cookie、token、sid、sn 与页面初始化状态。
+- 浏览器会话失效时只自动重新登录一次，避免此前每 3 秒重复登录和持续 403 循环。
+- 浏览器对象由专用单线程持有，兼容 Flask 多线程请求并统一串行执行路由器读写操作。
+- 默认启用 `ROUTER_BROWSER_AUTH_MODE=required`；可改为 `preferred` 使用浏览器失败后直连回退，或改为 `off` 完全关闭。
+- Hub 版本更新至 0.9.12；APP 与 LabRelay 版本不变。
+
 ## 0.9.7 / LabRelay 0.2.8
 
 - LabRelay 每小时执行一次 `df -h /overlay`，优先上报可写 Overlay 分区的真实磁盘利用率。
