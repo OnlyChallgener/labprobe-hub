@@ -402,7 +402,8 @@ def _normalize_dashboard(self: Any, raw: Dict[str, Any]) -> Dict[str, Any]:
         except (TypeError, ValueError):
             pass
 
-    normalized["online"] = bool(slow.get("connected")) or _truthy(slow.get("status")) or bool(ws_status := _dict(raw.get("wsStatus"))).get("connected", False)
+    ws_connected = bool(_dict(raw.get("wsStatus")).get("connected", False))
+    normalized["online"] = bool(slow.get("connected")) or _truthy(slow.get("status")) or ws_connected
     normalized["telemetryStale"] = False if raw.get("fast") else normalized.get("telemetryStale", True)
     normalized["detailsStale"] = False if raw.get("slow") or raw.get("static") else normalized.get("detailsStale", True)
     normalized["source"] = "router_ws+rpc" if raw.get("fast") or raw.get("slow") else normalized.get("source", "router_rpc")
