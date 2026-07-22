@@ -11,9 +11,8 @@ ENV PYTHONDONTWRITEBYTECODE=1 \
     BACKUPS_DIR=./backups \
     LOGS_DIR=./logs \
     CONFIG_PATH=./config/config.yaml \
-    PLAYWRIGHT_BROWSERS_PATH=/ms-playwright \
     ROUTER_BROWSER_AUTH_MODE=required \
-    ROUTER_BROWSER_HEADLESS=true
+    ROUTER_BROWSER_REMOTE_URL=http://127.0.0.1:4445
 
 WORKDIR /app
 
@@ -23,16 +22,14 @@ RUN apt-get update \
 
 COPY requirements.txt /app/requirements.txt
 RUN pip install --no-cache-dir -r /app/requirements.txt \
-    && python -m playwright install --with-deps chromium \
-    && rm -rf /var/lib/apt/lists/* /root/.cache/pip
+    && rm -rf /root/.cache/pip
 
 COPY hub.py /app/hub.py
 COPY hub_entry.py /app/hub_entry.py
 COPY router_rpc.py /app/router_rpc.py
 COPY router_rpc_v099.py /app/router_rpc_v099.py
 COPY router_rpc_v010.py /app/router_rpc_v010.py
-COPY router_browser_timeout_patch.py /app/router_browser_timeout_patch.py
-COPY router_browser_locator_patch.py /app/router_browser_locator_patch.py
+COPY router_browser_remote_patch.py /app/router_browser_remote_patch.py
 COPY router_compat.py /app/router_compat.py
 COPY labprobe_storage.py /app/labprobe_storage.py
 COPY scripts/repair_storage.py /app/scripts/repair_storage.py
@@ -43,8 +40,7 @@ RUN python -m py_compile \
         /app/router_rpc.py \
         /app/router_rpc_v099.py \
         /app/router_rpc_v010.py \
-        /app/router_browser_timeout_patch.py \
-        /app/router_browser_locator_patch.py \
+        /app/router_browser_remote_patch.py \
         /app/router_compat.py \
         /app/labprobe_storage.py \
     && mkdir -p /app/data /app/config /app/backups /app/logs /app/scripts \
