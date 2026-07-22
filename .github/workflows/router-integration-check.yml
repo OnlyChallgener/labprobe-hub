@@ -6,8 +6,11 @@ on:
       - codex/router-rpc-v098-relay-v029
     paths:
       - router_*.py
+      - hub.py
       - hub_entry.py
+      - labprobe_storage.py
       - requirements.txt
+      - pytest.ini
       - tests/**
       - .github/workflows/router-integration-check.yml
   workflow_dispatch:
@@ -22,6 +25,8 @@ permissions:
 jobs:
   test:
     runs-on: ubuntu-latest
+    env:
+      PYTHONPATH: ${{ github.workspace }}
     steps:
       - uses: actions/checkout@v4
       - uses: actions/setup-python@v5
@@ -32,6 +37,7 @@ jobs:
           python -m pip install --upgrade pip
           python -m pip install -r requirements.txt pytest
       - name: Compile and test
+        working-directory: ${{ github.workspace }}
         run: |
-          python -m py_compile hub.py hub_entry.py router_rpc.py router_rpc_v099.py router_rpc_v010.py router_developer_flow_patch.py router_http_developer_transport_patch.py router_be72_auth_patch.py router_be72_sid_wire_patch.py router_ws_patch.py router_compat.py
-          pytest -q
+          python -m py_compile hub.py hub_entry.py labprobe_storage.py router_rpc.py router_rpc_v099.py router_rpc_v010.py router_developer_flow_patch.py router_http_developer_transport_patch.py router_be72_auth_patch.py router_be72_sid_wire_patch.py router_ws_patch.py router_compat.py
+          python -m pytest -q
