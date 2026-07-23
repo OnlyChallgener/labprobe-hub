@@ -7,6 +7,7 @@ from router_be72_sid_wire_patch import install_router_be72_sid_wire_patch
 from router_compat import install_router_rpc_compat
 from router_developer_flow_patch import install_router_developer_flow_patch
 from router_http_developer_transport_patch import install_router_http_developer_transport_patch
+from router_lite_realtime_patch import install_router_lite_realtime_patch
 from router_native_features_patch import install_router_native_features_patch
 from router_realtime_stability_patch import (
     install_router_realtime_stability_patch,
@@ -16,7 +17,7 @@ from router_relay_credentials_patch import install_router_relay_credentials_patc
 from router_rpc_v010 import create_router_blueprint_v010
 from router_ws_patch import install_router_ws_patch
 
-HUB_VERSION = "0.9.15"
+HUB_VERSION = "0.9.16"
 hub.APP_VERSION = HUB_VERSION
 install_router_http_developer_transport_patch()
 install_router_developer_flow_patch()
@@ -35,6 +36,7 @@ hub.app.register_blueprint(
 )
 router_sync = install_router_rpc_compat(hub)
 install_router_status_localization(hub, router_sync)
+install_router_lite_realtime_patch(hub, router_sync)
 
 if __name__ == "__main__":
     raise SystemExit(hub.command_line())
