@@ -5,6 +5,11 @@ long-poll condition; while demand remains active, Relay executes the same local
 ``dev_sta`` commands that were previously fast over SSH and pushes only compact
 numeric samples. Hub never performs high-frequency eWeb/CMD calls here, and the
 normal full device/configuration sync remains completely independent.
+
+The APP request itself is the lease. Once the lease expires, Relay push requests
+are acknowledged with inactive demand but their samples are not written into the
+Hub cache. The last valid frame remains available for UI continuity without any
+continued cache churn or high-frequency collection.
 """
 from __future__ import annotations
 
@@ -177,11 +182,19 @@ class RouterLiteRealtimeService:
     def accept_push(self, payload: Any) -> Dict[str, Any]:
         if not isinstance(payload, dict):
             raise ValueError("invalid realtime payload")
+
+        # Snapshot the APP-owned lease before touching sample memory. A Relay push
+        # never renews demand and cannot keep high-frequency collection alive.
+        with self._demand:
+            demand = self._demand_payload_locked()
+        router_active = bool(demand["routerActive"])
+        devices_active = bool(demand["devicesActive"])
+
         sample_epoch_ms = self._sample_epoch_ms(payload.get("sampleEpochMs"))
         source = _clean_source(payload.get("source"))
         agent_version = str(payload.get("agentVersion") or "").strip()[:32]
-        router = self._router_fields(payload.get("routerSample"))
-        devices_supplied = isinstance(payload.get("devices"), list)
+        router = self._router_fields(payload.get("routerSample")) if router_active else {}
+        devices_supplied = devices_active and isinstance(payload.get("devices"), list)
         devices = self._device_rows(payload.get("devices")) if devices_supplied else []
 
         if router and "onlineDeviceCount" not in router and devices_supplied:
@@ -205,8 +218,9 @@ class RouterLiteRealtimeService:
                 if changed:
                     self._devices_sequence += 1
 
-        with self._demand:
-            return self._demand_payload_locked()
+        demand["acceptedRouter"] = bool(router)
+        demand["acceptedDevices"] = devices_supplied
+        return demand
 
     def router_payload(self) -> Dict[str, Any]:
         self.mark_router_demand()
