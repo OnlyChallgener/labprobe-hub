@@ -35,6 +35,7 @@ COPY router_native_features_patch.py /app/router_native_features_patch.py
 COPY router_ws_patch.py /app/router_ws_patch.py
 COPY router_compat.py /app/router_compat.py
 COPY router_realtime_stability_patch.py /app/router_realtime_stability_patch.py
+COPY router_relay_credentials_patch.py /app/router_relay_credentials_patch.py
 COPY labprobe_storage.py /app/labprobe_storage.py
 COPY scripts/repair_storage.py /app/scripts/repair_storage.py
 
@@ -52,6 +53,7 @@ RUN python -m py_compile \
         /app/router_ws_patch.py \
         /app/router_compat.py \
         /app/router_realtime_stability_patch.py \
+        /app/router_relay_credentials_patch.py \
         /app/labprobe_storage.py \
     && mkdir -p /app/data /app/config /app/backups /app/logs /app/scripts \
     && chmod 755 /app/scripts/repair_storage.py
