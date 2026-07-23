@@ -1,5 +1,16 @@
 # LabProbe 变更记录
 
+## 0.9.18 / LabRelay 0.2.11
+
+- 实时数据源改为路由器本地 LabRelay，不再由 Hub 高频调用 eWeb/CMD，也不依赖路由器 WSS 的实际推送周期。
+- APP 首次请求 `/api/router/realtime` 或 `/api/devices/realtime` 时，Hub 通过 55 秒长轮询立即唤醒 Relay；APP 持续前台请求时维持 5 秒需求租约。
+- Relay 在本机并行执行 `dev_sta get -m ws_sysinfo '{"get":"fast"}'` 与 `dev_sta get -m user_list '{"devType":"all","dataType":"timely"}'`，沿用此前 SSH 快速读取的本地执行路径。
+- Relay 只上传网速、连接数、CPU、内存、温度、运行时间及终端 MAC/实时上下行/连接数等小字段，不上传完整 Dashboard 或完整终端资料。
+- Hub 的 APP 接口只读取内存样本，正常请求不等待路由器；完整设备、配置、DDNS、NAT 等仍走原有低频 eWeb 同步，互不阻塞。
+- APP 退出前台且 5 秒需求租约到期后，Relay 停止高频本地采集和推送，恢复长轮询，避免全天产生无效流量。
+- 路由与终端命令并行执行，单次本地命令限制约 1.4 秒；一个命令失败或超时不会阻塞另一个样本。
+- 配套 APP 继续使用 v0.10.15 build150；Hub 升级到 0.9.18，路由器 LabRelay 必须升级到 0.2.11。
+
 ## 0.9.15 / LabRelay 0.2.10
 
 - 路由器实时仪表盘与终端列表拆成独立线程，慢速终端 RPC 不再阻塞 WSS 快数据刷新。
