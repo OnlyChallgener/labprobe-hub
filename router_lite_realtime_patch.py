@@ -1,7 +1,7 @@
 """Verified low-latency runtime channels for the Android foreground UI.
 
 Design rules:
-- Router counters read the native /ws ``fast`` frame directly.  They never wait
+- Router counters read the native /ws ``fast`` frame directly. They never wait
   for the full dashboard normalizer or device/configuration RPCs.
 - If the router does not emit a fresh ``fast`` frame for 2.5 seconds, a separate
   short-timeout HTTP lane requests ``devSta.get/ws_sysinfo {get: fast}``.
@@ -166,7 +166,7 @@ def _router_metrics_from_fast(fast_value: Any, online_devices: int = 0) -> Dict[
 class _RealtimeRpcLane:
     """Independent short-timeout eWeb CMD connection.
 
-    It shares only the already-authenticated SID/cookie snapshot.  It does not
+    It shares only the already-authenticated SID/cookie snapshot. It does not
     share requests.Session, connection pools or locks with normal Hub syncing.
     """
 
@@ -337,9 +337,15 @@ class RouterLiteRealtimeService:
         fast, epoch = self._ws_fast_snapshot()
         if not fast or epoch <= 0:
             return False
-        metrics = _router_metrics_from_fast(fast, self._online_device_count())
-        self._store_router(metrics, epoch, "router_ws_fast", 0)
-        return time.time() - epoch <= ROUTER_WS_FRESH_SECONDS
+        fresh = time.time() - epoch <= ROUTER_WS_FRESH_SECONDS
+        with self._cache_lock:
+            has_sample = bool(self._router_sample)
+        # A stale WS frame may fill an empty cache at startup, but must never
+        # overwrite a newer short-timeout RPC sample on every APP read.
+        if fresh or not has_sample:
+            metrics = _router_metrics_from_fast(fast, self._online_device_count())
+            self._store_router(metrics, epoch, "router_ws_fast", 0)
+        return fresh
 
     def _refresh_router_rpc(self) -> None:
         try:
