@@ -3,7 +3,9 @@ from types import SimpleNamespace
 
 from flask import Flask
 
+import router_relay_credentials_patch as credentials_patch
 from router_relay_credentials_patch import (
+    _direct_credentials_refresh_view,
     _extract_router_credentials,
     _relay_dashboard_ack,
 )
@@ -70,3 +72,62 @@ def test_extract_router_credentials_rejects_masked_password():
 
     assert result["username"] == "user-3"
     assert result["password"] == ""
+
+
+def _refresh_fixture():
+    hub = SimpleNamespace(
+        check_app_token=lambda: True,
+        ROUTER_CREDENTIALS_LOCK=threading.RLock(),
+        ROUTER_CREDENTIALS_REFRESH_NONCE=100,
+        ROUTER_CREDENTIALS_CACHE={},
+        primary_router_name=lambda: "router",
+        now_str=lambda: "2026-07-23 10:00:00",
+    )
+    return SimpleNamespace(
+        hub=hub,
+        client=object(),
+        logger=SimpleNamespace(warning=lambda *_args, **_kwargs: None),
+    )
+
+
+def test_partial_direct_credentials_wait_for_router_local_fallback(monkeypatch):
+    app = Flask(__name__)
+    sync = _refresh_fixture()
+    monkeypatch.setattr(
+        credentials_patch,
+        "_read_direct_credentials",
+        lambda _client: {"username": "only-user", "password": "", "lanMac": ""},
+    )
+
+    with app.app_context():
+        payload = _direct_credentials_refresh_view(sync).get_json()
+
+    assert payload["refreshNonce"] == 101
+    assert payload["refreshCompletedNonce"] == 0
+    assert payload["credentialsAvailable"] is False
+    assert payload["relayFallbackPending"] is True
+    assert sync.hub.ROUTER_CREDENTIALS_CACHE == {}
+
+
+def test_complete_direct_credentials_are_memory_only_and_completed(monkeypatch):
+    app = Flask(__name__)
+    sync = _refresh_fixture()
+    monkeypatch.setattr(
+        credentials_patch,
+        "_read_direct_credentials",
+        lambda _client: {
+            "username": "broadband-user",
+            "password": "broadband-pass",
+            "lanMac": "10:5f:02:05:80:67",
+        },
+    )
+
+    with app.app_context():
+        payload = _direct_credentials_refresh_view(sync).get_json()
+
+    assert payload["refreshCompletedNonce"] == 101
+    assert payload["credentialsAvailable"] is True
+    assert payload["relayFallbackPending"] is False
+    assert sync.hub.ROUTER_CREDENTIALS_CACHE["username"] == "broadband-user"
+    assert sync.hub.ROUTER_CREDENTIALS_CACHE["password"] == "broadband-pass"
+    assert sync.hub.ROUTER_CREDENTIALS_CACHE["refreshCompletedNonce"] == 101
