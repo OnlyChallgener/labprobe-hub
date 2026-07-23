@@ -1,5 +1,67 @@
 # LabProbe 变更记录
 
+## 0.9.19 / LabRelay 0.2.11
+
+- APP v0.10.15 build152 使用轻量路由接口成功响应作为 5 秒实时连接租约；APP 与 Hub 失联后停止终端实时请求、200ms 平滑渲染和缓存计算。
+- 断线期间 APP 只保留一个路由恢复探测，并按 3 / 5 / 10 / 15 秒逐级退避；连接恢复后自动恢复每秒采样和短时平滑显示。
+- Hub 的实时样本写入同样受 APP 租约约束：租约过期后，Relay 的尾部推送只用于返回“停止采样”状态，不再覆盖或追加路由与终端缓存。
+- Hub 继续保留最后一帧有效内存样本用于页面连续性，但不写 SQLite、revision 或历史曲线，也不会由 Relay 推送续租。
+- APP 退到后台、被关闭、网络中断或认证失败时，5 秒租约自然到期；LabRelay 随后退出每秒 `dev_sta` 采集并恢复 55 秒长轮询。
+- 配套版本：APP v0.10.15 build152、Hub 0.9.19、LabRelay 0.2.11。
+
+## 0.9.18 / LabRelay 0.2.11
+
+- 实时数据源改为路由器本地 LabRelay，不再由 Hub 高频调用 eWeb/CMD，也不依赖路由器 WSS 的实际推送周期。
+- APP 首次请求 `/api/router/realtime` 或 `/api/devices/realtime` 时，Hub 通过 55 秒长轮询立即唤醒 Relay；APP 持续前台请求时维持 5 秒需求租约。
+- Relay 在本机并行执行 `dev_sta get -m ws_sysinfo '{"get":"fast"}'` 与 `dev_sta get -m user_list '{"devType":"all","dataType":"timely"}'`，沿用此前 SSH 快速读取的本地执行路径。
+- Relay 只上传网速、连接数、CPU、内存、温度、运行时间及终端 MAC/实时上下行/连接数等小字段，不上传完整 Dashboard 或完整终端资料。
+- Hub 的 APP 接口只读取内存样本，正常请求不等待路由器；完整设备、配置、DDNS、NAT 等仍走原有低频 eWeb 同步，互不阻塞。
+- APP 退出前台且 5 秒需求租约到期后，Relay 停止高频本地采集和推送，恢复长轮询，避免全天产生无效流量。
+- 路由与终端命令并行执行，单次本地命令限制约 1.4 秒；一个命令失败或超时不会阻塞另一个样本。
+- 配套 APP 使用 v0.10.15 build151；Hub 升级到 0.9.18，路由器 LabRelay 必须升级到 0.2.11。
+
+## 0.9.15 / LabRelay 0.2.10
+
+- 路由器实时仪表盘与终端列表拆成独立线程，慢速终端 RPC 不再阻塞 WSS 快数据刷新。
+- WSS 快照默认每 1 秒归一化并写入 Hub 内存，APP 可连续读取最新速率、连接数、CPU、内存和温度。
+- 瞬时空响应不再清空已有仪表盘，Hub 会深度合并新快照并保留上一份完整配置，避免刷新时页面变白。
+- 手动刷新立即返回并在后台更新终端和配置，不再长时间占用 APP 刷新按钮。
+- 路由器状态接口统一返回中文，并区分“已连接且数据正常”“已连接正在同步”“连接恢复中”。
+- Hub 直接复用现有 eWeb 会话读取完整 PPPoE 账号密码；固件仅返回部分字段时，由轻量 Agent 指令长轮询触发路由器本地 `dev_config network` 兜底，凭证只保存在 Hub 内存。
+- LabRelay 默认启用 Hub 直连模式，不再上传完整仪表盘、终端列表和设备事件；仅保留 IPv6 邻居、6to6、端口映射及按需凭证兜底。
+- Relay 使用 55 秒长轮询维持约 1 分钟的 IPv6 检查节拍；账号密码刷新会立即唤醒，不需要等待下一轮。状态心跳和端口映射状态降为 5 分钟。
+- IPv6 快照仅在地址或邻居内容变化、或 15 分钟心跳时发送；忽略 REACHABLE/STALE 状态抖动，避免每天产生数 MB 无效流量。
+- Hub 与 Relay 均拒绝空账号、空密码或掩码密码；无效结果不会覆盖上一份有效内存缓存，也不会确认刷新序号，后续会自动重试。
+- 路由 NAT 结果继续携带请求上下文用于诊断；APP 的最近检测按 RFC3489/RFC5780 协议分组，STUN 端口不参与历史分组。
+- Hub 版本保持 0.9.15；LabRelay 提升至 0.2.10，需要同步更新路由器端 Agent。
+
+## 0.9.14 / LabRelay 0.2.9
+
+- 新增路由器原生 NAT 诊断接口，支持 RFC 3489、RFC 5780、WAN/WAN1、可选 STUN 服务器与检测结果轮询。
+- 新增 ReyeeOS Beta 在线版本检查接口，读取当前版本和可用固件列表；在实际安装负载确认前不执行升级。
+- NAT 诊断与 Beta 检查复用现有 eWeb SID、Cookie 和 CMD 签名链路，不创建第二套登录会话。
+- APP 路由器状态页可每约 2 秒读取 Hub 内存中的最新 WebSocket 快照；配置类 CMD 仍保持低频校准。
+- Hub 版本提升至 0.9.14；LabRelay 继续使用 0.2.9，无需更新。
+
+## 0.9.13 / LabRelay 0.2.9
+
+- 新增锐捷 eWeb 原生 `/ws` WebSocket 长连接，直接接收 `static`、`slow`、`fast`、`recent_wan` 与 `daily_wan` 数据。
+- 路由器实时 CPU、内存、温度、运行时间、WAN 速率、连接数、端口和无线电状态改由 WebSocket 主动推送，减少高频 CMD 轮询。
+- WebSocket 连接后自动发送 `get_recent_wan`、`get_daily_wan`、`ping`，并每 10 秒发送 `keepalive`；断线后指数退避自动重连。
+- CMD 继续负责终端列表、无线配置、DDNS、防火墙、端口映射等查询和控制；仪表盘配置默认每 30 秒校准一次。
+- 合并 `acConfig.get / wireless` 与 WebSocket 无线实时状态，避免 WebSocket 空 `ssidList` 覆盖真实 Wi-Fi 名称。
+- 兼容 WebSocket `port_status.List`、2.4G/5G 实时信道与利用率，并继续保留 HTTP/CMD 作为断线兜底。
+- Hub 版本提升至 0.9.13；镜像继续保持轻量 AMD64/ARM64 双架构，不引入浏览器内核。
+
+## 0.9.12 / LabRelay 0.2.9
+
+- 路由器 eWeb 登录改为直接 HTTP 会话：先读取 `/cgi-bin/luci/` 中的动态 GibberishAES 密钥，再加密管理密码并调用 `/cgi-bin/luci/api/auth`。
+- 登录成功后在 Hub 内存中缓存 `sid`、Cookie、token、sn 与登录时间；后续业务接口统一使用 `?auth=<sid>` 并复用同一个 `requests.Session`。
+- 同时兼容 `password/limit/setInit` 与 `username/pwd/isCheckReadAgreement` 两种登录参数格式，适配不同 ReyeeOS/eWeb 固件。
+- 只有收到 401/403、登录页重定向或本地会话到期时才串行重新登录一次，避免高频轮询导致重复登录和持续 403。
+- 删除 Playwright、Chromium、Firefox、Selenium 与独立 `router-browser` 容器，Hub 恢复轻量 AMD64/ARM64 镜像。
+- Hub 版本保持 0.9.12；APP 与 LabRelay 版本不变。
+
 ## 0.9.7 / LabRelay 0.2.8
 
 - LabRelay 每小时执行一次 `df -h /overlay`，优先上报可写 Overlay 分区的真实磁盘利用率。
@@ -15,7 +77,7 @@
 ## 0.9.5 / LabRelay 0.2.6
 
 - 新增 Agent 一键清理指令链路：APP 经 Hub 下发，LabRelay 清理 `/etc/labprobe/backups`、非必要 `/tmp` 日志和失效安装临时文件。
-- 清理结果回传已删除分类、项目数量、异常项和回收空间；配置、当前程序和状态数据不会被删除。
+- 清理结果回传已删除分类、项目数量、异常项和回收空间；配置、当前程序和状态数据不会删除。
 - 修复 Agent 状态上报可能误将清理任务按更新任务提前完成的问题。
 - 路由器状态页 WAN、网络配置和 AP 信息改为固定四卡片布局，并修复背景图层与网口视觉。
 - WAN 运营商由 LabRelay/Hub 识别；新增 WAN/WAN1 接口显示、LAN MAC 与按需读取的宽带账号密码。
@@ -51,6 +113,3 @@
 ## 0.7.x–0.8.x（历史版本）
 
 早期 DSM/NAS 专用部署说明、逐版本发布记录和 Shell 采集方案已合并归档。为避免继续误用旧入口，仓库不再保留这些分散文件；完整历史仍可从 Git 提交记录查看。
-
-- Hub 0.9.5 hotfix: credentials refresh nonce now starts from epoch milliseconds, preventing a Hub restart from reusing a nonce already acknowledged by LabRelay.
-- LabRelay 0.2.6 exposes `network.wan[].service` as `details.lan.broadbandRemark`; credentials remain memory-only.

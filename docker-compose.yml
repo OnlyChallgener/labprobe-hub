@@ -3,6 +3,7 @@ services:
     extends:
       file: docker-compose.host.yml
       service: labprobe-mqtt
+
   labprobe-hub:
     extends:
       file: docker-compose.host.yml

@@ -1,0 +1,43 @@
+name: Router RPC CI
+
+on:
+  workflow_dispatch:
+
+concurrency:
+  group: router-rpc-ci-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  test:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.12'
+      - name: Install dependencies
+        run: |
+          python -m pip install --upgrade pip
+          pip install -r requirements.txt pytest
+      - name: Compile Python
+        run: python -m py_compile hub.py hub_entry.py router_rpc.py router_rpc_v099.py router_rpc_v010.py router_compat.py labprobe_storage.py
+      - name: Unit tests
+        shell: bash
+        run: |
+          set +e
+          PYTHONPATH=. pytest -vv --tb=short tests/test_router_rpc.py > /tmp/pytest.log 2>&1
+          STATUS=$?
+          tail -n 100 /tmp/pytest.log
+          exit $STATUS
+      - name: Upload pytest log
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: router-rpc-pytest-log
+          path: /tmp/pytest.log
+      - name: Build Docker image
+        run: docker build -t labprobe-hub:router-rpc-ci .
+      - name: Verify versions
+        run: |
+          grep -q 'HUB_VERSION = "0.9.10"' hub_entry.py
+          grep -q 'version = "0.2.9"' labrelay/Cargo.toml
