@@ -59,8 +59,15 @@ jobs:
           grep -q 'incomplete_credentials' router_relay_credentials_patch.py
           grep -q '/api/router/realtime' router_lite_realtime_patch.py
           grep -q '/api/devices/realtime' router_lite_realtime_patch.py
-          grep -q 'router lightweight realtime APIs enabled' router_lite_realtime_patch.py
-          grep -q 'HUB_VERSION = "0.9.16"' hub_entry.py
+          grep -q 'router verified realtime channels enabled' router_lite_realtime_patch.py
+          grep -q 'router_ws_fast' router_lite_realtime_patch.py
+          grep -q 'router_rpc_fast' router_lite_realtime_patch.py
+          grep -q 'router_rpc_timely' router_lite_realtime_patch.py
+          grep -q 'ws_sysinfo' router_lite_realtime_patch.py
+          grep -q 'user_list' router_lite_realtime_patch.py
+          ! grep -q '_wrap_full_device_sync' router_lite_realtime_patch.py
+          ! grep -q '_rpc_lock' router_lite_realtime_patch.py
+          grep -q 'HUB_VERSION = "0.9.17"' hub_entry.py
       - name: Build and inspect runtime Docker image
         working-directory: ${{ github.workspace }}
         run: |
