@@ -7,16 +7,14 @@ fn replace_once(source: &mut String, old: &str, new: &str, label: &str) {
         return;
     }
     if !source.contains(old) {
-        panic!("LabRelay low-traffic patch pattern missing: {label}");
+        panic!("LabRelay patch pattern missing: {label}");
     }
     *source = source.replacen(old, new, 1);
 }
 
 fn main() {
-    // Existing installations are built from the long-lived agent.rs source. Keep
-    // this narrowly scoped transformation automatic and idempotent so every
-    // local/CI/cross build gets the same direct-Hub traffic policy.
     println!("cargo:rerun-if-changed=build.rs");
+    println!("cargo:rerun-if-changed=src/runtime.rs");
     let manifest = PathBuf::from(env::var("CARGO_MANIFEST_DIR").expect("CARGO_MANIFEST_DIR"));
     let agent_path = manifest.join("src/agent.rs");
     let mut source = fs::read_to_string(&agent_path).expect("read src/agent.rs");
@@ -25,7 +23,7 @@ fn main() {
         replace_once(
             &mut source,
             "    pub router_name: String,\n    pub interval_seconds: u64,",
-            "    pub router_name: String,\n    /// Hub owns WSS/dashboard/devices; Relay only supplements IPv6 and 6to6.\n    pub hub_direct_mode: bool,\n    pub interval_seconds: u64,",
+            "    pub router_name: String,\n    /// Hub owns full eWeb sync; Relay supplies local IPv6 and requested realtime samples.\n    pub hub_direct_mode: bool,\n    pub interval_seconds: u64,",
             "AgentConfig hub_direct_mode",
         );
         replace_once(
@@ -44,7 +42,7 @@ fn main() {
         replace_once(
             &mut source,
             "fn now_epoch() -> u64 {\n    SystemTime::now()\n        .duration_since(UNIX_EPOCH)\n        .unwrap_or_default()\n        .as_secs()\n}\n",
-            "fn now_epoch() -> u64 {\n    SystemTime::now()\n        .duration_since(UNIX_EPOCH)\n        .unwrap_or_default()\n        .as_secs()\n}\n\nfn snapshot_signature(value: &Value) -> String {\n    let mut stable = value.clone();\n    if let Value::Object(root) = &mut stable {\n        root.remove(\"ts\");\n        if let Some(Value::Array(neighbors)) = root.get_mut(\"ipv6_neighbors\") {\n            for neighbor in neighbors {\n                if let Value::Object(row) = neighbor {\n                    // REACHABLE/STALE changes constantly and is not an address change.\n                    row.remove(\"state\");\n                }\n            }\n        }\n    }\n    serde_json::to_string(&stable).unwrap_or_default()\n}\n",
+            "fn now_epoch() -> u64 {\n    SystemTime::now()\n        .duration_since(UNIX_EPOCH)\n        .unwrap_or_default()\n        .as_secs()\n}\n\nfn snapshot_signature(value: &Value) -> String {\n    let mut stable = value.clone();\n    if let Value::Object(root) = &mut stable {\n        root.remove(\"ts\");\n        if let Some(Value::Array(neighbors)) = root.get_mut(\"ipv6_neighbors\") {\n            for neighbor in neighbors {\n                if let Value::Object(row) = neighbor {\n                    row.remove(\"state\");\n                }\n            }\n        }\n    }\n    serde_json::to_string(&stable).unwrap_or_default()\n}\n",
             "stable IPv6 snapshot signature",
         );
 
@@ -65,7 +63,7 @@ fn main() {
         replace_once(
             &mut source,
             "    let wan_scope = network.get(\"wan\").unwrap_or(&network);\n    let lan_scope = network.get(\"lan\").unwrap_or(&network);",
-            "    // Firmware variants place PPPoE fields under wan arrays, profiles or\n    // nested service objects. The recursive helper must inspect the full tree.\n    let wan_scope = &network;\n    let lan_scope = &network;",
+            "    let wan_scope = &network;\n    let lan_scope = &network;",
             "router-local credential tree scope",
         );
         replace_once(
@@ -83,7 +81,7 @@ fn main() {
         replace_once(
             &mut source,
             "    let lan_mac = first_text_by_keys(lan_scope, &[\"mac\", \"macaddr\", \"macAddress\", \"hwaddr\"]);\n    Ok(json!({",
-            "    let lan_mac = first_text_by_keys(lan_scope, &[\"mac\", \"macaddr\", \"macAddress\", \"hwaddr\"]);\n    let compact_password: String = password.chars().filter(|ch| !ch.is_whitespace()).collect();\n    let masked_password = !compact_password.is_empty()\n        && compact_password\n            .chars()\n            .all(|ch| matches!(ch, '*' | 'x' | 'X' | '.' | '•' | '·'));\n    if username.trim().is_empty() || password.trim().is_empty() || masked_password {\n        bail!(\"router did not expose a complete broadband credential pair\");\n    }\n    Ok(json!({",
+            "    let lan_mac = first_text_by_keys(lan_scope, &[\"mac\", \"macaddr\", \"macAddress\", \"hwaddr\"]);\n    let compact_password: String = password.chars().filter(|ch| !ch.is_whitespace()).collect();\n    let masked_password = !compact_password.is_empty()\n        && compact_password.chars().all(|ch| matches!(ch, '*' | 'x' | 'X' | '.' | '•' | '·'));\n    if username.trim().is_empty() || password.trim().is_empty() || masked_password {\n        bail!(\"router did not expose a complete broadband credential pair\");\n    }\n    Ok(json!({",
             "router-local complete credential guard",
         );
 
@@ -117,15 +115,28 @@ fn main() {
             &mut source,
             "        if dashboard_due {\n            if let Err(error) = sync_router_dashboard(&client, &config, &mut state, once).await {",
             "        if !config.hub_direct_mode && dashboard_due {\n            if let Err(error) = sync_router_dashboard(&client, &config, &mut state, once).await {",
-            "disable Relay dashboard in direct mode",
+            "disable Relay full dashboard in direct mode",
         );
-
-        fs::write(&agent_path, source).expect("write patched src/agent.rs");
     }
 
-    // Avoid a second hard-coded runtime version that can drift from Cargo.toml.
+    if !source.contains("crate::runtime::run") {
+        replace_once(
+            &mut source,
+            "    let client = http_client()?;\n    let mut last_agent_cycle_at = 0u64;",
+            "    let client = http_client()?;\n    let _runtime_task = if config.hub_direct_mode && !once {\n        Some(tokio::spawn(crate::runtime::run(config.clone())))\n    } else {\n        None\n    };\n    let mut last_agent_cycle_at = 0u64;",
+            "demand-driven local realtime task",
+        );
+    }
+    fs::write(&agent_path, source).expect("write patched src/agent.rs");
+
     let main_path = manifest.join("src/main.rs");
     let mut main_source = fs::read_to_string(&main_path).expect("read src/main.rs");
+    replace_once(
+        &mut main_source,
+        "mod agent;",
+        "mod agent;\nmod runtime;",
+        "runtime module",
+    );
     replace_once(
         &mut main_source,
         "const VERSION: &str = \"0.2.4\";",
