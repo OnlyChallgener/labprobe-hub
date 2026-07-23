@@ -164,9 +164,12 @@ def test_stale_ws_uses_independent_fast_rpc_lane():
     service.start()
     try:
         service.router_payload()
-        payload = wait_until(
-            lambda: (value := service.router_payload()) if value.get("source") == "router_rpc_fast" else None
-        )
+
+        def ready():
+            value = service.router_payload()
+            return value if value.get("source") == "router_rpc_fast" else None
+
+        payload = wait_until(ready)
         assert payload
         assert payload["uploadBps"] == 7000
         assert router_lane.calls[0][0] == "ws_sysinfo"
@@ -184,9 +187,12 @@ def test_device_timely_lane_never_calls_or_locks_full_sync():
     service.start()
     try:
         service.devices_payload()
-        latest = wait_until(
-            lambda: (value := service.devices_payload()) if value.get("devices") else None
-        )
+
+        def ready():
+            value = service.devices_payload()
+            return value if value.get("devices") else None
+
+        latest = wait_until(ready)
         assert latest
         assert latest["devices"][0]["downloadBps"] == 22
         assert latest["source"] == "router_rpc_timely"
@@ -211,10 +217,12 @@ def test_blocked_device_lane_cannot_block_router_lane():
         service.devices_payload()
         assert device_lane.entered.wait(timeout=1.0)
         service.router_payload()
-        payload = wait_until(
-            lambda: (value := service.router_payload()) if value.get("source") == "router_rpc_fast" else None,
-            timeout=1.0,
-        )
+
+        def ready():
+            value = service.router_payload()
+            return value if value.get("source") == "router_rpc_fast" else None
+
+        payload = wait_until(ready, timeout=1.0)
         assert payload
         assert payload["uploadBps"] == 9090
         assert sync.full_sync_calls == 0
