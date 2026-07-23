@@ -53,6 +53,8 @@ jobs:
         run: |
           python -m py_compile hub.py hub_entry.py labprobe_storage.py router_rpc.py router_rpc_v099.py router_rpc_v010.py router_developer_flow_patch.py router_http_developer_transport_patch.py router_be72_auth_patch.py router_be72_sid_wire_patch.py router_native_features_patch.py router_ws_patch.py router_compat.py router_realtime_stability_patch.py router_relay_credentials_patch.py
           python -m pytest -q
+          grep -q 'def _relay_credentials_push_view' router_relay_credentials_patch.py
+          grep -q 'incomplete_credentials' router_relay_credentials_patch.py
       - name: Compile and test LabRelay low-traffic agent
         working-directory: ${{ github.workspace }}/labrelay
         run: |
@@ -63,4 +65,5 @@ jobs:
           grep -q 'credentialsSince={}&wait=55' src/agent.rs
           grep -q '.timeout(request_timeout)' src/agent.rs
           grep -q 'credentialsCompletedNonce' src/agent.rs
+          grep -q 'router did not expose a complete broadband credential pair' src/agent.rs
           grep -q 'env!("CARGO_PKG_VERSION")' src/main.rs
