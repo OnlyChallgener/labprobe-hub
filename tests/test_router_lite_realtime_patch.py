@@ -20,6 +20,11 @@ def _fixture():
     return hub, RouterLiteRealtimeService(hub)
 
 
+def _activate_both(service):
+    service.mark_router_demand()
+    service.mark_device_demand()
+
+
 def test_router_request_marks_demand_and_returns_immediately():
     _hub, service = _fixture()
     started = time.monotonic()
@@ -56,28 +61,43 @@ def test_device_request_wakes_idle_agent_long_poll():
     assert result["sequence"] >= 1
 
 
-def test_app_demand_lease_expires_and_relay_push_does_not_keep_it_alive():
+def test_app_demand_lease_expires_and_relay_push_is_not_cached():
     _hub, service = _fixture()
-    service.mark_router_demand()
-    service.mark_device_demand()
-    assert service.demand_payload()["routerActive"] is True
-    assert service.demand_payload()["devicesActive"] is True
+    _activate_both(service)
+    first_ms = int(time.time() * 1000)
+    accepted = service.accept_push({
+        "sampleEpochMs": first_ms,
+        "routerSample": {"uploadBps": 1},
+        "devices": [{"mac": "aa", "uploadBps": 2, "downloadBps": 3, "connectionCount": 4}],
+    })
+    assert accepted["acceptedRouter"] is True
+    assert accepted["acceptedDevices"] is True
 
     with service._demand:
         service._router_demand_until = time.time() - 0.01
         service._devices_demand_until = time.time() - 0.01
 
     expired = service.accept_push({
-        "sampleEpochMs": int(time.time() * 1000),
-        "routerSample": {"uploadBps": 1},
-        "devices": [],
+        "sampleEpochMs": first_ms + 1000,
+        "routerSample": {"uploadBps": 999},
+        "devices": [{"mac": "aa", "uploadBps": 888, "downloadBps": 777, "connectionCount": 6}],
     })
     assert expired["routerActive"] is False
     assert expired["devicesActive"] is False
+    assert expired["acceptedRouter"] is False
+    assert expired["acceptedDevices"] is False
+
+    # Inspect memory directly so the assertion itself does not renew APP demand.
+    with service._lock:
+        assert service._router_sample["uploadBps"] == 1
+        assert service._router_epoch_ms == first_ms
+        assert service._devices[0]["uploadBps"] == 2
+        assert service._devices_epoch_ms == first_ms
 
 
 def test_relay_push_updates_router_and_device_memory_samples():
     _hub, service = _fixture()
+    _activate_both(service)
     now_ms = int(time.time() * 1000)
     response = service.accept_push({
         "source": "relay_local_dev_sta",
@@ -100,6 +120,8 @@ def test_relay_push_updates_router_and_device_memory_samples():
     })
 
     assert response["ok"] is True
+    assert response["acceptedRouter"] is True
+    assert response["acceptedDevices"] is True
     router = service.router_payload()
     devices = service.devices_payload()
     assert router["uploadBps"] == 1234
@@ -120,6 +142,7 @@ def test_relay_push_updates_router_and_device_memory_samples():
 
 def test_router_and_device_samples_can_update_independently():
     _hub, service = _fixture()
+    _activate_both(service)
     first_ms = int(time.time() * 1000)
     service.accept_push({
         "sampleEpochMs": first_ms,
@@ -137,6 +160,7 @@ def test_router_and_device_samples_can_update_independently():
 
 def test_expired_samples_are_reported_stale_without_blocking():
     _hub, service = _fixture()
+    _activate_both(service)
     old_ms = int((time.time() - 10) * 1000)
     service.accept_push({
         "sampleEpochMs": old_ms,
@@ -168,3 +192,5 @@ def test_service_contains_no_high_frequency_eweb_or_full_sync_path():
     assert "sync_devices" not in source
     assert "_rpc_lock" not in source
     assert "relay_local_dev_sta" in source
+    assert 'demand["acceptedRouter"]' in source
+    assert 'demand["acceptedDevices"]' in source
