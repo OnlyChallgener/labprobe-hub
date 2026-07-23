@@ -5,6 +5,7 @@ on:
     branches:
       - codex/router-rpc-v098-relay-v029
     paths:
+      - Dockerfile
       - router_*.py
       - hub.py
       - hub_entry.py
@@ -16,6 +17,7 @@ on:
       - .github/workflows/router-integration-check.yml
   pull_request:
     paths:
+      - Dockerfile
       - router_*.py
       - hub.py
       - hub_entry.py
@@ -59,6 +61,13 @@ jobs:
           grep -q '/api/devices/realtime' router_lite_realtime_patch.py
           grep -q 'router lightweight realtime APIs enabled' router_lite_realtime_patch.py
           grep -q 'HUB_VERSION = "0.9.16"' hub_entry.py
+      - name: Build and inspect runtime Docker image
+        working-directory: ${{ github.workspace }}
+        run: |
+          set -e
+          docker build --tag labprobe-hub-ci:latest .
+          docker run --rm --entrypoint sh labprobe-hub-ci:latest -c 'test -f /app/router_lite_realtime_patch.py'
+          docker run --rm --entrypoint python labprobe-hub-ci:latest -c 'import router_lite_realtime_patch; print("router_lite_realtime_patch import ok")'
       - name: Compile and test LabRelay low-traffic agent
         working-directory: ${{ github.workspace }}/labrelay
         run: |
