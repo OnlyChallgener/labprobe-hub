@@ -165,10 +165,19 @@ def test_agent_command_response_reports_requested_and_completed_nonce():
     assert payload["credentialsCompletedNonce"] == 101
 
 
-def test_agent_long_poll_wakes_immediately_on_credential_refresh():
+def test_agent_long_poll_wakes_immediately_on_credential_refresh(monkeypatch):
     app = Flask(__name__)
     sync = _command_fixture(requested=100, completed=100)
     result = {}
+    entered_snapshot = threading.Event()
+    original_snapshot = credentials_patch._agent_command_snapshot
+
+    def observed_snapshot(owner, router):
+        value = original_snapshot(owner, router)
+        entered_snapshot.set()
+        return value
+
+    monkeypatch.setattr(credentials_patch, "_agent_command_snapshot", observed_snapshot)
 
     def wait_for_command():
         started = time.monotonic()
@@ -180,7 +189,7 @@ def test_agent_long_poll_wakes_immediately_on_credential_refresh():
 
     thread = threading.Thread(target=wait_for_command)
     thread.start()
-    time.sleep(0.1)
+    assert entered_snapshot.wait(timeout=1.0)
     with sync.hub.ROUTER_CREDENTIALS_LOCK:
         sync.hub.ROUTER_CREDENTIALS_REFRESH_NONCE = 101
     with _AGENT_COMMAND_CONDITION:
