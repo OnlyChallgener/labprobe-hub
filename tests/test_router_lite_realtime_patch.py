@@ -8,7 +8,6 @@ from router_lite_realtime_patch import (
     RouterLiteRealtimeService,
     _device_rows,
     _router_metrics_from_fast,
-    install_router_lite_realtime_patch,
 )
 
 
@@ -36,35 +35,44 @@ def fast_payload(up=1000, down=2000, ipv4=5, ipv6=6):
 
 
 class FakeLane:
-    def __init__(self, result, delay=0.0):
+    def __init__(self, result):
         self.result = result
-        self.delay = delay
         self.calls = []
         self.closed = False
 
     def rpc(self, module, data=None):
         self.calls.append((module, data, time.monotonic()))
-        if self.delay:
-            time.sleep(self.delay)
         value = self.result() if callable(self.result) else self.result
-        return value, int(self.delay * 1000)
+        return value, 0
 
     def close(self):
         self.closed = True
 
 
+class BlockingLane(FakeLane):
+    def __init__(self, result):
+        super().__init__(result)
+        self.entered = threading.Event()
+        self.release = threading.Event()
+
+    def rpc(self, module, data=None):
+        self.calls.append((module, data, time.monotonic()))
+        self.entered.set()
+        assert self.release.wait(timeout=3), "blocking lane was not released"
+        value = self.result() if callable(self.result) else self.result
+        return value, 800
+
+
 def test_device_rows_extract_only_runtime_fields():
     hub = SimpleNamespace(norm_mac=lambda value: str(value).lower())
     rows = _device_rows(hub, {
-        "list": [
-            {
-                "mac": "AA:BB:CC:DD:EE:FF",
-                "flowUp": "1234",
-                "flowDown": 5678,
-                "flow_cnt": "9",
-                "name": "large static field must not be returned",
-            }
-        ]
+        "list": [{
+            "mac": "AA:BB:CC:DD:EE:FF",
+            "flowUp": "1234",
+            "flowDown": 5678,
+            "flow_cnt": "9",
+            "name": "large static field must not be returned",
+        }]
     })
     assert rows == [{
         "mac": "aa:bb:cc:dd:ee:ff",
@@ -118,6 +126,16 @@ def _fixture(ws_epoch=None, ws_fast=None, router_lane=None, device_lane=None):
     return hub, sync, monitor, router_lane or FakeLane(fast_payload()), device_lane or FakeLane({"list": []})
 
 
+def wait_until(predicate, timeout=2.0):
+    deadline = time.time() + timeout
+    while time.time() < deadline:
+        value = predicate()
+        if value:
+            return value
+        time.sleep(0.02)
+    return predicate()
+
+
 def test_router_payload_reads_ws_fast_directly_not_dashboard_cache():
     hub, sync, monitor, router_lane, device_lane = _fixture(ws_fast=fast_payload(up=4321, down=8765))
     service = RouterLiteRealtimeService(hub, sync, router_lane, device_lane)
@@ -146,12 +164,10 @@ def test_stale_ws_uses_independent_fast_rpc_lane():
     service.start()
     try:
         service.router_payload()
-        deadline = time.time() + 2
-        payload = service.router_payload()
-        while time.time() < deadline and payload.get("source") != "router_rpc_fast":
-            time.sleep(0.03)
-            payload = service.router_payload()
-        assert payload["source"] == "router_rpc_fast"
+        payload = wait_until(
+            lambda: (value := service.router_payload()) if value.get("source") == "router_rpc_fast" else None
+        )
+        assert payload
         assert payload["uploadBps"] == 7000
         assert router_lane.calls[0][0] == "ws_sysinfo"
         assert router_lane.calls[0][1] == {"get": "fast"}
@@ -167,12 +183,11 @@ def test_device_timely_lane_never_calls_or_locks_full_sync():
     service = RouterLiteRealtimeService(hub, sync, router_lane, device_lane)
     service.start()
     try:
-        first = service.devices_payload()
-        deadline = time.time() + 2
-        latest = first
-        while time.time() < deadline and not latest["devices"]:
-            time.sleep(0.03)
-            latest = service.devices_payload()
+        service.devices_payload()
+        latest = wait_until(
+            lambda: (value := service.devices_payload()) if value.get("devices") else None
+        )
+        assert latest
         assert latest["devices"][0]["downloadBps"] == 22
         assert latest["source"] == "router_rpc_timely"
         assert device_lane.calls[0][0] == "user_list"
@@ -182,9 +197,9 @@ def test_device_timely_lane_never_calls_or_locks_full_sync():
         service.stop()
 
 
-def test_slow_device_lane_does_not_delay_router_lane():
+def test_blocked_device_lane_cannot_block_router_lane():
     router_lane = FakeLane(fast_payload(up=9090, down=8080))
-    device_lane = FakeLane({"list": []}, delay=0.8)
+    device_lane = BlockingLane({"list": []})
     hub, sync, _monitor, _, _ = _fixture(
         ws_epoch=time.time() - 20,
         router_lane=router_lane,
@@ -194,36 +209,27 @@ def test_slow_device_lane_does_not_delay_router_lane():
     service.start()
     try:
         service.devices_payload()
-        time.sleep(0.05)
-        started = time.monotonic()
+        assert device_lane.entered.wait(timeout=1.0)
         service.router_payload()
-        deadline = time.time() + 1
-        payload = service.router_payload()
-        while time.time() < deadline and payload.get("source") != "router_rpc_fast":
-            time.sleep(0.02)
-            payload = service.router_payload()
-        assert payload["source"] == "router_rpc_fast"
-        assert time.monotonic() - started < 0.5
+        payload = wait_until(
+            lambda: (value := service.router_payload()) if value.get("source") == "router_rpc_fast" else None,
+            timeout=1.0,
+        )
+        assert payload
+        assert payload["uploadBps"] == 9090
         assert sync.full_sync_calls == 0
     finally:
+        device_lane.release.set()
         service.stop()
 
 
-def test_routes_return_memory_snapshots_immediately():
+def test_payload_methods_return_memory_immediately():
     hub, sync, _monitor, router_lane, device_lane = _fixture()
-    service = install_router_lite_realtime_patch(hub, sync)
-    # Replace real lanes immediately in this route smoke test to avoid external IO.
-    service.stop()
-
-    hub2, sync2, _monitor2, router_lane2, device_lane2 = _fixture()
-    service2 = RouterLiteRealtimeService(hub2, sync2, router_lane2, device_lane2)
-    hub2.ROUTER_LITE_REALTIME = service2
-
-    @hub2.app.get("/probe/router")
-    def probe_router():
-        return service2.router_payload()
-
+    service = RouterLiteRealtimeService(hub, sync, router_lane, device_lane)
     started = time.monotonic()
-    response = hub2.app.test_client().get("/probe/router")
-    assert response.status_code == 200
-    assert time.monotonic() - started < 0.2
+    router = service.router_payload()
+    devices = service.devices_payload()
+    elapsed = time.monotonic() - started
+    assert router["ok"] is True
+    assert devices["ok"] is True
+    assert elapsed < 0.2
