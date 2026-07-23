@@ -10,6 +10,7 @@ from router_relay_credentials_patch import (
     _agent_commands_view,
     _direct_credentials_refresh_view,
     _extract_router_credentials,
+    _relay_credentials_push_view,
     _relay_dashboard_ack,
 )
 
@@ -80,6 +81,7 @@ def test_extract_router_credentials_rejects_masked_password():
 def _refresh_fixture():
     hub = SimpleNamespace(
         check_app_token=lambda: True,
+        check_hook_token=lambda: True,
         ROUTER_CREDENTIALS_LOCK=threading.RLock(),
         ROUTER_CREDENTIALS_REFRESH_NONCE=100,
         ROUTER_CREDENTIALS_CACHE={},
@@ -134,6 +136,57 @@ def test_complete_direct_credentials_are_memory_only_and_completed(monkeypatch):
     assert sync.hub.ROUTER_CREDENTIALS_CACHE["username"] == "broadband-user"
     assert sync.hub.ROUTER_CREDENTIALS_CACHE["password"] == "broadband-pass"
     assert sync.hub.ROUTER_CREDENTIALS_CACHE["refreshCompletedNonce"] == 101
+
+
+def test_incomplete_relay_push_does_not_overwrite_valid_memory_cache():
+    app = Flask(__name__)
+    sync = _refresh_fixture()
+    sync.hub.ROUTER_CREDENTIALS_REFRESH_NONCE = 101
+    sync.hub.ROUTER_CREDENTIALS_CACHE.update({
+        "username": "old-user",
+        "password": "old-pass",
+        "refreshCompletedNonce": 100,
+    })
+
+    with app.test_request_context(
+        "/api/router/dashboard/credentials/push",
+        method="POST",
+        json={"router": "router", "username": "new-user", "password": "******", "refreshNonce": 101},
+    ):
+        response, status = _relay_credentials_push_view(sync)
+        payload = response.get_json()
+
+    assert status == 422
+    assert payload["error"] == "incomplete_credentials"
+    assert sync.hub.ROUTER_CREDENTIALS_CACHE["username"] == "old-user"
+    assert sync.hub.ROUTER_CREDENTIALS_CACHE["password"] == "old-pass"
+    assert sync.hub.ROUTER_CREDENTIALS_CACHE["refreshCompletedNonce"] == 100
+
+
+def test_complete_relay_push_updates_memory_cache_and_nonce():
+    app = Flask(__name__)
+    sync = _refresh_fixture()
+    sync.hub.ROUTER_CREDENTIALS_REFRESH_NONCE = 101
+
+    with app.test_request_context(
+        "/api/router/dashboard/credentials/push",
+        method="POST",
+        json={
+            "router": "router",
+            "lanMac": "10:5f:02:05:80:67",
+            "username": "local-user",
+            "password": "local-pass",
+            "refreshNonce": 101,
+        },
+    ):
+        payload = _relay_credentials_push_view(sync).get_json()
+
+    assert payload["ok"] is True
+    assert payload["refreshNonce"] == 101
+    assert sync.hub.ROUTER_CREDENTIALS_CACHE["username"] == "local-user"
+    assert sync.hub.ROUTER_CREDENTIALS_CACHE["password"] == "local-pass"
+    assert sync.hub.ROUTER_CREDENTIALS_CACHE["refreshCompletedNonce"] == 101
+    assert sync.hub.ROUTER_CREDENTIALS_CACHE["source"] == "router_local_agent"
 
 
 def _command_fixture(requested=100, completed=100):
