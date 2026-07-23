@@ -60,7 +60,7 @@ jobs:
           cargo build --release
           grep -q 'pub hub_direct_mode: bool' src/agent.rs
           grep -q 'if !config.hub_direct_mode && dashboard_due' src/agent.rs
-          grep -q 'credentialsSince={}&wait=300' src/agent.rs
+          grep -q 'credentialsSince={}&wait=55' src/agent.rs
           grep -q '.timeout(request_timeout)' src/agent.rs
           grep -q 'credentialsCompletedNonce' src/agent.rs
           grep -q 'env!("CARGO_PKG_VERSION")' src/main.rs
