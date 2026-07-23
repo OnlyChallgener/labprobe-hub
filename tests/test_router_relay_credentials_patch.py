@@ -1,10 +1,13 @@
 import threading
+import time
 from types import SimpleNamespace
 
 from flask import Flask
 
 import router_relay_credentials_patch as credentials_patch
 from router_relay_credentials_patch import (
+    _AGENT_COMMAND_CONDITION,
+    _agent_commands_view,
     _direct_credentials_refresh_view,
     _extract_router_credentials,
     _relay_dashboard_ack,
@@ -131,3 +134,60 @@ def test_complete_direct_credentials_are_memory_only_and_completed(monkeypatch):
     assert sync.hub.ROUTER_CREDENTIALS_CACHE["username"] == "broadband-user"
     assert sync.hub.ROUTER_CREDENTIALS_CACHE["password"] == "broadband-pass"
     assert sync.hub.ROUTER_CREDENTIALS_CACHE["refreshCompletedNonce"] == 101
+
+
+def _command_fixture(requested=100, completed=100):
+    hub = SimpleNamespace(
+        check_hook_token=lambda: True,
+        clean_saved_value=lambda value: str(value or "").strip(),
+        primary_router_name=lambda: "router",
+        AGENT_UPDATE_COMMANDS_FILE="commands.json",
+        load_json=lambda _path, default: default,
+        ROUTER_CREDENTIALS_LOCK=threading.RLock(),
+        ROUTER_CREDENTIALS_REFRESH_NONCE=requested,
+        ROUTER_CREDENTIALS_CACHE={"refreshCompletedNonce": completed},
+        now_str=lambda: "2026-07-23 10:00:00",
+    )
+    return SimpleNamespace(hub=hub)
+
+
+def test_agent_command_response_reports_requested_and_completed_nonce():
+    app = Flask(__name__)
+    sync = _command_fixture(requested=101, completed=101)
+
+    with app.test_request_context(
+        "/api/router/agent/commands?router=router&credentialsSince=100&wait=0"
+    ):
+        payload = _agent_commands_view(sync).get_json()
+
+    assert payload["commands"] == []
+    assert payload["credentialsRefreshNonce"] == 101
+    assert payload["credentialsCompletedNonce"] == 101
+
+
+def test_agent_long_poll_wakes_immediately_on_credential_refresh():
+    app = Flask(__name__)
+    sync = _command_fixture(requested=100, completed=100)
+    result = {}
+
+    def wait_for_command():
+        started = time.monotonic()
+        with app.test_request_context(
+            "/api/router/agent/commands?router=router&credentialsSince=100&wait=2"
+        ):
+            result["payload"] = _agent_commands_view(sync).get_json()
+        result["elapsed"] = time.monotonic() - started
+
+    thread = threading.Thread(target=wait_for_command)
+    thread.start()
+    time.sleep(0.1)
+    with sync.hub.ROUTER_CREDENTIALS_LOCK:
+        sync.hub.ROUTER_CREDENTIALS_REFRESH_NONCE = 101
+    with _AGENT_COMMAND_CONDITION:
+        _AGENT_COMMAND_CONDITION.notify_all()
+    thread.join(timeout=1.5)
+
+    assert not thread.is_alive()
+    assert result["elapsed"] < 1.0
+    assert result["payload"]["credentialsRefreshNonce"] == 101
+    assert result["payload"]["credentialsCompletedNonce"] == 100
