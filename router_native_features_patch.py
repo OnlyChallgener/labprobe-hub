@@ -6,6 +6,8 @@ router login or WebSocket connection is created.
 """
 from __future__ import annotations
 
+import json
+import threading
 import time
 from typing import Any, Callable, Dict
 
@@ -47,6 +49,24 @@ def normalize_nat_request(body: Dict[str, Any]) -> Dict[str, Any]:
     }
 
 
+def _nat_result_with_request(data: Any, requested: Dict[str, Any]) -> Any:
+    """Attach the requested STUN port without changing router result fields."""
+    parsed = data
+    if isinstance(parsed, str):
+        try:
+            parsed = json.loads(parsed)
+        except Exception:
+            return data
+    if not isinstance(parsed, dict):
+        return parsed
+    result = dict(parsed)
+    result["requested_host"] = requested.get("host", DEFAULT_STUN_HOST)
+    result["requested_port"] = int(requested.get("port") or 3478)
+    result["requested_interface"] = requested.get("interface", "wan")
+    result["requested_mode"] = requested.get("mode", "classic")
+    return result
+
+
 def install_router_native_features_patch() -> None:
     if getattr(v099, "_labprobe_native_features_patch", False):
         return
@@ -76,14 +96,28 @@ def install_router_native_features_patch() -> None:
         if client is None:
             raise RuntimeError("router client capture failed")
 
+        nat_request_lock = threading.RLock()
+        last_nat_request: Dict[str, Any] = {
+            "host": DEFAULT_STUN_HOST,
+            "port": 3478,
+            "interface": "wan",
+            "mode": "classic",
+        }
+
         @bp.get("/nat-diagnostic")
         def nat_diagnostic_get():
-            return jsonify({"ok": True, "data": client.rpc("devSta.get", "nat_detector")})
+            data = client.rpc("devSta.get", "nat_detector")
+            with nat_request_lock:
+                requested = dict(last_nat_request)
+            return jsonify({"ok": True, "data": _nat_result_with_request(data, requested)})
 
         @bp.post("/nat-diagnostic")
         def nat_diagnostic_start():
             payload = normalize_nat_request(request.get_json(silent=True) or {})
             client.rpc("devSta.set", "nat_detector", payload)
+            with nat_request_lock:
+                last_nat_request.clear()
+                last_nat_request.update(payload)
             return jsonify({
                 "ok": True,
                 "message": "路由NAT诊断已启动",
