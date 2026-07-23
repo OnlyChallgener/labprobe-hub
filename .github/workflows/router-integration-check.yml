@@ -58,11 +58,15 @@ jobs:
           grep -q '/api/router/realtime/agent/demand' router_lite_realtime_patch.py
           grep -q '/api/router/realtime/agent/push' router_lite_realtime_patch.py
           grep -q 'relay_local_dev_sta' router_lite_realtime_patch.py
+          grep -q 'acceptedRouter' router_lite_realtime_patch.py
+          grep -q 'acceptedDevices' router_lite_realtime_patch.py
+          grep -q 'if router_active else {}' router_lite_realtime_patch.py
+          grep -q 'devices_active and isinstance' router_lite_realtime_patch.py
           ! grep -q 'requests.Session' router_lite_realtime_patch.py
           ! grep -q 'ws_sysinfo' router_lite_realtime_patch.py
           ! grep -q 'user_list' router_lite_realtime_patch.py
           ! grep -q 'sync_devices' router_lite_realtime_patch.py
-          grep -q 'HUB_VERSION = "0.9.18"' hub_entry.py
+          grep -q 'HUB_VERSION = "0.9.19"' hub_entry.py
       - name: Build and inspect runtime Docker image
         working-directory: ${{ github.workspace }}
         run: |
