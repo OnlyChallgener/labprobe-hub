@@ -80,6 +80,12 @@ fn main() {
             "&[\"password\", \"passwd\", \"pwd\", \"passWord\", \"pppoePassword\", \"pppoe_password\", \"pppoe_passwd\", \"broadbandPassword\", \"broadbandPasswd\"],",
             "router-local password keys",
         );
+        replace_once(
+            &mut source,
+            "    let lan_mac = first_text_by_keys(lan_scope, &[\"mac\", \"macaddr\", \"macAddress\", \"hwaddr\"]);\n    Ok(json!({",
+            "    let lan_mac = first_text_by_keys(lan_scope, &[\"mac\", \"macaddr\", \"macAddress\", \"hwaddr\"]);\n    let compact_password: String = password.chars().filter(|ch| !ch.is_whitespace()).collect();\n    let masked_password = !compact_password.is_empty()\n        && compact_password\n            .chars()\n            .all(|ch| matches!(ch, '*' | 'x' | 'X' | '.' | '•' | '·'));\n    if username.trim().is_empty() || password.trim().is_empty() || masked_password {\n        bail!(\"router did not expose a complete broadband credential pair\");\n    }\n    Ok(json!({",
+            "router-local complete credential guard",
+        );
 
         replace_once(
             &mut source,
