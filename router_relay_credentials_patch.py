@@ -7,8 +7,8 @@ over eWeb, the lightweight Agent command endpoint wakes the router-local Relay
 fallback without uploading dashboard snapshots.
 
 The Agent endpoint supports long polling. In steady state the router keeps one
-small request open for up to five minutes instead of sending frequent request
-headers, while credential refreshes wake it immediately.
+small request open instead of sending frequent request headers, while credential
+refreshes wake it immediately.
 
 Credentials remain memory-only and are never logged, persisted, backed up or
 published over MQTT.
@@ -268,6 +268,46 @@ def _direct_credentials_refresh_view(self: Any):
     })
 
 
+def _relay_credentials_push_view(self: Any):
+    """Accept only a complete, unmasked router-local credential pair."""
+    if not self.hub.check_hook_token():
+        return jsonify({"ok": False, "error": "bad agent token"}), 401
+    payload = request.get_json(silent=True) or {}
+    if not isinstance(payload, dict):
+        return jsonify({"ok": False, "error": "invalid payload"}), 400
+
+    username = _clean_value(payload.get("username"))
+    password = _clean_value(payload.get("password"), secret=True)
+    completed = _safe_int(payload.get("refreshNonce"), 0)
+    if not username or not password or completed <= 0:
+        # Never overwrite a prior valid memory snapshot with an empty/masked
+        # router response, and never acknowledge the nonce so Relay retries.
+        with self.hub.ROUTER_CREDENTIALS_LOCK:
+            requested = self.hub.ROUTER_CREDENTIALS_REFRESH_NONCE
+        return jsonify({
+            "ok": False,
+            "error": "incomplete_credentials",
+            "message": "router did not expose a complete broadband credential pair",
+            "refreshNonce": requested,
+        }), 422
+
+    safe = {
+        "router": _clean_value(payload.get("router")) or self.hub.primary_router_name() or "router",
+        "lanMac": _clean_value(payload.get("lanMac")),
+        "username": username,
+        "password": password,
+        "refreshCompletedNonce": completed,
+        "receivedAt": self.hub.now_str(),
+        "receivedEpoch": time.time(),
+        "source": "router_local_agent",
+    }
+    with self.hub.ROUTER_CREDENTIALS_LOCK:
+        self.hub.ROUTER_CREDENTIALS_CACHE.clear()
+        self.hub.ROUTER_CREDENTIALS_CACHE.update(safe)
+        requested = self.hub.ROUTER_CREDENTIALS_REFRESH_NONCE
+    return jsonify({"ok": True, "time": self.hub.now_str(), "refreshNonce": requested})
+
+
 def _agent_command_snapshot(self: Any, router: str) -> tuple[list[Dict[str, Any]], int, int]:
     data = self.hub.load_json(self.hub.AGENT_UPDATE_COMMANDS_FILE, {"commands": []})
     commands = data.get("commands", []) if isinstance(data, dict) else []
@@ -315,12 +355,15 @@ def install_router_relay_credentials_patch() -> None:
         result = original_start(self)
         if "api_router_credentials_refresh" in self.hub.app.view_functions:
             self.hub.app.view_functions["api_router_credentials_refresh"] = self.direct_credentials_refresh_view
+        if "api_router_credentials_push" in self.hub.app.view_functions:
+            self.hub.app.view_functions["api_router_credentials_push"] = self.relay_credentials_push_view
         if "api_router_agent_commands" in self.hub.app.view_functions:
             self.hub.app.view_functions["api_router_agent_commands"] = self.agent_commands_view
         return result
 
     cls.ignored_relay_dashboard_push = _relay_dashboard_ack
     cls.direct_credentials_refresh_view = _direct_credentials_refresh_view
+    cls.relay_credentials_push_view = _relay_credentials_push_view
     cls.agent_commands_view = _agent_commands_view
     cls.start = start_with_scoped_routes
     cls._labprobe_relay_credentials_patch = True
