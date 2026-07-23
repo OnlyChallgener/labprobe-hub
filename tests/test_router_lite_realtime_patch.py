@@ -56,6 +56,26 @@ def test_device_request_wakes_idle_agent_long_poll():
     assert result["sequence"] >= 1
 
 
+def test_app_demand_lease_expires_and_relay_push_does_not_keep_it_alive():
+    _hub, service = _fixture()
+    service.mark_router_demand()
+    service.mark_device_demand()
+    assert service.demand_payload()["routerActive"] is True
+    assert service.demand_payload()["devicesActive"] is True
+
+    with service._demand:
+        service._router_demand_until = time.time() - 0.01
+        service._devices_demand_until = time.time() - 0.01
+
+    expired = service.accept_push({
+        "sampleEpochMs": int(time.time() * 1000),
+        "routerSample": {"uploadBps": 1},
+        "devices": [],
+    })
+    assert expired["routerActive"] is False
+    assert expired["devicesActive"] is False
+
+
 def test_relay_push_updates_router_and_device_memory_samples():
     _hub, service = _fixture()
     now_ms = int(time.time() * 1000)
