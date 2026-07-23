@@ -1,13 +1,17 @@
 # LabProbe 变更记录
 
-## 0.9.15 / LabRelay 0.2.9
+## 0.9.15 / LabRelay 0.2.10
 
 - 路由器实时仪表盘与终端列表拆成独立线程，慢速终端 RPC 不再阻塞 WSS 快数据刷新。
 - WSS 快照默认每 1 秒归一化并写入 Hub 内存，APP 可连续读取最新速率、连接数、CPU、内存和温度。
 - 瞬时空响应不再清空已有仪表盘，Hub 会深度合并新快照并保留上一份完整配置，避免刷新时页面变白。
-- 手动刷新改为立即返回并在后台更新终端和配置，不再长时间占用 APP 刷新按钮。
+- 手动刷新立即返回并在后台更新终端和配置，不再长时间占用 APP 刷新按钮。
 - 路由器状态接口统一返回中文，并区分“已连接且数据正常”“已连接正在同步”“连接恢复中”。
-- Hub 版本提升至 0.9.15；LabRelay 继续使用 0.2.9，无需更新。
+- Hub 直接复用现有 eWeb 会话读取完整 PPPoE 账号密码；固件仅返回部分字段时，由轻量 Agent 指令轮询触发路由器本地 `dev_config network` 兜底，凭证只保存在 Hub 内存。
+- LabRelay 默认启用 Hub 直连模式，不再上传完整仪表盘、终端列表和设备事件；仅保留 IPv6 邻居、6to6、端口映射及按需凭证兜底。
+- Relay Agent 主循环最低 60 秒，状态心跳 5 分钟，端口映射状态 5 分钟；IPv6 快照仅在内容变化或 15 分钟心跳时发送，避免每天产生数 MB 无效流量。
+- 路由 NAT 结果附带实际请求的 STUN 端口，使 APP 可分别保存 3478 与 5478 的最新结果。
+- Hub 版本保持 0.9.15；LabRelay 提升至 0.2.10，需要同步更新路由器端 Agent。
 
 ## 0.9.14 / LabRelay 0.2.9
 
@@ -87,6 +91,3 @@
 ## 0.7.x–0.8.x（历史版本）
 
 早期 DSM/NAS 专用部署说明、逐版本发布记录和 Shell 采集方案已合并归档。为避免继续误用旧入口，仓库不再保留这些分散文件；完整历史仍可从 Git 提交记录查看。
-
-- Hub 0.9.5 hotfix: credentials refresh nonce now starts from epoch milliseconds, preventing a Hub restart from reusing a nonce already acknowledged by LabRelay.
-- LabRelay 0.2.6 exposes `network.wan[].service` as `details.lan.broadbandRemark`; credentials remain memory-only.
