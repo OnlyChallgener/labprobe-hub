@@ -3,9 +3,12 @@
 Hub direct RPC is authoritative for router telemetry and terminal data. This
 patch first reads the temporary PPPoE credentials through the existing Hub
 router session. If a firmware does not expose a complete username/password pair
-over eWeb, the refresh nonce is also returned by the lightweight Agent command
-endpoint so Relay can perform the router-local ``dev_config get -m network
-'{}'`` fallback without uploading dashboard snapshots.
+over eWeb, the lightweight Agent command endpoint wakes the router-local Relay
+fallback without uploading dashboard snapshots.
+
+The Agent endpoint supports long polling. In steady state the router keeps one
+small request open for up to five minutes instead of sending frequent request
+headers, while credential refreshes wake it immediately.
 
 Credentials remain memory-only and are never logged, persisted, backed up or
 published over MQTT.
@@ -14,6 +17,7 @@ from __future__ import annotations
 
 import json
 import re
+import threading
 import time
 from typing import Any, Dict, Iterable, Tuple
 
@@ -31,6 +35,7 @@ _PASSWORD_KEYS = {
     "broadbandpassword",
 }
 _MAC_KEYS = {"mac", "macaddr", "macaddress", "hwaddr", "lanmac"}
+_AGENT_COMMAND_CONDITION = threading.Condition()
 
 
 def _normalized_key(value: Any) -> str:
@@ -48,6 +53,13 @@ def _clean_value(value: Any, *, secret: bool = False) -> str:
         if compact and all(ch in "*xX•·." for ch in compact):
             return ""
     return text
+
+
+def _safe_int(value: Any, default: int = 0) -> int:
+    try:
+        return int(str(value).strip())
+    except (TypeError, ValueError):
+        return default
 
 
 def _decode_payload(value: Any) -> Any:
@@ -239,6 +251,12 @@ def _direct_credentials_refresh_view(self: Any):
             self.hub.ROUTER_CREDENTIALS_CACHE.clear()
             self.hub.ROUTER_CREDENTIALS_CACHE.update(safe)
 
+    # Wake the single long-polling Relay immediately. For a direct-complete
+    # result it advances its nonce without re-reading the router; otherwise it
+    # performs the local fallback and pushes the complete pair.
+    with _AGENT_COMMAND_CONDITION:
+        _AGENT_COMMAND_CONDITION.notify_all()
+
     return jsonify({
         "ok": True,
         "refreshNonce": nonce,
@@ -250,11 +268,7 @@ def _direct_credentials_refresh_view(self: Any):
     })
 
 
-def _agent_commands_view(self: Any):
-    """Combine update commands and the credential nonce in one tiny poll."""
-    if not self.hub.check_hook_token():
-        return jsonify({"ok": False, "error": "bad agent token"}), 401
-    router = self.hub.clean_saved_value(request.args.get("router")) or self.hub.primary_router_name()
+def _agent_command_snapshot(self: Any, router: str) -> tuple[list[Dict[str, Any]], int, int]:
     data = self.hub.load_json(self.hub.AGENT_UPDATE_COMMANDS_FILE, {"commands": []})
     commands = data.get("commands", []) if isinstance(data, dict) else []
     pending = [
@@ -262,11 +276,30 @@ def _agent_commands_view(self: Any):
         if isinstance(row, dict) and row.get("router") == router and row.get("state") == "pending"
     ][:5]
     with self.hub.ROUTER_CREDENTIALS_LOCK:
-        credentials_nonce = self.hub.ROUTER_CREDENTIALS_REFRESH_NONCE
+        requested = self.hub.ROUTER_CREDENTIALS_REFRESH_NONCE
+        completed = _safe_int(self.hub.ROUTER_CREDENTIALS_CACHE.get("refreshCompletedNonce"), 0)
+    return pending, requested, completed
+
+
+def _agent_commands_view(self: Any):
+    """Return commands with a low-traffic, credential-aware long poll."""
+    if not self.hub.check_hook_token():
+        return jsonify({"ok": False, "error": "bad agent token"}), 401
+    router = self.hub.clean_saved_value(request.args.get("router")) or self.hub.primary_router_name()
+    since_credentials = max(0, _safe_int(request.args.get("credentialsSince"), 0))
+    wait_seconds = min(300, max(0, _safe_int(request.args.get("wait"), 0)))
+
+    with _AGENT_COMMAND_CONDITION:
+        pending, requested, completed = _agent_command_snapshot(self, router)
+        if wait_seconds and not pending and requested <= since_credentials:
+            _AGENT_COMMAND_CONDITION.wait(timeout=wait_seconds)
+            pending, requested, completed = _agent_command_snapshot(self, router)
+
     return jsonify({
         "ok": True,
         "commands": pending,
-        "credentialsRefreshNonce": credentials_nonce,
+        "credentialsRefreshNonce": requested,
+        "credentialsCompletedNonce": completed,
         "time": self.hub.now_str(),
     })
 
