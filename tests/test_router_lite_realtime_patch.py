@@ -4,13 +4,59 @@ from types import SimpleNamespace
 
 from flask import Flask
 
-from router_lite_realtime_patch import RouterLiteRealtimeService, _device_rows, install_router_lite_realtime_patch
+from router_lite_realtime_patch import (
+    RouterLiteRealtimeService,
+    _device_rows,
+    _router_metrics_from_fast,
+    install_router_lite_realtime_patch,
+)
+
+
+def fast_payload(up=1000, down=2000, ipv4=5, ipv6=6):
+    return {
+        "type": "fast",
+        "cpu_usage": 12,
+        "memutil": 34,
+        "temp": 48,
+        "runtime": 3600,
+        "wan_stat": {
+            "wans": {
+                "up": up,
+                "down": down,
+                "total_up": 3000,
+                "total_down": 4000,
+                "ipv4_connection_count": ipv4,
+                "ipv6_connection_count": ipv6,
+                "ipv4_half_connection_count": 1,
+                "ipv6_half_connection_count": 2,
+                "cps": 3,
+            }
+        },
+    }
+
+
+class FakeLane:
+    def __init__(self, result, delay=0.0):
+        self.result = result
+        self.delay = delay
+        self.calls = []
+        self.closed = False
+
+    def rpc(self, module, data=None):
+        self.calls.append((module, data, time.monotonic()))
+        if self.delay:
+            time.sleep(self.delay)
+        value = self.result() if callable(self.result) else self.result
+        return value, int(self.delay * 1000)
+
+    def close(self):
+        self.closed = True
 
 
 def test_device_rows_extract_only_runtime_fields():
     hub = SimpleNamespace(norm_mac=lambda value: str(value).lower())
     rows = _device_rows(hub, {
-        "items": [
+        "list": [
             {
                 "mac": "AA:BB:CC:DD:EE:FF",
                 "flowUp": "1234",
@@ -28,79 +74,156 @@ def test_device_rows_extract_only_runtime_fields():
     }]
 
 
-def _fixture():
-    app = Flask(__name__)
-    hub = SimpleNamespace(
-        app=app,
-        LOGGER=SimpleNamespace(info=lambda *_args: None, warning=lambda *_args: None),
-        check_app_token=lambda: True,
-        ROUTER_DASHBOARD_LOCK=threading.RLock(),
-        ROUTER_DASHBOARD_CACHE={
-            "telemetryEpoch": time.time(),
-            "telemetry": {
-                "cpuPercent": 12,
-                "memoryPercent": 34,
-                "temperatureC": 48,
-                "uptimeSeconds": 3600,
-                "onlineDeviceCount": 1,
-                "wan": {
-                    "uploadBps": 1000,
-                    "downloadBps": 2000,
-                    "totalUploadBytes": 3000,
-                    "totalDownloadBytes": 4000,
-                },
-                "connections": {"ipv4": 5, "ipv6": 6, "ipv4Half": 1, "ipv6Half": 2, "cps": 3},
-            },
-        },
-        norm_mac=lambda value: str(value).lower(),
-    )
+def test_router_metrics_parse_native_fast_frame():
+    result = _router_metrics_from_fast(fast_payload(up=111, down=222, ipv4=7, ipv6=8), 4)
+    assert result["uploadBps"] == 111
+    assert result["downloadBps"] == 222
+    assert result["ipv4Connections"] == 7
+    assert result["ipv6Connections"] == 8
+    assert result["onlineDeviceCount"] == 4
 
-    class Client:
-        def devices(self, force=True):
-            return {"items": [{"mac": "AA", "flowUp": 11, "flowDown": 22, "flow_cnt": 3}]}
+
+def _fixture(ws_epoch=None, ws_fast=None, router_lane=None, device_lane=None):
+    app = Flask(__name__)
+    monitor = SimpleNamespace(
+        _lock=threading.RLock(),
+        _messages={"fast": ws_fast or fast_payload()},
+        _message_at={"fast": ws_epoch if ws_epoch is not None else time.time()},
+    )
+    client = SimpleNamespace(router_ws_monitor=monitor)
 
     class Sync:
-        client = Client()
+        def __init__(self):
+            self.client = client
+            self.full_sync_calls = 0
 
         def configured(self):
             return True
 
         def sync_devices(self, force=True):
-            return {"online": [{"mac": "AA", "realtimeUpload": 11, "realtimeDownload": 22, "connectionCount": 3}]}
+            self.full_sync_calls += 1
+            raise AssertionError("realtime service must never call full device sync")
 
-    return hub, Sync()
+    hub = SimpleNamespace(
+        app=app,
+        LOGGER=SimpleNamespace(info=lambda *_args: None, warning=lambda *_args: None),
+        check_app_token=lambda: True,
+        ROUTER_DASHBOARD_LOCK=threading.RLock(),
+        ROUTER_DASHBOARD_CACHE={"telemetry": {"onlineDeviceCount": 1}},
+        norm_mac=lambda value: str(value).lower(),
+        DEVICES_FILE="devices.json",
+        load_json=lambda _path, default: default,
+    )
+    sync = Sync()
+    return hub, sync, monitor, router_lane or FakeLane(fast_payload()), device_lane or FakeLane({"list": []})
 
 
-def test_router_payload_is_small_and_wss_cache_backed():
-    hub, sync = _fixture()
-    service = RouterLiteRealtimeService(hub, sync)
+def test_router_payload_reads_ws_fast_directly_not_dashboard_cache():
+    hub, sync, monitor, router_lane, device_lane = _fixture(ws_fast=fast_payload(up=4321, down=8765))
+    service = RouterLiteRealtimeService(hub, sync, router_lane, device_lane)
     payload = service.router_payload()
-    assert payload["uploadBps"] == 1000
-    assert payload["downloadBps"] == 2000
-    assert payload["ipv4Connections"] == 5
-    assert payload["ipv6Connections"] == 6
-    assert "details" not in payload
+    assert payload["uploadBps"] == 4321
+    assert payload["downloadBps"] == 8765
+    assert payload["source"] == "router_ws_fast"
+    assert payload["sampleAgeMs"] < 500
+    assert router_lane.calls == []
+
+    with monitor._lock:
+        monitor._messages["fast"] = fast_payload(up=9999, down=1111)
+        monitor._message_at["fast"] = time.time()
+    updated = service.router_payload()
+    assert updated["uploadBps"] == 9999
+    assert updated["sequence"] > payload["sequence"]
 
 
-def test_routes_return_immediately_and_background_sample_devices():
-    hub, sync = _fixture()
-    service = install_router_lite_realtime_patch(hub, sync)
+def test_stale_ws_uses_independent_fast_rpc_lane():
+    router_lane = FakeLane(fast_payload(up=7000, down=8000))
+    hub, sync, _monitor, _, device_lane = _fixture(
+        ws_epoch=time.time() - 20,
+        router_lane=router_lane,
+    )
+    service = RouterLiteRealtimeService(hub, sync, router_lane, device_lane)
+    service.start()
     try:
-        client = hub.app.test_client()
-        router = client.get("/api/router/realtime").get_json()
-        assert router["uploadBps"] == 1000
+        service.router_payload()
+        deadline = time.time() + 2
+        payload = service.router_payload()
+        while time.time() < deadline and payload.get("source") != "router_rpc_fast":
+            time.sleep(0.03)
+            payload = service.router_payload()
+        assert payload["source"] == "router_rpc_fast"
+        assert payload["uploadBps"] == 7000
+        assert router_lane.calls[0][0] == "ws_sysinfo"
+        assert router_lane.calls[0][1] == {"get": "fast"}
+    finally:
+        service.stop()
 
-        first = client.get("/api/devices/realtime").get_json()
-        assert first["ok"] is True
+
+def test_device_timely_lane_never_calls_or_locks_full_sync():
+    device_lane = FakeLane({
+        "list": [{"mac": "AA", "flowUp": 11, "flowDown": 22, "flow_cnt": 3}]
+    })
+    hub, sync, _monitor, router_lane, _ = _fixture(device_lane=device_lane)
+    service = RouterLiteRealtimeService(hub, sync, router_lane, device_lane)
+    service.start()
+    try:
+        first = service.devices_payload()
         deadline = time.time() + 2
         latest = first
         while time.time() < deadline and not latest["devices"]:
-            time.sleep(0.05)
-            latest = client.get("/api/devices/realtime").get_json()
+            time.sleep(0.03)
+            latest = service.devices_payload()
         assert latest["devices"][0]["downloadBps"] == 22
-
-        combined = client.get("/api/realtime").get_json()
-        assert combined["router"]["cpuPercent"] == 12
-        assert combined["deviceRuntime"]["devices"][0]["connectionCount"] == 3
+        assert latest["source"] == "router_rpc_timely"
+        assert device_lane.calls[0][0] == "user_list"
+        assert device_lane.calls[0][1] == {"devType": "all", "dataType": "timely"}
+        assert sync.full_sync_calls == 0
     finally:
         service.stop()
+
+
+def test_slow_device_lane_does_not_delay_router_lane():
+    router_lane = FakeLane(fast_payload(up=9090, down=8080))
+    device_lane = FakeLane({"list": []}, delay=0.8)
+    hub, sync, _monitor, _, _ = _fixture(
+        ws_epoch=time.time() - 20,
+        router_lane=router_lane,
+        device_lane=device_lane,
+    )
+    service = RouterLiteRealtimeService(hub, sync, router_lane, device_lane)
+    service.start()
+    try:
+        service.devices_payload()
+        time.sleep(0.05)
+        started = time.monotonic()
+        service.router_payload()
+        deadline = time.time() + 1
+        payload = service.router_payload()
+        while time.time() < deadline and payload.get("source") != "router_rpc_fast":
+            time.sleep(0.02)
+            payload = service.router_payload()
+        assert payload["source"] == "router_rpc_fast"
+        assert time.monotonic() - started < 0.5
+        assert sync.full_sync_calls == 0
+    finally:
+        service.stop()
+
+
+def test_routes_return_memory_snapshots_immediately():
+    hub, sync, _monitor, router_lane, device_lane = _fixture()
+    service = install_router_lite_realtime_patch(hub, sync)
+    # Replace real lanes immediately in this route smoke test to avoid external IO.
+    service.stop()
+
+    hub2, sync2, _monitor2, router_lane2, device_lane2 = _fixture()
+    service2 = RouterLiteRealtimeService(hub2, sync2, router_lane2, device_lane2)
+    hub2.ROUTER_LITE_REALTIME = service2
+
+    @hub2.app.get("/probe/router")
+    def probe_router():
+        return service2.router_payload()
+
+    started = time.monotonic()
+    response = hub2.app.test_client().get("/probe/router")
+    assert response.status_code == 200
+    assert time.monotonic() - started < 0.2
