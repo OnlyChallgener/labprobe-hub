@@ -55,19 +55,14 @@ jobs:
         run: |
           python -m py_compile hub.py hub_entry.py labprobe_storage.py router_rpc.py router_rpc_v099.py router_rpc_v010.py router_developer_flow_patch.py router_http_developer_transport_patch.py router_be72_auth_patch.py router_be72_sid_wire_patch.py router_native_features_patch.py router_ws_patch.py router_compat.py router_realtime_stability_patch.py router_relay_credentials_patch.py router_lite_realtime_patch.py
           python -m pytest -q
-          grep -q 'def _relay_credentials_push_view' router_relay_credentials_patch.py
-          grep -q 'incomplete_credentials' router_relay_credentials_patch.py
-          grep -q '/api/router/realtime' router_lite_realtime_patch.py
-          grep -q '/api/devices/realtime' router_lite_realtime_patch.py
-          grep -q 'router verified realtime channels enabled' router_lite_realtime_patch.py
-          grep -q 'router_ws_fast' router_lite_realtime_patch.py
-          grep -q 'router_rpc_fast' router_lite_realtime_patch.py
-          grep -q 'router_rpc_timely' router_lite_realtime_patch.py
-          grep -q 'ws_sysinfo' router_lite_realtime_patch.py
-          grep -q 'user_list' router_lite_realtime_patch.py
-          ! grep -q '_wrap_full_device_sync' router_lite_realtime_patch.py
-          ! grep -q '_rpc_lock' router_lite_realtime_patch.py
-          grep -q 'HUB_VERSION = "0.9.17"' hub_entry.py
+          grep -q '/api/router/realtime/agent/demand' router_lite_realtime_patch.py
+          grep -q '/api/router/realtime/agent/push' router_lite_realtime_patch.py
+          grep -q 'relay_local_dev_sta' router_lite_realtime_patch.py
+          ! grep -q 'requests.Session' router_lite_realtime_patch.py
+          ! grep -q 'ws_sysinfo' router_lite_realtime_patch.py
+          ! grep -q 'user_list' router_lite_realtime_patch.py
+          ! grep -q 'sync_devices' router_lite_realtime_patch.py
+          grep -q 'HUB_VERSION = "0.9.18"' hub_entry.py
       - name: Build and inspect runtime Docker image
         working-directory: ${{ github.workspace }}
         run: |
@@ -75,15 +70,18 @@ jobs:
           docker build --tag labprobe-hub-ci:latest .
           docker run --rm --entrypoint sh labprobe-hub-ci:latest -c 'test -f /app/router_lite_realtime_patch.py'
           docker run --rm --entrypoint python labprobe-hub-ci:latest -c 'import router_lite_realtime_patch; print("router_lite_realtime_patch import ok")'
-      - name: Compile and test LabRelay low-traffic agent
+      - name: Compile and test LabRelay local realtime agent
         working-directory: ${{ github.workspace }}/labrelay
         run: |
           cargo test --all-targets
           cargo build --release
           grep -q 'pub hub_direct_mode: bool' src/agent.rs
-          grep -q 'if !config.hub_direct_mode && dashboard_due' src/agent.rs
-          grep -q 'credentialsSince={}&wait=55' src/agent.rs
-          grep -q '.timeout(request_timeout)' src/agent.rs
-          grep -q 'credentialsCompletedNonce' src/agent.rs
-          grep -q 'router did not expose a complete broadband credential pair' src/agent.rs
+          grep -q 'crate::runtime::run' src/agent.rs
+          grep -q '^mod runtime;' src/main.rs
+          grep -q '/api/router/realtime/agent/demand' src/runtime.rs
+          grep -q '/api/router/realtime/agent/push' src/runtime.rs
+          grep -q 'dev_sta_json("ws_sysinfo"' src/runtime.rs
+          grep -q '"user_list"' src/runtime.rs
+          grep -q 'relay_local_dev_sta' src/runtime.rs
           grep -q 'env!("CARGO_PKG_VERSION")' src/main.rs
+          grep -q 'version = "0.2.11"' Cargo.toml
