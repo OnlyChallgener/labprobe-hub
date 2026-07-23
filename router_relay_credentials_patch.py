@@ -1,11 +1,11 @@
 """Bridge broadband credentials without restoring Relay dashboard traffic.
 
-Hub direct RPC is authoritative for router telemetry and terminal data.  This
+Hub direct RPC is authoritative for router telemetry and terminal data. This
 patch first reads the temporary PPPoE credentials through the existing Hub
-router session.  If a firmware does not expose them over eWeb, the refresh
-nonce is also returned by the lightweight Agent command endpoint so Relay can
-perform the router-local ``dev_config get -m network '{}'`` fallback without
-uploading dashboard snapshots.
+router session. If a firmware does not expose a complete username/password pair
+over eWeb, the refresh nonce is also returned by the lightweight Agent command
+endpoint so Relay can perform the router-local ``dev_config get -m network
+'{}'`` fallback without uploading dashboard snapshots.
 
 Credentials remain memory-only and are never logged, persisted, backed up or
 published over MQTT.
@@ -100,7 +100,7 @@ def _candidate_score(row: Dict[str, Any]) -> int:
 
 
 def _extract_router_credentials(value: Any) -> Dict[str, str]:
-    """Extract one WAN/PPPoE credential pair without exposing raw payloads."""
+    """Extract the highest-scoring same-object WAN/PPPoE credential pair."""
     root = _decode_payload(value)
     rows: list[Dict[str, Any]] = []
 
@@ -120,6 +120,7 @@ def _extract_router_credentials(value: Any) -> Dict[str, str]:
     username = ""
     password = ""
     lan_mac = ""
+    pair_selected = False
     for row in rows:
         local_user = ""
         local_password = ""
@@ -133,13 +134,16 @@ def _extract_router_credentials(value: Any) -> Dict[str, str]:
                 candidate = _clean_value(child).lower().replace("-", ":")
                 if re.fullmatch(r"[0-9a-f]{2}(?::[0-9a-f]{2}){5}", candidate):
                     lan_mac = candidate
-        if local_user and not username:
-            username = local_user
-        if local_password and not password:
-            password = local_password
-        if local_user and local_password:
+        # Rows are score-sorted; retain the first complete pair but continue
+        # scanning so a LAN MAC in a separate object is not lost.
+        if local_user and local_password and not pair_selected:
             username, password = local_user, local_password
-            break
+            pair_selected = True
+        elif not pair_selected:
+            if local_user and not username:
+                username = local_user
+            if local_password and not password:
+                password = local_password
 
     if not username or not password:
         for key, child, _parent in _walk(root):
@@ -214,21 +218,22 @@ def _direct_credentials_refresh_view(self: Any):
         self.logger.warning("router credential direct refresh failed type=%s", type(exc).__name__)
         found = {"username": "", "password": "", "lanMac": ""}
 
-    username = found.get("username") or str(previous.get("username") or "")
-    password = found.get("password") or str(previous.get("password") or "")
-    lan_mac = found.get("lanMac") or str(previous.get("lanMac") or "")
-    direct_available = bool(found.get("username") or found.get("password"))
+    found_username = str(found.get("username") or "")
+    found_password = str(found.get("password") or "")
+    direct_complete = bool(found_username and found_password)
 
-    if direct_available or username or password:
+    # Do not mark a partial eWeb response complete. Leaving the new nonce
+    # outstanding makes the router-local Relay fallback fetch both fields.
+    if direct_complete:
         safe = {
             "router": str(previous.get("router") or self.hub.primary_router_name() or "router"),
-            "lanMac": lan_mac,
-            "username": username,
-            "password": password,
+            "lanMac": str(found.get("lanMac") or previous.get("lanMac") or ""),
+            "username": found_username,
+            "password": found_password,
             "refreshCompletedNonce": nonce,
             "receivedAt": self.hub.now_str(),
             "receivedEpoch": time.time(),
-            "source": "hub_router_rpc" if direct_available else str(previous.get("source") or "memory"),
+            "source": "hub_router_rpc",
         }
         with self.hub.ROUTER_CREDENTIALS_LOCK:
             self.hub.ROUTER_CREDENTIALS_CACHE.clear()
@@ -237,10 +242,10 @@ def _direct_credentials_refresh_view(self: Any):
     return jsonify({
         "ok": True,
         "refreshNonce": nonce,
-        "refreshCompletedNonce": nonce if (direct_available or username or password) else 0,
-        "credentialsAvailable": bool(username or password),
-        "relayFallbackPending": not direct_available and not (username or password),
-        "message": "credentials refreshed from router" if direct_available else "waiting for router-local credential fallback",
+        "refreshCompletedNonce": nonce if direct_complete else 0,
+        "credentialsAvailable": direct_complete,
+        "relayFallbackPending": not direct_complete,
+        "message": "credentials refreshed from router" if direct_complete else "waiting for router-local credential fallback",
         "time": self.hub.now_str(),
     })
 
