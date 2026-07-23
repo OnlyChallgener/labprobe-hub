@@ -73,7 +73,10 @@ def dashboard_has_data(payload: Any, require_fresh: bool = False) -> bool:
         root.get("router"), identity.get("hostname"), identity.get("model"), identity.get("serialNumber"),
         wan.get("ipv4"), wan.get("gateway"), ap.get("hostName"), ap.get("model"), ap.get("networkName"),
     ]
-    return any(_text(value) not in {"router", "路由器"} for value in meaningful) or bool(details.get("ports"))
+    return any(
+        bool(text) and text not in {"router", "路由器"}
+        for text in (_text(value) for value in meaningful)
+    ) or bool(details.get("ports"))
 
 
 def merge_dashboard(previous: Any, latest: Any) -> Dict[str, Any]:
