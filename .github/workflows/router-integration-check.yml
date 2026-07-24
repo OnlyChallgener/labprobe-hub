@@ -61,6 +61,8 @@ jobs:
           grep -q 'HUB_VERSION = "0.9.22"' hub_entry.py
           grep -q 'install_router_fast_watchdog_patch()' hub_entry.py
           grep -q 'FAST_STALL_SECONDS = 4.5' router_fast_watchdog_patch.py
+          grep -q 'MAX_ROUTER_RETRY_SECONDS = 3.0' router_fast_watchdog_patch.py
+          grep -q 'monitor_class._loop = _router_ws_loop_fast_recovery' router_fast_watchdog_patch.py
           grep -q 'router fast stream stalled; reconnecting' router_fast_watchdog_patch.py
           grep -q '/api/realtime/ws' hub_realtime_ws.py
           grep -q 'PROTOCOL_NAME = "labprobe-realtime-v2"' hub_realtime_ws.py
