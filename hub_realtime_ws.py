@@ -1,9 +1,9 @@
 """Authenticated Hub-native WebSocket fan-out for compact realtime deltas.
 
 Router eWeb ``type=fast`` frames and LabRelay terminal samples are already
-stored in Hub memory.  This module keeps one authenticated foreground WSS
+stored in Hub memory. This module keeps one authenticated foreground WSS
 connection per APP, immediately sends the latest memory snapshots, then fans
-out compact deltas.  It never reads a router HTTP API, full Dashboard, terminal
+out compact deltas. It never reads a router HTTP API, full Dashboard, terminal
 list, SQLite document or revision stream.
 """
 from __future__ import annotations
@@ -22,7 +22,7 @@ from flask_sock import Sock
 
 CLIENT_QUEUE_SIZE = 4
 KEEPALIVE_SECONDS = 3.0
-PROTOCOL_NAME = "labprobe-realtime-v2"
+PROTOCOL_NAME = "labprobe-realtime-v3"
 
 
 @dataclass
@@ -92,15 +92,35 @@ class HubRealtimeWebSocketService:
         with self._clients_lock:
             return len(self._clients)
 
+    def _wake_device_sampler(self) -> None:
+        """Wake an Agent long poll for every newly authenticated APP socket.
+
+        A previous APP process can leave a still-valid demand lease behind for a
+        few seconds. Merely adding another lease then keeps the aggregate state
+        active and the old implementation did not advance the demand sequence,
+        so LabRelay could remain inside its 55-second long poll. A new foreground
+        socket is an explicit demand edge and must wake that poll immediately.
+        """
+        condition = getattr(self.realtime_service, "_demand", None)
+        if condition is None:
+            return
+        try:
+            with condition:
+                self.realtime_service._demand_sequence += 1
+                condition.notify_all()
+        except Exception:
+            self.logger.debug("unable to wake terminal realtime sampler", exc_info=True)
+
     def _register(self) -> _RealtimeClient:
         client = _RealtimeClient(client_id=f"app-ws-{secrets.token_hex(8)}")
         with self._clients_lock:
             self._clients[client.client_id] = client
         self._renew_client_lease(client)
+        self._wake_device_sampler()
         return client
 
     def _renew_client_lease(self, client: _RealtimeClient) -> None:
-        # A live APP WSS connection is the terminal realtime demand lease.  The
+        # A live APP WSS connection is the terminal realtime demand lease. The
         # router fast lane is independent and never waits for Agent demand.
         self.realtime_service.set_wss_demand(client.client_id, True)
 
@@ -138,6 +158,7 @@ class HubRealtimeWebSocketService:
                         "clientId": client.client_id,
                         "serverEpochMs": int(time.time() * 1000),
                         "keepaliveSeconds": KEEPALIVE_SECONDS,
+                        "terminalSamplerWake": True,
                     },
                 ),
             )
