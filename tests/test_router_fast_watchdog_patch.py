@@ -13,7 +13,9 @@ def test_install_sets_short_realtime_thresholds_and_patches_monitor():
     assert router_lite_realtime_patch.DEMAND_TTL_SECONDS == patch.DEVICE_DEMAND_TTL_SECONDS
     assert router_lite_realtime_patch.ROUTER_STALE_MS == patch.ROUTER_STALE_MS
     assert router_lite_realtime_patch.DEVICES_STALE_MS == patch.DEVICES_STALE_MS
+    assert patch.MAX_ROUTER_RETRY_SECONDS == 3.0
     assert router_ws_patch.RouterWebSocketMonitor._run_connection is patch._run_connection_with_fast_watchdog
+    assert router_ws_patch.RouterWebSocketMonitor._loop is patch._router_ws_loop_fast_recovery
 
 
 def test_fast_stall_detection_uses_current_connection_only():
