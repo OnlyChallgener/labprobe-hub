@@ -58,15 +58,18 @@ jobs:
         run: |
           python -m py_compile hub.py hub_entry.py hub_realtime_ws.py labprobe_storage.py router_rpc.py router_rpc_v099.py router_rpc_v010.py router_developer_flow_patch.py router_http_developer_transport_patch.py router_be72_auth_patch.py router_be72_sid_wire_patch.py router_native_features_patch.py router_ws_patch.py router_fast_watchdog_patch.py router_compat.py router_realtime_stability_patch.py router_relay_credentials_patch.py router_lite_realtime_patch.py
           python -m pytest -q
-          grep -q 'HUB_VERSION = "0.9.22"' hub_entry.py
+          grep -q 'HUB_VERSION = "0.9.23"' hub_entry.py
           grep -q 'install_router_fast_watchdog_patch()' hub_entry.py
-          grep -q 'FAST_STALL_SECONDS = 4.5' router_fast_watchdog_patch.py
-          grep -q 'MAX_ROUTER_RETRY_SECONDS = 3.0' router_fast_watchdog_patch.py
+          grep -q 'FAST_STALL_SECONDS = 8.0' router_fast_watchdog_patch.py
+          grep -q 'MAX_ROUTER_RETRY_SECONDS = 2.0' router_fast_watchdog_patch.py
+          grep -q 'ROUTER_STALE_MS = 12_000' router_fast_watchdog_patch.py
           grep -q 'monitor_class._loop = _router_ws_loop_fast_recovery' router_fast_watchdog_patch.py
           grep -q 'router fast stream stalled; reconnecting' router_fast_watchdog_patch.py
           grep -q '/api/realtime/ws' hub_realtime_ws.py
-          grep -q 'PROTOCOL_NAME = "labprobe-realtime-v2"' hub_realtime_ws.py
+          grep -q 'PROTOCOL_NAME = "labprobe-realtime-v3"' hub_realtime_ws.py
           grep -q '_send_initial_snapshots' hub_realtime_ws.py
+          grep -q '_wake_device_sampler' hub_realtime_ws.py
+          grep -q 'terminalSamplerWake' hub_realtime_ws.py
           grep -q 'KEEPALIVE_SECONDS = 3.0' hub_realtime_ws.py
           grep -q 'router_eweb_ws_fast' router_lite_realtime_patch.py
           grep -q 'acceptedRouter' router_lite_realtime_patch.py
