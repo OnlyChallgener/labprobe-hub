@@ -4,6 +4,7 @@ from types import SimpleNamespace
 import websocket
 
 import router_build024_fix
+import router_compat
 import router_fast_watchdog_patch as patch
 import router_lite_realtime_patch
 import router_ws_patch
@@ -20,13 +21,36 @@ def test_install_sets_short_realtime_thresholds_and_patches_monitor():
 
 
 def test_build024_restores_radio_temperature_storage_and_detail_worker():
-    router_build024_fix.install_router_build024_fix()
-    assert "temperature2gC" in router_lite_realtime_patch._ROUTER_FIELDS
-    assert "temperature5gC" in router_lite_realtime_patch._ROUTER_FIELDS
-    assert "storagePercent" in router_lite_realtime_patch._ROUTER_FIELDS
-    assert router_ws_patch._FAST_ROOT_NUMBER_FIELDS["temperature2gC"][0] == "temp_2g"
-    assert router_ws_patch._FAST_ROOT_NUMBER_FIELDS["temperature5gC"][0] == "temp_5g"
-    assert router_build024_fix.DETAIL_REFRESH_SECONDS == 60.0
+    old_fields = set(router_lite_realtime_patch._ROUTER_FIELDS)
+    old_fast_fields = dict(router_ws_patch._FAST_ROOT_NUMBER_FIELDS)
+    old_router_fields = router_lite_realtime_patch.RouterLiteRealtimeService._router_fields
+    old_start = router_compat.RouterRpcCompatibilitySync.start
+    try:
+        router_build024_fix.install_router_build024_fix()
+        assert "temperature2gC" in router_lite_realtime_patch._ROUTER_FIELDS
+        assert "temperature5gC" in router_lite_realtime_patch._ROUTER_FIELDS
+        assert "storagePercent" in router_lite_realtime_patch._ROUTER_FIELDS
+        assert router_ws_patch._FAST_ROOT_NUMBER_FIELDS["temperature2gC"][0] == "temp_2g"
+        assert router_ws_patch._FAST_ROOT_NUMBER_FIELDS["temperature5gC"][0] == "temp_5g"
+        assert router_build024_fix.DETAIL_REFRESH_SECONDS == 60.0
+        service = object.__new__(router_lite_realtime_patch.RouterLiteRealtimeService)
+        mapped = service._router_fields({
+            "temperature2gC": 47.5,
+            "temperature5gC": "50.25",
+            "storagePercent": "34.23%",
+        })
+        assert mapped == {
+            "temperature2gC": 47.5,
+            "temperature5gC": 50.25,
+            "storagePercent": 34.23,
+        }
+    finally:
+        router_lite_realtime_patch._ROUTER_FIELDS.clear()
+        router_lite_realtime_patch._ROUTER_FIELDS.update(old_fields)
+        router_ws_patch._FAST_ROOT_NUMBER_FIELDS.clear()
+        router_ws_patch._FAST_ROOT_NUMBER_FIELDS.update(old_fast_fields)
+        router_lite_realtime_patch.RouterLiteRealtimeService._router_fields = old_router_fields
+        router_compat.RouterRpcCompatibilitySync.start = old_start
 
 
 def test_fast_stall_detection_uses_current_connection_only():
