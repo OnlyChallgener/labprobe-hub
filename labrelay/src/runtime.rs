@@ -1,20 +1,20 @@
 use anyhow::{anyhow, bail, Context, Result};
 use reqwest::Client;
 use serde_json::{json, Map, Value};
-use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
+use std::time::{Duration, SystemTime, UNIX_EPOCH};
 use tokio::process::Command;
-use tokio::time::{sleep, timeout};
+use tokio::sync::watch;
+use tokio::time::{sleep, timeout, MissedTickBehavior};
 
 use crate::agent::AgentConfig;
 
 const DEMAND_WAIT_SECONDS: u64 = 55;
-const SAMPLE_INTERVAL: Duration = Duration::from_secs(1);
+const DEVICES_SAMPLE_INTERVAL: Duration = Duration::from_secs(2);
 const COMMAND_TIMEOUT: Duration = Duration::from_millis(1_400);
 
 #[derive(Debug, Clone, Default)]
 struct Demand {
     sequence: u64,
-    router_active: bool,
     devices_active: bool,
 }
 
@@ -116,59 +116,6 @@ fn number(value: Option<&Value>) -> u64 {
     }
 }
 
-fn decimal(value: Option<&Value>) -> f64 {
-    match value {
-        Some(Value::Number(number)) => number.as_f64().unwrap_or(0.0),
-        Some(Value::String(text)) => text
-            .trim()
-            .trim_end_matches('%')
-            .parse::<f64>()
-            .unwrap_or(0.0),
-        _ => 0.0,
-    }
-}
-
-fn first_value<'a>(root: &'a Value, keys: &[&str]) -> Option<&'a Value> {
-    match root {
-        Value::Object(object) => {
-            for key in keys {
-                if let Some(value) = object.get(*key) {
-                    if !value.is_null() {
-                        return Some(value);
-                    }
-                }
-            }
-            object.values().find_map(|child| first_value(child, keys))
-        }
-        Value::Array(items) => items.iter().find_map(|child| first_value(child, keys)),
-        _ => None,
-    }
-}
-
-fn router_metrics(fast: &Value) -> Value {
-    let wan_stat = fast.get("wan_stat").or_else(|| fast.get("wanStat"));
-    let aggregate = wan_stat
-        .and_then(|value| value.get("wans"))
-        .or_else(|| wan_stat.and_then(|value| value.get("wan")))
-        .or(wan_stat)
-        .unwrap_or(&Value::Null);
-    json!({
-        "uploadBps": number(aggregate.get("up")),
-        "downloadBps": number(aggregate.get("down")),
-        "totalUploadBytes": number(aggregate.get("total_up").or_else(|| aggregate.get("totalUploadBytes"))),
-        "totalDownloadBytes": number(aggregate.get("total_down").or_else(|| aggregate.get("totalDownloadBytes"))),
-        "cpuPercent": decimal(first_value(fast, &["cpu_usage", "cpuUsage", "cpuutil"])),
-        "memoryPercent": decimal(first_value(fast, &["memutil", "memoryPercent", "memory_usage"])),
-        "temperatureC": decimal(first_value(fast, &["temp", "temperature", "temperatureC"])),
-        "uptimeSeconds": number(first_value(fast, &["runtime", "uptime", "uptimeSeconds"])),
-        "ipv4Connections": number(aggregate.get("ipv4_connection_count")),
-        "ipv6Connections": number(aggregate.get("ipv6_connection_count")),
-        "ipv4HalfConnections": number(aggregate.get("ipv4_half_connection_count")),
-        "ipv6HalfConnections": number(aggregate.get("ipv6_half_connection_count")),
-        "cps": number(aggregate.get("cps")),
-    })
-}
-
 fn normalized_mac(value: &str) -> String {
     let raw = value.trim().replace('-', ":").to_ascii_lowercase();
     if raw.contains(':') || raw.len() != 12 {
@@ -242,11 +189,6 @@ fn device_rows(root: &Value) -> Vec<Value> {
     rows
 }
 
-async fn collect_router() -> Result<Value> {
-    let fast = dev_sta_json("ws_sysinfo", r#"{"get":"fast"}"#).await?;
-    Ok(router_metrics(&fast))
-}
-
 async fn collect_devices() -> Result<Vec<Value>> {
     let devices = dev_sta_json(
         "user_list",
@@ -262,10 +204,6 @@ fn parse_demand(root: &Value, fallback_sequence: u64) -> Demand {
             .get("sequence")
             .and_then(Value::as_u64)
             .unwrap_or(fallback_sequence),
-        router_active: root
-            .get("routerActive")
-            .and_then(Value::as_bool)
-            .unwrap_or(false),
         devices_active: root
             .get("devicesActive")
             .and_then(Value::as_bool)
@@ -299,8 +237,7 @@ async fn push_samples(
     client: &Client,
     config: &AgentConfig,
     demand: &Demand,
-    router: Option<Value>,
-    devices: Option<Vec<Value>>,
+    devices: Vec<Value>,
 ) -> Result<Demand> {
     let sampled_at_ms = now_ms();
     let mut body = json!({
@@ -309,12 +246,7 @@ async fn push_samples(
         "sampleEpochMs": sampled_at_ms,
         "source": "relay_local_dev_sta",
     });
-    if let Some(metrics) = router {
-        body["routerSample"] = metrics;
-    }
-    if let Some(rows) = devices {
-        body["devices"] = Value::Array(rows);
-    }
+    body["devices"] = Value::Array(devices);
     let url = format!(
         "{}/api/router/realtime/agent/push",
         config.hub_url.trim_end_matches('/')
@@ -323,7 +255,7 @@ async fn push_samples(
         .post(url)
         .header("X-LabProbe-Token", &config.hook_token)
         .json(&body)
-        .timeout(Duration::from_secs(8))
+        .timeout(Duration::from_millis(900))
         .send()
         .await?;
     let status = response.status();
@@ -332,6 +264,47 @@ async fn push_samples(
         bail!("realtime push HTTP {status}");
     }
     Ok(parse_demand(&root, demand.sequence))
+}
+
+async fn demand_lane(client: Client, config: AgentConfig, demand_tx: watch::Sender<Demand>) {
+    let mut sequence = 0u64;
+    loop {
+        let currently_active = {
+            let demand = demand_tx.borrow();
+            demand.devices_active
+        };
+        if currently_active {
+            sleep(Duration::from_secs(2)).await;
+        }
+        match demand_long_poll(&client, &config, sequence).await {
+            Ok(next) => {
+                sequence = next.sequence;
+                let _ = demand_tx.send(next);
+            }
+            Err(_) => {
+                let _ = demand_tx.send(Demand {
+                    sequence,
+                    ..Demand::default()
+                });
+                sleep(Duration::from_secs(2)).await;
+            }
+        }
+    }
+}
+
+async fn devices_lane(client: Client, config: AgentConfig, demand_rx: watch::Receiver<Demand>) {
+    let mut tick = tokio::time::interval(DEVICES_SAMPLE_INTERVAL);
+    tick.set_missed_tick_behavior(MissedTickBehavior::Skip);
+    loop {
+        tick.tick().await;
+        let demand = demand_rx.borrow().clone();
+        if !demand.devices_active {
+            continue;
+        }
+        if let Ok(sample) = collect_devices().await {
+            let _ = push_samples(&client, &config, &demand, sample).await;
+        }
+    }
 }
 
 pub async fn run(config: AgentConfig) {
@@ -344,87 +317,16 @@ pub async fn run(config: AgentConfig) {
         Ok(client) => client,
         Err(_) => return,
     };
-    let mut demand = Demand::default();
-    let mut consecutive_push_errors = 0u8;
-    loop {
-        if !demand.router_active && !demand.devices_active {
-            match demand_long_poll(&client, &config, demand.sequence).await {
-                Ok(next) => demand = next,
-                Err(_) => sleep(Duration::from_secs(2)).await,
-            }
-            continue;
-        }
-
-        let started = Instant::now();
-        let router_future = async {
-            if demand.router_active {
-                collect_router().await.ok()
-            } else {
-                None
-            }
-        };
-        let devices_future = async {
-            if demand.devices_active {
-                collect_devices().await.ok()
-            } else {
-                None
-            }
-        };
-        let (mut router_sample, device_sample) = tokio::join!(router_future, devices_future);
-        if let (Some(Value::Object(metrics)), Some(devices)) = (&mut router_sample, &device_sample) {
-            metrics.insert("onlineDeviceCount".into(), json!(devices.len()));
-        }
-
-        if router_sample.is_some() || device_sample.is_some() {
-            match push_samples(&client, &config, &demand, router_sample, device_sample).await {
-                Ok(next) => {
-                    demand = next;
-                    consecutive_push_errors = 0;
-                }
-                Err(_) => {
-                    consecutive_push_errors = consecutive_push_errors.saturating_add(1);
-                    if consecutive_push_errors >= 5 {
-                        demand.router_active = false;
-                        demand.devices_active = false;
-                    }
-                }
-            }
-        }
-
-        let elapsed = started.elapsed();
-        if elapsed < SAMPLE_INTERVAL {
-            sleep(SAMPLE_INTERVAL - elapsed).await;
-        }
-    }
+    let (demand_tx, demand_rx) = watch::channel(Demand::default());
+    tokio::join!(
+        demand_lane(client.clone(), config.clone(), demand_tx),
+        devices_lane(client, config, demand_rx),
+    );
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
-
-    #[test]
-    fn parses_router_fast_metrics() {
-        let fast = json!({
-            "cpu_usage": 12,
-            "memutil": "34",
-            "temp": 48,
-            "runtime": 3600,
-            "wan_stat": {"wans": {
-                "up": "111", "down": 222,
-                "total_up": 333, "total_down": 444,
-                "ipv4_connection_count": 7,
-                "ipv6_connection_count": 8,
-                "ipv4_half_connection_count": 1,
-                "ipv6_half_connection_count": 2,
-                "cps": 3
-            }}
-        });
-        let result = router_metrics(&fast);
-        assert_eq!(result["uploadBps"], 111);
-        assert_eq!(result["downloadBps"], 222);
-        assert_eq!(result["ipv4Connections"], 7);
-        assert_eq!(result["ipv6Connections"], 8);
-    }
 
     #[test]
     fn parses_only_small_device_runtime_fields() {
@@ -450,7 +352,6 @@ mod tests {
             1,
         );
         assert_eq!(result.sequence, 5);
-        assert!(result.router_active);
         assert!(!result.devices_active);
     }
 }

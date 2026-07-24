@@ -75,6 +75,9 @@ MQTT_TOPIC_PREFIX = re.sub(r"[^A-Za-z0-9._/-]+", "-", (os.environ.get("MQTT_TOPI
 MQTT_REVISION_TOPIC = f"{MQTT_TOPIC_PREFIX}/sync/revision"
 MQTT_AVAILABILITY_TOPIC = f"{MQTT_TOPIC_PREFIX}/availability"
 MQTT_ROUTER_DASHBOARD_TOPIC = f"{MQTT_TOPIC_PREFIX}/router/dashboard"
+MQTT_ROUTER_REALTIME_TOPIC = f"{MQTT_TOPIC_PREFIX}/router/realtime"
+MQTT_DEVICES_REALTIME_TOPIC = f"{MQTT_TOPIC_PREFIX}/devices/realtime"
+MQTT_REALTIME_DEMAND_TOPIC = f"{MQTT_TOPIC_PREFIX}/app/realtime-demand"
 
 
 class SecretRedactionFilter(logging.Filter):
@@ -165,7 +168,7 @@ ROUTER_CREDENTIALS_TTL_SEC = max(30, int(os.environ.get("ROUTER_CREDENTIALS_TTL_
 
 
 class MqttRevisionPublisher:
-    """Publish retained revision and router dashboard signals; HTTP remains authoritative."""
+    """Publish sync signals and compact realtime samples over the single WSS path."""
 
     @staticmethod
     def _timestamp() -> str:
@@ -185,6 +188,7 @@ class MqttRevisionPublisher:
         self._last_publish_at = None
         self._last_published_revision = 0
         self._latest_dashboard: Dict[str, Any] = dict(ROUTER_DASHBOARD_CACHE)
+        self._realtime_demand_handler = None
 
     def start(self) -> None:
         if not self.enabled:
@@ -210,6 +214,7 @@ class MqttRevisionPublisher:
                 self._last_error = ""
                 self._connected_at = self._timestamp()
             LOGGER.info("mqtt realtime connected host=%s port=%s topic=%s", MQTT_INTERNAL_HOST, MQTT_INTERNAL_PORT, MQTT_REVISION_TOPIC)
+            active.subscribe(f"{MQTT_REALTIME_DEMAND_TOPIC}/+", qos=1)
             active.publish(MQTT_AVAILABILITY_TOPIC, payload="online", qos=1, retain=True)
             with self._lock:
                 revision = max(self._latest_revision, STORE.revision_info()["revision"])
@@ -241,6 +246,26 @@ class MqttRevisionPublisher:
 
         client.on_connect = on_connect
         client.on_disconnect = on_disconnect
+
+        def on_message(_active, _userdata, message):
+            topic = str(getattr(message, "topic", "") or "")
+            prefix = f"{MQTT_REALTIME_DEMAND_TOPIC}/"
+            if not topic.startswith(prefix):
+                return
+            client_id = topic[len(prefix):].strip()
+            if not client_id:
+                return
+            payload = bytes(getattr(message, "payload", b"") or b"").decode("utf-8", errors="replace")
+            active = payload.strip().lower() not in {"", "0", "false", "offline", "stop"}
+            with self._lock:
+                handler = self._realtime_demand_handler
+            if handler is not None:
+                try:
+                    handler(client_id, active)
+                except Exception as exc:
+                    LOGGER.warning("mqtt realtime demand rejected client=%s error=%s", client_id[:32], exc)
+
+        client.on_message = on_message
         client.reconnect_delay_set(min_delay=1, max_delay=60)
         client.connect_async(MQTT_INTERNAL_HOST, MQTT_INTERNAL_PORT, keepalive=25)
         client.loop_start()
@@ -285,6 +310,30 @@ class MqttRevisionPublisher:
                 with self._lock:
                     self._last_error = f"dashboard publish failed rc={info.rc}"
 
+    def set_realtime_demand_handler(self, handler) -> None:
+        with self._lock:
+            self._realtime_demand_handler = handler
+
+    def _publish_realtime(self, topic: str, payload: Dict[str, Any]) -> None:
+        if not isinstance(payload, dict) or not payload:
+            return
+        if self.enabled and self.connected and self._client is not None:
+            info = self._client.publish(
+                topic,
+                json.dumps(payload, ensure_ascii=False, separators=(",", ":")),
+                qos=0,
+                retain=False,
+            )
+            if info.rc != mqtt.MQTT_ERR_SUCCESS:
+                with self._lock:
+                    self._last_error = f"realtime publish failed rc={info.rc}"
+
+    def publish_router_realtime(self, payload: Dict[str, Any]) -> None:
+        self._publish_realtime(MQTT_ROUTER_REALTIME_TOPIC, payload)
+
+    def publish_devices_realtime(self, payload: Dict[str, Any]) -> None:
+        self._publish_realtime(MQTT_DEVICES_REALTIME_TOPIC, payload)
+
     def status(self) -> Dict[str, Any]:
         with self._lock:
             return {
@@ -293,6 +342,9 @@ class MqttRevisionPublisher:
                 "publicUrlConfigured": bool(MQTT_PUBLIC_URL),
                 "revisionTopic": MQTT_REVISION_TOPIC if self.enabled else "",
                 "dashboardTopic": MQTT_ROUTER_DASHBOARD_TOPIC if self.enabled else "",
+                "routerRealtimeTopic": MQTT_ROUTER_REALTIME_TOPIC if self.enabled else "",
+                "devicesRealtimeTopic": MQTT_DEVICES_REALTIME_TOPIC if self.enabled else "",
+                "realtimeDemandTopic": MQTT_REALTIME_DEMAND_TOPIC if self.enabled else "",
                 "connectedAt": self._connected_at,
                 "disconnectedAt": self._disconnected_at,
                 "lastPublishAt": self._last_publish_at,
@@ -309,7 +361,12 @@ MQTT_PUBLISHER.start()
 def lock_request_data():
     # High-frequency router telemetry uses a dedicated in-memory lock and must not
     # block SQLite-backed device/event synchronization.
-    if request.path.startswith("/api/router/dashboard"):
+    if (
+        request.path.startswith("/api/router/dashboard")
+        or request.path.startswith("/api/router/realtime")
+        or request.path.startswith("/api/devices/realtime")
+        or request.path == "/api/realtime"
+    ):
         g.data_lock_acquired = False
         return
     DATA_LOCK.acquire()
@@ -2293,6 +2350,9 @@ def mqtt_client_config(include_secret: bool = True) -> Dict[str, Any]:
         "revisionTopic": MQTT_REVISION_TOPIC if enabled else "",
         "availabilityTopic": MQTT_AVAILABILITY_TOPIC if enabled else "",
         "dashboardTopic": MQTT_ROUTER_DASHBOARD_TOPIC if enabled else "",
+        "routerRealtimeTopic": MQTT_ROUTER_REALTIME_TOPIC if enabled else "",
+        "devicesRealtimeTopic": MQTT_DEVICES_REALTIME_TOPIC if enabled else "",
+        "realtimeDemandTopic": MQTT_REALTIME_DEMAND_TOPIC if enabled else "",
         "transport": "wss" if MQTT_PUBLIC_URL.lower().startswith("wss://") else "mqtt",
         "keepAliveSeconds": 25,
     }

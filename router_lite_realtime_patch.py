@@ -1,15 +1,13 @@
-"""Demand-driven realtime bridge backed by router-local LabRelay collection.
+"""Compact realtime cache for APP numeric refreshes.
 
-APP requests only read memory. The first foreground request wakes LabRelay by a
-long-poll condition; while demand remains active, Relay executes the same local
-``dev_sta`` commands that were previously fast over SSH and pushes only compact
-numeric samples. Hub never performs high-frequency eWeb/CMD calls here, and the
-normal full device/configuration sync remains completely independent.
+Route realtime comes from Hub's authenticated eWeb ``/ws type=fast`` receiver.
+Terminal realtime remains the router-local LabRelay lane. HTTP reads only this
+memory cache for initial page load, manual refresh and reconnect calibration;
+it never starts eWeb/CMD collection.
 
-The APP request itself is the lease. Once the lease expires, Relay push requests
-are acknowledged with inactive demand but their samples are not written into the
-Hub cache. The last valid frame remains available for UI continuity without any
-continued cache churn or high-frequency collection.
+When the WSS APP lease expires, Relay terminal pushes are acknowledged as
+inactive and are not written into the device cache. The route ``fast`` receiver
+keeps the last valid frame and reconnects in the background.
 """
 from __future__ import annotations
 
@@ -20,7 +18,7 @@ from typing import Any, Dict, List
 from flask import jsonify, request
 
 
-DEMAND_TTL_SECONDS = 5.0
+DEMAND_TTL_SECONDS = 45.0
 ROUTER_STALE_MS = 3_000
 DEVICES_STALE_MS = 4_000
 _ROUTER_FIELDS = {
@@ -69,8 +67,7 @@ class RouterLiteRealtimeService:
         self._demand = threading.Condition(threading.RLock())
         self._stopped = False
         self._demand_sequence = 0
-        self._router_demand_until = 0.0
-        self._devices_demand_until = 0.0
+        self._client_demand_until: Dict[str, float] = {}
 
         self._router_sample: Dict[str, Any] = {}
         self._router_epoch_ms = 0
@@ -85,39 +82,55 @@ class RouterLiteRealtimeService:
         self._devices_agent_version = ""
 
     def start(self) -> None:
-        self.logger.info("router relay-local realtime bridge enabled")
+        monitor = getattr(getattr(self.sync, "client", None), "router_ws_monitor", None)
+        if monitor is not None and hasattr(monitor, "set_fast_handler"):
+            monitor.set_fast_handler(self.accept_router_fast)
+            self.logger.info("router eweb /ws fast realtime bridge enabled; relay handles devices only")
+        else:
+            self.logger.info("router realtime cache enabled; waiting for eweb /ws monitor")
 
     def stop(self) -> None:
         with self._demand:
             self._stopped = True
             self._demand.notify_all()
 
-    def _mark_demand(self, kind: str) -> None:
+    def set_wss_demand(self, client_id: str, active: bool) -> None:
+        client_id = str(client_id or "").strip()[:96]
+        if not client_id:
+            return
         now = time.time()
         with self._demand:
-            attribute = "_router_demand_until" if kind == "router" else "_devices_demand_until"
-            previous = float(getattr(self, attribute))
-            was_active = previous > now
-            setattr(self, attribute, max(previous, now + DEMAND_TTL_SECONDS))
-            if not was_active:
+            was_active = any(until > now for until in self._client_demand_until.values())
+            if active:
+                self._client_demand_until[client_id] = now + DEMAND_TTL_SECONDS
+            else:
+                self._client_demand_until.pop(client_id, None)
+            self._client_demand_until = {
+                key: until for key, until in self._client_demand_until.items() if until > now
+            }
+            is_active = bool(self._client_demand_until)
+            if is_active != was_active:
                 self._demand_sequence += 1
                 self._demand.notify_all()
 
     def mark_router_demand(self) -> None:
-        self._mark_demand("router")
+        return None
 
     def mark_device_demand(self) -> None:
-        self._mark_demand("devices")
+        self.set_wss_demand("legacy-devices", True)
 
     def _demand_payload_locked(self) -> Dict[str, Any]:
         now = time.time()
+        self._client_demand_until = {
+            key: until for key, until in self._client_demand_until.items() if until > now
+        }
+        active = bool(self._client_demand_until)
         return {
             "ok": True,
             "sequence": self._demand_sequence,
-            "routerActive": self._router_demand_until > now,
-            "devicesActive": self._devices_demand_until > now,
-            "routerUntilEpochMs": int(self._router_demand_until * 1000),
-            "devicesUntilEpochMs": int(self._devices_demand_until * 1000),
+            "routerActive": False,
+            "devicesActive": active,
+            "demandClientCount": len(self._client_demand_until),
             "serverEpochMs": int(now * 1000),
         }
 
@@ -157,6 +170,33 @@ class RouterLiteRealtimeService:
                 output[key] = _integer(value.get(key))
         return output
 
+    def accept_router_fast(self, sample: Any, sample_epoch_ms: int = 0) -> None:
+        router = self._router_fields(sample)
+        if not router:
+            return
+        epoch_ms = self._sample_epoch_ms(sample_epoch_ms)
+        router_event: Dict[str, Any] = {}
+        with self._lock:
+            merged_router = dict(self._router_sample)
+            merged_router.update(router)
+            changed = merged_router != self._router_sample or epoch_ms != self._router_epoch_ms
+            self._router_sample = merged_router
+            self._router_epoch_ms = epoch_ms
+            self._router_source = "router_eweb_ws_fast"
+            self._router_agent_version = ""
+            if changed:
+                self._router_sequence += 1
+                router_event = {
+                    "ok": True,
+                    "sampleEpochMs": epoch_ms,
+                    "sequence": self._router_sequence,
+                    "source": self._router_source,
+                    **merged_router,
+                }
+        publisher = getattr(self.hub, "MQTT_PUBLISHER", None)
+        if router_event and publisher is not None:
+            publisher.publish_router_realtime(router_event)
+
     def _device_rows(self, value: Any) -> List[Dict[str, Any]]:
         if not isinstance(value, list):
             return []
@@ -187,29 +227,22 @@ class RouterLiteRealtimeService:
         # never renews demand and cannot keep high-frequency collection alive.
         with self._demand:
             demand = self._demand_payload_locked()
-        router_active = bool(demand["routerActive"])
         devices_active = bool(demand["devicesActive"])
 
         sample_epoch_ms = self._sample_epoch_ms(payload.get("sampleEpochMs"))
         source = _clean_source(payload.get("source"))
         agent_version = str(payload.get("agentVersion") or "").strip()[:32]
-        router = self._router_fields(payload.get("routerSample")) if router_active else {}
         devices_supplied = devices_active and isinstance(payload.get("devices"), list)
         devices = self._device_rows(payload.get("devices")) if devices_supplied else []
 
-        if router and "onlineDeviceCount" not in router and devices_supplied:
-            router["onlineDeviceCount"] = len(devices)
-
+        devices_event: Dict[str, Any] = {}
         with self._lock:
-            if router:
-                changed = router != self._router_sample or sample_epoch_ms != self._router_epoch_ms
-                self._router_sample = router
-                self._router_epoch_ms = sample_epoch_ms
-                self._router_source = source
-                self._router_agent_version = agent_version
-                if changed:
-                    self._router_sequence += 1
             if devices_supplied:
+                previous = {row["mac"]: row for row in self._devices}
+                changed_rows = [
+                    row for row in devices
+                    if previous.get(row["mac"]) != row
+                ]
                 changed = devices != self._devices or sample_epoch_ms != self._devices_epoch_ms
                 self._devices = devices
                 self._devices_epoch_ms = sample_epoch_ms
@@ -217,13 +250,25 @@ class RouterLiteRealtimeService:
                 self._devices_agent_version = agent_version
                 if changed:
                     self._devices_sequence += 1
+                devices_event = {
+                    "ok": True,
+                    "sampleEpochMs": sample_epoch_ms,
+                    "sequence": self._devices_sequence,
+                    "source": source,
+                    "delta": True,
+                    "onlineDeviceCount": len(devices),
+                    "devices": changed_rows,
+                }
 
-        demand["acceptedRouter"] = bool(router)
+        publisher = getattr(self.hub, "MQTT_PUBLISHER", None)
+        if devices_event and publisher is not None:
+            publisher.publish_devices_realtime(devices_event)
+
+        demand["acceptedRouter"] = False
         demand["acceptedDevices"] = devices_supplied
         return demand
 
     def router_payload(self) -> Dict[str, Any]:
-        self.mark_router_demand()
         with self._lock:
             sample = dict(self._router_sample)
             epoch_ms = self._router_epoch_ms
@@ -238,7 +283,7 @@ class RouterLiteRealtimeService:
             "serverEpochMs": now_ms,
             "sampleAgeMs": age_ms,
             "sequence": sequence,
-            "source": source or "waiting_relay_local",
+            "source": source or "waiting_router_eweb_ws_fast",
             "agentVersion": agent_version,
             "stale": not epoch_ms or age_ms > ROUTER_STALE_MS,
             **sample,
@@ -246,7 +291,6 @@ class RouterLiteRealtimeService:
         }
 
     def devices_payload(self) -> Dict[str, Any]:
-        self.mark_device_demand()
         with self._lock:
             devices = [dict(row) for row in self._devices]
             epoch_ms = self._devices_epoch_ms
@@ -264,6 +308,8 @@ class RouterLiteRealtimeService:
             "source": source or "waiting_relay_local",
             "agentVersion": agent_version,
             "stale": not epoch_ms or age_ms > DEVICES_STALE_MS,
+            "delta": False,
+            "onlineDeviceCount": len(devices),
             "devices": devices,
             "error": "" if epoch_ms else "等待路由器本地终端采样",
         }
@@ -317,5 +363,8 @@ def install_router_lite_realtime_patch(hub: Any, router_sync: Any) -> RouterLite
         return jsonify(result)
 
     service.start()
+    publisher = getattr(hub, "MQTT_PUBLISHER", None)
+    if publisher is not None:
+        publisher.set_realtime_demand_handler(service.set_wss_demand)
     hub.ROUTER_LITE_REALTIME = service
     return service

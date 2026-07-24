@@ -11,7 +11,6 @@ import os
 import threading
 import time
 from typing import Any, Dict
-from urllib.parse import urlsplit
 
 from flask import jsonify
 
@@ -34,7 +33,7 @@ def _text(value: Any) -> str:
 
 def _ws_fresh_from_status(status: Any, max_age: float = 8.0) -> bool:
     row = _dict(status)
-    last_message_at = float(row.get("lastMessageAt") or 0.0)
+    last_message_at = float(row.get("lastFastAt") or row.get("lastMessageAt") or 0.0)
     return bool(row.get("connected")) and last_message_at > 0 and time.time() - last_message_at <= max_age
 
 
@@ -105,51 +104,11 @@ def merge_dashboard(previous: Any, latest: Any) -> Dict[str, Any]:
     return base
 
 
-def _dashboard_fast_seconds() -> float:
+def _static_bootstrap_timeout_seconds() -> float:
     try:
-        return max(0.5, float(os.environ.get("ROUTER_DASHBOARD_FAST_SEC", "0.75")))
+        return max(1.0, float(os.environ.get("ROUTER_STATIC_BOOTSTRAP_WAIT_SEC", "20")))
     except (TypeError, ValueError):
-        return 0.75
-
-
-def _dashboard_fallback_seconds() -> float:
-    try:
-        return max(6.0, float(os.environ.get("ROUTER_DASHBOARD_FALLBACK_SEC", "8")))
-    except (TypeError, ValueError):
-        return 8.0
-
-
-def _device_interval_seconds() -> float:
-    try:
-        return max(5.0, float(os.environ.get("ROUTER_DEVICE_POLL_SEC", "8")))
-    except (TypeError, ValueError):
-        return 8.0
-
-
-def _authenticated_connection_info(self: Any) -> tuple[str, str, str, bool, str]:
-    cfg = self.client.config
-    address = str(cfg.get("address") or "").strip().rstrip("/")
-    session = self.client.session
-    sid = str(getattr(session, "sid", "") or "").strip()
-    if not address or not sid or not getattr(session, "valid_locally", False):
-        # Waiting here avoids an unauthenticated connect/reconnect loop before login.
-        return "", "", "", False, ""
-
-    parsed = urlsplit(address if "://" in address else f"http://{address}")
-    secure = parsed.scheme.lower() == "https"
-    ws_url = f"{'wss' if secure else 'ws'}://{parsed.netloc}/ws"
-    origin = f"{'https' if secure else 'http'}://{parsed.netloc}"
-
-    cookies: Dict[str, str] = {}
-    try:
-        cookies.update({cookie.name: cookie.value for cookie in self.client.http.cookies})
-    except Exception:
-        pass
-    serial = str(getattr(session, "serial_number", "") or "").strip()
-    if serial:
-        cookies[serial] = sid
-    cookie = "; ".join(f"{key}={value}" for key, value in cookies.items() if key and value)
-    return ws_url, origin, cookie, bool(cfg.get("verifyTls", False)), parsed.hostname or ""
+        return 20.0
 
 
 def _stable_normalize(original):
@@ -159,9 +118,9 @@ def _stable_normalize(original):
         normalized = original(self, raw)
 
         ws_status = _dict(raw.get("wsStatus"))
-        has_payload = any(isinstance(raw.get(key), dict) and raw.get(key) for key in ("fast", "slow", "static"))
+        has_payload = isinstance(raw.get("fast"), dict) and bool(raw.get("fast"))
         fresh = bool(has_payload and _ws_fresh_from_status(ws_status))
-        last_message_at = float(ws_status.get("lastMessageAt") or 0.0)
+        last_message_at = float(ws_status.get("lastFastAt") or ws_status.get("lastMessageAt") or 0.0)
 
         if previous and not fresh:
             if isinstance(previous.get("telemetry"), dict):
@@ -181,7 +140,7 @@ def _stable_normalize(original):
 
 
 def _stable_sync_dashboard(self: Any, force: bool = False) -> Dict[str, Any]:
-    raw = self.client.dashboard(force=False)
+    raw = self.client.dashboard(force=force)
     normalized = self._normalize_dashboard(raw if isinstance(raw, dict) else {})
     with self.hub.ROUTER_DASHBOARD_LOCK:
         previous = _clone(self.hub.ROUTER_DASHBOARD_CACHE) if self.hub.ROUTER_DASHBOARD_CACHE else {}
@@ -200,68 +159,28 @@ def _stable_sync_dashboard(self: Any, force: bool = False) -> Dict[str, Any]:
     return public
 
 
-def _dashboard_loop(self: Any) -> None:
-    last_error = ""
-    last_run = 0.0
-    while not self._stop.wait(0.25):
-        if not self.configured():
-            continue
-        fresh, _snapshot = _client_ws_snapshot(self.client)
-        interval = _dashboard_fast_seconds() if fresh else _dashboard_fallback_seconds()
-        now = time.monotonic()
-        if now - last_run < interval:
-            continue
-        last_run = now
-        try:
-            self.sync_dashboard(force=False)
-            last_error = ""
-        except Exception as exc:
-            message = f"{type(exc).__name__}: {exc}"
-            if message != last_error:
-                self.logger.warning("router realtime dashboard refresh failed: %s", message)
-                last_error = message
-            self._stop.wait(1.5)
-
-
-def _device_loop(self: Any) -> None:
-    interval = _device_interval_seconds()
-    last_error = ""
-    self._stop.wait(2.0)
-    while not self._stop.is_set():
-        if not self.configured():
-            self._stop.wait(1.0)
-            continue
-        session = self.client.session
-        if not getattr(session, "sid", "") or not getattr(session, "valid_locally", False):
-            self._stop.wait(3.0)
-            continue
-        try:
-            with self._refresh_lock:
-                self.sync_devices(force=True)
-            last_error = ""
-        except Exception as exc:
-            message = f"{type(exc).__name__}: {exc}"
-            if message != last_error:
-                self.logger.warning("router terminal refresh failed: %s", message)
-                last_error = message
-        self._stop.wait(interval)
+def _static_bootstrap_once(self: Any) -> None:
+    if not self.configured():
+        return
+    monitor = getattr(self.client, "router_ws_monitor", None)
+    if monitor is not None:
+        monitor.wait_authenticated(_static_bootstrap_timeout_seconds())
+    try:
+        self.sync_dashboard(force=True)
+    except Exception as exc:
+        self.logger.debug("router initial static dashboard refresh deferred: %s", exc)
 
 
 def _start_workers(self: Any) -> None:
     if not self.primary or self._thread is not None:
         return
-    self._thread = threading.Thread(target=_dashboard_loop, args=(self,), name="router-dashboard-realtime", daemon=True)
-    self._device_thread = threading.Thread(target=_device_loop, args=(self,), name="router-device-sync", daemon=True)
+    self._thread = threading.Thread(target=_static_bootstrap_once, args=(self,), name="router-static-bootstrap", daemon=True)
     self._thread.start()
-    self._device_thread.start()
-    self.logger.info(
-        "router realtime workers started dashboard=%ss fallback=%ss devices=%ss",
-        _dashboard_fast_seconds(), _dashboard_fallback_seconds(), _device_interval_seconds(),
-    )
+    self.logger.info("router static bootstrap worker started; /ws fast handles realtime independently")
 
 
 def _sync_once_dashboard_first(self: Any, force: bool = True) -> Dict[str, Any]:
-    dashboard = self.sync_dashboard(force=False)
+    dashboard = self.sync_dashboard(force=force)
     devices: Dict[str, Any] = {}
     try:
         with self._refresh_lock:
@@ -285,7 +204,7 @@ def _non_blocking_refresh_view(self: Any):
 
     def worker() -> None:
         try:
-            self.sync_dashboard(force=False)
+            self.sync_dashboard(force=True)
         except Exception as exc:
             self.logger.warning("router manual dashboard refresh failed: %s", exc)
         try:
@@ -306,8 +225,6 @@ def _non_blocking_refresh_view(self: Any):
 
 
 def install_router_realtime_stability_patch() -> None:
-    router_ws_patch.RouterWebSocketMonitor._connection_info = _authenticated_connection_info
-
     original_config_poll = router_ws_patch._config_poll_seconds
 
     def stable_config_poll() -> float:
@@ -341,11 +258,15 @@ def install_router_status_localization(hub: Any, sync: Any) -> None:
         state = sync.client.status(probe=False)
         configured = bool(state.get("configured"))
         session_connected = bool(state.get("connected"))
+        realtime_service = getattr(hub, "ROUTER_LITE_REALTIME", None)
+        realtime_payload = realtime_service.router_payload() if realtime_service is not None else {}
+        realtime_epoch_ms = int(_dict(realtime_payload).get("sampleEpochMs") or 0)
+        realtime_fresh = bool(realtime_epoch_ms and not _dict(realtime_payload).get("stale"))
         with hub.ROUTER_DASHBOARD_LOCK:
-            data_available = dashboard_has_data(hub.ROUTER_DASHBOARD_CACHE, require_fresh=True)
+            data_available = realtime_fresh or dashboard_has_data(hub.ROUTER_DASHBOARD_CACHE, require_fresh=True)
 
         error_code = str(state.get("lastErrorCode") or "")
-        if data_available:
+        if realtime_fresh:
             status = "ready"
             message = "路由器已连接，实时数据正常"
             error_code = ""
