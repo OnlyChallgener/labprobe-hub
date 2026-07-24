@@ -366,6 +366,7 @@ def lock_request_data():
         or request.path.startswith("/api/router/realtime")
         or request.path.startswith("/api/devices/realtime")
         or request.path == "/api/realtime"
+        or request.path.startswith("/api/realtime/ws")
     ):
         g.data_lock_acquired = False
         return

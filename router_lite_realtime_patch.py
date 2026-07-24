@@ -80,6 +80,7 @@ class RouterLiteRealtimeService:
         self._devices_sequence = 0
         self._devices_source = ""
         self._devices_agent_version = ""
+        self._app_realtime_publisher: Any = None
 
     def start(self) -> None:
         monitor = getattr(getattr(self.sync, "client", None), "router_ws_monitor", None)
@@ -93,6 +94,11 @@ class RouterLiteRealtimeService:
         with self._demand:
             self._stopped = True
             self._demand.notify_all()
+
+    def set_app_realtime_publisher(self, publisher: Any) -> None:
+        """Attach the Hub-native WSS fan-out after routes are initialized."""
+        with self._lock:
+            self._app_realtime_publisher = publisher
 
     def set_wss_demand(self, client_id: str, active: bool) -> None:
         client_id = str(client_id or "").strip()[:96]
@@ -193,7 +199,8 @@ class RouterLiteRealtimeService:
                     "source": self._router_source,
                     **merged_router,
                 }
-        publisher = getattr(self.hub, "MQTT_PUBLISHER", None)
+        with self._lock:
+            publisher = self._app_realtime_publisher
         if router_event and publisher is not None:
             publisher.publish_router_realtime(router_event)
 
@@ -260,7 +267,8 @@ class RouterLiteRealtimeService:
                     "devices": changed_rows,
                 }
 
-        publisher = getattr(self.hub, "MQTT_PUBLISHER", None)
+        with self._lock:
+            publisher = self._app_realtime_publisher
         if devices_event and publisher is not None:
             publisher.publish_devices_realtime(devices_event)
 
@@ -363,8 +371,5 @@ def install_router_lite_realtime_patch(hub: Any, router_sync: Any) -> RouterLite
         return jsonify(result)
 
     service.start()
-    publisher = getattr(hub, "MQTT_PUBLISHER", None)
-    if publisher is not None:
-        publisher.set_realtime_demand_handler(service.set_wss_demand)
     hub.ROUTER_LITE_REALTIME = service
     return service

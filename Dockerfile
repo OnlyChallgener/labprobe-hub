@@ -24,6 +24,7 @@ RUN pip install --no-cache-dir -r /app/requirements.txt \
 
 COPY hub.py /app/hub.py
 COPY hub_entry.py /app/hub_entry.py
+COPY hub_realtime_ws.py /app/hub_realtime_ws.py
 COPY router_rpc.py /app/router_rpc.py
 COPY router_rpc_v099.py /app/router_rpc_v099.py
 COPY router_rpc_v010.py /app/router_rpc_v010.py
@@ -43,6 +44,7 @@ COPY scripts/repair_storage.py /app/scripts/repair_storage.py
 RUN python -m py_compile \
         /app/hub.py \
         /app/hub_entry.py \
+        /app/hub_realtime_ws.py \
         /app/router_rpc.py \
         /app/router_rpc_v099.py \
         /app/router_rpc_v010.py \

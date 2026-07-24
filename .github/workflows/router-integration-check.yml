@@ -53,10 +53,12 @@ jobs:
       - name: Compile and test Hub
         working-directory: ${{ github.workspace }}
         run: |
-          python -m py_compile hub.py hub_entry.py labprobe_storage.py router_rpc.py router_rpc_v099.py router_rpc_v010.py router_developer_flow_patch.py router_http_developer_transport_patch.py router_be72_auth_patch.py router_be72_sid_wire_patch.py router_native_features_patch.py router_ws_patch.py router_compat.py router_realtime_stability_patch.py router_relay_credentials_patch.py router_lite_realtime_patch.py
+          python -m py_compile hub.py hub_entry.py hub_realtime_ws.py labprobe_storage.py router_rpc.py router_rpc_v099.py router_rpc_v010.py router_developer_flow_patch.py router_http_developer_transport_patch.py router_be72_auth_patch.py router_be72_sid_wire_patch.py router_native_features_patch.py router_ws_patch.py router_compat.py router_realtime_stability_patch.py router_relay_credentials_patch.py router_lite_realtime_patch.py
           python -m pytest -q
           grep -q '/api/router/realtime/agent/demand' router_lite_realtime_patch.py
           grep -q '/api/router/realtime/agent/push' router_lite_realtime_patch.py
+          grep -q '/api/realtime/ws' hub_realtime_ws.py
+          grep -q 'check_app_token' hub_realtime_ws.py
           grep -q 'relay_local_dev_sta' router_lite_realtime_patch.py
           grep -q 'acceptedRouter' router_lite_realtime_patch.py
           grep -q 'acceptedDevices' router_lite_realtime_patch.py
@@ -66,14 +68,16 @@ jobs:
           ! grep -q 'ws_sysinfo' router_lite_realtime_patch.py
           ! grep -q 'user_list' router_lite_realtime_patch.py
           ! grep -q 'sync_devices' router_lite_realtime_patch.py
-          grep -q 'HUB_VERSION = "0.9.19"' hub_entry.py
+          ! grep -q 'MQTT_PUBLISHER' router_lite_realtime_patch.py
+          grep -q 'HUB_VERSION = "0.9.20"' hub_entry.py
       - name: Build and inspect runtime Docker image
         working-directory: ${{ github.workspace }}
         run: |
           set -e
           docker build --tag labprobe-hub-ci:latest .
           docker run --rm --entrypoint sh labprobe-hub-ci:latest -c 'test -f /app/router_lite_realtime_patch.py'
-          docker run --rm --entrypoint python labprobe-hub-ci:latest -c 'import router_lite_realtime_patch; print("router_lite_realtime_patch import ok")'
+          docker run --rm --entrypoint sh labprobe-hub-ci:latest -c 'test -f /app/hub_realtime_ws.py'
+          docker run --rm --entrypoint python labprobe-hub-ci:latest -c 'import router_lite_realtime_patch, hub_realtime_ws; print("Hub realtime websocket imports ok")'
       - name: Compile and test LabRelay local realtime agent
         working-directory: ${{ github.workspace }}/labrelay
         run: |

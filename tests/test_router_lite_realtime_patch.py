@@ -1,4 +1,5 @@
 import inspect
+import json
 from pathlib import Path
 import threading
 import time
@@ -15,20 +16,20 @@ def _fixture():
     publisher = SimpleNamespace(
         router=[],
         devices=[],
-        demand_handler=None,
         publish_router_realtime=lambda payload: publisher.router.append(payload),
         publish_devices_realtime=lambda payload: publisher.devices.append(payload),
-        set_realtime_demand_handler=lambda handler: setattr(publisher, "demand_handler", handler),
     )
     hub = SimpleNamespace(
         app=app,
         LOGGER=SimpleNamespace(info=lambda *_args: None, warning=lambda *_args: None),
-        MQTT_PUBLISHER=publisher,
+        realtime_publisher=publisher,
         check_app_token=lambda: True,
         check_hook_token=lambda: True,
         norm_mac=lambda value: str(value or "").strip().lower().replace("-", ":"),
     )
-    return hub, RouterLiteRealtimeService(hub)
+    service = RouterLiteRealtimeService(hub)
+    service.set_app_realtime_publisher(publisher)
+    return hub, service
 
 
 def _activate_both(service):
@@ -103,7 +104,7 @@ def test_app_demand_lease_expires_and_relay_push_is_not_cached():
         assert service._devices_epoch_ms == first_ms
 
 
-def test_ws_fast_updates_router_memory_sample_and_pushes_mqtt():
+def test_ws_fast_updates_router_memory_sample_and_pushes_native_wss():
     hub, service = _fixture()
     now_ms = int(time.time() * 1000)
     service.accept_router_fast({
@@ -121,7 +122,7 @@ def test_ws_fast_updates_router_memory_sample_and_pushes_mqtt():
     assert router["source"] == "router_eweb_ws_fast"
     assert router["sampleAgeMs"] < 500
     assert router["stale"] is False
-    assert hub.MQTT_PUBLISHER.router[-1]["uploadBps"] == 1234
+    assert hub.realtime_publisher.router[-1]["uploadBps"] == 1234
 
 
 def test_relay_push_updates_only_device_memory_samples():
@@ -162,9 +163,9 @@ def test_relay_push_updates_only_device_memory_samples():
         "connectionCount": 3,
     }]
     assert devices["stale"] is False
-    assert hub.MQTT_PUBLISHER.router == []
-    assert hub.MQTT_PUBLISHER.devices[-1]["devices"][0]["mac"] == "aa:bb:cc:dd:ee:ff"
-    assert hub.MQTT_PUBLISHER.devices[-1]["delta"] is True
+    assert hub.realtime_publisher.router == []
+    assert hub.realtime_publisher.devices[-1]["devices"][0]["mac"] == "aa:bb:cc:dd:ee:ff"
+    assert hub.realtime_publisher.devices[-1]["delta"] is True
 
 
 def test_router_and_device_samples_can_update_independently():
@@ -207,7 +208,7 @@ def test_device_wss_payload_contains_only_changed_rows():
         ],
     })
 
-    event = hub.MQTT_PUBLISHER.devices[-1]
+    event = hub.realtime_publisher.devices[-1]
     assert event["sampleEpochMs"] == first_ms + 2000
     assert event["devices"] == [{
         "mac": "bb",
@@ -242,7 +243,6 @@ def test_install_registers_app_and_agent_routes():
     assert "/api/devices/realtime" in rules
     assert "/api/router/realtime/agent/demand" in rules
     assert "/api/router/realtime/agent/push" in rules
-    assert hub.MQTT_PUBLISHER.demand_handler == installed.set_wss_demand
     installed.stop()
 
 
@@ -255,6 +255,7 @@ def test_service_contains_no_high_frequency_eweb_or_full_sync_path():
     assert "_rpc_lock" not in source
     assert "relay_local_dev_sta" in source
     assert "router_eweb_ws_fast" in source
+    assert "MQTT_PUBLISHER" not in source
     assert 'demand["acceptedRouter"]' in source
     assert 'demand["acceptedDevices"]' in source
 
@@ -341,3 +342,61 @@ def test_http_realtime_routes_bypass_global_data_and_router_rpc_locks():
     assert 'request.path.startswith("/api/router/realtime")' in hub_source
     assert 'request.path.startswith("/api/devices/realtime")' in hub_source
     assert 'or request.path == "/api/realtime"' in hub_source
+    assert 'request.path.startswith("/api/realtime/ws")' in hub_source
+
+
+def test_hub_native_wss_fans_out_only_compact_realtime_events():
+    import pytest
+
+    pytest.importorskip("flask_sock")
+    from hub_realtime_ws import install_hub_realtime_ws
+
+    hub, service = _fixture()
+    websocket = install_hub_realtime_ws(hub, service)
+    rules = {rule.rule for rule in hub.app.url_map.iter_rules()}
+    assert "/api/realtime/ws" in rules
+
+    client = websocket._register()
+    try:
+        websocket.publish_router_realtime({"sequence": 1, "uploadBps": 2})
+        frame = json.loads(client.frames.get(timeout=0.2))
+        assert frame == {"type": "router", "data": {"sequence": 1, "uploadBps": 2}}
+        assert "devices" not in frame["data"]
+    finally:
+        websocket._unregister(client)
+        service.stop()
+
+
+def test_hub_native_wss_route_streams_fast_sample_to_authenticated_client():
+    import pytest
+
+    pytest.importorskip("flask_sock")
+    websocket_client = pytest.importorskip("websocket")
+    from werkzeug.serving import make_server
+    from hub_realtime_ws import install_hub_realtime_ws
+
+    hub, service = _fixture()
+    install_hub_realtime_ws(hub, service)
+    server = make_server("127.0.0.1", 0, hub.app, threaded=True)
+    worker = threading.Thread(target=server.serve_forever, daemon=True)
+    worker.start()
+    client = None
+    try:
+        client = websocket_client.create_connection(
+            f"ws://127.0.0.1:{server.server_port}/api/realtime/ws",
+            timeout=2,
+            http_proxy_host=None,
+            http_proxy_port=None,
+        )
+        assert json.loads(client.recv())["type"] == "ready"
+        service.accept_router_fast({"uploadBps": 123, "downloadBps": 456}, int(time.time() * 1000))
+        frame = json.loads(client.recv())
+        assert frame["type"] == "router"
+        assert frame["data"]["uploadBps"] == 123
+        assert frame["data"]["downloadBps"] == 456
+    finally:
+        if client is not None:
+            client.close()
+        server.shutdown()
+        worker.join(timeout=2)
+        service.stop()
