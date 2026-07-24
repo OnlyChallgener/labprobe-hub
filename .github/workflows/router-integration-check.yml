@@ -64,6 +64,7 @@ jobs:
           grep -q 'MAX_ROUTER_RETRY_SECONDS = 2.0' router_fast_watchdog_patch.py
           grep -q 'ROUTER_STALE_MS = 12_000' router_fast_watchdog_patch.py
           grep -q 'DETAIL_REFRESH_SECONDS = 60.0' router_build024_fix.py
+          grep -q '_router_fields_precise' router_build024_fix.py
           grep -q '"temperature2gC"' router_build024_fix.py
           grep -q '"temperature5gC"' router_build024_fix.py
           grep -q '"storagePercent"' router_build024_fix.py
