@@ -1,10 +1,10 @@
 """Hardening for the router native ``/ws type=fast`` realtime lane.
 
 The router socket can remain TCP-connected while its one-second ``fast`` stream
-has silently stopped. The original outer reconnect loop could also back off to
-30 seconds after ordinary transport failures. This patch detects a silent fast
-stall and caps every reconnect delay at three seconds, without using HTTP
-Dashboard, terminal, configuration or Agent realtime fallbacks.
+has silently stopped. This patch detects a real silent fast stall and keeps
+recovery short, while tolerating brief mobile/router scheduling gaps without
+repeatedly cycling a healthy socket. It never uses HTTP Dashboard, terminal,
+configuration or Agent realtime fallbacks.
 """
 from __future__ import annotations
 
@@ -19,13 +19,13 @@ import websocket
 import router_lite_realtime_patch
 import router_ws_patch
 
-FAST_START_GRACE_SECONDS = 5.0
-FAST_STALL_SECONDS = 4.5
+FAST_START_GRACE_SECONDS = 8.0
+FAST_STALL_SECONDS = 8.0
 FAST_SOCKET_POLL_SECONDS = 1.0
-MAX_ROUTER_RETRY_SECONDS = 3.0
+MAX_ROUTER_RETRY_SECONDS = 2.0
 DEVICE_DEMAND_TTL_SECONDS = 15.0
-ROUTER_STALE_MS = 7_000
-DEVICES_STALE_MS = 7_000
+ROUTER_STALE_MS = 12_000
+DEVICES_STALE_MS = 10_000
 
 
 def _fast_stream_stalled(monitor: Any, connected_at: float, now: float) -> bool:
@@ -44,7 +44,7 @@ def _run_connection_with_fast_watchdog(
     verify_tls: bool,
     hostname: str,
 ) -> None:
-    """Receive router frames and reopen the socket when ``fast`` goes silent."""
+    """Receive router frames and reopen the socket only when ``fast`` truly stalls."""
     sslopt = None
     if ws_url.startswith("wss://") and not verify_tls:
         sslopt = {"cert_reqs": ssl.CERT_NONE, "check_hostname": False}
@@ -96,7 +96,7 @@ def _run_connection_with_fast_watchdog(
 
 
 def _router_ws_loop_fast_recovery(self: Any) -> None:
-    """Original authentication semantics with a strict 1/2/3 second retry cap."""
+    """Original authentication semantics with a strict 1/2 second retry cap."""
     retry = 1.0
     last_logged_error = ""
     force_login = False
