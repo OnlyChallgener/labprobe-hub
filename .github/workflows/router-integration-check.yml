@@ -56,13 +56,18 @@ jobs:
       - name: Compile and test Hub
         working-directory: ${{ github.workspace }}
         run: |
-          python -m py_compile hub.py hub_entry.py hub_realtime_ws.py labprobe_storage.py router_rpc.py router_rpc_v099.py router_rpc_v010.py router_developer_flow_patch.py router_http_developer_transport_patch.py router_be72_auth_patch.py router_be72_sid_wire_patch.py router_native_features_patch.py router_ws_patch.py router_fast_watchdog_patch.py router_compat.py router_realtime_stability_patch.py router_relay_credentials_patch.py router_lite_realtime_patch.py
+          python -m py_compile hub.py hub_entry.py hub_realtime_ws.py labprobe_storage.py router_rpc.py router_rpc_v099.py router_rpc_v010.py router_developer_flow_patch.py router_http_developer_transport_patch.py router_be72_auth_patch.py router_be72_sid_wire_patch.py router_native_features_patch.py router_ws_patch.py router_fast_watchdog_patch.py router_build024_fix.py router_compat.py router_realtime_stability_patch.py router_relay_credentials_patch.py router_lite_realtime_patch.py
           python -m pytest -q
-          grep -q 'HUB_VERSION = "0.9.23"' hub_entry.py
-          grep -q 'install_router_fast_watchdog_patch()' hub_entry.py
+          grep -q 'HUB_VERSION = "0.9.24"' hub_entry.py
+          grep -q 'install_router_build024_fix()' hub_entry.py
           grep -q 'FAST_STALL_SECONDS = 8.0' router_fast_watchdog_patch.py
           grep -q 'MAX_ROUTER_RETRY_SECONDS = 2.0' router_fast_watchdog_patch.py
           grep -q 'ROUTER_STALE_MS = 12_000' router_fast_watchdog_patch.py
+          grep -q 'DETAIL_REFRESH_SECONDS = 60.0' router_build024_fix.py
+          grep -q '"temperature2gC"' router_build024_fix.py
+          grep -q '"temperature5gC"' router_build024_fix.py
+          grep -q '"storagePercent"' router_build024_fix.py
+          grep -q 'router-details-refresh' router_build024_fix.py
           grep -q 'monitor_class._loop = _router_ws_loop_fast_recovery' router_fast_watchdog_patch.py
           grep -q 'router fast stream stalled; reconnecting' router_fast_watchdog_patch.py
           grep -q '/api/realtime/ws' hub_realtime_ws.py
@@ -87,7 +92,8 @@ jobs:
           docker run --rm --entrypoint sh labprobe-hub-ci:latest -c 'test -f /app/router_lite_realtime_patch.py'
           docker run --rm --entrypoint sh labprobe-hub-ci:latest -c 'test -f /app/hub_realtime_ws.py'
           docker run --rm --entrypoint sh labprobe-hub-ci:latest -c 'test -f /app/router_fast_watchdog_patch.py'
-          docker run --rm --entrypoint python labprobe-hub-ci:latest -c 'import router_lite_realtime_patch, router_fast_watchdog_patch, hub_realtime_ws; print("Hub realtime imports ok")'
+          docker run --rm --entrypoint sh labprobe-hub-ci:latest -c 'test -f /app/router_build024_fix.py'
+          docker run --rm --entrypoint python labprobe-hub-ci:latest -c 'import router_lite_realtime_patch, router_fast_watchdog_patch, router_build024_fix, hub_realtime_ws; print("Hub realtime imports ok")'
       - name: Compile and test LabRelay device-only realtime agent
         working-directory: ${{ github.workspace }}/labrelay
         run: |
