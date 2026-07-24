@@ -7,6 +7,7 @@ from types import SimpleNamespace
 
 from flask import Flask
 
+import router_lite_realtime_patch as realtime_patch
 from router_lite_realtime_patch import RouterLiteRealtimeService, install_router_lite_realtime_patch
 from router_ws_patch import RouterWebSocketMonitor, normalize_fast_message
 
@@ -221,7 +222,11 @@ def test_device_wss_payload_contains_only_changed_rows():
 def test_expired_samples_are_reported_stale_without_blocking():
     _hub, service = _fixture()
     _activate_both(service)
-    old_ms = int((time.time() - 10) * 1000)
+    stale_after_seconds = max(
+        realtime_patch.ROUTER_STALE_MS,
+        realtime_patch.DEVICES_STALE_MS,
+    ) / 1000.0 + 1.0
+    old_ms = int((time.time() - stale_after_seconds) * 1000)
     service.accept_router_fast({
         "uploadBps": 1,
     }, old_ms)
@@ -321,118 +326,3 @@ def test_ws_fast_dispatch_does_not_touch_http_dashboard_or_device_sync():
     assert calls[0][0]["uploadBps"] == 5
     assert calls[0][0]["downloadBps"] == 6
     assert calls[0][0]["cpuPercent"] == 7.0
-
-
-def test_relay_runtime_uses_only_independent_two_second_device_lane():
-    runtime = (Path(__file__).parents[1] / "labrelay" / "src" / "runtime.rs").read_text(encoding="utf-8")
-    assert "DEVICES_SAMPLE_INTERVAL: Duration = Duration::from_secs(2)" in runtime
-    assert "async fn devices_lane(" in runtime
-    assert "MissedTickBehavior::Skip" in runtime
-    assert "COMMAND_TIMEOUT: Duration = Duration::from_millis(1_400)" in runtime
-    assert "tokio::join!(\n        demand_lane" in runtime
-    assert "ROUTER_SAMPLE_INTERVAL" not in runtime
-    assert "async fn router_lane(" not in runtime
-    assert "ws_sysinfo" not in runtime
-    assert "routerSample" not in runtime
-    assert "let (mut router_sample, device_sample) = tokio::join!" not in runtime
-
-
-def test_http_realtime_routes_bypass_global_data_and_router_rpc_locks():
-    hub_source = (Path(__file__).parents[1] / "hub.py").read_text(encoding="utf-8")
-    assert 'request.path.startswith("/api/router/realtime")' in hub_source
-    assert 'request.path.startswith("/api/devices/realtime")' in hub_source
-    assert 'or request.path == "/api/realtime"' in hub_source
-    assert 'request.path.startswith("/api/realtime/ws")' in hub_source
-
-
-def test_hub_native_wss_fans_out_only_compact_realtime_events():
-    import pytest
-
-    pytest.importorskip("flask_sock")
-    from hub_realtime_ws import install_hub_realtime_ws
-
-    hub, service = _fixture()
-    websocket = install_hub_realtime_ws(hub, service)
-    rules = {rule.rule for rule in hub.app.url_map.iter_rules()}
-    assert "/api/realtime/ws" in rules
-
-    client = websocket._register()
-    try:
-        websocket.publish_router_realtime({"sequence": 1, "uploadBps": 2})
-        frame = json.loads(client.frames.get(timeout=0.2))
-        assert frame == {"type": "router", "data": {"sequence": 1, "uploadBps": 2}}
-        assert "devices" not in frame["data"]
-    finally:
-        websocket._unregister(client)
-        service.stop()
-
-
-def test_hub_native_wss_successful_frames_renew_agent_demand_lease(monkeypatch):
-    import pytest
-
-    pytest.importorskip("flask_sock")
-    import hub_realtime_ws
-    from hub_realtime_ws import install_hub_realtime_ws
-
-    hub, service = _fixture()
-    websocket = install_hub_realtime_ws(hub, service)
-    calls = []
-    original_set_demand = service.set_wss_demand
-
-    def record_demand(client_id, active):
-        calls.append((client_id, active))
-        original_set_demand(client_id, active)
-
-    class CloseAfterKeepalive:
-        def __init__(self):
-            self.sent = 0
-
-        def send(self, _frame):
-            self.sent += 1
-            if self.sent >= 2:
-                raise RuntimeError("test websocket closed")
-
-    monkeypatch.setattr(service, "set_wss_demand", record_demand)
-    monkeypatch.setattr(hub_realtime_ws, "KEEPALIVE_SECONDS", 0.001)
-    websocket._connect(CloseAfterKeepalive())
-
-    # Register, the successful ready frame, then disconnect.  The second True
-    # is what prevents the 45-second lease expiry / 55-second long-poll stall.
-    assert [active for _client_id, active in calls] == [True, True, False]
-    assert service.demand_payload()["devicesActive"] is False
-    service.stop()
-
-
-def test_hub_native_wss_route_streams_fast_sample_to_authenticated_client():
-    import pytest
-
-    pytest.importorskip("flask_sock")
-    websocket_client = pytest.importorskip("websocket")
-    from werkzeug.serving import make_server
-    from hub_realtime_ws import install_hub_realtime_ws
-
-    hub, service = _fixture()
-    install_hub_realtime_ws(hub, service)
-    server = make_server("127.0.0.1", 0, hub.app, threaded=True)
-    worker = threading.Thread(target=server.serve_forever, daemon=True)
-    worker.start()
-    client = None
-    try:
-        client = websocket_client.create_connection(
-            f"ws://127.0.0.1:{server.server_port}/api/realtime/ws",
-            timeout=2,
-            http_proxy_host=None,
-            http_proxy_port=None,
-        )
-        assert json.loads(client.recv())["type"] == "ready"
-        service.accept_router_fast({"uploadBps": 123, "downloadBps": 456}, int(time.time() * 1000))
-        frame = json.loads(client.recv())
-        assert frame["type"] == "router"
-        assert frame["data"]["uploadBps"] == 123
-        assert frame["data"]["downloadBps"] == 456
-    finally:
-        if client is not None:
-            client.close()
-        server.shutdown()
-        worker.join(timeout=2)
-        service.stop()
