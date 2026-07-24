@@ -1,11 +1,11 @@
 """Authenticated Hub-native WebSocket fan-out for compact realtime deltas.
 
-This is intentionally separate from the router's eWeb socket.  Router eWeb
-``fast`` frames and LabRelay device samples are first stored in Hub memory by
-``RouterLiteRealtimeService``; this module only fans out the resulting compact
-increments to foreground APP clients authenticated with the existing APP_TOKEN.
+Router eWeb ``type=fast`` frames and LabRelay terminal samples are already
+stored in Hub memory.  This module keeps one authenticated foreground WSS
+connection per APP, immediately sends the latest memory snapshots, then fans
+out compact deltas.  It never reads a router HTTP API, full Dashboard, terminal
+list, SQLite document or revision stream.
 """
-
 from __future__ import annotations
 
 import json
@@ -22,6 +22,7 @@ from flask_sock import Sock
 
 CLIENT_QUEUE_SIZE = 4
 KEEPALIVE_SECONDS = 3.0
+PROTOCOL_NAME = "labprobe-realtime-v2"
 
 
 @dataclass
@@ -39,18 +40,12 @@ class HubRealtimeWebSocketService:
         self.logger = hub.LOGGER
         self._clients_lock = threading.RLock()
         self._clients: Dict[str, _RealtimeClient] = {}
-        # Register through Flask-Sock's blueprint path before binding it to
-        # the application.  This also works when this is the first dynamic
-        # route installed on a minimal Flask app.
         self._sock = Sock()
         self._sock.route("/api/realtime/ws")(self._connect)
         self._sock.init_app(hub.app)
 
         @hub.app.before_request
         def _reject_unauthorized_realtime_ws():
-            # Reject before the protocol upgrade so an invalid APP_TOKEN is
-            # reported to the client as an HTTP authentication failure rather
-            # than a briefly-open WebSocket that immediately closes.
             if request.path == "/api/realtime/ws" and not hub.check_app_token():
                 return jsonify({"ok": False, "error": "unauthorized"}), 401
             return None
@@ -76,15 +71,11 @@ class HubRealtimeWebSocketService:
         try:
             client.frames.put_nowait(frame)
         except queue.Full:
-            # A concurrent fan-out replaced the dropped frame.  Keeping the
-            # latest queued values is preferable to blocking fast reception.
             return
 
     def _publish(self, kind: str, payload: Dict[str, Any]) -> None:
         if not isinstance(payload, dict) or not payload:
             return
-        # The payload is already a compact in-memory event.  Never read a
-        # dashboard, terminal list, SQLite document or router HTTP API here.
         frame = self._frame(kind, dict(payload))
         with self._clients_lock:
             clients = tuple(self._clients.values())
@@ -109,15 +100,8 @@ class HubRealtimeWebSocketService:
         return client
 
     def _renew_client_lease(self, client: _RealtimeClient) -> None:
-        """Keep Relay sampling enabled only while this WSS sender is alive.
-
-        Registering once is insufficient: the Relay demand lease deliberately
-        expires after a short interval so a dead foreground connection cannot
-        keep terminal sampling alive.  A successfully written WSS frame is the
-        Hub-side liveness signal, so renew the lease after each send.  This is
-        isolated from the router ``fast`` receive path and never takes the
-        router/config/device synchronization locks.
-        """
+        # A live APP WSS connection is the terminal realtime demand lease.  The
+        # router fast lane is independent and never waits for Agent demand.
         self.realtime_service.set_wss_demand(client.client_id, True)
 
     def _unregister(self, client: _RealtimeClient) -> None:
@@ -125,27 +109,56 @@ class HubRealtimeWebSocketService:
             self._clients.pop(client.client_id, None)
         self.realtime_service.set_wss_demand(client.client_id, False)
 
+    def _send(self, ws: Any, client: _RealtimeClient, frame: str) -> None:
+        ws.send(frame)
+        self._renew_client_lease(client)
+
+    def _send_initial_snapshots(self, ws: Any, client: _RealtimeClient) -> None:
+        router = self.realtime_service.router_payload()
+        if int(router.get("sampleEpochMs") or 0) > 0:
+            self._send(ws, client, self._frame("router", router))
+        devices = self.realtime_service.devices_payload()
+        if int(devices.get("sampleEpochMs") or 0) > 0:
+            self._send(ws, client, self._frame("devices", devices))
+
     def _connect(self, ws: Any) -> None:
-        # Flask-Sock exposes the normal Flask request context during the
-        # handshake, so the same Bearer APP_TOKEN guard covers HTTP and WSS.
         if not self.hub.check_app_token():
             ws.close(1008, "unauthorized")
             return
 
         client = self._register()
         try:
-            ws.send(self._frame("ready", {"serverEpochMs": int(time.time() * 1000)}))
-            self._renew_client_lease(client)
+            self._send(
+                ws,
+                client,
+                self._frame(
+                    "ready",
+                    {
+                        "protocol": PROTOCOL_NAME,
+                        "clientId": client.client_id,
+                        "serverEpochMs": int(time.time() * 1000),
+                        "keepaliveSeconds": KEEPALIVE_SECONDS,
+                    },
+                ),
+            )
+            # Initial values come only from Hub memory, so the APP never waits
+            # for Agent, HTTP login, Dashboard or a fresh router command.
+            self._send_initial_snapshots(ws, client)
+            sequence = 0
             while True:
                 try:
                     frame = client.frames.get(timeout=KEEPALIVE_SECONDS)
                 except queue.Empty:
-                    frame = self._frame("keepalive", {"serverEpochMs": int(time.time() * 1000)})
-                ws.send(frame)
-                self._renew_client_lease(client)
+                    sequence += 1
+                    frame = self._frame(
+                        "keepalive",
+                        {
+                            "sequence": sequence,
+                            "serverEpochMs": int(time.time() * 1000),
+                        },
+                    )
+                self._send(ws, client, frame)
         except Exception:
-            # A normal APP background/close path is expected.  Do not log a
-            # noisy warning or let one client affect another sender.
             return
         finally:
             self._unregister(client)
