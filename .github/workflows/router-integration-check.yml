@@ -3,12 +3,14 @@ name: Router Integration Check
 on:
   push:
     branches:
+      - hub0919
       - codex/router-rpc-v098-relay-v029
     paths:
       - Dockerfile
       - router_*.py
       - hub.py
       - hub_entry.py
+      - hub_realtime_ws.py
       - labprobe_storage.py
       - requirements.txt
       - pytest.ini
@@ -21,6 +23,7 @@ on:
       - router_*.py
       - hub.py
       - hub_entry.py
+      - hub_realtime_ws.py
       - labprobe_storage.py
       - requirements.txt
       - pytest.ini
@@ -53,23 +56,24 @@ jobs:
       - name: Compile and test Hub
         working-directory: ${{ github.workspace }}
         run: |
-          python -m py_compile hub.py hub_entry.py hub_realtime_ws.py labprobe_storage.py router_rpc.py router_rpc_v099.py router_rpc_v010.py router_developer_flow_patch.py router_http_developer_transport_patch.py router_be72_auth_patch.py router_be72_sid_wire_patch.py router_native_features_patch.py router_ws_patch.py router_compat.py router_realtime_stability_patch.py router_relay_credentials_patch.py router_lite_realtime_patch.py
+          python -m py_compile hub.py hub_entry.py hub_realtime_ws.py labprobe_storage.py router_rpc.py router_rpc_v099.py router_rpc_v010.py router_developer_flow_patch.py router_http_developer_transport_patch.py router_be72_auth_patch.py router_be72_sid_wire_patch.py router_native_features_patch.py router_ws_patch.py router_fast_watchdog_patch.py router_compat.py router_realtime_stability_patch.py router_relay_credentials_patch.py router_lite_realtime_patch.py
           python -m pytest -q
-          grep -q '/api/router/realtime/agent/demand' router_lite_realtime_patch.py
-          grep -q '/api/router/realtime/agent/push' router_lite_realtime_patch.py
+          grep -q 'HUB_VERSION = "0.9.22"' hub_entry.py
+          grep -q 'install_router_fast_watchdog_patch()' hub_entry.py
+          grep -q 'FAST_STALL_SECONDS = 4.5' router_fast_watchdog_patch.py
+          grep -q 'router fast stream stalled; reconnecting' router_fast_watchdog_patch.py
           grep -q '/api/realtime/ws' hub_realtime_ws.py
-          grep -q 'check_app_token' hub_realtime_ws.py
-          grep -q 'relay_local_dev_sta' router_lite_realtime_patch.py
+          grep -q 'PROTOCOL_NAME = "labprobe-realtime-v2"' hub_realtime_ws.py
+          grep -q '_send_initial_snapshots' hub_realtime_ws.py
+          grep -q 'KEEPALIVE_SECONDS = 3.0' hub_realtime_ws.py
+          grep -q 'router_eweb_ws_fast' router_lite_realtime_patch.py
           grep -q 'acceptedRouter' router_lite_realtime_patch.py
           grep -q 'acceptedDevices' router_lite_realtime_patch.py
-          grep -q 'if router_active else {}' router_lite_realtime_patch.py
-          grep -q 'devices_active and isinstance' router_lite_realtime_patch.py
           ! grep -q 'requests.Session' router_lite_realtime_patch.py
           ! grep -q 'ws_sysinfo' router_lite_realtime_patch.py
           ! grep -q 'user_list' router_lite_realtime_patch.py
           ! grep -q 'sync_devices' router_lite_realtime_patch.py
           ! grep -q 'MQTT_PUBLISHER' router_lite_realtime_patch.py
-          grep -q 'HUB_VERSION = "0.9.21"' hub_entry.py
       - name: Build and inspect runtime Docker image
         working-directory: ${{ github.workspace }}
         run: |
@@ -77,19 +81,20 @@ jobs:
           docker build --tag labprobe-hub-ci:latest .
           docker run --rm --entrypoint sh labprobe-hub-ci:latest -c 'test -f /app/router_lite_realtime_patch.py'
           docker run --rm --entrypoint sh labprobe-hub-ci:latest -c 'test -f /app/hub_realtime_ws.py'
-          docker run --rm --entrypoint python labprobe-hub-ci:latest -c 'import router_lite_realtime_patch, hub_realtime_ws; print("Hub realtime websocket imports ok")'
-      - name: Compile and test LabRelay local realtime agent
+          docker run --rm --entrypoint sh labprobe-hub-ci:latest -c 'test -f /app/router_fast_watchdog_patch.py'
+          docker run --rm --entrypoint python labprobe-hub-ci:latest -c 'import router_lite_realtime_patch, router_fast_watchdog_patch, hub_realtime_ws; print("Hub realtime imports ok")'
+      - name: Compile and test LabRelay device-only realtime agent
         working-directory: ${{ github.workspace }}/labrelay
         run: |
           cargo test --all-targets
           cargo build --release
-          grep -q 'pub hub_direct_mode: bool' src/agent.rs
-          grep -q 'crate::runtime::run' src/agent.rs
-          grep -q '^mod runtime;' src/main.rs
+          grep -q 'DEVICES_SAMPLE_INTERVAL: Duration = Duration::from_secs(2)' src/runtime.rs
+          grep -q 'async fn devices_lane(' src/runtime.rs
+          grep -q 'MissedTickBehavior::Skip' src/runtime.rs
           grep -q '/api/router/realtime/agent/demand' src/runtime.rs
           grep -q '/api/router/realtime/agent/push' src/runtime.rs
-          grep -q 'dev_sta_json("ws_sysinfo"' src/runtime.rs
           grep -q '"user_list"' src/runtime.rs
+          ! grep -q 'ws_sysinfo' src/runtime.rs
+          ! grep -q 'routerSample' src/runtime.rs
           grep -q 'relay_local_dev_sta' src/runtime.rs
-          grep -q 'env!("CARGO_PKG_VERSION")' src/main.rs
           grep -q 'version = "0.2.11"' Cargo.toml
