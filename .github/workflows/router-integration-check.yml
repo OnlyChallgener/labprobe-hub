@@ -57,7 +57,7 @@ jobs:
               sha: context.sha,
               state: 'pending',
               context: 'labprobe/hub-integration-stage',
-              description: 'Hub 0.9.24 validation started',
+              description: 'Hub 0.9.25 validation started',
               target_url: `${context.serverUrl}/${context.repo.owner}/${context.repo.repo}/actions/runs/${context.runId}`,
             });
       - uses: actions/setup-python@v5
@@ -86,11 +86,11 @@ jobs:
             tail -n 18 /tmp/hub-pytest.log | tr '\n' ' ' | cut -c1-500 > /tmp/hub-ci-error.txt
           fi
           exit $STATUS
-      - name: Verify Hub 0.9.24 source invariants
+      - name: Verify Hub 0.9.25 source invariants
         id: invariants
         working-directory: ${{ github.workspace }}
         run: |
-          grep -q 'HUB_VERSION = "0.9.24"' hub_entry.py
+          grep -q 'HUB_VERSION = "0.9.25"' hub_entry.py
           grep -q 'install_router_build024_fix()' hub_entry.py
           grep -q 'FAST_STALL_SECONDS = 8.0' router_fast_watchdog_patch.py
           grep -q 'MAX_ROUTER_RETRY_SECONDS = 2.0' router_fast_watchdog_patch.py
@@ -112,6 +112,12 @@ jobs:
           grep -q 'router_eweb_ws_fast' router_lite_realtime_patch.py
           grep -q 'acceptedRouter' router_lite_realtime_patch.py
           grep -q 'acceptedDevices' router_lite_realtime_patch.py
+          grep -q 'NAT_TIMEOUT_SECONDS = 75.0' router_native_features_patch.py
+          grep -q 'router-nat-diagnostic-' router_native_features_patch.py
+          grep -q '路由 NAT 诊断已在后台启动' router_native_features_patch.py
+          grep -q 'status": "timeout"' router_native_features_patch.py
+          grep -q 'DEFAULT_STUN_HOST = "stun.voip.aebc.com"' router_native_features_patch.py
+          ! grep -A4 '@bp.get("/nat-diagnostic")' router_native_features_patch.py | grep -q 'client.rpc'
           ! grep -q 'requests.Session' router_lite_realtime_patch.py
           ! grep -q 'ws_sysinfo' router_lite_realtime_patch.py
           ! grep -q 'user_list' router_lite_realtime_patch.py
@@ -127,7 +133,7 @@ jobs:
           docker run --rm --entrypoint sh labprobe-hub-ci:latest -c 'test -f /app/hub_realtime_ws.py'
           docker run --rm --entrypoint sh labprobe-hub-ci:latest -c 'test -f /app/router_fast_watchdog_patch.py'
           docker run --rm --entrypoint sh labprobe-hub-ci:latest -c 'test -f /app/router_build024_fix.py'
-          docker run --rm --entrypoint python labprobe-hub-ci:latest -c 'import router_lite_realtime_patch, router_fast_watchdog_patch, router_build024_fix, hub_realtime_ws; print("Hub realtime imports ok")'
+          docker run --rm --entrypoint python labprobe-hub-ci:latest -c 'import router_lite_realtime_patch, router_fast_watchdog_patch, router_build024_fix, router_native_features_patch, hub_realtime_ws; print("Hub realtime and NAT imports ok")'
       - name: Compile and test LabRelay device-only realtime agent
         id: relay
         working-directory: ${{ github.workspace }}/labrelay
