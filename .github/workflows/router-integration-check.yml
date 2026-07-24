@@ -76,7 +76,16 @@ jobs:
       - name: Run Hub pytest suite
         id: pytest
         working-directory: ${{ github.workspace }}
-        run: python -m pytest -q
+        shell: bash
+        run: |
+          set +e
+          python -m pytest -q > /tmp/hub-pytest.log 2>&1
+          STATUS=$?
+          cat /tmp/hub-pytest.log
+          if [ "$STATUS" -ne 0 ]; then
+            tail -n 18 /tmp/hub-pytest.log | tr '\n' ' ' | cut -c1-500 > /tmp/hub-ci-error.txt
+          fi
+          exit $STATUS
       - name: Verify Hub 0.9.24 source invariants
         id: invariants
         working-directory: ${{ github.workspace }}
@@ -147,6 +156,7 @@ jobs:
           RELAY_OUTCOME: ${{ steps.relay.outcome }}
         with:
           script: |
+            const fs = require('fs');
             const outcomes = {
               install: process.env.INSTALL_OUTCOME,
               compile: process.env.COMPILE_OUTCOME,
@@ -156,7 +166,10 @@ jobs:
               relay: process.env.RELAY_OUTCOME,
             };
             const ok = Object.values(outcomes).every(value => value === 'success');
-            const detail = Object.entries(outcomes).map(([key, value]) => `${key}=${value}`).join(' ');
+            let detail = Object.entries(outcomes).map(([key, value]) => `${key}=${value}`).join(' ');
+            if (fs.existsSync('/tmp/hub-ci-error.txt')) {
+              detail = fs.readFileSync('/tmp/hub-ci-error.txt', 'utf8').trim() || detail;
+            }
             await github.rest.repos.createCommitStatus({
               owner: context.repo.owner,
               repo: context.repo.repo,
@@ -166,3 +179,12 @@ jobs:
               description: detail.slice(0, 140),
               target_url: `${context.serverUrl}/${context.repo.owner}/${context.repo.repo}/actions/runs/${context.runId}`,
             });
+      - name: Upload Hub pytest diagnostic
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: hub-pytest-diagnostic
+          path: |
+            /tmp/hub-pytest.log
+            /tmp/hub-ci-error.txt
+          if-no-files-found: ignore
