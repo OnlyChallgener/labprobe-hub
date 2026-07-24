@@ -8,13 +8,21 @@ from __future__ import annotations
 import os
 import threading
 import time
-from typing import Any
+from typing import Any, Dict
 
 import router_compat
 import router_lite_realtime_patch
 import router_ws_patch
 
 DETAIL_REFRESH_SECONDS = 60.0
+_FLOAT_ROUTER_FIELDS = {
+    "cpuPercent",
+    "memoryPercent",
+    "temperatureC",
+    "temperature2gC",
+    "temperature5gC",
+    "storagePercent",
+}
 
 
 def _refresh_interval() -> float:
@@ -57,6 +65,20 @@ def _start_details_worker(self: Any) -> None:
     )
 
 
+def _router_fields_precise(self: Any, value: Any) -> Dict[str, Any]:
+    if not isinstance(value, dict):
+        return {}
+    output: Dict[str, Any] = {}
+    for key in router_lite_realtime_patch._ROUTER_FIELDS:
+        if key not in value:
+            continue
+        if key in _FLOAT_ROUTER_FIELDS:
+            output[key] = router_lite_realtime_patch._number(value.get(key))
+        else:
+            output[key] = router_lite_realtime_patch._integer(value.get(key))
+    return output
+
+
 def install_router_build024_fix() -> None:
     # BE72 native fast already carries these two radio temperatures. Some
     # firmwares also expose diskutil in fast; otherwise the independent detail
@@ -71,6 +93,7 @@ def install_router_build024_fix() -> None:
         "temperature5gC",
         "storagePercent",
     })
+    router_lite_realtime_patch.RouterLiteRealtimeService._router_fields = _router_fields_precise
 
     cls = router_compat.RouterRpcCompatibilitySync
     cls.start = _start_details_worker
