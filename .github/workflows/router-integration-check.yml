@@ -69,7 +69,7 @@ jobs:
           ! grep -q 'user_list' router_lite_realtime_patch.py
           ! grep -q 'sync_devices' router_lite_realtime_patch.py
           ! grep -q 'MQTT_PUBLISHER' router_lite_realtime_patch.py
-          grep -q 'HUB_VERSION = "0.9.20"' hub_entry.py
+          grep -q 'HUB_VERSION = "0.9.21"' hub_entry.py
       - name: Build and inspect runtime Docker image
         working-directory: ${{ github.workspace }}
         run: |

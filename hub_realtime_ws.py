@@ -105,8 +105,20 @@ class HubRealtimeWebSocketService:
         client = _RealtimeClient(client_id=f"app-ws-{secrets.token_hex(8)}")
         with self._clients_lock:
             self._clients[client.client_id] = client
-        self.realtime_service.set_wss_demand(client.client_id, True)
+        self._renew_client_lease(client)
         return client
+
+    def _renew_client_lease(self, client: _RealtimeClient) -> None:
+        """Keep Relay sampling enabled only while this WSS sender is alive.
+
+        Registering once is insufficient: the Relay demand lease deliberately
+        expires after a short interval so a dead foreground connection cannot
+        keep terminal sampling alive.  A successfully written WSS frame is the
+        Hub-side liveness signal, so renew the lease after each send.  This is
+        isolated from the router ``fast`` receive path and never takes the
+        router/config/device synchronization locks.
+        """
+        self.realtime_service.set_wss_demand(client.client_id, True)
 
     def _unregister(self, client: _RealtimeClient) -> None:
         with self._clients_lock:
@@ -123,12 +135,14 @@ class HubRealtimeWebSocketService:
         client = self._register()
         try:
             ws.send(self._frame("ready", {"serverEpochMs": int(time.time() * 1000)}))
+            self._renew_client_lease(client)
             while True:
                 try:
                     frame = client.frames.get(timeout=KEEPALIVE_SECONDS)
                 except queue.Empty:
                     frame = self._frame("keepalive", {"serverEpochMs": int(time.time() * 1000)})
                 ws.send(frame)
+                self._renew_client_lease(client)
         except Exception:
             # A normal APP background/close path is expected.  Do not log a
             # noisy warning or let one client affect another sender.

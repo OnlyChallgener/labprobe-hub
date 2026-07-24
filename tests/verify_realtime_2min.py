@@ -57,10 +57,12 @@ def main():
     hub = SimpleNamespace(
         app=Flask(__name__),
         LOGGER=SimpleNamespace(info=lambda *_args: None, warning=lambda *_args: None),
-        MQTT_PUBLISHER=publisher,
         norm_mac=lambda value: str(value or "").strip().lower().replace("-", ":"),
     )
     service = RouterLiteRealtimeService(hub)
+    # The production service fans out compact cache deltas through Hub-native
+    # WSS.  Use the same publisher seam here instead of the removed MQTT path.
+    service.set_app_realtime_publisher(publisher)
     service.set_wss_demand("soak-app", True)
 
     # HTTP is calibration-only: one initial cache read for each lane.

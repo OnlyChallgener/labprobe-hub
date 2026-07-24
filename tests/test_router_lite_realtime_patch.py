@@ -367,6 +367,42 @@ def test_hub_native_wss_fans_out_only_compact_realtime_events():
         service.stop()
 
 
+def test_hub_native_wss_successful_frames_renew_agent_demand_lease(monkeypatch):
+    import pytest
+
+    pytest.importorskip("flask_sock")
+    import hub_realtime_ws
+    from hub_realtime_ws import install_hub_realtime_ws
+
+    hub, service = _fixture()
+    websocket = install_hub_realtime_ws(hub, service)
+    calls = []
+    original_set_demand = service.set_wss_demand
+
+    def record_demand(client_id, active):
+        calls.append((client_id, active))
+        original_set_demand(client_id, active)
+
+    class CloseAfterKeepalive:
+        def __init__(self):
+            self.sent = 0
+
+        def send(self, _frame):
+            self.sent += 1
+            if self.sent >= 2:
+                raise RuntimeError("test websocket closed")
+
+    monkeypatch.setattr(service, "set_wss_demand", record_demand)
+    monkeypatch.setattr(hub_realtime_ws, "KEEPALIVE_SECONDS", 0.001)
+    websocket._connect(CloseAfterKeepalive())
+
+    # Register, the successful ready frame, then disconnect.  The second True
+    # is what prevents the 45-second lease expiry / 55-second long-poll stall.
+    assert [active for _client_id, active in calls] == [True, True, False]
+    assert service.demand_payload()["devicesActive"] is False
+    service.stop()
+
+
 def test_hub_native_wss_route_streams_fast_sample_to_authenticated_client():
     import pytest
 
