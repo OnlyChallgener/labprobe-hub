@@ -1,11 +1,10 @@
 """Hardening for the router native ``/ws type=fast`` realtime lane.
 
 The router socket can remain TCP-connected while its one-second ``fast`` stream
-has silently stopped.  The original receiver only reconnected after a socket
-exception, so APP clients could keep a healthy Hub WSS connection while seeing
-an increasingly old router sample.  This patch treats missing fast frames as a
-stalled upstream stream and reconnects the router socket immediately, without
-calling HTTP, Dashboard, terminal, configuration or Agent paths.
+has silently stopped. The original outer reconnect loop could also back off to
+30 seconds after ordinary transport failures. This patch detects a silent fast
+stall and caps every reconnect delay at three seconds, without using HTTP
+Dashboard, terminal, configuration or Agent realtime fallbacks.
 """
 from __future__ import annotations
 
@@ -23,6 +22,7 @@ import router_ws_patch
 FAST_START_GRACE_SECONDS = 5.0
 FAST_STALL_SECONDS = 4.5
 FAST_SOCKET_POLL_SECONDS = 1.0
+MAX_ROUTER_RETRY_SECONDS = 3.0
 DEVICE_DEMAND_TTL_SECONDS = 15.0
 ROUTER_STALE_MS = 7_000
 DEVICES_STALE_MS = 7_000
@@ -44,12 +44,7 @@ def _run_connection_with_fast_watchdog(
     verify_tls: bool,
     hostname: str,
 ) -> None:
-    """Receive router frames and reconnect if ``fast`` silently stops.
-
-    Returning normally on a fast stall is intentional: the existing outer loop
-    resets its retry delay and opens a fresh socket immediately. Real transport
-    errors still propagate through the original exponential reconnect path.
-    """
+    """Receive router frames and reopen the socket when ``fast`` goes silent."""
     sslopt = None
     if ws_url.startswith("wss://") and not verify_tls:
         sslopt = {"cert_reqs": ssl.CERT_NONE, "check_hostname": False}
@@ -100,6 +95,56 @@ def _run_connection_with_fast_watchdog(
             pass
 
 
+def _router_ws_loop_fast_recovery(self: Any) -> None:
+    """Original authentication semantics with a strict 1/2/3 second retry cap."""
+    retry = 1.0
+    last_logged_error = ""
+    force_login = False
+    while not self._stop.is_set():
+        try:
+            if not self._ensure_authenticated(force=force_login):
+                self._stop.wait(1.0)
+                continue
+            force_login = False
+        except Exception as exc:
+            message = f"{type(exc).__name__}: {exc}"
+            self._set_connected(False, "", message if message != last_logged_error else "")
+            last_logged_error = message
+            self._stop.wait(retry)
+            retry = min(MAX_ROUTER_RETRY_SECONDS, retry + 1.0)
+            continue
+
+        ws_url, origin, cookie, verify_tls, hostname = self._connection_info()
+        if not ws_url:
+            self._stop.wait(1.0)
+            continue
+        try:
+            self._run_connection(ws_url, origin, cookie, verify_tls, hostname)
+            retry = 1.0
+            last_logged_error = ""
+        except router_ws_patch.RouterWebSocketAuthExpired as exc:
+            message = f"{type(exc).__name__}: {exc}"
+            self._set_connected(False, ws_url, message if message != last_logged_error else "")
+            last_logged_error = message
+            force_login = True
+            self._stop.wait(1.0)
+            retry = 1.0
+        except websocket.WebSocketBadStatusException as exc:
+            message = f"{type(exc).__name__}: {exc}"
+            status_code = self._bad_status_code(exc)
+            force_login = status_code in {401, 403}
+            self._set_connected(False, ws_url, message if message != last_logged_error else "")
+            last_logged_error = message
+            self._stop.wait(1.0 if force_login else retry)
+            retry = 1.0 if force_login else min(MAX_ROUTER_RETRY_SECONDS, retry + 1.0)
+        except Exception as exc:
+            message = f"{type(exc).__name__}: {exc}"
+            self._set_connected(False, ws_url, message if message != last_logged_error else "")
+            last_logged_error = message
+            self._stop.wait(retry)
+            retry = min(MAX_ROUTER_RETRY_SECONDS, retry + 1.0)
+
+
 def install_router_fast_watchdog_patch() -> None:
     """Install once before the router client instance is created."""
     router_lite_realtime_patch.DEMAND_TTL_SECONDS = DEVICE_DEMAND_TTL_SECONDS
@@ -110,4 +155,5 @@ def install_router_fast_watchdog_patch() -> None:
     if getattr(monitor_class, "_labprobe_fast_watchdog_patch", False):
         return
     monitor_class._run_connection = _run_connection_with_fast_watchdog
+    monitor_class._loop = _router_ws_loop_fast_recovery
     monitor_class._labprobe_fast_watchdog_patch = True
