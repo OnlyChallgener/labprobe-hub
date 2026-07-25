@@ -53,7 +53,7 @@ def test_nat_terminal_accepts_completed_failed_and_nat_type_results():
 
 
 def test_nat_transport_errors_are_localized():
-    assert _nat_error_message(RuntimeError("read timed out")) == "路由器 NAT 检测请求超时"
+    assert _nat_error_message(RuntimeError("read timed out")) == "路由器 NAT 检测请求暂时无响应"
     assert _nat_error_message(RuntimeError("DNS resolution failed")) == "STUN 服务器域名解析失败"
 
 
