@@ -1,10 +1,14 @@
-name: Hub 0919 Check
+name: Hub 0920 Check
 
 on:
   push:
     branches:
-      - hub0919
+      - hub0920
   workflow_dispatch:
+
+concurrency:
+  group: hub0920-${{ github.ref }}
+  cancel-in-progress: true
 
 jobs:
   test:
@@ -28,8 +32,20 @@ jobs:
 
       - name: Compile Hub runtime
         run: |
-          python -m py_compile hub.py hub_entry.py router_rpc.py router_rpc_v099.py router_rpc_v010.py router_native_features_patch.py router_slow_cache_patch.py
+          python -m py_compile hub.py hub_entry.py router_rpc.py router_rpc_v099.py router_rpc_v010.py router_native_features_patch.py router_slow_cache_patch.py router_control_scheduler_patch.py hub_realtime_ws.py
 
-      - name: Test router cache and NAT helpers
+      - name: Verify Hub version and runtime wiring
         run: |
-          python -m pytest -q tests/test_router_slow_cache_patch.py tests/test_router_native_nat_helpers.py
+          grep -F 'HUB_VERSION = "0.9.26"' hub_entry.py
+          grep -F 'install_router_control_scheduler_patch()' hub_entry.py
+          grep -F 'router_control_scheduler_patch.py' Dockerfile
+          grep -F 'NAT_MAX_RUNTIME_SECONDS' router_native_features_patch.py
+          grep -F 'BETA_CACHE_TTL_SECONDS' router_native_features_patch.py
+          ! grep -F 'natDiagnosticCancel"] = True' router_native_features_patch.py
+
+      - name: Test router cache, scheduling and NAT helpers
+        run: |
+          python -m pytest -q tests/test_router_slow_cache_patch.py tests/test_router_control_scheduler_patch.py tests/test_router_native_nat_helpers.py tests/test_router_native_features_patch.py
+
+      - name: Build runtime image
+        run: docker build -t labprobe-hub:0.9.26-test .
