@@ -1,14 +1,13 @@
 """Add router-native NAT diagnostics and Beta update checks to the v0.10 API.
 
-NAT detection is intentionally asynchronous. Reyee's ``nat_detector`` RPC can
-block for the whole STUN procedure, so Flask requests must never wait on it.
-The APP starts a job, then polls the in-memory result while a Hub worker talks
-to the router in the background. Cancellation stops Hub polling for both
-RFC3489 and RFC5780; packet capture has not exposed a router-native cancel RPC.
+NAT detection is asynchronous. Reyee's ``nat_detector`` RPC can run for several
+minutes, so Flask requests never wait on the whole procedure. The APP starts a
+job and polls the in-memory result while one Hub worker follows the router.
 """
 from __future__ import annotations
 
 import json
+import os
 import threading
 import time
 from typing import Any, Callable, Dict
@@ -23,7 +22,16 @@ DEFAULT_STUN_HOST = "stun.voip.aebc.com"
 ALLOWED_NAT_MODES = {"classic", "5780"}
 ALLOWED_WAN_INTERFACES = {"wan", "wan1"}
 NAT_POLL_SECONDS = 1.0
-NAT_TIMEOUT_SECONDS = 75.0
+# Do not synthesize a Hub timeout while the router may still be running. The old
+# 75-second limit regularly raced the router's own RFC5780 retries.
+NAT_MAX_RUNTIME_SECONDS = max(
+    180.0,
+    float(os.environ.get("ROUTER_NAT_MAX_RUNTIME_SEC", "600")),
+)
+BETA_CACHE_TTL_SECONDS = max(
+    60.0,
+    float(os.environ.get("ROUTER_BETA_CACHE_TTL_SEC", "21600")),
+)
 
 
 def normalize_nat_request(body: Dict[str, Any]) -> Dict[str, Any]:
@@ -142,12 +150,21 @@ def _nat_error_message(exc: Exception) -> str:
     raw = str(exc or "").strip()
     lower = raw.lower()
     if "timeout" in lower or "timed out" in lower:
-        return "路由器 NAT 检测请求超时"
+        return "路由器 NAT 检测请求暂时无响应"
     if "unauthorized" in lower or "forbidden" in lower or "401" in lower or "403" in lower:
         return "路由器认证失效，请重新连接"
     if "resolve" in lower or "dns" in lower:
         return "STUN 服务器域名解析失败"
     return f"路由器 NAT 检测失败：{raw}" if raw else "路由器 NAT 检测失败"
+
+
+def _beta_snapshot(data: Any, checked_at: int) -> Dict[str, Any]:
+    if isinstance(data, dict):
+        result = dict(data)
+    else:
+        result = {"raw": data}
+    result["checkedAt"] = int(checked_at)
+    return result
 
 
 def install_router_native_features_patch() -> None:
@@ -192,6 +209,10 @@ def install_router_native_features_patch() -> None:
             last_nat_request,
         )
 
+        beta_lock = threading.RLock()
+        beta_result: Dict[str, Any] = {}
+        beta_updated_at = 0.0
+
         def store_nat_result(generation: int, value: Any, requested: Dict[str, Any]) -> bool:
             nonlocal nat_result
             normalized = _nat_result_with_request(value, requested)
@@ -216,7 +237,7 @@ def install_router_native_features_patch() -> None:
                 start_data = client.rpc("devSta.set", "nat_detector", requested)
                 if store_nat_result(generation, start_data, requested):
                     return
-                deadline = time.monotonic() + NAT_TIMEOUT_SECONDS
+                deadline = time.monotonic() + NAT_MAX_RUNTIME_SECONDS
                 while time.monotonic() < deadline:
                     with nat_lock:
                         if generation != nat_generation:
@@ -226,14 +247,26 @@ def install_router_native_features_patch() -> None:
                         if store_nat_result(generation, latest, requested):
                             return
                     except Exception as poll_error:
+                        # A single control-RPC timeout must not become the final NAT
+                        # result. The router may still be retrying a STUN sub-test.
                         logger.debug("router NAT result poll deferred: %s", poll_error)
                     time.sleep(NAT_POLL_SECONDS)
+
+                # One final router read before declaring the Hub-side maximum runtime.
+                try:
+                    latest = client.rpc("devSta.get", "nat_detector")
+                    if store_nat_result(generation, latest, requested):
+                        return
+                except Exception as poll_error:
+                    logger.debug("router NAT final poll deferred: %s", poll_error)
+
                 store_nat_result(
                     generation,
                     {
-                        "status": "timeout",
-                        "message": "检测超时，请更换 STUN 服务器或 WAN 接口后重试",
-                        "log": "检测超时：在规定时间内未收到路由器最终结果",
+                        "status": "error",
+                        "message": "路由器长时间未返回最终检测结果",
+                        "log": f"Hub 已等待 {int(NAT_MAX_RUNTIME_SECONDS)} 秒，路由器仍未返回最终状态",
+                        "timeoutSource": "hub_max_runtime",
                     },
                     requested,
                 )
@@ -282,37 +315,21 @@ def install_router_native_features_patch() -> None:
                 "request": payload,
             }), 202
 
-        @bp.post("/nat-diagnostic/cancel")
-        def nat_diagnostic_cancel():
-            nonlocal nat_generation, nat_result
-            with nat_lock:
-                nat_generation += 1
-                previous = dict(nat_result)
-                previous_log = str(previous.get("log") or "").rstrip()
-                cancel_line = "[NAT Detection] Cancelled by APP; Hub polling stopped"
-                nat_result = _nat_result_with_request(
-                    {
-                        **previous,
-                        "status": "cancelled",
-                        "message": "检测已取消",
-                        "cancelledAt": int(time.time()),
-                        "updatedAt": int(time.time()),
-                        "log": f"{previous_log}\n{cancel_line}".strip(),
-                    },
-                    dict(last_nat_request),
-                )
-                data = dict(nat_result)
-            return jsonify({
-                "ok": True,
-                "message": "已停止 APP 与 Hub 的 NAT 检测轮询",
-                "routerNativeCancelSupported": False,
-                "data": data,
-            })
-
         @bp.get("/beta-upgrade")
         def beta_upgrade_get():
+            nonlocal beta_result, beta_updated_at
+            now = time.time()
+            force = request.args.get("force") == "1"
+            with beta_lock:
+                if beta_result and not force and now - beta_updated_at <= BETA_CACHE_TTL_SECONDS:
+                    return jsonify({"ok": True, "data": dict(beta_result), "cached": True})
+
             data = client.rpc("devSta.get", "ehr_beta_upgrade", {"action": "version"})
-            return jsonify({"ok": True, "data": data})
+            snapshot = _beta_snapshot(data, int(time.time()))
+            with beta_lock:
+                beta_result = dict(snapshot)
+                beta_updated_at = time.time()
+            return jsonify({"ok": True, "data": snapshot, "cached": False})
 
         @bp.after_request
         def advertise_native_features(response: Any):
@@ -322,7 +339,7 @@ def install_router_native_features_patch() -> None:
                     features = root.setdefault("features", {})
                     if isinstance(features, dict):
                         features["natDiagnostic"] = True
-                        features["natDiagnosticCancel"] = True
+                        features.pop("natDiagnosticCancel", None)
                         features["betaUpgrade"] = True
                     response.set_data(jsonify(root).get_data())
                     response.content_type = "application/json"
