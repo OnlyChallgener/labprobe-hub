@@ -35,11 +35,13 @@ def test_slow_cache_returns_stale_immediately_and_refreshes_once():
     client = _Client()
     client.cache.put("ddns", {"value": "old"})
     _age(client.cache, "ddns", 120)
+    entered = threading.Event()
     release = threading.Event()
     calls = []
 
     def loader():
         calls.append(1)
+        entered.set()
         release.wait(1)
         return {"value": "new"}
 
@@ -49,6 +51,7 @@ def test_slow_cache_returns_stale_immediately_and_refreshes_once():
     assert time.monotonic() - started < 0.2
     assert first == {"value": "old"}
     assert second == {"value": "old"}
+    assert entered.wait(1)
     assert len(calls) == 1
 
     release.set()
