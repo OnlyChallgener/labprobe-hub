@@ -28,8 +28,8 @@ jobs:
 
       - name: Compile Hub runtime
         run: |
-          python -m py_compile hub.py hub_entry.py router_rpc.py router_rpc_v099.py router_rpc_v010.py router_slow_cache_patch.py
+          python -m py_compile hub.py hub_entry.py router_rpc.py router_rpc_v099.py router_rpc_v010.py router_native_features_patch.py router_slow_cache_patch.py
 
-      - name: Test slow router cache
+      - name: Test router cache and NAT helpers
         run: |
-          python -m pytest -q tests/test_router_slow_cache_patch.py
+          python -m pytest -q tests/test_router_slow_cache_patch.py tests/test_router_native_nat_helpers.py
