@@ -1,9 +1,9 @@
 """Bounded stale-while-revalidate cache for slow router-control reads.
 
-The APP should receive the last successful DDNS/firewall/UPnP/port-mapping
-snapshot immediately. Once its short freshness TTL expires, Hub refreshes the
-router in one background worker and atomically replaces the cached value. A
-transient router/login failure never replaces usable data with an empty value.
+The APP receives the last successful DDNS/firewall/UPnP/port-mapping snapshot
+immediately. Once its short freshness TTL expires, Hub refreshes the router in
+one background worker and atomically replaces the cached value. A transient
+router/login failure never replaces usable data with an empty value.
 
 This cache is process memory only. It does not write periodic snapshots to disk.
 Old entries are pruned opportunistically and the cache is hard bounded.
@@ -24,6 +24,10 @@ SLOW_CACHE_TTLS: Dict[str, float] = {
     "firewall": float(os.environ.get("ROUTER_FIREWALL_CACHE_TTL_SEC", "60")),
     "ddns": float(os.environ.get("ROUTER_DDNS_CACHE_TTL_SEC", "60")),
 }
+CACHE_REFRESH_RETRY_SEC = max(
+    5.0,
+    float(os.environ.get("ROUTER_CACHE_REFRESH_RETRY_SEC", "15")),
+)
 CACHE_PRUNE_INTERVAL_SEC = max(
     60.0,
     float(os.environ.get("ROUTER_CACHE_PRUNE_INTERVAL_SEC", "300")),
@@ -49,6 +53,7 @@ def _ensure_runtime(client: Any) -> None:
     if not hasattr(client, "_slow_cache_state_lock"):
         client._slow_cache_state_lock = threading.RLock()
         client._slow_cache_refreshing = set()
+        client._slow_cache_retry_after = {}
         client._slow_cache_scope = None
         client._slow_cache_last_prune = 0.0
 
@@ -69,6 +74,7 @@ def _ensure_scope(client: Any) -> None:
         # Router address/password changed. Never serve the previous router's data.
         client.cache.clear()
         client._slow_cache_refreshing.clear()
+        client._slow_cache_retry_after.clear()
         client._slow_cache_scope = scope
         client._slow_cache_last_prune = time.time()
 
@@ -79,6 +85,9 @@ def _prune(client: Any, now: float) -> None:
         if now - client._slow_cache_last_prune < CACHE_PRUNE_INTERVAL_SEC:
             return
         client._slow_cache_last_prune = now
+        for key, retry_at in list(client._slow_cache_retry_after.items()):
+            if float(retry_at) <= now:
+                client._slow_cache_retry_after.pop(key, None)
 
     cache = client.cache
     with cache._lock:
@@ -106,11 +115,24 @@ def _finish_refresh(client: Any, key: str) -> None:
         client._slow_cache_refreshing.discard(key)
 
 
+def _refresh_succeeded(client: Any, key: str) -> None:
+    with client._slow_cache_state_lock:
+        client._slow_cache_retry_after.pop(key, None)
+
+
+def _refresh_failed(client: Any, key: str) -> None:
+    with client._slow_cache_state_lock:
+        client._slow_cache_retry_after[key] = time.time() + CACHE_REFRESH_RETRY_SEC
+
+
 def _start_refresh(client: Any, key: str, loader: Callable[[], Any]) -> None:
     _ensure_runtime(client)
+    now = time.time()
     with client._slow_cache_state_lock:
         refreshing: Set[str] = client._slow_cache_refreshing
         if key in refreshing:
+            return
+        if float(client._slow_cache_retry_after.get(key, 0.0)) > now:
             return
         refreshing.add(key)
 
@@ -118,9 +140,11 @@ def _start_refresh(client: Any, key: str, loader: Callable[[], Any]) -> None:
         try:
             latest = loader()
             client.cache.put(key, latest)
+            _refresh_succeeded(client, key)
             _logger_call(client, "debug", "router slow cache refreshed key=%s", key)
         except Exception as exc:
-            # Keep the last successful value. The next request may schedule a retry.
+            # Keep the last successful value and briefly back off before retrying.
+            _refresh_failed(client, key)
             _logger_call(client, "debug", "router slow cache refresh deferred key=%s error=%s", key, exc)
         finally:
             _finish_refresh(client, key)
@@ -157,12 +181,14 @@ def install_router_slow_cache_patch() -> None:
 
         if force:
             latest = loader()
+            _refresh_succeeded(self, key)
             return self.cache.put(key, latest)
 
         row = _peek(self.cache, key)
         if row is None:
             # First request has no usable value, so one synchronous read is required.
             latest = loader()
+            _refresh_succeeded(self, key)
             return self.cache.put(key, latest)
 
         saved_at, value = row
