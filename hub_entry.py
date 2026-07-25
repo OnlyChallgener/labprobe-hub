@@ -18,6 +18,7 @@ from router_realtime_stability_patch import (
 )
 from router_relay_credentials_patch import install_router_relay_credentials_patch
 from router_rpc_v010 import create_router_blueprint_v010
+from router_slow_cache_patch import install_router_slow_cache_patch
 from router_ws_patch import install_router_ws_patch
 
 HUB_VERSION = "0.9.25"
@@ -32,6 +33,7 @@ install_router_fast_watchdog_patch()
 install_router_realtime_stability_patch()
 install_router_build024_fix()
 install_router_relay_credentials_patch()
+install_router_slow_cache_patch()
 hub.app.register_blueprint(
     create_router_blueprint_v010(
         check_app_token=hub.check_app_token,
