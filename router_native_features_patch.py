@@ -3,7 +3,8 @@
 NAT detection is intentionally asynchronous. Reyee's ``nat_detector`` RPC can
 block for the whole STUN procedure, so Flask requests must never wait on it.
 The APP starts a job, then polls the in-memory result while a Hub worker talks
-to the router in the background.
+to the router in the background. Cancellation stops Hub polling for both
+RFC3489 and RFC5780; packet capture has not exposed a router-native cancel RPC.
 """
 from __future__ import annotations
 
@@ -52,14 +53,63 @@ def normalize_nat_request(body: Dict[str, Any]) -> Dict[str, Any]:
     }
 
 
-def _nat_result_with_request(data: Any, requested: Dict[str, Any]) -> Any:
-    """Attach the requested parameters without changing router result fields."""
-    parsed = data
+def _first_text(data: Dict[str, Any], *keys: str) -> str:
+    for key in keys:
+        value = data.get(key)
+        if value is None:
+            continue
+        text = str(value).strip()
+        if text and text.lower() not in {"none", "null", "--"}:
+            return text
+    return ""
+
+
+def _normalize_nat_payload(value: Any) -> Any:
+    parsed = value
     if isinstance(parsed, str):
         try:
             parsed = json.loads(parsed)
         except Exception:
-            return data
+            return value
+    if not isinstance(parsed, dict):
+        return parsed
+
+    result = dict(parsed)
+    mapping = _first_text(result, "mapping_behavior", "mappingBehavior", "mapping")
+    filtering = _first_text(result, "filtering_behavior", "filteringBehavior", "filtering")
+    nat_type = _first_text(result, "nat_type", "natType", "classic_type", "classicType")
+    external_address = _first_text(
+        result,
+        "external_address",
+        "externalAddress",
+        "mapped_address",
+        "mappedAddress",
+    )
+    other_address = _first_text(result, "other_address", "otherAddress")
+
+    if mapping:
+        result["mapping_behavior"] = mapping
+    if filtering:
+        result["filtering_behavior"] = filtering
+    if nat_type:
+        result["nat_type"] = nat_type
+    if external_address:
+        result["external_address"] = external_address
+    if other_address:
+        result["other_address"] = other_address
+
+    status = _first_text(result, "status").lower()
+    terminal_statuses = {"completed", "success", "failed", "error", "timeout", "cancelled", "canceled"}
+    if mapping and filtering and status not in {"cancelled", "canceled", "failed", "error", "timeout"}:
+        result["status"] = "completed"
+    elif nat_type and status not in terminal_statuses:
+        result["status"] = "completed"
+    return result
+
+
+def _nat_result_with_request(data: Any, requested: Dict[str, Any]) -> Any:
+    """Normalize result aliases and attach the requested parameters."""
+    parsed = _normalize_nat_payload(data)
     if not isinstance(parsed, dict):
         return parsed
     result = dict(parsed)
@@ -67,16 +117,25 @@ def _nat_result_with_request(data: Any, requested: Dict[str, Any]) -> Any:
     result["requested_port"] = int(requested.get("port") or 3478)
     result["requested_interface"] = requested.get("interface", "wan")
     result["requested_mode"] = requested.get("mode", "classic")
+    result.setdefault("mode", requested.get("mode", "classic"))
     return result
 
 
 def _nat_terminal(data: Any) -> bool:
     if not isinstance(data, dict):
         return False
-    status = str(data.get("status") or "").strip().lower()
+    normalized = _normalize_nat_payload(data)
+    if not isinstance(normalized, dict):
+        return False
+    status = str(normalized.get("status") or "").strip().lower()
     if status in {"completed", "success", "failed", "error", "timeout", "cancelled", "canceled"}:
         return True
-    return bool(str(data.get("nat_type") or data.get("natType") or "").strip())
+    if _first_text(normalized, "nat_type", "natType"):
+        return True
+    return bool(
+        _first_text(normalized, "mapping_behavior", "mappingBehavior", "mapping")
+        and _first_text(normalized, "filtering_behavior", "filteringBehavior", "filtering")
+    )
 
 
 def _nat_error_message(exc: Exception) -> str:
@@ -141,10 +200,10 @@ def install_router_native_features_patch() -> None:
                     {"status": "running", "message": "检测进行中"},
                     requested,
                 )
-            if not str(normalized.get("status") or "").strip() and str(
-                normalized.get("nat_type") or normalized.get("natType") or ""
-            ).strip():
-                normalized["status"] = "completed"
+            if _nat_terminal(normalized):
+                status = str(normalized.get("status") or "").strip().lower()
+                if status not in {"failed", "error", "timeout", "cancelled", "canceled"}:
+                    normalized["status"] = "completed"
             normalized["updatedAt"] = int(time.time())
             with nat_lock:
                 if generation != nat_generation:
@@ -223,6 +282,33 @@ def install_router_native_features_patch() -> None:
                 "request": payload,
             }), 202
 
+        @bp.post("/nat-diagnostic/cancel")
+        def nat_diagnostic_cancel():
+            nonlocal nat_generation, nat_result
+            with nat_lock:
+                nat_generation += 1
+                previous = dict(nat_result)
+                previous_log = str(previous.get("log") or "").rstrip()
+                cancel_line = "[NAT Detection] Cancelled by APP; Hub polling stopped"
+                nat_result = _nat_result_with_request(
+                    {
+                        **previous,
+                        "status": "cancelled",
+                        "message": "检测已取消",
+                        "cancelledAt": int(time.time()),
+                        "updatedAt": int(time.time()),
+                        "log": f"{previous_log}\n{cancel_line}".strip(),
+                    },
+                    dict(last_nat_request),
+                )
+                data = dict(nat_result)
+            return jsonify({
+                "ok": True,
+                "message": "已停止 APP 与 Hub 的 NAT 检测轮询",
+                "routerNativeCancelSupported": False,
+                "data": data,
+            })
+
         @bp.get("/beta-upgrade")
         def beta_upgrade_get():
             data = client.rpc("devSta.get", "ehr_beta_upgrade", {"action": "version"})
@@ -236,6 +322,7 @@ def install_router_native_features_patch() -> None:
                     features = root.setdefault("features", {})
                     if isinstance(features, dict):
                         features["natDiagnostic"] = True
+                        features["natDiagnosticCancel"] = True
                         features["betaUpgrade"] = True
                     response.set_data(jsonify(root).get_data())
                     response.content_type = "application/json"
