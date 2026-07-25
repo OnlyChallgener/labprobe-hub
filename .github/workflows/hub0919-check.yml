@@ -1,0 +1,35 @@
+name: Hub 0919 Check
+
+on:
+  push:
+    branches:
+      - hub0919
+  workflow_dispatch:
+
+jobs:
+  test:
+    runs-on: ubuntu-latest
+    env:
+      PYTHONPATH: ${{ github.workspace }}
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: '3.12'
+
+      - name: Install dependencies
+        run: |
+          python -m pip install --upgrade pip
+          python -m pip install -r requirements.txt pytest
+
+      - name: Compile Hub runtime
+        run: |
+          python -m py_compile hub.py hub_entry.py router_rpc.py router_rpc_v099.py router_rpc_v010.py router_slow_cache_patch.py
+
+      - name: Test slow router cache
+        run: |
+          python -m pytest -q tests/test_router_slow_cache_patch.py
