@@ -115,6 +115,11 @@ ACTOR = RouterControlActor()
 
 def _request_priority() -> int:
     if not has_request_context():
+        # NAT continues in a dedicated Hub worker after the HTTP 202 response. It
+        # remains a user-started task, not disposable dashboard/device polling.
+        thread_name = threading.current_thread().name.lower()
+        if thread_name.startswith("router-nat-diagnostic-"):
+            return PRIORITY_TASK
         return PRIORITY_BACKGROUND
     method = str(request.method or "GET").upper()
     path = str(request.path or "")
