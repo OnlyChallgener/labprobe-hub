@@ -7,7 +7,9 @@ import router_rpc
 from router_control_actor_patch import (
     PRIORITY_BACKGROUND,
     PRIORITY_COMMAND,
+    PRIORITY_TASK,
     RouterControlActor,
+    _request_priority,
 )
 
 
@@ -70,3 +72,27 @@ def test_foreground_commands_are_serialized():
     first_thread.join(2)
     second_thread.join(2)
     assert order == ["first-start", "first-end", "second"]
+
+
+def test_nat_worker_keeps_manual_task_priority_without_flask_context():
+    result = []
+    worker = threading.Thread(
+        target=lambda: result.append(_request_priority()),
+        name="router-nat-diagnostic-7",
+        daemon=True,
+    )
+    worker.start()
+    worker.join(1)
+    assert result == [PRIORITY_TASK]
+
+
+def test_unrelated_worker_remains_disposable_background_priority():
+    result = []
+    worker = threading.Thread(
+        target=lambda: result.append(_request_priority()),
+        name="router-rpc-sync",
+        daemon=True,
+    )
+    worker.start()
+    worker.join(1)
+    assert result == [PRIORITY_BACKGROUND]
