@@ -151,11 +151,11 @@ class RouterTaskManager:
                 self._save()
         self._publish(kind)
 
-    def _begin(self, kind: str, stage_text: str) -> tuple[str, Dict[str, Any]]:
+    def _begin(self, kind: str, stage_text: str) -> tuple[str, Dict[str, Any], bool]:
         with self.lock:
             active = self.tasks[kind]
             if active.get("state") in {"queued", "running"}:
-                return str(active.get("taskId") or ""), self._snapshot_locked(kind)
+                return str(active.get("taskId") or ""), self._snapshot_locked(kind), False
             task_id = f"{kind}-{uuid.uuid4().hex[:12]}"
             self.tasks[kind] = {
                 **_task(kind),
@@ -169,12 +169,12 @@ class RouterTaskManager:
             self._save()
             snapshot = self._snapshot_locked(kind)
         self._publish(kind)
-        return task_id, snapshot
+        return task_id, snapshot, True
 
     def start_nat(self, payload: Dict[str, Any]) -> Dict[str, Any]:
         request_data = normalize_nat_request(payload)
-        task_id, snapshot = self._begin("nat", "检测任务已排队")
-        if snapshot.get("state") != "queued" or snapshot.get("taskId") != task_id:
+        task_id, snapshot, created = self._begin("nat", "检测任务已排队")
+        if not created:
             return snapshot
         threading.Thread(
             target=self._run_nat,
@@ -201,6 +201,12 @@ class RouterTaskManager:
                 if isinstance(latest, dict):
                     normalized = _normalize_nat_payload(latest)
                     if isinstance(normalized, dict):
+                        normalized = dict(normalized)
+                        normalized["requested_host"] = requested.get("host", "")
+                        normalized["requested_port"] = int(requested.get("port") or 3478)
+                        normalized["requested_interface"] = requested.get("interface", "wan")
+                        normalized["requested_mode"] = requested.get("mode", "classic")
+                        normalized.setdefault("mode", requested.get("mode", "classic"))
                         raw_log = normalized.get("log")
                         if raw_log:
                             for line in str(raw_log).splitlines():
@@ -239,8 +245,8 @@ class RouterTaskManager:
             self._update(kind, state="failed", stage="failed", stageText="检测失败", message=str(exc) or "NAT 检测失败")
 
     def start_diagnostic(self) -> Dict[str, Any]:
-        task_id, snapshot = self._begin("diagnostic", "网络自检已排队")
-        if snapshot.get("state") != "queued" or snapshot.get("taskId") != task_id:
+        task_id, snapshot, created = self._begin("diagnostic", "网络自检已排队")
+        if not created:
             return snapshot
         threading.Thread(
             target=self._run_diagnostic,
@@ -289,8 +295,8 @@ class RouterTaskManager:
             self._update(kind, state="failed", stage="failed", stageText="网络自检失败", message=str(exc) or "网络自检失败")
 
     def start_beta(self) -> Dict[str, Any]:
-        task_id, snapshot = self._begin("beta", "版本检测已排队")
-        if snapshot.get("state") != "queued" or snapshot.get("taskId") != task_id:
+        task_id, snapshot, created = self._begin("beta", "版本检测已排队")
+        if not created:
             return snapshot
         threading.Thread(
             target=self._run_beta,
