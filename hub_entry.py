@@ -7,6 +7,7 @@ from router_be72_auth_patch import install_router_be72_auth_patch
 from router_be72_sid_wire_patch import install_router_be72_sid_wire_patch
 from router_build024_fix import install_router_build024_fix
 from router_compat import install_router_rpc_compat
+from router_control_actor_patch import install_router_control_actor_patch
 from router_control_scheduler_patch import install_router_control_scheduler_patch
 from router_developer_flow_patch import install_router_developer_flow_patch
 from router_fast_watchdog_patch import install_router_fast_watchdog_patch
@@ -22,7 +23,7 @@ from router_rpc_v010 import create_router_blueprint_v010
 from router_slow_cache_patch import install_router_slow_cache_patch
 from router_ws_patch import install_router_ws_patch
 
-HUB_VERSION = "0.9.26"
+HUB_VERSION = "0.9.27"
 hub.APP_VERSION = HUB_VERSION
 install_router_http_developer_transport_patch()
 install_router_developer_flow_patch()
@@ -36,6 +37,7 @@ install_router_build024_fix()
 install_router_relay_credentials_patch()
 install_router_slow_cache_patch()
 install_router_control_scheduler_patch()
+install_router_control_actor_patch()
 hub.app.register_blueprint(
     create_router_blueprint_v010(
         check_app_token=hub.check_app_token,
