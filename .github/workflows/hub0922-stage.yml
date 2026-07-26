@@ -3,6 +3,8 @@ name: Hub0922 Stage
 on:
   push:
     branches: [hub0922]
+  pull_request:
+    branches: [hub0921]
   workflow_dispatch:
 
 concurrency:
