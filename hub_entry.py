@@ -8,6 +8,7 @@ from router_be72_auth_patch import install_router_be72_auth_patch
 from router_be72_sid_wire_patch import install_router_be72_sid_wire_patch
 from router_build024_fix import install_router_build024_fix
 from router_compat import install_router_rpc_compat
+from router_config_sync_patch import install_router_config_sync_patch
 from router_control_actor_patch import install_router_control_actor_patch
 from router_control_scheduler_patch import install_router_control_scheduler_patch
 from router_developer_flow_patch import install_router_developer_flow_patch
@@ -52,6 +53,7 @@ router_sync = install_router_rpc_compat(hub)
 install_router_status_localization(hub, router_sync)
 router_lite_realtime = install_router_lite_realtime_patch(hub, router_sync)
 install_hub_realtime_ws(hub, router_lite_realtime)
+install_router_config_sync_patch(hub, hub.ROUTER_TASK_MANAGER.client)
 install_agent_presence_patch(hub)
 
 if __name__ == "__main__":
