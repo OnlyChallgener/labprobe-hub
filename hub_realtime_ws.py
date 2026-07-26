@@ -20,7 +20,7 @@ from flask import jsonify, request
 from flask_sock import Sock
 
 
-CLIENT_QUEUE_SIZE = 4
+CLIENT_QUEUE_SIZE = 8
 KEEPALIVE_SECONDS = 3.0
 PROTOCOL_NAME = "labprobe-realtime-v3"
 
@@ -32,7 +32,7 @@ class _RealtimeClient:
 
 
 class HubRealtimeWebSocketService:
-    """Fan out only small router/device realtime messages to APP clients."""
+    """Fan out compact router/device/config/task/presence messages to APP clients."""
 
     def __init__(self, hub: Any, realtime_service: Any):
         self.hub = hub
@@ -141,6 +141,37 @@ class HubRealtimeWebSocketService:
         if int(devices.get("sampleEpochMs") or 0) > 0:
             self._send(ws, client, self._frame("devices", devices))
 
+        # Persistent configuration snapshots are Hub-owned state. Replaying them
+        # makes a cold APP render settings immediately without opening each page.
+        config_sync = getattr(self.hub, "ROUTER_CONFIG_SYNC", None)
+        frames = getattr(config_sync, "frames", None)
+        if callable(frames):
+            for payload in frames():
+                if isinstance(payload, dict) and payload.get("resource"):
+                    self._send(ws, client, self._frame("config", payload))
+
+        # Long tasks survive APP page/process lifecycle. Replay their latest state
+        # so NAT/self-test/Beta pages resume instead of starting or spinning again.
+        task_manager = getattr(self.hub, "ROUTER_TASK_MANAGER", None)
+        snapshot = getattr(task_manager, "snapshot", None)
+        if callable(snapshot):
+            for kind in ("nat", "diagnostic", "beta"):
+                payload = snapshot(kind)
+                if isinstance(payload, dict) and (
+                    payload.get("state") != "idle"
+                    or payload.get("result")
+                    or payload.get("log")
+                ):
+                    self._send(ws, client, self._frame("task", payload))
+
+        # Agent presence is separate from port-map page loading. A heartbeat
+        # snapshot is replayed even when no port-map runtime sample arrived lately.
+        presence = getattr(self.hub, "agent_presence_snapshot", None)
+        if callable(presence):
+            payload = presence()
+            if isinstance(payload, dict) and int(payload.get("agentLastSeenEpoch") or 0) > 0:
+                self._send(ws, client, self._frame("agent", payload))
+
     def _connect(self, ws: Any) -> None:
         if not self.hub.check_app_token():
             ws.close(1008, "unauthorized")
@@ -162,8 +193,8 @@ class HubRealtimeWebSocketService:
                     },
                 ),
             )
-            # Initial values come only from Hub memory, so the APP never waits
-            # for Agent, HTTP login, Dashboard or a fresh router command.
+            # Initial values come only from Hub memory/disk snapshots, so the APP
+            # never waits for Agent, HTTP login, Dashboard or a fresh router command.
             self._send_initial_snapshots(ws, client)
             sequence = 0
             while True:
