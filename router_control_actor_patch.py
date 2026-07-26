@@ -2,7 +2,7 @@
 
 All HTTP/RPC control calls are serialized through one worker. The router-native
 WebSocket receiver is not wrapped and therefore cannot be blocked or restarted
-by settings reads, background polling, NAT/Beta tasks, or user commands.
+by settings reads, background polling, task-state reads, or user commands.
 """
 from __future__ import annotations
 
@@ -115,19 +115,20 @@ ACTOR = RouterControlActor()
 
 def _request_priority() -> int:
     if not has_request_context():
-        # NAT continues in a dedicated Hub worker after the HTTP 202 response. It
-        # remains a user-started task, not disposable dashboard/device polling.
+        # Hub-owned NAT, diagnostic and Beta workers submit one short RPC at a
+        # time. They release the actor between polls, so user commands can run
+        # before the next task observation instead of waiting behind a long job.
         thread_name = threading.current_thread().name.lower()
-        if thread_name.startswith("router-nat-diagnostic-"):
+        if thread_name.startswith("router-task-") or thread_name.startswith("router-nat-diagnostic-"):
             return PRIORITY_TASK
         return PRIORITY_BACKGROUND
     method = str(request.method or "GET").upper()
     path = str(request.path or "")
     if method in {"POST", "PUT", "PATCH", "DELETE"}:
-        if any(token in path for token in ("nat-diagnostic", "diagnostic", "beta-upgrade")):
+        if any(token in path for token in ("nat-diagnostic", "diagnostic", "beta-upgrade", "/tasks/")):
             return PRIORITY_TASK
         return PRIORITY_COMMAND
-    if any(token in path for token in ("nat-diagnostic", "diagnostic", "beta-upgrade")):
+    if any(token in path for token in ("nat-diagnostic", "diagnostic", "beta-upgrade", "/tasks/")):
         return PRIORITY_TASK
     return PRIORITY_READ
 
