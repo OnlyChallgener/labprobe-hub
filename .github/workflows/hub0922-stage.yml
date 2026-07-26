@@ -1,0 +1,89 @@
+name: Hub0922 Stage
+
+on:
+  push:
+    branches: [hub0922]
+  workflow_dispatch:
+
+concurrency:
+  group: hub0922-stage-${{ github.ref }}
+  cancel-in-progress: true
+
+permissions:
+  contents: read
+
+jobs:
+  validate:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+      - name: Set up Python 3.12
+        uses: actions/setup-python@v5
+        with:
+          python-version: '3.12'
+      - name: Install dependencies
+        run: pip install --disable-pip-version-check -r requirements.txt
+      - name: Compile Hub sources
+        run: |
+          python -m py_compile \
+            hub.py hub_entry.py hub_realtime_ws.py agent_presence_patch.py \
+            router_rpc.py router_rpc_v099.py router_rpc_v010.py \
+            router_native_features_patch.py router_control_actor_patch.py \
+            router_task_manager_patch.py
+      - name: Verify task and presence invariants
+        run: |
+          set -e
+          grep -q 'HUB_VERSION = "0.9.28"' hub_entry.py
+          grep -q 'install_router_task_manager_patch(hub)' hub_entry.py
+          grep -q 'install_agent_presence_patch(hub)' hub_entry.py
+          grep -q '@bp.post("/tasks/<kind>")' router_task_manager_patch.py
+          grep -q 'thread_name.startswith("router-task-")' router_control_actor_patch.py
+          grep -q 'publish("agent", snapshot)' agent_presence_patch.py
+          grep -q 'ONLINE_SECONDS.*90' agent_presence_patch.py
+          python - <<'PY'
+          import json
+          import logging
+          import os
+          import tempfile
+          from pathlib import Path
+          from types import SimpleNamespace
+
+          import agent_presence_patch as presence
+          import router_task_manager_patch as tasks
+
+          assert tasks._translate_beta_message("no new version available") == "暂无可用的新版本"
+          assert tasks._translate_beta_message("update available") == "发现可用的新版本"
+
+          with tempfile.TemporaryDirectory() as directory:
+              root = Path(directory)
+              status_file = root / "agent_status.json"
+              runtime_file = root / "portmap_status.json"
+              now = __import__('time').time()
+              status_file.write_text(json.dumps({"r1": {"lastSeenAt": __import__('datetime').datetime.fromtimestamp(now).strftime("%Y-%m-%d %H:%M:%S"), "version": "1.2.3"}}), encoding="utf-8")
+              runtime_file.write_text("{}", encoding="utf-8")
+              fake = SimpleNamespace(
+                  PORTMAP_ROUTER_STATUS_FILE=runtime_file,
+                  AGENT_STATUS_FILE=status_file,
+                  load_json=lambda path, default: json.loads(Path(path).read_text(encoding="utf-8")) if Path(path).exists() else default,
+                  clean_saved_value=lambda value: str(value or "").strip(),
+                  primary_router_name=lambda: "r1",
+              )
+              snapshot = presence._presence(fake, "r1")
+              assert snapshot["agentState"] == "online", snapshot
+              assert snapshot["agentVersion"] == "1.2.3", snapshot
+
+          with tempfile.TemporaryDirectory() as directory:
+              os.environ["DATA_DIR"] = directory
+              fake_hub = SimpleNamespace(LOGGER=logging.getLogger("test"))
+              manager = tasks.RouterTaskManager(fake_hub, object(), logging.getLogger("test"))
+              first_id, first, created = manager._begin("nat", "queued")
+              second_id, second, duplicate_created = manager._begin("nat", "queued")
+              assert created is True
+              assert duplicate_created is False
+              assert first_id == second_id
+              assert first["state"] == second["state"] == "queued"
+          print("Hub task and Agent presence invariants verified")
+          PY
+      - name: Build Docker image
+        run: docker build --pull=false -t labprobe-hub:hub0922 .
