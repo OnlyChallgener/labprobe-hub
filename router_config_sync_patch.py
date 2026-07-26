@@ -43,8 +43,31 @@ def _jsonable(value: Any) -> Any:
     return str(value)
 
 
-def _digest(value: Any) -> str:
-    wire = json.dumps(_jsonable(value), ensure_ascii=False, sort_keys=True, separators=(",", ":"))
+def _comparison_value(resource: str, value: Any) -> Any:
+    """Remove transport/runtime fields that are not configuration changes."""
+    normalized = _jsonable(value)
+    if not isinstance(normalized, dict):
+        return normalized
+    result = dict(normalized)
+    for key in ("updatedAt", "checkedAt", "receivedAt", "receivedEpoch"):
+        result.pop(key, None)
+    if resource == "firewall":
+        rows = result.get("list")
+        if isinstance(rows, list):
+            clean_rows = []
+            for row in rows:
+                if isinstance(row, dict):
+                    clean = dict(row)
+                    clean.pop("stats", None)
+                    clean_rows.append(clean)
+                else:
+                    clean_rows.append(row)
+            result["list"] = clean_rows
+    return result
+
+
+def _digest(resource: str, value: Any) -> str:
+    wire = json.dumps(_comparison_value(resource, value), ensure_ascii=False, sort_keys=True, separators=(",", ":"))
     return hashlib.sha256(wire.encode("utf-8")).hexdigest()
 
 
@@ -125,7 +148,7 @@ class RouterConfigSync:
         if resource not in {"firewall", "ddns", "upnp", "portMappings"}:
             return {}
         normalized = _jsonable(data)
-        fingerprint = _digest(normalized)
+        fingerprint = _digest(resource, normalized)
         with self.lock:
             previous = self.rows.get(resource) or {}
             if previous.get("digest") == fingerprint:
