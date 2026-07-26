@@ -43,6 +43,7 @@ COPY router_lite_realtime_patch.py /app/router_lite_realtime_patch.py
 COPY router_slow_cache_patch.py /app/router_slow_cache_patch.py
 COPY router_control_scheduler_patch.py /app/router_control_scheduler_patch.py
 COPY router_control_actor_patch.py /app/router_control_actor_patch.py
+COPY router_task_manager_patch.py /app/router_task_manager_patch.py
 COPY labprobe_storage.py /app/labprobe_storage.py
 COPY scripts/repair_storage.py /app/scripts/repair_storage.py
 
@@ -68,8 +69,9 @@ RUN python -m py_compile \
         /app/router_slow_cache_patch.py \
         /app/router_control_scheduler_patch.py \
         /app/router_control_actor_patch.py \
+        /app/router_task_manager_patch.py \
         /app/labprobe_storage.py \
-    && python -c "import router_lite_realtime_patch, router_fast_watchdog_patch, router_build024_fix, router_slow_cache_patch, router_control_scheduler_patch, router_control_actor_patch, hub_realtime_ws" \
+    && python -c "import router_lite_realtime_patch, router_fast_watchdog_patch, router_build024_fix, router_slow_cache_patch, router_control_scheduler_patch, router_control_actor_patch, router_task_manager_patch, hub_realtime_ws" \
     && mkdir -p /app/data /app/config /app/backups /app/logs /app/scripts \
     && chmod 755 /app/scripts/repair_storage.py
 
