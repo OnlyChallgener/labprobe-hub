@@ -2,6 +2,7 @@
 from pathlib import Path
 
 import hub
+from agent_presence_patch import install_agent_presence_patch
 from hub_realtime_ws import install_hub_realtime_ws
 from router_be72_auth_patch import install_router_be72_auth_patch
 from router_be72_sid_wire_patch import install_router_be72_sid_wire_patch
@@ -51,6 +52,7 @@ router_sync = install_router_rpc_compat(hub)
 install_router_status_localization(hub, router_sync)
 router_lite_realtime = install_router_lite_realtime_patch(hub, router_sync)
 install_hub_realtime_ws(hub, router_lite_realtime)
+install_agent_presence_patch(hub)
 
 if __name__ == "__main__":
     raise SystemExit(hub.command_line())
