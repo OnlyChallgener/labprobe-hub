@@ -1,16 +1,20 @@
 use anyhow::{anyhow, bail, Context, Result};
 use reqwest::Client;
 use serde_json::{json, Map, Value};
+use std::sync::Arc;
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 use tokio::process::Command;
-use tokio::sync::watch;
+use tokio::sync::{watch, Mutex};
 use tokio::time::{sleep, timeout, MissedTickBehavior};
 
 use crate::agent::AgentConfig;
 
 const DEMAND_WAIT_SECONDS: u64 = 55;
 const DEVICES_SAMPLE_INTERVAL: Duration = Duration::from_secs(2);
+const DURABLE_SNAPSHOT_INTERVAL: Duration = Duration::from_secs(60);
 const COMMAND_TIMEOUT: Duration = Duration::from_millis(1_400);
+
+type CommandLock = Arc<Mutex<()>>;
 
 #[derive(Debug, Clone, Default)]
 struct Demand {
@@ -82,7 +86,15 @@ fn decode_wire(mut value: Value) -> Result<Value> {
     Ok(value)
 }
 
-async fn dev_sta_json(module: &'static str, data: &'static str) -> Result<Value> {
+async fn dev_sta_json(
+    command_lock: &CommandLock,
+    module: &'static str,
+    data: &'static str,
+) -> Result<Value> {
+    // dev_sta is not safely re-entrant on the embedded router.  Serialize the
+    // two-second realtime read and the one-minute durable read, but release the
+    // lock before any network upload.
+    let _guard = command_lock.lock().await;
     let mut command = Command::new("dev_sta");
     command
         .args(["get", "-m", module, data])
@@ -189,12 +201,17 @@ fn device_rows(root: &Value) -> Vec<Value> {
     rows
 }
 
-async fn collect_devices() -> Result<Vec<Value>> {
-    let devices = dev_sta_json(
+async fn collect_full_devices(command_lock: &CommandLock) -> Result<Value> {
+    dev_sta_json(
+        command_lock,
         "user_list",
         r#"{"devType":"all","dataType":"timely"}"#,
     )
-    .await?;
+    .await
+}
+
+async fn collect_devices(command_lock: &CommandLock) -> Result<Vec<Value>> {
+    let devices = collect_full_devices(command_lock).await?;
     Ok(device_rows(&devices))
 }
 
@@ -266,6 +283,26 @@ async fn push_samples(
     Ok(parse_demand(&root, demand.sequence))
 }
 
+async fn push_full_snapshot(client: &Client, config: &AgentConfig, snapshot: Value) -> Result<()> {
+    let url = format!(
+        "{}/api/router/devices/snapshot",
+        config.hub_url.trim_end_matches('/')
+    );
+    let response = client
+        .post(url)
+        .header("X-LabProbe-Token", &config.hook_token)
+        .json(&snapshot)
+        .timeout(Duration::from_secs(12))
+        .send()
+        .await?;
+    let status = response.status();
+    let root: Value = response.json().await.unwrap_or(Value::Null);
+    if !status.is_success() {
+        bail!("durable snapshot HTTP {status}: {root}");
+    }
+    Ok(())
+}
+
 async fn demand_lane(client: Client, config: AgentConfig, demand_tx: watch::Sender<Demand>) {
     let mut sequence = 0u64;
     loop {
@@ -292,7 +329,12 @@ async fn demand_lane(client: Client, config: AgentConfig, demand_tx: watch::Send
     }
 }
 
-async fn devices_lane(client: Client, config: AgentConfig, demand_rx: watch::Receiver<Demand>) {
+async fn devices_lane(
+    client: Client,
+    config: AgentConfig,
+    demand_rx: watch::Receiver<Demand>,
+    command_lock: CommandLock,
+) {
     let mut tick = tokio::time::interval(DEVICES_SAMPLE_INTERVAL);
     tick.set_missed_tick_behavior(MissedTickBehavior::Skip);
     loop {
@@ -301,8 +343,24 @@ async fn devices_lane(client: Client, config: AgentConfig, demand_rx: watch::Rec
         if !demand.devices_active {
             continue;
         }
-        if let Ok(sample) = collect_devices().await {
+        if let Ok(sample) = collect_devices(&command_lock).await {
             let _ = push_samples(&client, &config, &demand, sample).await;
+        }
+    }
+}
+
+async fn durable_devices_lane(client: Client, config: AgentConfig, command_lock: CommandLock) {
+    // tokio intervals tick immediately, restoring persisted device state shortly
+    // after the agent starts and then maintaining it independently of APP demand.
+    let mut tick = tokio::time::interval(DURABLE_SNAPSHOT_INTERVAL);
+    tick.set_missed_tick_behavior(MissedTickBehavior::Skip);
+    loop {
+        tick.tick().await;
+        match collect_full_devices(&command_lock).await {
+            Ok(snapshot) => {
+                let _ = push_full_snapshot(&client, &config, snapshot).await;
+            }
+            Err(_) => sleep(Duration::from_secs(3)).await,
         }
     }
 }
@@ -318,9 +376,16 @@ pub async fn run(config: AgentConfig) {
         Err(_) => return,
     };
     let (demand_tx, demand_rx) = watch::channel(Demand::default());
+    let command_lock = Arc::new(Mutex::new(()));
     tokio::join!(
         demand_lane(client.clone(), config.clone(), demand_tx),
-        devices_lane(client, config, demand_rx),
+        devices_lane(
+            client.clone(),
+            config.clone(),
+            demand_rx,
+            command_lock.clone(),
+        ),
+        durable_devices_lane(client, config, command_lock),
     );
 }
 
@@ -343,6 +408,22 @@ mod tests {
         assert_eq!(result[0]["downloadBps"], 5678);
         assert_eq!(result[0]["connectionCount"], 9);
         assert!(result[0].get("name").is_none());
+    }
+
+    #[test]
+    fn durable_snapshot_keeps_history_fields() {
+        let raw = json!({"list": [{
+            "mac": "AA-BB-CC-DD-EE-FF",
+            "devRecommend": "NAS",
+            "userIp": "192.168.5.2",
+            "onlinetime": "2026-07-27 08:00:00",
+            "dailyUp": 12345,
+            "dailyDown": 67890
+        }]});
+        let row = device_array(&raw)[0].as_object().unwrap();
+        assert_eq!(row.get("devRecommend").and_then(Value::as_str), Some("NAS"));
+        assert_eq!(row.get("dailyUp").and_then(Value::as_u64), Some(12345));
+        assert_eq!(row.get("onlinetime").and_then(Value::as_str), Some("2026-07-27 08:00:00"));
     }
 
     #[test]
