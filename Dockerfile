@@ -26,6 +26,8 @@ COPY hub.py /app/hub.py
 COPY hub_entry.py /app/hub_entry.py
 COPY hub_realtime_ws.py /app/hub_realtime_ws.py
 COPY agent_presence_patch.py /app/agent_presence_patch.py
+COPY device_history_patch.py /app/device_history_patch.py
+COPY portmap_persistence_patch.py /app/portmap_persistence_patch.py
 COPY router_rpc.py /app/router_rpc.py
 COPY router_rpc_v099.py /app/router_rpc_v099.py
 COPY router_rpc_v010.py /app/router_rpc_v010.py
@@ -54,6 +56,8 @@ RUN python -m py_compile \
         /app/hub_entry.py \
         /app/hub_realtime_ws.py \
         /app/agent_presence_patch.py \
+        /app/device_history_patch.py \
+        /app/portmap_persistence_patch.py \
         /app/router_rpc.py \
         /app/router_rpc_v099.py \
         /app/router_rpc_v010.py \
@@ -75,7 +79,7 @@ RUN python -m py_compile \
         /app/router_task_manager_patch.py \
         /app/router_config_sync_patch.py \
         /app/labprobe_storage.py \
-    && python -c "import agent_presence_patch, router_lite_realtime_patch, router_fast_watchdog_patch, router_build024_fix, router_slow_cache_patch, router_control_scheduler_patch, router_control_actor_patch, router_task_manager_patch, router_config_sync_patch, hub_realtime_ws" \
+    && python -c "import agent_presence_patch, device_history_patch, portmap_persistence_patch, router_lite_realtime_patch, router_fast_watchdog_patch, router_build024_fix, router_slow_cache_patch, router_control_scheduler_patch, router_control_actor_patch, router_task_manager_patch, router_config_sync_patch, hub_realtime_ws" \
     && mkdir -p /app/data /app/config /app/backups /app/logs /app/scripts \
     && chmod 755 /app/scripts/repair_storage.py
 
