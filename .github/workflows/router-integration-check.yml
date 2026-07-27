@@ -162,7 +162,7 @@ jobs:
           grep -q 'DEVICES_SAMPLE_INTERVAL: Duration = Duration::from_secs(2)' src/runtime.rs
           grep -q 'DURABLE_SNAPSHOT_INTERVAL: Duration = Duration::from_secs(60)' src/runtime.rs
           grep -q 'async fn devices_lane(' src/runtime.rs
-          grep -q 'async fn durable_snapshot_lane(' src/runtime.rs
+          grep -q 'async fn durable_devices_lane(' src/runtime.rs
           grep -q 'MissedTickBehavior::Skip' src/runtime.rs
           grep -q '/api/router/realtime/agent/demand' src/runtime.rs
           grep -q '/api/router/realtime/agent/push' src/runtime.rs
