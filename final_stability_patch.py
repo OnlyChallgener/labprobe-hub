@@ -3,18 +3,33 @@
 - Freeze elapsed time when NAT/diagnostic/Beta tasks reach a terminal state.
 - Expose an asynchronous Agent update-check endpoint that always returns quickly.
 - Keep HTTP 502/HTML gateway bodies out of APP-facing messages.
+- Serve a resilient local /agent update repository with an installer fallback.
 """
 from __future__ import annotations
 
+import os
 import threading
 import time
+from pathlib import Path
 from types import MethodType
 from typing import Any, Dict
 
-from flask import jsonify, request
+from flask import abort, jsonify, request, send_file
 
 
 TERMINAL_TASK_STATES = {"succeeded", "failed", "timed_out", "cancelled"}
+AGENT_ASSET_NAMES = {
+    "latest.json",
+    "install.sh",
+    "labprobe-install.sh",
+    "checksums.txt",
+    "labrelay-linux-arm64",
+    "labrelay-linux-aarch64",
+    "labrelay-aarch64-musl",
+    "labrelay-linux-amd64",
+    "labrelay-linux-x86_64",
+    "labrelay-x86_64-musl",
+}
 
 
 def _friendly_update_error(value: Any) -> str:
@@ -25,10 +40,135 @@ def _friendly_update_error(value: Any) -> str:
     if "timeout" in lower or "timed out" in lower or "read timed out" in lower:
         return "更新源响应超时，Hub 将继续在后台重试"
     if "404" in lower:
-        return "更新清单不存在，请检查 HTTPS 更新仓配置"
+        return "更新清单不存在，Hub 已切换本地更新清单"
     if "ssl" in lower or "certificate" in lower:
         return "HTTPS 更新源证书校验失败，请检查证书或系统时间"
     return f"更新检查失败：{text[:120]}" if text else "更新检查失败，已保留上次版本信息"
+
+
+def _update_repository_dir() -> Path:
+    return Path(os.environ.get("UPDATE_REPOSITORY_DIR", "/app/update-repository")).resolve()
+
+
+def _local_agent_asset(name: str) -> Path | None:
+    if name not in AGENT_ASSET_NAMES:
+        return None
+    roots = (
+        _update_repository_dir() / "agent",
+        _update_repository_dir(),
+        Path("/app/agent"),
+    )
+    for root in roots:
+        candidate = (root / name).resolve()
+        try:
+            candidate.relative_to(root.resolve())
+        except ValueError:
+            continue
+        if candidate.is_file():
+            return candidate
+    return None
+
+
+def _fallback_manifest(hub: Any) -> Dict[str, Any]:
+    local = _local_agent_asset("latest.json")
+    if local is not None:
+        try:
+            value = hub.json.loads(local.read_text(encoding="utf-8"))
+            if isinstance(value, dict) and value.get("versionName"):
+                return value
+        except Exception as exc:
+            hub.LOGGER.warning("local agent manifest parse failed: %s", exc)
+
+    version = (os.environ.get("LABRELAY_RELEASE_VERSION") or "0.2.12").strip()
+    public_root = (os.environ.get("UPDATE_REPOSITORY_ROOT") or "").strip().rstrip("/")
+    fallback_root = "https://github.com/OnlyChallgener/labprobe-hub/releases/latest/download"
+    if not public_root:
+        public_root = fallback_root
+    return {
+        "schemaVersion": 1,
+        "versionName": version,
+        "changelog": "LabRelay OpenWrt installer and update-source stability fixes.",
+        "installUrl": f"{public_root}/agent/install.sh",
+        "checksumsUrl": f"{public_root}/agent/checksums.txt",
+        "binaries": {
+            "arm64": {
+                "url": f"{public_root}/agent/labrelay-linux-arm64",
+                "fallbackUrl": f"{fallback_root}/labrelay-linux-arm64",
+            },
+            "amd64": {
+                "url": f"{public_root}/agent/labrelay-linux-amd64",
+                "fallbackUrl": f"{fallback_root}/labrelay-linux-amd64",
+            },
+        },
+        "installer": {
+            "url": f"{public_root}/agent/install.sh",
+            "fallbackUrl": f"{fallback_root}/labprobe-install.sh",
+        },
+        "source": "hub-local-fallback",
+    }
+
+
+def _install_update_repository_routes(hub: Any) -> None:
+    if getattr(hub, "_final_update_repository_patched", False):
+        return
+
+    def agent_asset(name: str) -> Any:
+        if name not in AGENT_ASSET_NAMES:
+            abort(404)
+        local = _local_agent_asset(name)
+        if local is not None:
+            mimetype = {
+                "latest.json": "application/json; charset=utf-8",
+                "checksums.txt": "text/plain; charset=utf-8",
+                "install.sh": "text/x-shellscript; charset=utf-8",
+                "labprobe-install.sh": "text/x-shellscript; charset=utf-8",
+            }.get(name, "application/octet-stream")
+            return send_file(local, mimetype=mimetype, conditional=True, max_age=0)
+        if name == "latest.json":
+            return jsonify(_fallback_manifest(hub))
+        if name == "labprobe-install.sh":
+            installer = _local_agent_asset("install.sh")
+            if installer is not None:
+                return send_file(installer, mimetype="text/x-shellscript; charset=utf-8", conditional=True, max_age=0)
+        abort(404)
+
+    def repository_health() -> Any:
+        manifest = _fallback_manifest(hub)
+        assets = {}
+        for name in sorted(AGENT_ASSET_NAMES):
+            local = _local_agent_asset(name)
+            if local is not None:
+                assets[name] = {"available": True, "sizeBytes": local.stat().st_size}
+        return jsonify({
+            "ok": True,
+            "repositoryDir": str(_update_repository_dir()),
+            "manifestVersion": manifest.get("versionName", ""),
+            "assets": assets,
+            "installerAvailable": _local_agent_asset("install.sh") is not None,
+            "binaryAvailable": any(name.startswith("labrelay-") for name in assets),
+        })
+
+    if "final_agent_asset" not in hub.app.view_functions:
+        hub.app.add_url_rule(
+            "/agent/<path:name>",
+            endpoint="final_agent_asset",
+            view_func=agent_asset,
+            methods=["GET", "HEAD"],
+        )
+    else:
+        hub.app.view_functions["final_agent_asset"] = agent_asset
+    if "api_agent_repository_health" not in hub.app.view_functions:
+        hub.app.add_url_rule(
+            "/api/agent/repository/health",
+            endpoint="api_agent_repository_health",
+            view_func=repository_health,
+            methods=["GET"],
+        )
+    else:
+        hub.app.view_functions["api_agent_repository_health"] = repository_health
+
+    hub._final_update_repository_patched = True
+    hub.LOGGER.info("local Agent update repository enabled dir=%s", _update_repository_dir())
 
 
 def _freeze_router_task_timing(hub: Any) -> None:
@@ -75,7 +215,6 @@ def _freeze_router_task_timing(hub: Any) -> None:
     manager._update = MethodType(update, manager)
     manager._final_timing_patched = True
 
-    # Migrate already-finished persisted tasks so opening the APP cannot resume counting.
     with manager.lock:
         now = int(time.time())
         for current in manager.tasks.values():
@@ -120,27 +259,34 @@ def _install_agent_check_routes(hub: Any) -> None:
             })
 
         def worker() -> None:
+            remote_error = ""
             try:
                 manifest = hub.agent_release_manifest(force=force)
-                latest = hub.clean_saved_value(manifest.get("versionName") or manifest.get("version"))
-                if not latest:
-                    raise RuntimeError("更新清单缺少版本号")
+            except Exception as exc:
+                remote_error = _friendly_update_error(exc)
+                manifest = _fallback_manifest(hub)
+            latest = hub.clean_saved_value(manifest.get("versionName") or manifest.get("version"))
+            if latest:
                 with state_lock:
                     check_state.update({
                         "state": "ready",
-                        "message": "HTTPS 更新检查完成",
+                        "message": "已使用 Hub 本地更新清单" if remote_error else "HTTPS 更新检查完成",
                         "latestVersion": latest,
                         "updatedAt": int(time.time()),
+                        "remoteWarning": remote_error,
                     })
-            except Exception as exc:
-                message = _friendly_update_error(exc)
-                hub.LOGGER.warning("background agent update check failed: %s", message)
-                with state_lock:
-                    check_state.update({
-                        "state": "failed",
-                        "message": message,
-                        "updatedAt": int(time.time()),
-                    })
+                hub.AGENT_RELEASE_CACHE["data"] = manifest
+                hub.AGENT_RELEASE_CACHE["at"] = time.time()
+                if remote_error:
+                    hub.LOGGER.warning("remote Agent manifest unavailable; local fallback active: %s", remote_error)
+                return
+            message = remote_error or "更新清单缺少版本号"
+            with state_lock:
+                check_state.update({
+                    "state": "failed",
+                    "message": message,
+                    "updatedAt": int(time.time()),
+                })
 
         threading.Thread(target=worker, name="agent-update-check", daemon=True).start()
         return snapshot_state()
@@ -210,9 +356,9 @@ def _install_agent_check_routes(hub: Any) -> None:
             "installerUrl": hub.AGENT_INSTALLER_URL,
             "protocol": "HTTPS",
             "checkedAt": int(passive.get("updatedAt") or 0),
+            "remoteWarning": passive.get("remoteWarning", ""),
         })
 
-    # Replace the old status handler and add a dedicated async check endpoint.
     hub.app.view_functions["api_agent_update_status"] = update_status
     if "api_agent_update_check" not in hub.app.view_functions:
         hub.app.add_url_rule(
@@ -232,6 +378,7 @@ def _install_agent_check_routes(hub: Any) -> None:
 def install_final_stability_patch(hub: Any) -> None:
     if getattr(hub, "FINAL_STABILITY_PATCHED", False):
         return
+    _install_update_repository_routes(hub)
     _freeze_router_task_timing(hub)
     _install_agent_check_routes(hub)
     hub.FINAL_STABILITY_PATCHED = True
