@@ -42,7 +42,7 @@ impl Default for AgentConfig {
             hook_token: String::new(),
             router_name: "router".into(),
             interval_seconds: 15,
-            status_interval_seconds: 15,
+            status_interval_seconds: 5,
             dashboard_interval_seconds: 2,
             dashboard_details_interval_seconds: 30,
             dashboard_network_interval_seconds: 60,
@@ -1489,9 +1489,6 @@ async fn sync_portmaps(
 }
 
 async fn agent_cycle(client: &Client, config: &AgentConfig, state: &mut AgentState) -> Result<()> {
-    if let Err(error) = report_agent_status(client, config, state).await {
-        log_limited(config, state, "WARN", "agent-status", &format!("agent status report skipped: {:#}", error));
-    }
     match sync_agent_update(client, config, state).await {
         Ok(true) => return Ok(()),
         Ok(false) => {}
@@ -1504,7 +1501,6 @@ async fn agent_cycle(client: &Client, config: &AgentConfig, state: &mut AgentSta
     post_json(client, config, "/hook/ruijie/devices", &user_list).await?;
     flush_device_events(client, config, state).await;
     post_json(client, config, "/api/router/push", &router_snapshot(config)).await?;
-    sync_portmaps(client, config, state).await?;
     state.last_success_at = now_epoch();
     state.update_state = "idle".into();
     state.update_message.clear();
@@ -1517,11 +1513,28 @@ pub async fn run(args: &[String], once: bool) -> Result<()> {
     let mut state = load_state(&state_path);
     let client = http_client()?;
     let mut last_agent_cycle_at = 0u64;
+    let mut last_status_at = 0u64;
     log_line(&config, "INFO", "Rust agent started");
     loop {
         let now = now_epoch();
         let was_unhealthy = !state.last_error.is_empty();
         let mut errors = Vec::new();
+        // Presence and daemon runtime are a small, independent control lane.
+        // Keep it at five seconds even when full device snapshots are slower.
+        let status_due = once || last_status_at == 0 || now.saturating_sub(last_status_at) >= config.status_interval_seconds.clamp(3, 5);
+        if status_due {
+            if let Err(error) = report_agent_status(&client, &config, &state).await {
+                let text = redact(&format!("agent status: {:#}", error), &config.hook_token);
+                log_limited(&config, &mut state, "WARN", "agent-status", &text);
+                errors.push(text);
+            }
+            if let Err(error) = sync_portmaps(&client, &config, &mut state).await {
+                let text = redact(&format!("portmap status: {:#}", error), &config.hook_token);
+                log_limited(&config, &mut state, "WARN", "portmap-status", &text);
+                errors.push(text);
+            }
+            last_status_at = now;
+        }
         if once || last_agent_cycle_at == 0 || now.saturating_sub(last_agent_cycle_at) >= config.interval_seconds.clamp(5, 300) {
             if let Err(error) = agent_cycle(&client, &config, &mut state).await {
                 let text = redact(&format!("{:#}", error), &config.hook_token);
