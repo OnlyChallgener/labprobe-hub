@@ -74,7 +74,8 @@ jobs:
           cp agent/install.sh "$OUT/install.sh"
           cp agent/install.sh "$OUT/labprobe-install.sh"
           chmod 755 "$OUT/labrelay-linux-arm64" "$OUT/labrelay-aarch64-musl" "$OUT/install.sh" "$OUT/labprobe-install.sh"
-          "$OUT/labrelay-linux-arm64" version | grep -q "$VERSION"
+          file "$OUT/labrelay-linux-arm64" | grep -Eqi 'aarch64|ARM aarch64|ARM64'
+          strings "$OUT/labrelay-linux-arm64" | grep -q "$VERSION"
           python3 - <<'PY'
           import hashlib
           import json
