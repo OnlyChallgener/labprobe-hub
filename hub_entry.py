@@ -13,6 +13,7 @@ from router_compat import install_router_rpc_compat
 from router_config_sync_patch import install_router_config_sync_patch
 from router_control_actor_patch import install_router_control_actor_patch
 from router_control_scheduler_patch import install_router_control_scheduler_patch
+from router_device_live_sync_patch import install_router_device_live_sync_patch
 from router_developer_flow_patch import install_router_developer_flow_patch
 from router_fast_watchdog_patch import install_router_fast_watchdog_patch
 from router_http_developer_transport_patch import install_router_http_developer_transport_patch
@@ -28,7 +29,7 @@ from router_slow_cache_patch import install_router_slow_cache_patch
 from router_task_manager_patch import install_router_task_manager_patch
 from router_ws_patch import install_router_ws_patch
 
-HUB_VERSION = "0.9.29"
+HUB_VERSION = "0.9.30"
 hub.APP_VERSION = HUB_VERSION
 install_router_http_developer_transport_patch()
 install_router_developer_flow_patch()
@@ -59,6 +60,7 @@ install_router_config_sync_patch(hub, hub.ROUTER_TASK_MANAGER.client)
 install_agent_presence_patch(hub)
 install_device_history_patch(hub)
 install_portmap_persistence_patch(hub)
+install_router_device_live_sync_patch(hub, hub.ROUTER_TASK_MANAGER.client)
 
 if __name__ == "__main__":
     raise SystemExit(hub.command_line())
