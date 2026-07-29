@@ -537,19 +537,36 @@ def _auth_tokens_from_request() -> List[str]:
     return [t for t in tokens if t]
 
 
+def _token_matches(candidate: Any, expected: Any) -> bool:
+    """Compare tokens without allowing malformed Unicode input to crash Flask.
+
+    Python's ``hmac.compare_digest`` rejects non-ASCII ``str`` inputs. Router
+    requests must receive a normal authentication failure in that case, rather
+    than turning every protected endpoint into an HTTP 500 response. Comparing
+    UTF-8 bytes retains constant-time comparison and also supports an existing
+    non-ASCII token during a controlled token rotation.
+    """
+    if not isinstance(candidate, str) or not isinstance(expected, str):
+        return False
+    try:
+        return hmac.compare_digest(candidate.encode("utf-8"), expected.encode("utf-8"))
+    except UnicodeError:
+        return False
+
+
 def check_app_token() -> bool:
     app_token = get_app_token()
-    return any(hmac.compare_digest(t, app_token) for t in _auth_tokens_from_request())
+    return any(_token_matches(t, app_token) for t in _auth_tokens_from_request())
 
 
 def check_hook_token() -> bool:
     hook_token = get_hook_token()
-    return any(hmac.compare_digest(t, hook_token) for t in _auth_tokens_from_request())
+    return any(_token_matches(t, hook_token) for t in _auth_tokens_from_request())
 
 
 def check_read_token() -> bool:
     allowed = {get_app_token(), get_hook_token()}
-    return any(any(hmac.compare_digest(t, token) for token in allowed) for t in _auth_tokens_from_request())
+    return any(any(_token_matches(t, token) for token in allowed) for t in _auth_tokens_from_request())
 
 
 def add_event(event: Dict[str, Any]) -> Dict[str, Any]:
