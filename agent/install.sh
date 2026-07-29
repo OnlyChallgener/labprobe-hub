@@ -1,22 +1,41 @@
 #!/bin/sh
 # LabRelay universal OpenWrt/BusyBox installer.
-# Usage:
+# First install:
 #   sh install.sh HUB_URL HOOK_TOKEN ROUTER_NAME [LOCAL_BINARY] [REPOSITORY_ROOT]
+# Upgrade with an existing /etc/labprobe/agent.json:
+#   sh install.sh
 set -eu
 
 log() { printf '[LabRelay] %s\n' "$*"; }
 fail() { printf '[LabRelay] ERROR: %s\n' "$*" >&2; exit 1; }
 
-HUB_URL="${1:-${HUB_URL:-}}"
-HOOK_TOKEN="${2:-${HOOK_TOKEN:-}}"
-ROUTER_NAME="${3:-${ROUTER_NAME:-$(hostname 2>/dev/null || echo router)}}"
-LOCAL_BINARY="${4:-${LABRELAY_BINARY:-}}"
-REPOSITORY_ROOT="${5:-${LABRELAY_REPOSITORY_ROOT:-https://lab.net86.dynv6.net:27772}}"
-REPOSITORY_ROOT="${REPOSITORY_ROOT%/}"
+config_value() {
+  path="$1"; key="$2"; file="$3"
+  [ -f "$file" ] || return 0
+  if command -v jsonfilter >/dev/null 2>&1; then
+    jsonfilter -i "$file" -e "$path" 2>/dev/null | head -n 1
+  else
+    sed -n "s/.*\"$key\"[[:space:]]*:[[:space:]]*\"\([^\"]*\)\".*/\1/p" "$file" | head -n 1
+  fi
+}
 
-[ -n "$HUB_URL" ] || fail 'missing HUB_URL (first argument)'
-[ -n "$HOOK_TOKEN" ] || fail 'missing HOOK_TOKEN (second argument)'
-[ -n "$ROUTER_NAME" ] || ROUTER_NAME=router
+EXISTING_CONFIG=/etc/labprobe/agent.json
+SAVED_HUB="$(config_value '@.hubUrl' hubUrl "$EXISTING_CONFIG")"
+SAVED_TOKEN="$(config_value '@.hookToken' hookToken "$EXISTING_CONFIG")"
+SAVED_NAME="$(config_value '@.routerName' routerName "$EXISTING_CONFIG")"
+
+HUB_URL="${1:-${HUB_URL:-$SAVED_HUB}}"
+HOOK_TOKEN="${2:-${HOOK_TOKEN:-$SAVED_TOKEN}}"
+ROUTER_NAME="${3:-${ROUTER_NAME:-$SAVED_NAME}}"
+[ -n "$ROUTER_NAME" ] || ROUTER_NAME="$(hostname 2>/dev/null || echo router)"
+LOCAL_BINARY="${4:-${LABRELAY_BINARY:-}}"
+REPOSITORY_ROOT="${5:-${LABRELAY_REPOSITORY_ROOT:-${HUB_URL:-https://lab.net86.dynv6.net:27772}}}"
+REPOSITORY_ROOT="${REPOSITORY_ROOT%/}"
+PUBLIC_FALLBACK_ROOT="${LABRELAY_PUBLIC_ROOT:-https://lab.net86.dynv6.net:27772}"
+PUBLIC_FALLBACK_ROOT="${PUBLIC_FALLBACK_ROOT%/}"
+
+[ -n "$HUB_URL" ] || fail 'missing HUB_URL and no existing /etc/labprobe/agent.json'
+[ -n "$HOOK_TOKEN" ] || fail 'missing HOOK_TOKEN and no existing /etc/labprobe/agent.json'
 
 case "$(uname -m 2>/dev/null || true)" in
   aarch64|arm64|armv8*) ARCH=arm64 ;;
@@ -36,7 +55,7 @@ http_get() {
   rm -f "$output"
   if command -v curl >/dev/null 2>&1; then
     curl -fL --connect-timeout 7 --max-time 90 --retry 2 --retry-delay 1 \
-      -A 'LabRelay-Installer/2' "$url" -o "$output" >/dev/null 2>&1
+      -A 'LabRelay-Installer/3' "$url" -o "$output" >/dev/null 2>&1
     return $?
   fi
   if command -v wget >/dev/null 2>&1; then
@@ -53,13 +72,12 @@ is_elf() {
 }
 
 json_value() {
-  path="$1"; file="$2"
+  path="$1"; key="$2"; file="$3"
   if command -v jsonfilter >/dev/null 2>&1; then
     jsonfilter -i "$file" -e "$path" 2>/dev/null | head -n 1
-    return
+  else
+    sed -n "s/.*\"$key\"[[:space:]]*:[[:space:]]*\"\([^\"]*\)\".*/\1/p" "$file" | head -n 1
   fi
-  key="${path##*.}"
-  sed -n "s/.*\"$key\"[[:space:]]*:[[:space:]]*\"\([^\"]*\)\".*/\1/p" "$file" | head -n 1
 }
 
 try_download_binary() {
@@ -94,9 +112,10 @@ if [ -n "$LOCAL_BINARY" ]; then
 else
   manifest_ok=0
   for manifest_url in \
+    "${HUB_URL%/}/agent/latest.json" \
     "$REPOSITORY_ROOT/agent/latest.json" \
     "$REPOSITORY_ROOT/latest.json" \
-    "${HUB_URL%/}/agent/latest.json"; do
+    "$PUBLIC_FALLBACK_ROOT/agent/latest.json"; do
     log "fetching manifest $manifest_url"
     if http_get "$manifest_url" "$MANIFEST" && grep -q '"versionName"' "$MANIFEST" 2>/dev/null; then
       manifest_ok=1
@@ -107,11 +126,11 @@ else
   downloaded=0
   if [ "$manifest_ok" = 1 ]; then
     if [ "$ARCH" = arm64 ]; then
-      primary="$(json_value '@.binaries.arm64.url' "$MANIFEST")"
-      fallback="$(json_value '@.binaries.arm64.fallbackUrl' "$MANIFEST")"
+      primary="$(json_value '@.binaries.arm64.url' url "$MANIFEST")"
+      fallback="$(json_value '@.binaries.arm64.fallbackUrl' fallbackUrl "$MANIFEST")"
     else
-      primary="$(json_value '@.binaries.amd64.url' "$MANIFEST")"
-      fallback="$(json_value '@.binaries.amd64.fallbackUrl' "$MANIFEST")"
+      primary="$(json_value '@.binaries.amd64.url' url "$MANIFEST")"
+      fallback="$(json_value '@.binaries.amd64.fallbackUrl' fallbackUrl "$MANIFEST")"
     fi
     for url in "$primary" "$fallback"; do
       if try_download_binary "$url"; then downloaded=1; break; fi
@@ -128,8 +147,10 @@ else
     fi
     for name in $names; do
       for url in \
+        "${HUB_URL%/}/agent/$name" \
         "$REPOSITORY_ROOT/agent/$name" \
         "$REPOSITORY_ROOT/$name" \
+        "$PUBLIC_FALLBACK_ROOT/agent/$name" \
         "https://github.com/OnlyChallgener/labprobe-hub/releases/latest/download/$name"; do
         if try_download_binary "$url"; then downloaded=1; break 2; fi
       done
@@ -141,7 +162,7 @@ fi
 chmod 755 "$DOWNLOADED_BINARY"
 "$DOWNLOADED_BINARY" version >/dev/null 2>&1 || fail 'downloaded binary cannot run on this router'
 
-mkdir -p /etc/labprobe /usr/bin /etc/init.d /tmp/labrelay
+mkdir -p /etc/labprobe /usr/bin /etc/init.d /tmp/labrelay /tmp/labprobe
 [ -f /etc/labprobe/relay.json ] || printf '%s\n' '{"version":1,"rules":[]}' > /etc/labprobe/relay.json
 chmod 600 /etc/labprobe/relay.json
 
@@ -161,6 +182,7 @@ USE_PROCD=1
 START=97
 STOP=10
 start_service() {
+  mkdir -p /tmp/labrelay
   procd_open_instance
   procd_set_param command /usr/bin/labrelay daemon --config /etc/labprobe/relay.json --socket /tmp/labrelay.sock --state /tmp/labrelay/state.json --pid /tmp/labrelay.pid --port-min 20000 --port-max 20020 --lan-if br-lan
   procd_set_param respawn 5 5 0
@@ -177,6 +199,7 @@ USE_PROCD=1
 START=97
 STOP=10
 start_service() {
+  mkdir -p /tmp/labprobe
   procd_open_instance
   procd_set_param command /usr/bin/labrelay agent --config /etc/labprobe/agent.json
   procd_set_param respawn 5 5 0
