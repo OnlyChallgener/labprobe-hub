@@ -9,7 +9,6 @@
 from __future__ import annotations
 
 import threading
-import time
 from types import MethodType
 from typing import Any, Dict
 
@@ -35,10 +34,13 @@ def _update_command(hub: Any, command_id: str, values: Dict[str, Any]) -> Dict[s
 
 
 def _start_manifest_refresh(hub: Any, command_id: str = "", force: bool = False) -> None:
-    if not _MANIFEST_REFRESH_LOCK.acquire(blocking=False):
-        return
-
     def worker() -> None:
+        # A real update command must never be left in "preparing" merely because a
+        # passive status refresh was already using the manifest lock. It waits in
+        # this background thread; status-only refreshes remain best-effort.
+        acquired = _MANIFEST_REFRESH_LOCK.acquire(blocking=bool(command_id))
+        if not acquired:
+            return
         try:
             manifest = hub.agent_release_manifest(force=force)
             if command_id:
