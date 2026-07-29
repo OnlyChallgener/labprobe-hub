@@ -40,8 +40,11 @@ jobs:
           grep -q 'SAVED_HUB=' agent/install.sh
           grep -q 'SAVED_TOKEN=' agent/install.sh
           grep -q '${HUB_URL%/}/agent/latest.json' agent/install.sh
-          grep -q 'is_elf' agent/install.sh
-          grep -q 'unable to download LabRelay binary' agent/install.sh
+          grep -q 'is_labrelay_binary' agent/install.sh
+          grep -q 'version >/dev/null 2>&1' agent/install.sh
+          grep -q 'unable to download a runnable LabRelay binary' agent/install.sh
+          ! grep -q 'od -An' agent/install.sh
+          ! grep -q 'is_elf' agent/install.sh
       - name: Validate Hub-local Agent repository routes
         env:
           APP_TOKEN: ci-app-token
@@ -78,6 +81,8 @@ jobs:
           installer = client.get('/agent/install.sh')
           assert installer.status_code == 200, installer.status_code
           assert b'EXISTING_CONFIG=/etc/labprobe/agent.json' in installer.data
+          assert b'is_labrelay_binary' in installer.data
+          assert b'od -An' not in installer.data
 
           manifest = client.get('/agent/latest.json')
           assert manifest.status_code == 200, manifest.status_code
