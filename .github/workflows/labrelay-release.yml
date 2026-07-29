@@ -7,10 +7,16 @@ on:
       - labrelay/**
       - agent/**
       - .github/workflows/labrelay-release.yml
+  pull_request:
+    branches: [hub0923]
+    paths:
+      - labrelay/**
+      - agent/**
+      - .github/workflows/labrelay-release.yml
   workflow_dispatch:
 
 concurrency:
-  group: publish-labrelay-0.2.12
+  group: publish-labrelay-${{ github.event.pull_request.number || github.ref }}
   cancel-in-progress: true
 
 permissions:
@@ -49,6 +55,8 @@ jobs:
         run: cargo install cross --locked
 
       - name: Build static ARM64 router binary
+        env:
+          CARGO_TARGET_DIR: ${{ runner.temp }}/labrelay-cross-target
         run: cross build --manifest-path labrelay/Cargo.toml --release --target aarch64-unknown-linux-musl
 
       - name: Assemble complete installer repository
@@ -58,8 +66,10 @@ jobs:
         run: |
           set -euo pipefail
           OUT="$RUNNER_TEMP/agent"
+          BINARY="$RUNNER_TEMP/labrelay-cross-target/aarch64-unknown-linux-musl/release/labrelay"
+          test -x "$BINARY"
           mkdir -p "$OUT"
-          cp target/aarch64-unknown-linux-musl/release/labrelay "$OUT/labrelay-linux-arm64"
+          cp "$BINARY" "$OUT/labrelay-linux-arm64"
           cp "$OUT/labrelay-linux-arm64" "$OUT/labrelay-aarch64-musl"
           cp agent/install.sh "$OUT/install.sh"
           cp agent/install.sh "$OUT/labprobe-install.sh"
@@ -118,6 +128,7 @@ jobs:
           if-no-files-found: error
 
       - name: Publish or update GitHub release assets
+        if: github.event_name != 'pull_request'
         uses: softprops/action-gh-release@v2
         with:
           tag_name: ${{ steps.version.outputs.tag }}
