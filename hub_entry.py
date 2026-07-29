@@ -4,6 +4,7 @@ from pathlib import Path
 import hub
 from agent_presence_patch import install_agent_presence_patch
 from device_history_patch import install_device_history_patch
+from final_stability_patch import install_final_stability_patch
 from followup_stability_patch import install_followup_stability_patch
 from hub_realtime_ws import install_hub_realtime_ws
 from portmap_persistence_patch import install_portmap_persistence_patch
@@ -30,7 +31,7 @@ from router_slow_cache_patch import install_router_slow_cache_patch
 from router_task_manager_patch import install_router_task_manager_patch
 from router_ws_patch import install_router_ws_patch
 
-HUB_VERSION = "0.9.31"
+HUB_VERSION = "0.9.32"
 hub.APP_VERSION = HUB_VERSION
 install_router_http_developer_transport_patch()
 install_router_developer_flow_patch()
@@ -63,6 +64,7 @@ install_device_history_patch(hub)
 install_portmap_persistence_patch(hub)
 install_router_device_live_sync_patch(hub, hub.ROUTER_TASK_MANAGER.client)
 install_followup_stability_patch(hub, router_lite_realtime)
+install_final_stability_patch(hub)
 
 if __name__ == "__main__":
     raise SystemExit(hub.command_line())
