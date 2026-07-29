@@ -13,6 +13,12 @@ fn replace_once(source: &mut String, old: &str, new: &str, label: &str) {
 }
 
 fn main() {
+    // Source is maintained directly; build.rs must never rewrite tracked Rust files.
+    println!("cargo:rerun-if-changed=build.rs");
+    println!("cargo:rerun-if-changed=src/agent.rs");
+    println!("cargo:rerun-if-changed=src/main.rs");
+    println!("cargo:rerun-if-changed=src/runtime.rs");
+    return;
     println!("cargo:rerun-if-changed=build.rs");
     println!("cargo:rerun-if-changed=src/runtime.rs");
     let manifest = PathBuf::from(env::var("CARGO_MANIFEST_DIR").expect("CARGO_MANIFEST_DIR"));
