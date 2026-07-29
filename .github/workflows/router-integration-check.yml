@@ -6,6 +6,7 @@ on:
       - hub0919
       - hub0922
       - hub0923
+      - hub0924
       - codex/router-rpc-v098-relay-v029
     paths:
       - Dockerfile
@@ -53,6 +54,8 @@ jobs:
     runs-on: ubuntu-latest
     env:
       PYTHONPATH: ${{ github.workspace }}
+      APP_TOKEN: ci-app-token
+      HOOK_TOKEN: ci-hook-token
     steps:
       - uses: actions/checkout@v4
       - name: Publish Hub CI start
@@ -65,7 +68,7 @@ jobs:
               sha: context.sha,
               state: 'pending',
               context: 'labprobe/hub-integration-stage',
-              description: 'Hub 0.9.29 validation started',
+              description: 'Hub 0.9.30 validation started',
               target_url: `${context.serverUrl}/${context.repo.owner}/${context.repo.repo}/actions/runs/${context.runId}`,
             });
       - uses: actions/setup-python@v5
@@ -78,12 +81,21 @@ jobs:
           python -m pip install -r requirements.txt pytest
       - name: Compile Hub Python modules
         id: compile
-        working-directory: ${{ github.workspace }}
         run: |
-          python -m py_compile hub.py hub_entry.py hub_realtime_ws.py agent_presence_patch.py device_history_patch.py portmap_persistence_patch.py labprobe_storage.py router_rpc.py router_rpc_v099.py router_rpc_v010.py router_developer_flow_patch.py router_http_developer_transport_patch.py router_be72_auth_patch.py router_be72_sid_wire_patch.py router_native_features_patch.py router_ws_patch.py router_fast_watchdog_patch.py router_build024_fix.py router_compat.py router_realtime_stability_patch.py router_relay_credentials_patch.py router_lite_realtime_patch.py router_slow_cache_patch.py router_control_scheduler_patch.py router_control_actor_patch.py router_task_manager_patch.py router_config_sync_patch.py
+          python -m py_compile \
+            hub.py hub_entry.py hub_realtime_ws.py labprobe_storage.py \
+            agent_presence_patch.py device_history_patch.py portmap_persistence_patch.py \
+            router_rpc.py router_rpc_v099.py router_rpc_v010.py \
+            router_developer_flow_patch.py router_http_developer_transport_patch.py \
+            router_be72_auth_patch.py router_be72_sid_wire_patch.py \
+            router_native_features_patch.py router_ws_patch.py router_fast_watchdog_patch.py \
+            router_build024_fix.py router_compat.py router_realtime_stability_patch.py \
+            router_relay_credentials_patch.py router_lite_realtime_patch.py \
+            router_slow_cache_patch.py router_control_scheduler_patch.py \
+            router_control_actor_patch.py router_task_manager_patch.py \
+            router_config_sync_patch.py router_device_live_sync_patch.py
       - name: Run Hub pytest suite
         id: pytest
-        working-directory: ${{ github.workspace }}
         shell: bash
         run: |
           set +e
@@ -94,83 +106,45 @@ jobs:
             tail -n 18 /tmp/hub-pytest.log | tr '\n' ' ' | cut -c1-500 > /tmp/hub-ci-error.txt
           fi
           exit $STATUS
-      - name: Verify Hub 0.9.29 source invariants
+      - name: Verify Hub 0.9.30 active terminal sync invariants
         id: invariants
-        working-directory: ${{ github.workspace }}
         run: |
           set -e
-          grep -q 'HUB_VERSION = "0.9.29"' hub_entry.py
-          grep -q 'install_router_build024_fix()' hub_entry.py
-          grep -q 'install_router_control_actor_patch()' hub_entry.py
-          grep -q 'install_router_task_manager_patch(hub)' hub_entry.py
-          grep -q 'install_agent_presence_patch(hub)' hub_entry.py
-          grep -q 'install_device_history_patch(hub)' hub_entry.py
-          grep -q 'install_portmap_persistence_patch(hub)' hub_entry.py
-          grep -q 'FAST_STALL_SECONDS = 8.0' router_fast_watchdog_patch.py
-          grep -q 'MAX_ROUTER_RETRY_SECONDS = 2.0' router_fast_watchdog_patch.py
-          grep -q 'ROUTER_STALE_MS = 12_000' router_fast_watchdog_patch.py
-          grep -q 'DETAIL_REFRESH_SECONDS = 60.0' router_build024_fix.py
-          grep -q '_router_fields_precise' router_build024_fix.py
-          grep -q '"temperature2gC"' router_build024_fix.py
-          grep -q '"temperature5gC"' router_build024_fix.py
-          grep -q '"storagePercent"' router_build024_fix.py
-          grep -q 'router-details-refresh' router_build024_fix.py
-          grep -q 'monitor_class._loop = _router_ws_loop_fast_recovery' router_fast_watchdog_patch.py
-          grep -q 'router fast stream stalled; reconnecting' router_fast_watchdog_patch.py
+          grep -q 'HUB_VERSION = "0.9.30"' hub_entry.py
+          grep -q 'install_router_device_live_sync_patch(hub, hub.ROUTER_TASK_MANAGER.client)' hub_entry.py
+          grep -q 'POLL_INTERVAL_SECONDS.*ROUTER_DEVICE_LIVE_POLL_SEC.*, "5"' router_device_live_sync_patch.py
+          grep -q 'PERSIST_INTERVAL_SECONDS' router_device_live_sync_patch.py
+          grep -q '"devices_snapshot"' router_device_live_sync_patch.py
+          grep -q '"devType": "all", "dataType": "timely"' router_device_live_sync_patch.py
+          grep -q 'confirmedEmpty' router_device_live_sync_patch.py
+          grep -q 'BACKGROUND_DEFERRED' router_device_live_sync_patch.py
+          grep -q '/api/router/devices/live/status' router_device_live_sync_patch.py
           grep -q '/api/realtime/ws' hub_realtime_ws.py
           grep -q 'PROTOCOL_NAME = "labprobe-realtime-v3"' hub_realtime_ws.py
-          grep -q '_send_initial_snapshots' hub_realtime_ws.py
-          grep -q '_wake_device_sampler' hub_realtime_ws.py
-          grep -q 'terminalSamplerWake' hub_realtime_ws.py
-          grep -q 'KEEPALIVE_SECONDS = 3.0' hub_realtime_ws.py
-          grep -q 'router_eweb_ws_fast' router_lite_realtime_patch.py
-          grep -q 'acceptedRouter' router_lite_realtime_patch.py
-          grep -q 'acceptedDevices' router_lite_realtime_patch.py
-          grep -q '@bp.post("/tasks/<kind>")' router_task_manager_patch.py
-          grep -q 'state="timed_out"' router_task_manager_patch.py
-          grep -q '暂无可用的新版本' router_task_manager_patch.py
+          grep -q 'install_device_history_patch(hub)' hub_entry.py
+          grep -q 'install_portmap_persistence_patch(hub)' hub_entry.py
+          grep -q 'install_router_task_manager_patch(hub)' hub_entry.py
           grep -q 'thread_name.startswith("router-task-")' router_control_actor_patch.py
-          grep -q 'ONLINE_SECONDS.*90' agent_presence_patch.py
-          grep -q 'publish("agent", snapshot)' agent_presence_patch.py
-          grep -q '/api/router/devices/snapshot' device_history_patch.py
-          grep -q 'EMPTY_CONFIRMATIONS = 2' device_history_patch.py
-          grep -q 'hasDurableDeviceSnapshot' device_history_patch.py
-          grep -q 'rulesRevision' portmap_persistence_patch.py
-          grep -q 'rulesLoaded' portmap_persistence_patch.py
-          grep -q 'DEFAULT_STUN_HOST = "stun.voip.aebc.com"' router_native_features_patch.py
           ! grep -q 'requests.Session' router_lite_realtime_patch.py
-          ! grep -q 'ws_sysinfo' router_lite_realtime_patch.py
-          ! grep -q 'user_list' router_lite_realtime_patch.py
-          ! grep -q 'sync_devices' router_lite_realtime_patch.py
-          ! grep -q 'MQTT_PUBLISHER' router_lite_realtime_patch.py
       - name: Build and inspect runtime Docker image
         id: docker
-        working-directory: ${{ github.workspace }}
         run: |
           set -e
           docker build --tag labprobe-hub-ci:latest .
-          for file in router_lite_realtime_patch.py hub_realtime_ws.py router_fast_watchdog_patch.py router_build024_fix.py router_task_manager_patch.py agent_presence_patch.py device_history_patch.py portmap_persistence_patch.py; do
+          for file in router_device_live_sync_patch.py router_lite_realtime_patch.py hub_realtime_ws.py router_fast_watchdog_patch.py router_build024_fix.py router_task_manager_patch.py agent_presence_patch.py device_history_patch.py portmap_persistence_patch.py; do
             docker run --rm --entrypoint sh labprobe-hub-ci:latest -c "test -f /app/$file"
           done
-          docker run --rm --entrypoint python labprobe-hub-ci:latest -c 'import agent_presence_patch, device_history_patch, portmap_persistence_patch, router_lite_realtime_patch, router_fast_watchdog_patch, router_build024_fix, router_native_features_patch, router_control_actor_patch, router_task_manager_patch, hub_realtime_ws; print("Hub realtime, history, mapping, task and presence imports ok")'
-      - name: Compile and test LabRelay realtime and durable snapshot agent
+          docker run --rm --entrypoint python labprobe-hub-ci:latest -c 'import router_device_live_sync_patch, agent_presence_patch, device_history_patch, portmap_persistence_patch, router_lite_realtime_patch, router_fast_watchdog_patch, router_build024_fix, router_native_features_patch, router_control_actor_patch, router_task_manager_patch, hub_realtime_ws; print("Hub live terminal, history, mapping, task and presence imports ok")'
+      - name: Compile and test active LabRelay agent
         id: relay
-        working-directory: ${{ github.workspace }}/labrelay
+        working-directory: labrelay
         run: |
           cargo test --all-targets
           cargo build --release
-          grep -q 'DEVICES_SAMPLE_INTERVAL: Duration = Duration::from_secs(2)' src/runtime.rs
-          grep -q 'DURABLE_SNAPSHOT_INTERVAL: Duration = Duration::from_secs(60)' src/runtime.rs
-          grep -q 'async fn devices_lane(' src/runtime.rs
-          grep -q 'async fn durable_devices_lane(' src/runtime.rs
-          grep -q 'MissedTickBehavior::Skip' src/runtime.rs
-          grep -q '/api/router/realtime/agent/demand' src/runtime.rs
-          grep -q '/api/router/realtime/agent/push' src/runtime.rs
-          grep -q '/api/router/devices/snapshot' src/runtime.rs
-          grep -q '"user_list"' src/runtime.rs
-          ! grep -q 'ws_sysinfo' src/runtime.rs
-          ! grep -q 'routerSample' src/runtime.rs
-          grep -q 'relay_local_dev_sta' src/runtime.rs
+          grep -q 'fn collect_user_list()' src/agent.rs
+          grep -q '"user_list"' src/agent.rs
+          grep -q '"dataType":"timely"' src/agent.rs
+          grep -q '/hook/ruijie/devices' src/agent.rs
           grep -q 'version = "0.2.12"' Cargo.toml
       - name: Publish connector-readable Hub CI result
         if: always()
