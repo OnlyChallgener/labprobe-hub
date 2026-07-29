@@ -55,7 +55,7 @@ http_get() {
   rm -f "$output"
   if command -v curl >/dev/null 2>&1; then
     curl -fL --connect-timeout 7 --max-time 90 --retry 2 --retry-delay 1 \
-      -A 'LabRelay-Installer/3' "$url" -o "$output" >/dev/null 2>&1
+      -A 'LabRelay-Installer/4' "$url" -o "$output" >/dev/null 2>&1
     return $?
   fi
   if command -v wget >/dev/null 2>&1; then
@@ -65,10 +65,12 @@ http_get() {
   return 127
 }
 
-is_elf() {
+# Do not depend on od/hexdump/file: some vendor OpenWrt builds omit all of them.
+# A valid LabRelay binary must be executable on this router and answer the version command.
+is_labrelay_binary() {
   [ -s "$1" ] || return 1
-  magic="$(dd if="$1" bs=1 count=4 2>/dev/null | od -An -tx1 2>/dev/null | tr -d ' \n')"
-  [ "$magic" = '7f454c46' ]
+  chmod 755 "$1" 2>/dev/null || return 1
+  "$1" version >/dev/null 2>&1
 }
 
 json_value() {
@@ -84,7 +86,7 @@ try_download_binary() {
   url="$1"
   [ -n "$url" ] || return 1
   log "downloading $url"
-  if http_get "$url" "$DOWNLOADED_BINARY" && is_elf "$DOWNLOADED_BINARY"; then
+  if http_get "$url" "$DOWNLOADED_BINARY" && is_labrelay_binary "$DOWNLOADED_BINARY"; then
     return 0
   fi
   rm -f "$DOWNLOADED_BINARY"
@@ -107,7 +109,7 @@ fi
 if [ -n "$LOCAL_BINARY" ]; then
   [ -f "$LOCAL_BINARY" ] || fail "local binary not found: $LOCAL_BINARY"
   cp "$LOCAL_BINARY" "$DOWNLOADED_BINARY"
-  is_elf "$DOWNLOADED_BINARY" || fail "local binary is not an ELF executable: $LOCAL_BINARY"
+  is_labrelay_binary "$DOWNLOADED_BINARY" || fail "local LabRelay binary cannot run on this router: $LOCAL_BINARY"
   log "using local binary $LOCAL_BINARY"
 else
   manifest_ok=0
@@ -156,11 +158,11 @@ else
       done
     done
   fi
-  [ "$downloaded" = 1 ] || fail 'unable to download LabRelay binary; upload the complete agent bundle or repair /agent/latest.json'
+  [ "$downloaded" = 1 ] || fail 'unable to download a runnable LabRelay binary; upload the complete agent bundle or repair /agent/latest.json'
 fi
 
 chmod 755 "$DOWNLOADED_BINARY"
-"$DOWNLOADED_BINARY" version >/dev/null 2>&1 || fail 'downloaded binary cannot run on this router'
+"$DOWNLOADED_BINARY" version >/dev/null 2>&1 || fail 'downloaded LabRelay binary cannot run on this router'
 
 mkdir -p /etc/labprobe /usr/bin /etc/init.d /tmp/labrelay /tmp/labprobe
 [ -f /etc/labprobe/relay.json ] || printf '%s\n' '{"version":1,"rules":[]}' > /etc/labprobe/relay.json
@@ -196,7 +198,7 @@ EOF
 cat > /etc/init.d/labrelay_agent <<'EOF'
 #!/bin/sh /etc/rc.common
 USE_PROCD=1
-START=97
+START=98
 STOP=10
 start_service() {
   mkdir -p /tmp/labprobe
