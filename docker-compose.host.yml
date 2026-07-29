@@ -71,6 +71,8 @@ services:
       DATA_DIR: ./data
       BACKUPS_DIR: ./backups
       LOGS_DIR: ./logs
+      UPDATE_REPOSITORY_DIR: /app/update-repository
+      LABRELAY_RELEASE_VERSION: ${LABRELAY_RELEASE_VERSION:-0.2.12}
       LOG_LEVEL: ${LOG_LEVEL:-INFO}
       LOG_RETENTION_DAYS: ${LOG_RETENTION_DAYS:-14}
       REVISION_MAX_ROWS: ${REVISION_MAX_ROWS:-5000}
@@ -108,3 +110,4 @@ services:
       - ./config:/app/config
       - ./backups:/app/backups
       - ./logs:/app/logs
+      - ${UPDATE_REPOSITORY_HOST_DIR:-./update-repository}:/app/update-repository:ro
