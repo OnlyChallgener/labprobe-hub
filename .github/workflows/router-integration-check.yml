@@ -11,6 +11,7 @@ on:
     paths:
       - Dockerfile
       - router_*.py
+      - followup_stability_patch.py
       - agent_presence_patch.py
       - device_history_patch.py
       - portmap_persistence_patch.py
@@ -27,6 +28,7 @@ on:
     paths:
       - Dockerfile
       - router_*.py
+      - followup_stability_patch.py
       - agent_presence_patch.py
       - device_history_patch.py
       - portmap_persistence_patch.py
@@ -68,7 +70,7 @@ jobs:
               sha: context.sha,
               state: 'pending',
               context: 'labprobe/hub-integration-stage',
-              description: 'Hub 0.9.30 validation started',
+              description: 'Hub 0.9.31 validation started',
               target_url: `${context.serverUrl}/${context.repo.owner}/${context.repo.repo}/actions/runs/${context.runId}`,
             });
       - uses: actions/setup-python@v5
@@ -83,7 +85,7 @@ jobs:
         id: compile
         run: |
           python -m py_compile \
-            hub.py hub_entry.py hub_realtime_ws.py labprobe_storage.py \
+            hub.py hub_entry.py hub_realtime_ws.py labprobe_storage.py followup_stability_patch.py \
             agent_presence_patch.py device_history_patch.py portmap_persistence_patch.py \
             router_rpc.py router_rpc_v099.py router_rpc_v010.py \
             router_developer_flow_patch.py router_http_developer_transport_patch.py \
@@ -106,11 +108,14 @@ jobs:
             tail -n 18 /tmp/hub-pytest.log | tr '\n' ' ' | cut -c1-500 > /tmp/hub-ci-error.txt
           fi
           exit $STATUS
-      - name: Verify Hub 0.9.30 active terminal sync invariants
+      - name: Verify Hub 0.9.31 active terminal sync invariants
         id: invariants
         run: |
           set -e
-          grep -q 'HUB_VERSION = "0.9.30"' hub_entry.py
+          grep -q 'HUB_VERSION = "0.9.31"' hub_entry.py
+          grep -q 'install_followup_stability_patch(hub, router_lite_realtime)' hub_entry.py
+          grep -q 'continuous two-second terminal rate cache enabled' followup_stability_patch.py
+          grep -q '"state": "preparing"' followup_stability_patch.py
           grep -q 'install_router_device_live_sync_patch(hub, hub.ROUTER_TASK_MANAGER.client)' hub_entry.py
           grep -q 'POLL_INTERVAL_SECONDS.*ROUTER_DEVICE_LIVE_POLL_SEC.*, "5"' router_device_live_sync_patch.py
           grep -q 'PERSIST_INTERVAL_SECONDS' router_device_live_sync_patch.py
@@ -131,10 +136,10 @@ jobs:
         run: |
           set -e
           docker build --tag labprobe-hub-ci:latest .
-          for file in router_device_live_sync_patch.py router_lite_realtime_patch.py hub_realtime_ws.py router_fast_watchdog_patch.py router_build024_fix.py router_task_manager_patch.py agent_presence_patch.py device_history_patch.py portmap_persistence_patch.py; do
+          for file in followup_stability_patch.py router_device_live_sync_patch.py router_lite_realtime_patch.py hub_realtime_ws.py router_fast_watchdog_patch.py router_build024_fix.py router_task_manager_patch.py agent_presence_patch.py device_history_patch.py portmap_persistence_patch.py; do
             docker run --rm --entrypoint sh labprobe-hub-ci:latest -c "test -f /app/$file"
           done
-          docker run --rm --entrypoint python labprobe-hub-ci:latest -c 'import router_device_live_sync_patch, agent_presence_patch, device_history_patch, portmap_persistence_patch, router_lite_realtime_patch, router_fast_watchdog_patch, router_build024_fix, router_native_features_patch, router_control_actor_patch, router_task_manager_patch, hub_realtime_ws; print("Hub live terminal, history, mapping, task and presence imports ok")'
+          docker run --rm --entrypoint python labprobe-hub-ci:latest -c 'import followup_stability_patch, router_device_live_sync_patch, agent_presence_patch, device_history_patch, portmap_persistence_patch, router_lite_realtime_patch, router_fast_watchdog_patch, router_build024_fix, router_native_features_patch, router_control_actor_patch, router_task_manager_patch, hub_realtime_ws; print("Hub 0.9.31 live terminal, history, mapping, task and presence imports ok")'
       - name: Compile and test active LabRelay agent
         id: relay
         working-directory: labrelay
