@@ -74,8 +74,10 @@ jobs:
           cp agent/install.sh "$OUT/install.sh"
           cp agent/install.sh "$OUT/labprobe-install.sh"
           chmod 755 "$OUT/labrelay-linux-arm64" "$OUT/labrelay-aarch64-musl" "$OUT/install.sh" "$OUT/labprobe-install.sh"
-          file "$OUT/labrelay-linux-arm64" | grep -Eqi 'aarch64|ARM aarch64|ARM64'
-          strings "$OUT/labrelay-linux-arm64" | grep -q "$VERSION"
+          file "$OUT/labrelay-linux-arm64" > "$RUNNER_TEMP/labrelay-file.txt"
+          grep -Eqi 'aarch64|ARM aarch64|ARM64' "$RUNNER_TEMP/labrelay-file.txt"
+          strings "$OUT/labrelay-linux-arm64" > "$RUNNER_TEMP/labrelay-strings.txt"
+          grep -q "$VERSION" "$RUNNER_TEMP/labrelay-strings.txt"
           python3 - <<'PY'
           import hashlib
           import json
@@ -116,7 +118,7 @@ jobs:
               lines.append(f'{hashlib.sha256(data).hexdigest()}  {name}')
           (out / 'checksums.txt').write_text('\n'.join(lines) + '\n', encoding='utf-8')
           PY
-          sha256sum -c "$OUT/checksums.txt"
+          (cd "$OUT" && sha256sum -c checksums.txt)
           tar -C "$RUNNER_TEMP" -czf "$RUNNER_TEMP/labrelay-router-arm64-v$VERSION.tar.gz" agent
 
       - name: Upload complete router bundle artifact
