@@ -27,27 +27,70 @@ jobs:
       - name: Compile Hub sources
         run: |
           python -m py_compile \
-            hub.py hub_entry.py hub_realtime_ws.py followup_stability_patch.py \
+            hub.py hub_entry.py hub_realtime_ws.py followup_stability_patch.py final_stability_patch.py \
             device_history_patch.py router_device_live_sync_patch.py \
             portmap_persistence_patch.py agent_presence_patch.py \
             router_task_manager_patch.py router_config_sync_patch.py \
             router_lite_realtime_patch.py
       - name: Run existing Hub tests
         run: python -m pytest -q
+      - name: Verify Hub 0.9.32 final stability invariants
+        env:
+          APP_TOKEN: ci-app-token
+          HOOK_TOKEN: ci-hook-token
+        run: |
+          set -e
+          grep -q 'HUB_VERSION = "0.9.32"' hub_entry.py
+          grep -q 'install_final_stability_patch(hub)' hub_entry.py
+          grep -q 'TERMINAL_TASK_STATES' final_stability_patch.py
+          grep -q 'elapsed time is now frozen' final_stability_patch.py
+          grep -q '/api/agent/update/check' final_stability_patch.py
+          grep -q 'protocol": "HTTPS"' final_stability_patch.py
+          grep -q '网关 502' final_stability_patch.py
+          grep -q 'COPY final_stability_patch.py' Dockerfile
+          grep -q 'continuous two-second terminal rate cache enabled' followup_stability_patch.py
+          grep -q 'install_router_device_live_sync_patch' hub_entry.py
+          grep -q 'ROUTER_DEVICE_LIVE_POLL_SEC.*, "5"' router_device_live_sync_patch.py
+          grep -q '"devices_snapshot"' router_device_live_sync_patch.py
+          grep -q '"devType": "all", "dataType": "timely"' router_device_live_sync_patch.py
+          python - <<'PY'
+          import threading
+          import time
+          from types import SimpleNamespace
+          from final_stability_patch import _freeze_router_task_timing, _friendly_update_error
+
+          class Logger:
+              def info(self, *args, **kwargs): pass
+          class Manager:
+              def __init__(self):
+                  now = int(time.time())
+                  self.lock = threading.RLock()
+                  self.tasks = {
+                      'nat': {
+                          'kind': 'nat', 'state': 'succeeded', 'startedAt': now - 100,
+                          'updatedAt': now - 80, 'elapsedSeconds': 0, 'log': [], 'result': {}
+                      }
+                  }
+              def _save(self): pass
+              def _publish(self, kind): pass
+          manager = Manager()
+          fake = SimpleNamespace(ROUTER_TASK_MANAGER=manager, LOGGER=Logger())
+          _freeze_router_task_timing(fake)
+          first = manager._snapshot_locked('nat')['elapsedSeconds']
+          time.sleep(1.05)
+          second = manager._snapshot_locked('nat')['elapsedSeconds']
+          assert first == 20, first
+          assert second == first, (first, second)
+          assert '<!DOCTYPE' not in _friendly_update_error('HTTP 502: <!DOCTYPE html>')
+          assert '502' in _friendly_update_error('HTTP 502: <!DOCTYPE html>')
+          print('terminal timing freeze and friendly Agent errors verified')
+          PY
       - name: Verify continuous compact terminal lane and durable snapshots
         env:
           APP_TOKEN: ci-app-token
           HOOK_TOKEN: ci-hook-token
         run: |
           set -e
-          grep -q 'HUB_VERSION = "0.9.31"' hub_entry.py
-          grep -q 'install_followup_stability_patch' hub_entry.py
-          grep -q 'continuous two-second terminal rate cache enabled' followup_stability_patch.py
-          grep -q '"state": "preparing"' followup_stability_patch.py
-          grep -q 'install_router_device_live_sync_patch' hub_entry.py
-          grep -q 'ROUTER_DEVICE_LIVE_POLL_SEC.*, "5"' router_device_live_sync_patch.py
-          grep -q '"devices_snapshot"' router_device_live_sync_patch.py
-          grep -q '"devType": "all", "dataType": "timely"' router_device_live_sync_patch.py
           python - <<'PY'
           import os
           import tempfile
