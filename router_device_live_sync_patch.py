@@ -1,7 +1,7 @@
 """Authoritative five-second terminal snapshot synchronization.
 
 The router web UI reads ``devSta.get/user_list`` with ``dataType=timely`` every
-five seconds.  This service uses the same read through Hub's low-priority router
+five seconds. This service uses the same read through Hub's low-priority router
 control actor, publishes the complete normalized snapshot over the existing WSS,
 and lets the durable history service write to disk at a lower cadence.
 
@@ -14,8 +14,9 @@ import json
 import os
 import threading
 import time
+from datetime import date
 from types import MethodType
-from typing import Any, Dict, List, Optional, Set
+from typing import Any, Dict, List, Set
 
 from flask import jsonify
 
@@ -102,10 +103,27 @@ class RouterDeviceLiveSync:
         online, total = self.hub.parse_ruijie_devices(payload)
         archive = self.hub.load_device_archive()
         stamp = self.hub.now_str()
+        now_epoch = int(time.time())
+        today = date.today().isoformat()
+        with self.lock:
+            previous_epoch = int(self.latest.get("sampleEpochMs") or 0) // 1000
+            previous_rows = self.latest.get("devices") if isinstance(self.latest.get("devices"), list) else []
+            previous = {
+                self.hub.norm_mac(row.get("mac")): row
+                for row in previous_rows
+                if isinstance(row, dict) and self.hub.norm_mac(row.get("mac"))
+            }
         rows: List[Dict[str, Any]] = []
         for device in online:
             row = self.hub.hydrate_device_with_archive(device, archive)
             raw = row.get("raw") if isinstance(row.get("raw"), dict) else {}
+            mac = self.hub.norm_mac(row.get("mac"))
+            old = previous.get(mac, {})
+            router_seconds = _as_int(row.get("todayOnlineDurationSec"))
+            old_seconds = _as_int(old.get("todayOnlineDurationSec")) if old.get("todayOnlineDate") == today else 0
+            observed_delta = max(0, min(30, now_epoch - previous_epoch)) if previous_epoch else 0
+            observed_seconds = old_seconds + observed_delta if old else 0
+            seconds = max(router_seconds, observed_seconds)
             row.update(
                 {
                     "online": True,
@@ -114,6 +132,9 @@ class RouterDeviceLiveSync:
                     "uploadBps": _as_int(raw.get("flowUp")),
                     "downloadBps": _as_int(raw.get("flowDown")),
                     "connectionCount": _as_int(raw.get("flow_cnt")),
+                    "todayOnlineDurationSec": seconds,
+                    "todayOnlineDurationText": self.hub.human_duration(seconds),
+                    "todayOnlineDate": today,
                 }
             )
             rows.append(row)
@@ -121,12 +142,19 @@ class RouterDeviceLiveSync:
         rows.sort(key=lambda row: self.hub.norm_mac(row.get("mac")))
         return rows, total
 
-    def _frame(self, rows: List[Dict[str, Any]], total: int) -> Dict[str, Any]:
+    def _frame(
+        self,
+        rows: List[Dict[str, Any]],
+        total: int,
+        *,
+        confirmed_empty: bool = False,
+    ) -> Dict[str, Any]:
         now_ms = int(time.time() * 1000)
         return {
             "ok": True,
             "fullSnapshot": True,
             "accepted": True,
+            "confirmedEmpty": bool(confirmed_empty),
             "source": "hub_router_user_list_timely",
             "sampleEpochMs": now_ms,
             "updatedAt": self.hub.now_str(),
@@ -186,6 +214,7 @@ class RouterDeviceLiveSync:
 
         with self.lock:
             previous_non_empty = bool(self.latest.get("devices"))
+            confirmed_empty = False
             if not rows and previous_non_empty:
                 self.empty_streak += 1
                 if self.empty_streak < EMPTY_CONFIRMATIONS:
@@ -194,10 +223,11 @@ class RouterDeviceLiveSync:
                         "deferredEmpty": True,
                         "emptyStreak": self.empty_streak,
                     }
+                confirmed_empty = True
             else:
                 self.empty_streak = 0
 
-            frame = self._frame(rows, total)
+            frame = self._frame(rows, total, confirmed_empty=confirmed_empty)
             self.latest = frame
             self.last_success_at = time.time()
             self.last_error = ""
