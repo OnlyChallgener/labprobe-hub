@@ -27,20 +27,23 @@ jobs:
       - name: Compile Hub sources
         run: |
           python -m py_compile \
-            hub.py hub_entry.py hub_realtime_ws.py \
+            hub.py hub_entry.py hub_realtime_ws.py followup_stability_patch.py \
             device_history_patch.py router_device_live_sync_patch.py \
             portmap_persistence_patch.py agent_presence_patch.py \
             router_task_manager_patch.py router_config_sync_patch.py \
             router_lite_realtime_patch.py
       - name: Run existing Hub tests
         run: python -m pytest -q
-      - name: Verify five-second full terminal snapshots
+      - name: Verify continuous compact terminal lane and durable snapshots
         env:
           APP_TOKEN: ci-app-token
           HOOK_TOKEN: ci-hook-token
         run: |
           set -e
-          grep -q 'HUB_VERSION = "0.9.30"' hub_entry.py
+          grep -q 'HUB_VERSION = "0.9.31"' hub_entry.py
+          grep -q 'install_followup_stability_patch' hub_entry.py
+          grep -q 'continuous two-second terminal rate cache enabled' followup_stability_patch.py
+          grep -q '"state": "preparing"' followup_stability_patch.py
           grep -q 'install_router_device_live_sync_patch' hub_entry.py
           grep -q 'ROUTER_DEVICE_LIVE_POLL_SEC.*, "5"' router_device_live_sync_patch.py
           grep -q '"devices_snapshot"' router_device_live_sync_patch.py
@@ -130,7 +133,7 @@ jobs:
           confirmed = service.poll_once()
           assert confirmed['confirmedEmpty'] is True, confirmed
           assert confirmed['devices'] == []
-          print('captured user_list fields, five-second WSS frame and durable write verified')
+          print('compact two-second lane and durable user_list snapshots verified')
           PY
       - name: Test and build LabRelay
         working-directory: labrelay
