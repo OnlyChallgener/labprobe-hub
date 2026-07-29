@@ -1,0 +1,99 @@
+name: Agent Repository Check
+
+on:
+  push:
+    branches: [hub0924]
+    paths:
+      - agent/**
+      - final_stability_patch.py
+      - Dockerfile
+      - docker-compose.host.yml
+      - .github/workflows/agent-repository-check.yml
+  pull_request:
+    branches: [hub0923]
+    paths:
+      - agent/**
+      - final_stability_patch.py
+      - Dockerfile
+      - docker-compose.host.yml
+      - .github/workflows/agent-repository-check.yml
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  validate:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.12'
+      - name: Install Hub dependencies
+        run: pip install --disable-pip-version-check -r requirements.txt
+      - name: Validate BusyBox installer
+        run: |
+          set -e
+          sh -n agent/install.sh
+          grep -q 'EXISTING_CONFIG=/etc/labprobe/agent.json' agent/install.sh
+          grep -q 'SAVED_HUB=' agent/install.sh
+          grep -q 'SAVED_TOKEN=' agent/install.sh
+          grep -q '${HUB_URL%/}/agent/latest.json' agent/install.sh
+          grep -q 'is_elf' agent/install.sh
+          grep -q 'unable to download LabRelay binary' agent/install.sh
+      - name: Validate Hub-local Agent repository routes
+        env:
+          APP_TOKEN: ci-app-token
+          HOOK_TOKEN: ci-hook-token
+        run: |
+          set -e
+          python - <<'PY'
+          import json
+          import os
+          import shutil
+          import tempfile
+          from pathlib import Path
+
+          root = Path(tempfile.mkdtemp())
+          os.environ['DATA_DIR'] = str(root / 'data')
+          os.environ['CONFIG_DIR'] = str(root / 'config')
+          os.environ['BACKUPS_DIR'] = str(root / 'backups')
+          os.environ['LOGS_DIR'] = str(root / 'logs')
+          os.environ['DATABASE_PATH'] = str(root / 'data' / 'labprobe.db')
+          os.environ['CONFIG_PATH'] = str(root / 'config' / 'config.yaml')
+          os.environ['UPDATE_REPOSITORY_DIR'] = str(root / 'repository')
+          os.environ['LABRELAY_RELEASE_VERSION'] = '0.2.12'
+
+          agent_dir = root / 'repository' / 'agent'
+          agent_dir.mkdir(parents=True)
+          shutil.copy2('agent/install.sh', agent_dir / 'install.sh')
+
+          import hub
+          from final_stability_patch import install_final_stability_patch
+
+          install_final_stability_patch(hub)
+          client = hub.app.test_client()
+
+          installer = client.get('/agent/install.sh')
+          assert installer.status_code == 200, installer.status_code
+          assert b'EXISTING_CONFIG=/etc/labprobe/agent.json' in installer.data
+
+          manifest = client.get('/agent/latest.json')
+          assert manifest.status_code == 200, manifest.status_code
+          body = manifest.get_json()
+          assert body['versionName'] == '0.2.12', body
+          assert body['binaries']['arm64']['url'], body
+
+          health = client.get('/api/agent/repository/health')
+          assert health.status_code == 200, health.status_code
+          info = health.get_json()
+          assert info['installerAvailable'] is True, info
+          assert info['manifestVersion'] == '0.2.12', info
+          print(json.dumps(info, ensure_ascii=False, indent=2))
+          PY
+      - name: Verify Docker packages installer
+        run: |
+          set -e
+          docker build --pull=false -t labprobe-hub:agent-repository .
+          docker run --rm --entrypoint sh labprobe-hub:agent-repository -c 'sh -n /app/agent/install.sh && test -x /app/agent/install.sh && test -d /app/update-repository/agent'
