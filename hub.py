@@ -2544,6 +2544,19 @@ def api_agent_update_request():
     return jsonify({"ok": True, "commandId": command["id"], "targetVersion": target, "message": "Rust Agent 更新指令已发送"})
 
 
+@app.route("/api/agent/update/check", methods=["POST"])
+def api_agent_update_check():
+    """Refresh the release manifest for the APP's explicit check action."""
+    if not check_app_token():
+        return jsonify({"ok": False, "error": "unauthorized"}), 401
+    try:
+        agent_release_manifest(force=True)
+    except Exception as exc:
+        LOGGER.warning("agent manifest refresh failed: %s", exc)
+        return jsonify({"ok": False, "error": "manifest_unavailable", "message": f"更新仓检查失败：{exc}"}), 502
+    return api_agent_update_status()
+
+
 @app.route("/api/agent/cleanup", methods=["POST"])
 def api_agent_cleanup_request():
     if not check_app_token():

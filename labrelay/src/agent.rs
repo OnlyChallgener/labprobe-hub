@@ -539,6 +539,9 @@ async fn sync_agent_update(client: &Client, config: &AgentConfig, state: &mut Ag
             .arg("sleep 2; sh /tmp/labprobe-install.sh upgrade >>/tmp/labprobe/agent-update.log 2>&1")
             .env("LABPROBE_NONINTERACTIVE", "1")
             .env("LABPROBE_UPDATE_ROOT", repository_root)
+            .env("LABPROBE_COMMAND_ID", id)
+            .env("LABPROBE_COMMAND_HUB_URL", &config.hub_url)
+            .env("LABPROBE_COMMAND_HOOK_TOKEN", &config.hook_token)
             .stdin(Stdio::null())
             .stdout(Stdio::null())
             .stderr(Stdio::null())
@@ -1489,11 +1492,6 @@ async fn sync_portmaps(
 }
 
 async fn agent_cycle(client: &Client, config: &AgentConfig, state: &mut AgentState) -> Result<()> {
-    match sync_agent_update(client, config, state).await {
-        Ok(true) => return Ok(()),
-        Ok(false) => {}
-        Err(error) => log_limited(config, state, "WARN", "agent-update-check", &format!("agent update check skipped: {:#}", error)),
-    }
     let user_list = collect_user_list()?;
     let mut current = BTreeMap::new();
     find_devices(&user_list, &mut current);
@@ -1519,10 +1517,14 @@ pub async fn run(args: &[String], once: bool) -> Result<()> {
         let now = now_epoch();
         let was_unhealthy = !state.last_error.is_empty();
         let mut errors = Vec::new();
-        // Presence and daemon runtime are a small, independent control lane.
-        // Keep it at five seconds even when full device snapshots are slower.
+        // Presence, command delivery and daemon runtime are independent of the
+        // slower full inventory cycle, so APP update/cleanup responds in 3–5 s.
         let status_due = once || last_status_at == 0 || now.saturating_sub(last_status_at) >= config.status_interval_seconds.clamp(3, 5);
         if status_due {
+            match sync_agent_update(&client, &config, &mut state).await {
+                Ok(_) => {}
+                Err(error) => log_limited(&config, &mut state, "WARN", "agent-command-check", &format!("agent command check skipped: {:#}", error)),
+            }
             if let Err(error) = report_agent_status(&client, &config, &state).await {
                 let text = redact(&format!("agent status: {:#}", error), &config.hook_token);
                 log_limited(&config, &mut state, "WARN", "agent-status", &text);
