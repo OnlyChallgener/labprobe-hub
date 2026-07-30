@@ -190,7 +190,7 @@ jobs:
           grep -q '"user_list"' src/agent.rs
           grep -q '"dataType":"timely"' src/agent.rs
           grep -q '/hook/ruijie/devices' src/agent.rs
-          grep -q 'version = "0.2.12"' Cargo.toml
+          grep -q 'version = "0.2.14"' Cargo.toml
       - name: Publish connector-readable Hub CI result
         if: always()
         uses: actions/github-script@v7

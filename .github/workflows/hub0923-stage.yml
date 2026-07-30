@@ -44,7 +44,7 @@ jobs:
           grep -q 'install_portmap_persistence_patch(hub)' hub_entry.py
           grep -q 'DURABLE_SNAPSHOT_INTERVAL.*60' labrelay/src/runtime.rs
           grep -q '/api/router/devices/snapshot' labrelay/src/runtime.rs
-          grep -q 'version = "0.2.12"' labrelay/Cargo.toml
+          grep -q 'version = "0.2.14"' labrelay/Cargo.toml
           python - <<'PY'
           import os
           import tempfile
