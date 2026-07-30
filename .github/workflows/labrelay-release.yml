@@ -6,12 +6,14 @@ on:
     paths:
       - labrelay/**
       - agent/**
+      - scripts/labprobe-install.sh
       - .github/workflows/labrelay-release.yml
   pull_request:
     branches: [hub0923]
     paths:
       - labrelay/**
       - agent/**
+      - scripts/labprobe-install.sh
       - .github/workflows/labrelay-release.yml
   workflow_dispatch:
 

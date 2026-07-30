@@ -4,6 +4,7 @@
 #   sh install.sh HUB_URL HOOK_TOKEN ROUTER_NAME [LOCAL_BINARY] [REPOSITORY_ROOT]
 # Upgrade with an existing /etc/labprobe/agent.json:
 #   sh install.sh
+#   sh install.sh upgrade
 set -eu
 
 log() { printf '[LabRelay] %s\n' "$*"; }
@@ -24,18 +25,33 @@ SAVED_HUB="$(config_value '@.hubUrl' hubUrl "$EXISTING_CONFIG")"
 SAVED_TOKEN="$(config_value '@.hookToken' hookToken "$EXISTING_CONFIG")"
 SAVED_NAME="$(config_value '@.routerName' routerName "$EXISTING_CONFIG")"
 
+# APP-driven upgrades invoke the downloaded installer as `sh install.sh upgrade`.
+# Treat that as an action, never as the Hub URL. Older bundles accidentally
+# wrote `hubUrl: "upgrade"`, which left the new binary unable to report back.
+case "${1:-}" in
+  install|upgrade|repair)
+    ACTION="$1"
+    shift
+    ;;
+  *) ACTION="install" ;;
+esac
+
 HUB_URL="${1:-${HUB_URL:-$SAVED_HUB}}"
 HOOK_TOKEN="${2:-${HOOK_TOKEN:-$SAVED_TOKEN}}"
 ROUTER_NAME="${3:-${ROUTER_NAME:-$SAVED_NAME}}"
 [ -n "$ROUTER_NAME" ] || ROUTER_NAME="$(hostname 2>/dev/null || echo router)"
 LOCAL_BINARY="${4:-${LABRELAY_BINARY:-}}"
-REPOSITORY_ROOT="${5:-${LABRELAY_REPOSITORY_ROOT:-${HUB_URL:-https://lab.net86.dynv6.net:27772}}}"
+REPOSITORY_ROOT="${5:-${LABRELAY_REPOSITORY_ROOT:-${LABPROBE_UPDATE_ROOT:-${HUB_URL:-https://lab.net86.dynv6.net:27772}}}}"
 REPOSITORY_ROOT="${REPOSITORY_ROOT%/}"
 PUBLIC_FALLBACK_ROOT="${LABRELAY_PUBLIC_ROOT:-https://lab.net86.dynv6.net:27772}"
 PUBLIC_FALLBACK_ROOT="${PUBLIC_FALLBACK_ROOT%/}"
 
 [ -n "$HUB_URL" ] || fail 'missing HUB_URL and no existing /etc/labprobe/agent.json'
 [ -n "$HOOK_TOKEN" ] || fail 'missing HOOK_TOKEN and no existing /etc/labprobe/agent.json'
+case "$HUB_URL" in
+  http://*|https://*) ;;
+  *) fail "invalid HUB_URL: $HUB_URL" ;;
+esac
 
 case "$(uname -m 2>/dev/null || true)" in
   aarch64|arm64|armv8*) ARCH=arm64 ;;
