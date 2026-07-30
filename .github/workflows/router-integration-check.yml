@@ -110,11 +110,11 @@ jobs:
             tail -n 18 /tmp/hub-pytest.log | tr '\n' ' ' | cut -c1-500 > /tmp/hub-ci-error.txt
           fi
           exit $STATUS
-      - name: Verify Hub 0.9.32 active invariants
+      - name: Verify Hub 0.9.33 active invariants
         id: invariants
         run: |
           set -e
-          grep -q 'HUB_VERSION = "0.9.32"' hub_entry.py
+          grep -q 'HUB_VERSION = "0.9.33"' hub_entry.py
           grep -q 'install_final_stability_patch(hub)' hub_entry.py
           grep -q 'TERMINAL_TASK_STATES' final_stability_patch.py
           grep -q '/api/agent/update/check' final_stability_patch.py
@@ -179,7 +179,7 @@ jobs:
           for file in followup_stability_patch.py final_stability_patch.py router_device_live_sync_patch.py router_lite_realtime_patch.py hub_realtime_ws.py router_fast_watchdog_patch.py router_build024_fix.py router_task_manager_patch.py agent_presence_patch.py device_history_patch.py portmap_persistence_patch.py; do
             docker run --rm --entrypoint sh labprobe-hub-ci:latest -c "test -f /app/$file"
           done
-          docker run --rm --entrypoint python labprobe-hub-ci:latest -c 'import followup_stability_patch, final_stability_patch, router_device_live_sync_patch, agent_presence_patch, device_history_patch, portmap_persistence_patch, router_lite_realtime_patch, router_fast_watchdog_patch, router_build024_fix, router_native_features_patch, router_control_actor_patch, router_task_manager_patch, hub_realtime_ws; print("Hub 0.9.32 timing, Agent check, terminal, history, mapping and task imports ok")'
+          docker run --rm --entrypoint python labprobe-hub-ci:latest -c 'import followup_stability_patch, final_stability_patch, router_device_live_sync_patch, agent_presence_patch, device_history_patch, portmap_persistence_patch, router_lite_realtime_patch, router_fast_watchdog_patch, router_build024_fix, router_native_features_patch, router_control_actor_patch, router_task_manager_patch, hub_realtime_ws; print("Hub 0.9.33 timing, Agent check, terminal, history, mapping and task imports ok")'
       - name: Compile and test active LabRelay agent
         id: relay
         working-directory: labrelay

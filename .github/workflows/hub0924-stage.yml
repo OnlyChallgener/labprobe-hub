@@ -40,7 +40,7 @@ jobs:
           HOOK_TOKEN: ci-hook-token
         run: |
           set -e
-          grep -q 'HUB_VERSION = "0.9.32"' hub_entry.py
+          grep -q 'HUB_VERSION = "0.9.33"' hub_entry.py
           grep -q 'install_final_stability_patch(hub)' hub_entry.py
           grep -q 'TERMINAL_TASK_STATES' final_stability_patch.py
           grep -q 'elapsed time is now frozen' final_stability_patch.py
