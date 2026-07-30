@@ -71,8 +71,11 @@ jobs:
           mkdir -p "$OUT"
           cp "$BINARY" "$OUT/labrelay-linux-arm64"
           cp "$OUT/labrelay-linux-arm64" "$OUT/labrelay-aarch64-musl"
-          cp agent/install.sh "$OUT/install.sh"
-          cp agent/install.sh "$OUT/labprobe-install.sh"
+          # Keep the release bundle on the same transactional OpenWrt installer
+          # used by APP-driven upgrades, including service readiness checks and
+          # command-result acknowledgement.
+          cp scripts/labprobe-install.sh "$OUT/install.sh"
+          cp scripts/labprobe-install.sh "$OUT/labprobe-install.sh"
           chmod 755 "$OUT/labrelay-linux-arm64" "$OUT/labrelay-aarch64-musl" "$OUT/install.sh" "$OUT/labprobe-install.sh"
           file "$OUT/labrelay-linux-arm64" > "$RUNNER_TEMP/labrelay-file.txt"
           grep -Eqi 'aarch64|ARM aarch64|ARM64' "$RUNNER_TEMP/labrelay-file.txt"

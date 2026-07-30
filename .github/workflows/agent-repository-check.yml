@@ -66,7 +66,7 @@ jobs:
           os.environ['DATABASE_PATH'] = str(root / 'data' / 'labprobe.db')
           os.environ['CONFIG_PATH'] = str(root / 'config' / 'config.yaml')
           os.environ['UPDATE_REPOSITORY_DIR'] = str(root / 'repository')
-          os.environ['LABRELAY_RELEASE_VERSION'] = '0.2.12'
+          os.environ['LABRELAY_RELEASE_VERSION'] = '0.2.14'
 
           agent_dir = root / 'repository' / 'agent'
           agent_dir.mkdir(parents=True)
@@ -87,14 +87,14 @@ jobs:
           manifest = client.get('/agent/latest.json')
           assert manifest.status_code == 200, manifest.status_code
           body = manifest.get_json()
-          assert body['versionName'] == '0.2.12', body
+          assert body['versionName'] == '0.2.14', body
           assert body['binaries']['arm64']['url'], body
 
           health = client.get('/api/agent/repository/health')
           assert health.status_code == 200, health.status_code
           info = health.get_json()
           assert info['installerAvailable'] is True, info
-          assert info['manifestVersion'] == '0.2.12', info
+          assert info['manifestVersion'] == '0.2.14', info
           print(json.dumps(info, ensure_ascii=False, indent=2))
           PY
       - name: Verify Docker packages installer
