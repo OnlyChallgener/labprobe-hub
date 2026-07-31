@@ -246,7 +246,10 @@ class RouterDeviceLiveSync:
             history = getattr(self.hub, "DURABLE_DEVICE_HISTORY", None)
             ingest = getattr(history, "ingest", None)
             if callable(ingest):
-                ingest(payload)
+                # Persist the already-normalized five-second sample. Passing
+                # the raw payload here loses online seconds for routers whose
+                # user_list has no usable activeTime/onlinetime fields.
+                ingest(payload, prepared_online=rows, prepared_total=total)
                 with self.lock:
                     self.last_persist_at = time.time()
         return frame

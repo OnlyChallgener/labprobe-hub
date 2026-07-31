@@ -212,12 +212,26 @@ class DurableDeviceHistory:
             "device": device if online else previous,
         })
 
-    def ingest(self, payload: Any) -> Dict[str, Any]:
+    def ingest(
+        self,
+        payload: Any,
+        *,
+        prepared_online: Optional[List[Dict[str, Any]]] = None,
+        prepared_total: Optional[int] = None,
+    ) -> Dict[str, Any]:
         with self.lock:
             now = datetime.now()
             stamp = now.strftime("%Y-%m-%d %H:%M:%S")
             try:
-                online, total = self.hub.parse_ruijie_devices(payload)
+                if prepared_online is None:
+                    online, total = self.hub.parse_ruijie_devices(payload)
+                    online = self.hub.update_daily_online_durations(online, now)
+                else:
+                    # The five-second live sampler has already calculated the
+                    # authoritative same-day duration. Do not replace it with
+                    # a sparse raw router record during durable persistence.
+                    online = [dict(row) for row in prepared_online if isinstance(row, dict)]
+                    total = max(len(online), _integer(prepared_total))
             except Exception as exc:
                 self._save_health(accepted=False, count=0, error=str(exc))
                 raise
@@ -244,7 +258,6 @@ class DurableDeviceHistory:
             else:
                 self.empty_streak = 0
 
-            online = self.hub.update_daily_online_durations(online, now)
             try:
                 neighbors = self.hub.parse_ipv6_neighbors(payload)
                 self.hub.merge_ipv6_neighbors_to_archive(neighbors)
@@ -274,6 +287,14 @@ class DurableDeviceHistory:
                 offline["ip"] = None
                 offline["offlineAt"] = stamp
                 offline["lastChangedAt"] = stamp
+                # Keep the duration accumulated while the terminal was online;
+                # it is needed by the offline card and the traffic ranking.
+                offline["todayOnlineDurationSec"] = _integer(old.get("todayOnlineDurationSec"))
+                offline["todayOnlineDurationText"] = _clean(
+                    self.hub,
+                    old.get("todayOnlineDurationText"),
+                ) or self.hub.human_duration(offline["todayOnlineDurationSec"])
+                offline["todayOnlineDate"] = _clean(self.hub, old.get("todayOnlineDate")) or now.date().isoformat()
                 self._add_transition_event("device_offline", offline, stamp, old)
                 self.hub.archive_device_snapshot(offline)
 
