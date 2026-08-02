@@ -30,7 +30,7 @@ jobs:
       - name: Compile Hub sources
         run: |
           python -m py_compile \
-            hub.py hub_entry.py hub_realtime_ws.py hub0934_fixes.py \
+            hub.py hub_entry.py hub_realtime_ws.py hub0934_fixes.py hub0935_sync_fix.py \
             final_stability_patch.py followup_stability_patch.py \
             device_history_patch.py portmap_persistence_patch.py agent_presence_patch.py \
             router_task_manager_patch.py router_config_sync_patch.py \
@@ -40,11 +40,17 @@ jobs:
       - name: Run Hub tests
         run: python -m pytest -q
 
-      - name: Verify Hub 0.9.34 corrections
+      - name: Verify Hub 0.9.35 corrections
         run: |
           set -e
-          grep -q 'HUB_VERSION = "0.9.34"' hub_entry.py
+          grep -q 'HUB_VERSION = "0.9.35"' hub_entry.py
           grep -q 'install_hub0934_fixes(hub)' hub_entry.py
+          grep -q 'install_router_ws_passive_fix()' hub_entry.py
+          grep -q 'install_hub0935_device_sync_fix(hub)' hub_entry.py
+          grep -q 'labrelay_hook' hub0935_sync_fix.py
+          grep -q 'liveRouterPollPersistence' hub0935_sync_fix.py
+          grep -q '_run_router_connection_without_app_keepalive' hub0935_sync_fix.py
+          ! grep -q 'target=self._keepalive_loop' hub0935_sync_fix.py
           grep -q 'canonical_watched_devices' hub0934_fixes.py
           grep -q '_normalize_portmap_payload' hub0934_fixes.py
           grep -q 'install_router_task_manager_patch(hub)' hub_entry.py
@@ -63,6 +69,6 @@ jobs:
 
       - name: Build Hub Docker image
         run: |
-          docker build --pull=false -t labprobe-hub:0.9.34 .
-          docker run --rm --entrypoint python labprobe-hub:0.9.34 -c \
-            'import hub_entry, hub0934_fixes, labrelay_sync_patch; print("Hub 0.9.34 imports OK")'
+          docker build --pull=false -t labprobe-hub:0.9.35 .
+          docker run --rm --entrypoint python labprobe-hub:0.9.35 -c \
+            'import hub_entry, hub0934_fixes, hub0935_sync_fix, labrelay_sync_patch; print("Hub 0.9.35 imports OK")'
