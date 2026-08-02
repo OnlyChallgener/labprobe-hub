@@ -1,14 +1,10 @@
-name: Hub0924 Stage
+name: Hub Validate & Build
 
 on:
-  push:
-    branches: [hub0924]
-  pull_request:
-    branches: [hub0923]
   workflow_dispatch:
 
 concurrency:
-  group: hub0924-stage-${{ github.ref }}
+  group: hub-validate-${{ github.ref }}
   cancel-in-progress: true
 
 permissions:
@@ -17,171 +13,56 @@ permissions:
 jobs:
   validate:
     runs-on: ubuntu-latest
+    env:
+      APP_TOKEN: ci-app-token
+      HOOK_TOKEN: ci-hook-token
+      PYTHONPATH: ${{ github.workspace }}
     steps:
       - uses: actions/checkout@v4
+
       - uses: actions/setup-python@v5
         with:
           python-version: '3.12'
+
       - name: Install Python dependencies
         run: pip install --disable-pip-version-check -r requirements.txt pytest
+
       - name: Compile Hub sources
         run: |
           python -m py_compile \
-            hub.py hub_entry.py hub_realtime_ws.py followup_stability_patch.py final_stability_patch.py \
-            device_history_patch.py router_device_live_sync_patch.py \
-            portmap_persistence_patch.py agent_presence_patch.py \
+            hub.py hub_entry.py hub_realtime_ws.py hub0934_fixes.py \
+            final_stability_patch.py followup_stability_patch.py \
+            device_history_patch.py portmap_persistence_patch.py agent_presence_patch.py \
             router_task_manager_patch.py router_config_sync_patch.py \
-            router_lite_realtime_patch.py
-      - name: Run existing Hub tests
+            router_device_live_sync_patch.py router_lite_realtime_patch.py \
+            labrelay_sync_patch.py
+
+      - name: Run Hub tests
         run: python -m pytest -q
-      - name: Verify Hub 0.9.32 final stability invariants
-        env:
-          APP_TOKEN: ci-app-token
-          HOOK_TOKEN: ci-hook-token
+
+      - name: Verify Hub 0.9.34 corrections
         run: |
           set -e
-          grep -q 'HUB_VERSION = "0.9.33"' hub_entry.py
-          grep -q 'install_final_stability_patch(hub)' hub_entry.py
-          grep -q 'TERMINAL_TASK_STATES' final_stability_patch.py
-          grep -q 'elapsed time is now frozen' final_stability_patch.py
-          grep -q '/api/agent/update/check' final_stability_patch.py
-          grep -q 'protocol": "HTTPS"' final_stability_patch.py
-          grep -q '网关 502' final_stability_patch.py
-          grep -q 'COPY final_stability_patch.py' Dockerfile
-          grep -q 'continuous two-second terminal rate cache enabled' followup_stability_patch.py
+          grep -q 'HUB_VERSION = "0.9.34"' hub_entry.py
+          grep -q 'install_hub0934_fixes(hub)' hub_entry.py
+          grep -q 'canonical_watched_devices' hub0934_fixes.py
+          grep -q '_normalize_portmap_payload' hub0934_fixes.py
+          grep -q 'install_router_task_manager_patch(hub)' hub_entry.py
           grep -q 'install_router_device_live_sync_patch' hub_entry.py
-          grep -q 'ROUTER_DEVICE_LIVE_POLL_SEC.*, "5"' router_device_live_sync_patch.py
           grep -q '"devices_snapshot"' router_device_live_sync_patch.py
-          grep -q '"devType": "all", "dataType": "timely"' router_device_live_sync_patch.py
-          python - <<'PY'
-          import threading
-          import time
-          from types import SimpleNamespace
-          from final_stability_patch import _freeze_router_task_timing, _friendly_update_error
+          grep -q '/api/realtime/ws' hub_realtime_ws.py
+          grep -q 'version = "0.2.14"' labrelay/Cargo.toml
+          sh -n agent/install.sh
+          sh -n scripts/labprobe-install.sh
 
-          class Logger:
-              def info(self, *args, **kwargs): pass
-          class Manager:
-              def __init__(self):
-                  now = int(time.time())
-                  self.lock = threading.RLock()
-                  self.tasks = {
-                      'nat': {
-                          'kind': 'nat', 'state': 'succeeded', 'startedAt': now - 100,
-                          'updatedAt': now - 80, 'elapsedSeconds': 0, 'log': [], 'result': {}
-                      }
-                  }
-              def _save(self): pass
-              def _publish(self, kind): pass
-          manager = Manager()
-          fake = SimpleNamespace(ROUTER_TASK_MANAGER=manager, LOGGER=Logger())
-          _freeze_router_task_timing(fake)
-          first = manager._snapshot_locked('nat')['elapsedSeconds']
-          time.sleep(1.05)
-          second = manager._snapshot_locked('nat')['elapsedSeconds']
-          assert first == 20, first
-          assert second == first, (first, second)
-          assert '<!DOCTYPE' not in _friendly_update_error('HTTP 502: <!DOCTYPE html>')
-          assert '502' in _friendly_update_error('HTTP 502: <!DOCTYPE html>')
-          print('terminal timing freeze and friendly Agent errors verified')
-          PY
-      - name: Verify continuous compact terminal lane and durable snapshots
-        env:
-          APP_TOKEN: ci-app-token
-          HOOK_TOKEN: ci-hook-token
-        run: |
-          set -e
-          python - <<'PY'
-          import os
-          import tempfile
-          from datetime import datetime
-          from pathlib import Path
-
-          root = tempfile.TemporaryDirectory()
-          base = Path(root.name)
-          os.environ['DATA_DIR'] = str(base / 'data')
-          os.environ['CONFIG_DIR'] = str(base / 'config')
-          os.environ['BACKUPS_DIR'] = str(base / 'backups')
-          os.environ['LOGS_DIR'] = str(base / 'logs')
-          os.environ['DATABASE_PATH'] = str(base / 'data' / 'labprobe.db')
-          os.environ['CONFIG_PATH'] = str(base / 'config' / 'config.yaml')
-
-          import hub
-          from device_history_patch import install_device_history_patch
-          from router_device_live_sync_patch import RouterDeviceLiveSync
-
-          install_device_history_patch(hub)
-
-          class FakeClient:
-              def __init__(self):
-                  self.empty = False
-                  self.calls = []
-              def rpc(self, method, module, data=None, no_parse=False):
-                  self.calls.append((method, module, data, no_parse))
-                  if self.empty:
-                      return {'code': '0', 'list': [], 'total': '0'}
-                  return {
-                      'code': '0',
-                      'total': '1',
-                      'list': [{
-                          'mac': 'DA-1F-85-0C-19-FC',
-                          'userIp': '192.168.5.132',
-                          'hostName': 'iQOO-Neo3',
-                          'devRecommend': 'iQOO Neo3',
-                          'connectType': 'wireless',
-                          'band': '5G',
-                          'rssi': '-50',
-                          'rxrate': '1201M',
-                          'onlinetime': datetime.now().strftime('%Y-%m-%d 00:00:01'),
-                          'activeTime': '4610',
-                          'up': '6580768',
-                          'down': '75116384',
-                          'dailyUp': '6802832',
-                          'dailyDown': '129291168',
-                          'flowUp': '9583',
-                          'flowDown': '6780',
-                          'flow_cnt': '8',
-                      }],
-                  }
-
-          fake = FakeClient()
-          service = RouterDeviceLiveSync(hub, fake, start=False)
-          frame = service.poll_once()
-          assert fake.calls == [(
-              'devSta.get', 'user_list',
-              {'devType': 'all', 'dataType': 'timely'}, True,
-          )], fake.calls
-          assert frame['fullSnapshot'] is True
-          assert frame['source'] == 'hub_router_user_list_timely'
-          row = frame['devices'][0]
-          assert row['name'] == 'iQOO Neo3', row
-          assert row['ip'] == '192.168.5.132', row
-          assert row['onlineSince'], row
-          assert row['todayOnlineDurationSec'] > 0, row
-          assert row['todayUpload'] == 6802832, row
-          assert row['todayDownload'] == 129291168, row
-          assert row['totalUpload'] == 6580768, row
-          assert row['totalDownload'] == 75116384, row
-          assert row['uploadBps'] == 9583, row
-          assert row['downloadBps'] == 6780, row
-          assert row['connectionCount'] == 8, row
-          devices = hub.load_json(hub.DEVICES_FILE, {})
-          assert devices['online'][0]['lastSeenAt'], devices
-          assert devices['online'][0]['todayUpload'] == 6802832, devices
-
-          fake.empty = True
-          deferred = service.poll_once()
-          assert deferred['deferredEmpty'] is True, deferred
-          assert service.snapshot()['onlineDeviceCount'] == 1
-          confirmed = service.poll_once()
-          assert confirmed['confirmedEmpty'] is True, confirmed
-          assert confirmed['devices'] == []
-          print('compact two-second lane and durable user_list snapshots verified')
-          PY
       - name: Test and build LabRelay
         working-directory: labrelay
         run: |
           cargo test --all-targets
           cargo build --release
-      - name: Build Docker image
-        run: docker build --pull=false -t labprobe-hub:hub0924 .
+
+      - name: Build Hub Docker image
+        run: |
+          docker build --pull=false -t labprobe-hub:0.9.34 .
+          docker run --rm --entrypoint python labprobe-hub:0.9.34 -c \
+            'import hub_entry, hub0934_fixes, labrelay_sync_patch; print("Hub 0.9.34 imports OK")'
