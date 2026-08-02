@@ -33,6 +33,8 @@ from router_slow_cache_patch import install_router_slow_cache_patch
 from router_task_manager_patch import install_router_task_manager
 from router_ws_patch import install_router_ws_patch
 
+# Existing hub0924-stage checks this marker while the deployed version advances.
+PREVIOUS_HUB_VERSION = "0.9.33"
 HUB_VERSION = "0.9.34"
 hub.APP_VERSION = HUB_VERSION
 install_router_http_developer_transport_patch()
