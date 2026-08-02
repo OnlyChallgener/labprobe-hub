@@ -3,12 +3,37 @@
 This patch is intentionally small and installed after the existing Hub/Relay patches.
 It keeps one current record per MAC for every device view, protects a valid port-map
 ``startedAt`` from sparse status samples, normalizes permanent-rule fields before
-reconciliation, and narrows the router-credential read endpoint to APP_TOKEN only.
+reconciliation, prunes redundant queued upserts, and narrows the router-credential
+read endpoint to APP_TOKEN only.
 """
 from __future__ import annotations
 
 from typing import Any, Dict, List
 from flask import jsonify, request
+
+
+PORTMAP_COMPARE_KEYS = (
+    "enabled",
+    "mode",
+    "listenPort",
+    "targetMode",
+    "targetIpv4",
+    "targetIpv6",
+    "targetIpv6Suffix",
+    "targetMac",
+    "targetPort",
+    "expiresAt",
+    "leaseSeconds",
+    "maxConnections",
+    "idleTimeoutSec",
+)
+PORTMAP_INTEGER_KEYS = {
+    "listenPort",
+    "targetPort",
+    "leaseSeconds",
+    "maxConnections",
+    "idleTimeoutSec",
+}
 
 
 def _clean(hub: Any, value: Any) -> str:
@@ -118,6 +143,84 @@ def _normalize_portmap_payload(hub: Any, payload: Dict[str, Any]) -> Dict[str, A
     return payload
 
 
+def _portmap_value(hub: Any, row: Dict[str, Any], key: str) -> Any:
+    value = row.get(key)
+    if key == "enabled":
+        return bool(value)
+    if key in PORTMAP_INTEGER_KEYS:
+        return max(0, hub.to_int(value, 0))
+    if key == "expiresAt":
+        return hub._portmap_epoch(value)
+    return _clean(hub, value)
+
+
+def _portmap_rules_equal(hub: Any, expected: Dict[str, Any], local: Dict[str, Any]) -> bool:
+    if not isinstance(expected, dict) or not isinstance(local, dict):
+        return False
+    return all(_portmap_value(hub, expected, key) == _portmap_value(hub, local, key) for key in PORTMAP_COMPARE_KEYS)
+
+
+def _prune_redundant_portmap_commands(hub: Any) -> int:
+    """Close old duplicate upserts before an already-running Relay receives them.
+
+    This protects the first startup after the fix as well: a command queued by an
+    older Hub revision is marked complete when the persisted Relay status already
+    proves the same rule is running with an equivalent normalized configuration.
+    """
+    desired = {
+        _clean(hub, row.get("id")): row
+        for row in hub._load_portmap_rules()
+        if isinstance(row, dict) and _clean(hub, row.get("id"))
+    }
+    status_document = hub.load_json(hub.PORTMAP_ROUTER_STATUS_FILE, {})
+    status_payload = status_document.get("status") if isinstance(status_document, dict) and isinstance(status_document.get("status"), dict) else status_document
+    if not isinstance(status_payload, dict):
+        return 0
+    _normalize_portmap_payload(hub, status_payload)
+
+    local_rules: Dict[str, Dict[str, Any]] = {}
+    local_runtime: Dict[str, Dict[str, Any]] = {}
+    for item in status_payload.get("rules", []) if isinstance(status_payload.get("rules"), list) else []:
+        if not isinstance(item, dict):
+            continue
+        rule = item.get("rule") if isinstance(item.get("rule"), dict) else {}
+        runtime = item.get("runtime") if isinstance(item.get("runtime"), dict) else {}
+        rule_id = _clean(hub, rule.get("id") or runtime.get("id"))
+        if rule_id:
+            local_rules[rule_id] = rule
+            local_runtime[rule_id] = runtime
+
+    document = hub.load_json(hub.PORTMAP_COMMANDS_FILE, {"commands": []})
+    commands = document.get("commands", []) if isinstance(document, dict) else []
+    if not isinstance(commands, list):
+        return 0
+    changed = 0
+    for command in commands:
+        if not isinstance(command, dict) or command.get("status") not in {"pending", "delivered"} or command.get("action") != "upsert":
+            continue
+        payload = command.get("payload") if isinstance(command.get("payload"), dict) else {}
+        rule = payload.get("rule") if isinstance(payload.get("rule"), dict) else {}
+        rule_id = _clean(hub, rule.get("id"))
+        runtime = local_runtime.get(rule_id, {})
+        if (
+            rule_id
+            and bool(desired.get(rule_id, {}).get("enabled"))
+            and _clean(hub, runtime.get("state")) == "running"
+            and hub._portmap_epoch(runtime.get("startedAt")) is not None
+            and _portmap_rules_equal(hub, desired.get(rule_id, {}), local_rules.get(rule_id, {}))
+        ):
+            command.update({
+                "status": "done",
+                "result": {"ok": True, "unchanged": True, "message": "already synchronized"},
+                "finishedAt": hub.now_str(),
+                "finishedEpoch": hub.to_int(getattr(hub, "time", None).time() if getattr(hub, "time", None) else 0, 0),
+            })
+            changed += 1
+    if changed:
+        hub.save_json(hub.PORTMAP_COMMANDS_FILE, {"commands": commands})
+    return changed
+
+
 def install_hub0934_fixes(hub: Any) -> None:
     if getattr(hub, "HUB0934_FIXES_INSTALLED", False):
         return
@@ -190,5 +293,9 @@ def install_hub0934_fixes(hub: Any) -> None:
             state["updatedAt"] = hub.now_str()
             hub.save_json(hub.DEVICES_FILE, state)
 
+    pruned = _prune_redundant_portmap_commands(hub)
     hub.HUB0934_FIXES_INSTALLED = True
-    hub.LOGGER.info("Hub 0.9.34 canonical devices, stable port-map time and credential scope enabled")
+    hub.LOGGER.info(
+        "Hub 0.9.34 canonical devices, stable port-map time and credential scope enabled; pruned=%s",
+        pruned,
+    )
