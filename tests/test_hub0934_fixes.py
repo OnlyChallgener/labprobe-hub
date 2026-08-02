@@ -1,11 +1,23 @@
 from types import SimpleNamespace
 
-from hub0934_fixes import _normalize_portmap_payload, canonical_watched_devices
+from hub0934_fixes import (
+    _normalize_portmap_payload,
+    _prune_redundant_portmap_commands,
+    canonical_watched_devices,
+)
+
+
+class FakeTime:
+    @staticmethod
+    def time():
+        return 1722600000
 
 
 class FakeHub(SimpleNamespace):
     DEVICES_FILE = "devices.json"
     PORTMAP_ROUTER_STATUS_FILE = "portmap_status.json"
+    PORTMAP_COMMANDS_FILE = "portmap_commands.json"
+    time = FakeTime()
 
     def clean_saved_value(self, value):
         if value is None:
@@ -115,3 +127,58 @@ def test_existing_started_at_is_never_replaced():
 
     _normalize_portmap_payload(hub, payload)
     assert payload["rules"][0]["runtime"]["startedAt"] == 2000
+
+
+def test_redundant_permanent_upsert_is_closed_before_relay_receives_it():
+    hub = FakeHub()
+    desired = {
+        "id": "rule-1",
+        "enabled": True,
+        "mode": "6to4",
+        "listenPort": 20000,
+        "targetMode": "ipv4",
+        "targetIpv4": "192.168.5.2",
+        "targetIpv6": "",
+        "targetIpv6Suffix": "",
+        "targetMac": "",
+        "targetPort": 58443,
+        "expiresAt": None,
+        "leaseSeconds": 0,
+        "maxConnections": 32,
+        "idleTimeoutSec": 300,
+    }
+    runtime_document = {
+        "status": {
+            "rules": [{
+                "rule": {key: value for key, value in desired.items() if key != "leaseSeconds"},
+                "runtime": {"id": "rule-1", "state": "running", "startedAt": 1722500000},
+            }]
+        }
+    }
+    command_document = {
+        "commands": [{
+            "id": "cmd-1",
+            "status": "pending",
+            "action": "upsert",
+            "payload": {"rule": dict(desired)},
+        }]
+    }
+    saved = {}
+    hub._load_portmap_rules = lambda: [dict(desired)]
+    hub._portmap_runtime_map = lambda document: {"rule-1": {"startedAt": 1722500000}}
+
+    def load_json(path, default=None):
+        if path == hub.PORTMAP_ROUTER_STATUS_FILE:
+            return runtime_document
+        if path == hub.PORTMAP_COMMANDS_FILE:
+            return command_document
+        return default
+
+    hub.load_json = load_json
+    hub.save_json = lambda path, value: saved.update({path: value})
+
+    assert _prune_redundant_portmap_commands(hub) == 1
+    command = saved[hub.PORTMAP_COMMANDS_FILE]["commands"][0]
+    assert command["status"] == "done"
+    assert command["result"]["unchanged"] is True
+    assert command["finishedEpoch"] == 1722600000
