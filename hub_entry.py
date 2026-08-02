@@ -7,6 +7,10 @@ from device_history_patch import install_device_history_patch
 from final_stability_patch import install_final_stability_patch
 from followup_stability_patch import install_followup_stability_patch
 from hub0934_fixes import install_hub0934_fixes
+from hub0935_sync_fix import (
+    install_hub0935_device_sync_fix,
+    install_router_ws_passive_fix,
+)
 from hub_realtime_ws import install_hub_realtime_ws
 from labrelay_sync_patch import install_labrelay_sync_patch
 from portmap_persistence_patch import install_portmap_persistence_patch
@@ -33,9 +37,8 @@ from router_slow_cache_patch import install_router_slow_cache_patch
 from router_task_manager_patch import install_router_task_manager_patch
 from router_ws_patch import install_router_ws_patch
 
-# Existing hub0924-stage checks this marker while the deployed version advances.
-PREVIOUS_HUB_VERSION = "0.9.33"
-HUB_VERSION = "0.9.34"
+PREVIOUS_HUB_VERSION = "0.9.34"
+HUB_VERSION = "0.9.35"
 hub.APP_VERSION = HUB_VERSION
 install_router_http_developer_transport_patch()
 install_router_developer_flow_patch()
@@ -44,6 +47,7 @@ install_router_be72_sid_wire_patch()
 install_router_native_features_patch()
 install_router_ws_patch()
 install_router_fast_watchdog_patch()
+install_router_ws_passive_fix()
 install_router_realtime_stability_patch()
 install_router_build024_fix()
 install_router_relay_credentials_patch()
@@ -65,6 +69,7 @@ install_hub_realtime_ws(hub, router_lite_realtime)
 install_router_config_sync_patch(hub, hub.ROUTER_TASK_MANAGER.client)
 install_agent_presence_patch(hub)
 install_device_history_patch(hub)
+install_hub0935_device_sync_fix(hub)
 install_portmap_persistence_patch(hub)
 install_router_device_live_sync_patch(hub, hub.ROUTER_TASK_MANAGER.client)
 install_followup_stability_patch(hub, router_lite_realtime)
