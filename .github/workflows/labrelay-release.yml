@@ -26,8 +26,27 @@ jobs:
           echo "version=$VERSION" >> "$GITHUB_OUTPUT"
           echo "tag=labrelay-v$VERSION" >> "$GITHUB_OUTPUT"
 
-      - name: Test LabRelay
-        run: cargo test --manifest-path labrelay/Cargo.toml --all-targets
+      - name: Test LabRelay and refresh lock metadata
+        run: |
+          set -euo pipefail
+          cargo test --manifest-path labrelay/Cargo.toml --all-targets
+          VERSION="${{ steps.version.outputs.version }}"
+          python3 - <<'PY'
+          import os
+          import re
+          from pathlib import Path
+
+          version = os.environ['VERSION']
+          lock = Path('labrelay/Cargo.lock').read_text(encoding='utf-8')
+          match = re.search(r'\[\[package\]\]\nname = "labrelay"\nversion = "([^"]+)"', lock)
+          if not match:
+              raise SystemExit('labrelay package missing from Cargo.lock')
+          if match.group(1) != version:
+              raise SystemExit(f'Cargo.lock version {match.group(1)} != Cargo.toml {version}')
+          print(f'Cargo metadata aligned at {version}')
+          PY
+        env:
+          VERSION: ${{ steps.version.outputs.version }}
 
       - name: Keep CLI version aligned with Cargo package
         run: |
@@ -42,13 +61,27 @@ jobs:
           path.write_text(text, encoding='utf-8')
           PY
 
-      - name: Install cross
-        run: cargo install cross --locked
+      - name: Install cross and QEMU
+        run: |
+          cargo install cross --locked
+          sudo apt-get update
+          sudo apt-get install -y qemu-user-static
 
       - name: Build static ARM64 router binary
         env:
           CARGO_TARGET_DIR: ${{ runner.temp }}/labrelay-cross-target
         run: cross build --manifest-path labrelay/Cargo.toml --release --target aarch64-unknown-linux-musl
+
+      - name: Verify binary self-reported version
+        env:
+          VERSION: ${{ steps.version.outputs.version }}
+        run: |
+          set -euo pipefail
+          BINARY="$RUNNER_TEMP/labrelay-cross-target/aarch64-unknown-linux-musl/release/labrelay"
+          test -x "$BINARY"
+          OUTPUT="$(qemu-aarch64-static "$BINARY" version)"
+          printf '%s\n' "$OUTPUT"
+          test "$OUTPUT" = "labrelay $VERSION"
 
       - name: Assemble complete installer repository
         env:
@@ -61,14 +94,11 @@ jobs:
           test -x "$BINARY"
           mkdir -p "$OUT"
           cp "$BINARY" "$OUT/labrelay-linux-arm64"
-          cp "$OUT/labrelay-linux-arm64" "$OUT/labrelay-aarch64-musl"
           cp scripts/labprobe-install.sh "$OUT/install.sh"
           cp scripts/labprobe-install.sh "$OUT/labprobe-install.sh"
-          chmod 755 "$OUT/labrelay-linux-arm64" "$OUT/labrelay-aarch64-musl" "$OUT/install.sh" "$OUT/labprobe-install.sh"
+          chmod 755 "$OUT/labrelay-linux-arm64" "$OUT/install.sh" "$OUT/labprobe-install.sh"
           file "$OUT/labrelay-linux-arm64" > "$RUNNER_TEMP/labrelay-file.txt"
           grep -Eqi 'aarch64|ARM aarch64|ARM64' "$RUNNER_TEMP/labrelay-file.txt"
-          strings "$OUT/labrelay-linux-arm64" > "$RUNNER_TEMP/labrelay-strings.txt"
-          grep -q "$VERSION" "$RUNNER_TEMP/labrelay-strings.txt"
           python3 - <<'PY'
           import hashlib
           import json
@@ -93,14 +123,14 @@ jobs:
           manifest = {
               'schemaVersion': 1,
               'versionName': version,
-              'changelog': 'Canonical device state, stable permanent port-map runtime, and credential-scope fixes.',
+              'changelog': 'Fix permanent IPv6 mapping runtime stability and Relay update reporting.',
               'installUrl': f'{release_root}/install.sh',
               'checksumsUrl': f'{release_root}/checksums.txt',
               'installer': metadata('install.sh'),
               'binaries': {'arm64': metadata('labrelay-linux-arm64')},
           }
           (out / 'latest.json').write_text(json.dumps(manifest, ensure_ascii=False, indent=2) + '\n', encoding='utf-8')
-          names = ['labrelay-linux-arm64', 'labrelay-aarch64-musl', 'install.sh', 'labprobe-install.sh', 'latest.json']
+          names = ['labrelay-linux-arm64', 'install.sh', 'labprobe-install.sh', 'latest.json']
           lines = []
           for name in names:
               data = (out / name).read_bytes()
@@ -137,7 +167,6 @@ jobs:
             `sh install.sh`
           files: |
             ${{ runner.temp }}/agent/labrelay-linux-arm64
-            ${{ runner.temp }}/agent/labrelay-aarch64-musl
             ${{ runner.temp }}/agent/install.sh
             ${{ runner.temp }}/agent/labprobe-install.sh
             ${{ runner.temp }}/agent/latest.json
