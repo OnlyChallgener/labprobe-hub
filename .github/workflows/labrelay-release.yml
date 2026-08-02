@@ -1,24 +1,10 @@
 name: Publish LabRelay Router Bundle
 
 on:
-  push:
-    branches: [hub0924]
-    paths:
-      - labrelay/**
-      - agent/**
-      - scripts/labprobe-install.sh
-      - .github/workflows/labrelay-release.yml
-  pull_request:
-    branches: [hub0923]
-    paths:
-      - labrelay/**
-      - agent/**
-      - scripts/labprobe-install.sh
-      - .github/workflows/labrelay-release.yml
   workflow_dispatch:
 
 concurrency:
-  group: publish-labrelay-${{ github.event.pull_request.number || github.ref }}
+  group: publish-labrelay-${{ github.ref }}
   cancel-in-progress: true
 
 permissions:
@@ -39,6 +25,9 @@ jobs:
           test -n "$VERSION"
           echo "version=$VERSION" >> "$GITHUB_OUTPUT"
           echo "tag=labrelay-v$VERSION" >> "$GITHUB_OUTPUT"
+
+      - name: Test LabRelay
+        run: cargo test --manifest-path labrelay/Cargo.toml --all-targets
 
       - name: Keep CLI version aligned with Cargo package
         run: |
@@ -73,9 +62,6 @@ jobs:
           mkdir -p "$OUT"
           cp "$BINARY" "$OUT/labrelay-linux-arm64"
           cp "$OUT/labrelay-linux-arm64" "$OUT/labrelay-aarch64-musl"
-          # Keep the release bundle on the same transactional OpenWrt installer
-          # used by APP-driven upgrades, including service readiness checks and
-          # command-result acknowledgement.
           cp scripts/labprobe-install.sh "$OUT/install.sh"
           cp scripts/labprobe-install.sh "$OUT/labprobe-install.sh"
           chmod 755 "$OUT/labrelay-linux-arm64" "$OUT/labrelay-aarch64-musl" "$OUT/install.sh" "$OUT/labprobe-install.sh"
@@ -107,13 +93,11 @@ jobs:
           manifest = {
               'schemaVersion': 1,
               'versionName': version,
-              'changelog': 'OpenWrt installer fallback, Hub-local repository and terminal realtime stability fixes.',
+              'changelog': 'Canonical device state, stable permanent port-map runtime, and credential-scope fixes.',
               'installUrl': f'{release_root}/install.sh',
               'checksumsUrl': f'{release_root}/checksums.txt',
               'installer': metadata('install.sh'),
-              'binaries': {
-                  'arm64': metadata('labrelay-linux-arm64'),
-              },
+              'binaries': {'arm64': metadata('labrelay-linux-arm64')},
           }
           (out / 'latest.json').write_text(json.dumps(manifest, ensure_ascii=False, indent=2) + '\n', encoding='utf-8')
           names = ['labrelay-linux-arm64', 'labrelay-aarch64-musl', 'install.sh', 'labprobe-install.sh', 'latest.json']
@@ -136,7 +120,6 @@ jobs:
           if-no-files-found: error
 
       - name: Publish or update GitHub release assets
-        if: github.event_name != 'pull_request'
         uses: softprops/action-gh-release@v2
         with:
           tag_name: ${{ steps.version.outputs.tag }}
