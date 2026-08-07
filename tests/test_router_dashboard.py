@@ -1,3 +1,4 @@
+import json
 import os
 import tempfile
 import unittest
@@ -122,6 +123,72 @@ class RouterDashboardApiTests(unittest.TestCase):
         self.assertEqual(wan["publicIpv4"], "8.8.8.8")
         self.assertEqual(wan["operatorCheckedIp"], "8.8.8.8")
         self.assertEqual(wan["operator"], "测试运营商")
+
+    def test_wireguard_status_round_trip_and_backward_compat(self):
+        # An old-style push without the wireguard field must keep working.
+        with mock.patch.object(hub, "_cached_hub_exit_ipv4", return_value=""), \
+             mock.patch.object(hub, "_schedule_dashboard_operator_probe", return_value=None):
+            pushed = self.client.post(
+                "/api/router/dashboard/push",
+                headers={"X-LabProbe-Token": "test-hook-token"},
+                json={
+                    "router": "BE72",
+                    "telemetry": {"cpuPercent": 4},
+                    "wireguard": {
+                        "supported": True,
+                        "wgToolAvailable": True,
+                        "kernelSupport": True,
+                        "installed": True,
+                        "configured": True,
+                        "running": True,
+                        "interfaces": [{
+                            "name": "wg0",
+                            "publicKey": "pub-key-1",
+                            "listenPort": 51820,
+                            "peerCount": 2,
+                            "running": True,
+                            "addresses": ["10.88.0.1/24", "fd88::1/64"],
+                            "rxBytes": 123456,
+                            "txBytes": 654321,
+                            "latestHandshakeAt": 1786100000,
+                        }],
+                        "interfaceCount": 1,
+                        "peerCount": 2,
+                        "latestHandshakeAt": 1786100000,
+                        "error": None,
+                    },
+                },
+            )
+        self.assertEqual(pushed.status_code, 200)
+
+        body = self.client.get(
+            "/api/router/dashboard",
+            headers={"Authorization": "Bearer test-app-token"},
+        ).get_json()
+        self.assertEqual(body["wireguard"]["interfaceCount"], 1)
+        self.assertEqual(body["wireguard"]["peerCount"], 2)
+        self.assertEqual(body["wireguard"]["interfaces"][0]["name"], "wg0")
+        self.assertEqual(body["wireguard"]["interfaces"][0]["rxBytes"], 123456)
+        self.assertEqual(body["wireguard"]["latestHandshakeAt"], 1786100000)
+
+        # A later push without the field keeps the last known status; the Hub
+        # must not error or drop unrelated telemetry.
+        with mock.patch.object(hub, "_cached_hub_exit_ipv4", return_value=""), \
+             mock.patch.object(hub, "_schedule_dashboard_operator_probe", return_value=None):
+            pushed = self.client.post(
+                "/api/router/dashboard/push",
+                headers={"X-LabProbe-Token": "test-hook-token"},
+                json={"router": "BE72", "telemetry": {"cpuPercent": 7}},
+            )
+        self.assertEqual(pushed.status_code, 200)
+        body = self.client.get(
+            "/api/router/dashboard",
+            headers={"Authorization": "Bearer test-app-token"},
+        ).get_json()
+        self.assertEqual(body["telemetry"]["cpuPercent"], 7)
+        self.assertEqual(body["wireguard"]["interfaceCount"], 1)
+        self.assertNotIn("privateKey", json.dumps(body["wireguard"]))
+        self.assertNotIn("PrivateKey", json.dumps(body["wireguard"]))
 
     def test_credentials_are_memory_only_and_expire(self):
         refresh = self.client.post(

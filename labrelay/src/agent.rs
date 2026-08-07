@@ -29,6 +29,7 @@ pub struct AgentConfig {
     pub dashboard_interval_seconds: u64,
     pub dashboard_details_interval_seconds: u64,
     pub dashboard_network_interval_seconds: u64,
+    pub wireguard_interval_seconds: u64,
     pub relay_socket: String,
     pub state_path: String,
     pub log_path: String,
@@ -46,6 +47,7 @@ impl Default for AgentConfig {
             dashboard_interval_seconds: 2,
             dashboard_details_interval_seconds: 30,
             dashboard_network_interval_seconds: 60,
+            wireguard_interval_seconds: 30,
             relay_socket: "/tmp/labrelay.sock".into(),
             state_path: DEFAULT_AGENT_STATE.into(),
             log_path: DEFAULT_AGENT_LOG.into(),
@@ -71,6 +73,8 @@ struct AgentState {
     storage_percent: Option<f64>,
     last_dashboard_refresh_nonce: u64,
     last_credentials_refresh_nonce: u64,
+    last_wireguard_at: u64,
+    wireguard_status: Option<Value>,
 }
 
 fn now_epoch() -> u64 {
@@ -1206,6 +1210,18 @@ fn collect_dashboard_payload(
             Err(error) => log_limited(config, state, "WARN", "router-network", &format!("router network config skipped: {:#}", error)),
         }
     }
+    // WireGuard status is read-only and low-frequency (~30s). Detection is
+    // intentionally independent: a failure only lands in wireguard.error and
+    // never blocks the router dashboard push.
+    let wireguard_due = state.last_wireguard_at == 0
+        || now.saturating_sub(state.last_wireguard_at)
+            >= config.wireguard_interval_seconds.clamp(15, 600);
+    if wireguard_due {
+        let detected = crate::wireguard::detect_wireguard();
+        state.wireguard_status = serde_json::to_value(detected).ok();
+        state.last_wireguard_at = now;
+    }
+    payload["wireguard"] = state.wireguard_status.clone().unwrap_or(Value::Null);
     if slow_value.is_some() || network_value.is_some() || ipinfo_value.is_some() || ap_list_value.is_some() {
         payload["details"] = details_from_sources(
             slow_value.as_ref(),

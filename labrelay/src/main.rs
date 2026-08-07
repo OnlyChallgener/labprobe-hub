@@ -19,6 +19,7 @@ use tokio::task::JoinHandle;
 use tokio::time::{sleep, timeout};
 
 mod agent;
+mod wireguard;
 
 const VERSION: &str = env!("CARGO_PKG_VERSION");
 const DEFAULT_CONFIG: &str = "/etc/labprobe/relay.json";

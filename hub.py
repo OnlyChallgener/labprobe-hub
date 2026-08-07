@@ -2898,6 +2898,11 @@ def api_router_dashboard_push():
                 ROUTER_DASHBOARD_CACHE["details"] = merged_details
             ROUTER_DASHBOARD_CACHE["detailsAt"] = now_str()
             ROUTER_DASHBOARD_CACHE["detailsEpoch"] = _dashboard_epoch(payload.get("detailsEpoch")) or now_epoch
+        wireguard = payload.get("wireguard")
+        if isinstance(wireguard, dict):
+            # Phase 1 read-only status; old Hubs simply ignore the field and old
+            # Apps keep working because it is additive.
+            ROUTER_DASHBOARD_CACHE["wireguard"] = wireguard
         completed = int(_dashboard_number(payload.get("refreshNonce"), 0))
         if completed > int(_dashboard_number(ROUTER_DASHBOARD_CACHE.get("refreshCompletedNonce"), 0)):
             ROUTER_DASHBOARD_CACHE["refreshCompletedNonce"] = completed
