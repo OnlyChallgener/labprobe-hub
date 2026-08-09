@@ -2,6 +2,11 @@ name: Hub Validate & Build
 
 on:
   workflow_dispatch:
+  push:
+    branches:
+      - hub0924
+    paths:
+      - '.github/workflows/hub0924-stage.yml'
 
 concurrency:
   group: hub-validate-${{ github.ref }}
