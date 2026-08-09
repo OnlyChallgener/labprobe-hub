@@ -1,16 +1,25 @@
-//! Generic Linux DDNS egress-address detection.
+//! Generic Linux DDNS address detection.
 //!
-//! IPv4 and IPv6 are detected independently. The primary result is the
-//! address actually observed on the Internet; local interface/route data is
-//! only a fallback so CGNAT/private WAN addresses are never mistaken for an
-//! Internet-facing A record. All probes are read-only and use fixed HTTPS
-//! endpoints with short timeouts.
+//! The detector deliberately uses the standard `ip` command first so it can
+//! run on OpenWrt and other Linux routers. OpenWrt's ubus output is only used
+//! as a read-only hint when a delegated LAN prefix is present.
 
 use anyhow::Result;
+use reqwest::Client;
 use serde::Serialize;
-use std::net::{Ipv4Addr, Ipv6Addr};
+use std::net::{IpAddr, Ipv4Addr, Ipv6Addr};
 use std::process::Command;
 use std::time::{SystemTime, UNIX_EPOCH};
+use tokio::time::{timeout, Duration};
+
+const IPV4_EGRESS_ENDPOINTS: [(&str, &str); 2] = [
+    ("api.ipify.org", "https://api.ipify.org"),
+    ("ifconfig.me", "https://ifconfig.me/ip"),
+];
+const IPV6_EGRESS_ENDPOINTS: [(&str, &str); 2] = [
+    ("api6.ipify.org", "https://api6.ipify.org"),
+    ("ifconfig.co", "https://ifconfig.co/ip"),
+];
 
 #[derive(Debug, Clone, Serialize, Default, PartialEq, Eq)]
 #[serde(rename_all = "camelCase")]
@@ -39,17 +48,43 @@ struct Candidate6 {
     tentative: bool,
 }
 
-pub fn detect() -> DdnsAddressSnapshot {
-    // Keep the two address families independent. A broken IPv4 path must not
-    // prevent an IPv6-only DDNS record (and vice versa). Running them in
-    // parallel also caps the worst-case probe delay on routers with partial
-    // connectivity.
-    let v4 = std::thread::spawn(detect_ipv4);
-    let v6 = std::thread::spawn(detect_ipv6);
-    let (detected_ipv4, ipv4_state, ipv4_source) =
-        v4.join().unwrap_or_else(|_| local_ipv4_fallback());
-    let (detected_ipv6, ipv6_state, ipv6_source) =
-        v6.join().unwrap_or_else(|_| local_ipv6_fallback());
+pub async fn detect() -> DdnsAddressSnapshot {
+    let (external_ipv4, external_ipv6) =
+        tokio::join!(detect_external_ipv4(), detect_external_ipv6());
+    let default4 = command_text("ip", &["-4", "route", "show", "default"])
+        .ok()
+        .and_then(|text| default_interface(&text));
+    let default6 = command_text("ip", &["-6", "route", "show", "default"])
+        .ok()
+        .and_then(|text| default_interface(&text));
+    let candidates4 = command_text("ip", &["-4", "addr", "show"])
+        .map(|text| parse_ipv4(&text))
+        .unwrap_or_default();
+    let candidates6 = command_text("ip", &["-6", "addr", "show", "scope", "global"])
+        .map(|text| parse_ipv6(&text))
+        .unwrap_or_default();
+
+    let (detected_ipv4, ipv4_state, ipv4_source) = external_ipv4
+        .map(|(ip, source)| (ip.to_string(), "public".into(), source))
+        .unwrap_or_else(|| choose_ipv4(&candidates4, default4.as_deref()));
+    let openwrt_delegated_ifaces = openwrt_delegated_interfaces();
+    let route6 = command_text("ip", &["-6", "route", "get", "2001:4860:4860::8888"])
+        .ok()
+        .and_then(|text| parse_ipv6_route_get(&text));
+    let (detected_ipv6, ipv6_state, ipv6_source) = external_ipv6
+        .map(|(ip, source)| (ip.to_string(), "public".into(), source))
+        .or_else(|| {
+            route6.filter(ipv6_public_candidate).map(|candidate| {
+                (
+                    candidate.ip.to_string(),
+                    "public".into(),
+                    format!("route-src:{}", candidate.interface),
+                )
+            })
+        })
+        .unwrap_or_else(|| {
+            choose_ipv6(&candidates6, default6.as_deref(), &openwrt_delegated_ifaces)
+        });
 
     DdnsAddressSnapshot {
         detected_ipv4,
@@ -62,124 +97,70 @@ pub fn detect() -> DdnsAddressSnapshot {
     }
 }
 
-fn detect_ipv4() -> (String, String, String) {
-    for (source, url) in [
-        ("ip.sb", "https://api-ipv4.ip.sb/ip"),
-        ("ident.me", "https://4.ident.me"),
-    ] {
-        if let Some(text) = fetch_external_text(url, 4) {
-            if let Ok(ip) = text.trim().parse::<Ipv4Addr>() {
-                if ipv4_public(ip) {
-                    return (
-                        ip.to_string(),
-                        "public".into(),
-                        format!("egress-http:{}", source),
-                    );
-                }
+async fn detect_external_ipv4() -> Option<(Ipv4Addr, String)> {
+    timeout(Duration::from_secs(6), async {
+        let client = Client::builder()
+            .local_address(Some(IpAddr::V4(Ipv4Addr::UNSPECIFIED)))
+            .connect_timeout(Duration::from_secs(2))
+            .timeout(Duration::from_secs(3))
+            .user_agent(concat!("labrelay/", env!("CARGO_PKG_VERSION")))
+            .build()
+            .ok()?;
+        for (name, url) in IPV4_EGRESS_ENDPOINTS {
+            let Ok(response) = client.get(url).send().await else {
+                continue;
+            };
+            if !response.status().is_success() {
+                continue;
+            }
+            let Ok(body) = response.text().await else {
+                continue;
+            };
+            let Ok(ip) = body.trim().parse::<Ipv4Addr>() else {
+                continue;
+            };
+            if ipv4_public(ip) {
+                return Some((ip, format!("egress-http:{name}")));
             }
         }
-    }
-    local_ipv4_fallback()
+        None
+    })
+    .await
+    .ok()
+    .flatten()
 }
 
-fn detect_ipv6() -> (String, String, String) {
-    for (source, url) in [
-        ("ip.sb", "https://api-ipv6.ip.sb/ip"),
-        ("ident.me", "https://6.ident.me"),
-    ] {
-        if let Some(text) = fetch_external_text(url, 6) {
-            if let Ok(ip) = text.trim().parse::<Ipv6Addr>() {
-                if ipv6_public(ip) {
-                    return (
-                        ip.to_string(),
-                        "public".into(),
-                        format!("egress-http:{}", source),
-                    );
-                }
+async fn detect_external_ipv6() -> Option<(Ipv6Addr, String)> {
+    timeout(Duration::from_secs(6), async {
+        let client = Client::builder()
+            .local_address(Some(IpAddr::V6(Ipv6Addr::UNSPECIFIED)))
+            .connect_timeout(Duration::from_secs(2))
+            .timeout(Duration::from_secs(3))
+            .user_agent(concat!("labrelay/", env!("CARGO_PKG_VERSION")))
+            .build()
+            .ok()?;
+        for (name, url) in IPV6_EGRESS_ENDPOINTS {
+            let Ok(response) = client.get(url).send().await else {
+                continue;
+            };
+            if !response.status().is_success() {
+                continue;
+            }
+            let Ok(body) = response.text().await else {
+                continue;
+            };
+            let Ok(ip) = body.trim().parse::<Ipv6Addr>() else {
+                continue;
+            };
+            if ipv6_public(ip) {
+                return Some((ip, format!("egress-http:{name}")));
             }
         }
-    }
-    local_ipv6_fallback()
-}
-
-fn fetch_external_text(url: &str, family: u8) -> Option<String> {
-    // curl is preferred when available because it can explicitly bind the
-    // requested address family. OpenWrt commonly exposes BusyBox/uclient wget,
-    // so keep that as a compatible fallback. Hostnames themselves are
-    // family-specific, therefore wget still cannot silently return the wrong
-    // family.
-    let family_flag = if family == 4 { "-4" } else { "-6" };
-    let curl_args = [
-        "-fsS",
-        "--connect-timeout",
-        "2",
-        "--max-time",
-        "4",
-        family_flag,
-        url,
-    ];
-    if let Ok(text) = command_text("curl", &curl_args) {
-        if !text.trim().is_empty() {
-            return Some(text);
-        }
-    }
-
-    let wget_args = ["-qO-", "-T", "4", url];
-    command_text("wget", &wget_args)
-        .ok()
-        .filter(|text| !text.trim().is_empty())
-}
-
-fn local_ipv4_fallback() -> (String, String, String) {
-    let default4 = command_text("ip", &["-4", "route", "show", "default"])
-        .ok()
-        .and_then(|text| default_interface(&text));
-    let candidates4 = command_text("ip", &["-4", "addr", "show"])
-        .map(|text| parse_ipv4(&text))
-        .unwrap_or_default();
-    choose_ipv4(&candidates4, default4.as_deref())
-}
-
-fn local_ipv6_fallback() -> (String, String, String) {
-    let candidates6 = command_text("ip", &["-6", "addr", "show", "scope", "global"])
-        .map(|text| parse_ipv6(&text))
-        .unwrap_or_default();
-
-    // `ip route get` performs only a local routing lookup. It does not send a
-    // packet to the destination, but it tells us the source IPv6 the kernel
-    // would actually choose for Internet traffic. This is a stronger fallback
-    // than assuming interfaces are named wan6/br-lan on every vendor firmware.
-    if let Ok(text) = command_text(
-        "ip",
-        &["-6", "route", "get", "2001:4860:4860::8888"],
-    ) {
-        if let Some((ip, iface)) = parse_route_ipv6_source(&text) {
-            let bad_flags = candidates6
-                .iter()
-                .find(|candidate| candidate.ip == ip)
-                .map(|candidate| {
-                    candidate.temporary || candidate.deprecated || candidate.tentative
-                })
-                .unwrap_or(false);
-            if ipv6_public(ip) && !bad_flags && !virtual_interface(&iface) {
-                return (
-                    ip.to_string(),
-                    "public".into(),
-                    format!("route-src:{}", iface),
-                );
-            }
-        }
-    }
-
-    let default6 = command_text("ip", &["-6", "route", "show", "default"])
-        .ok()
-        .and_then(|text| default_interface(&text));
-    let openwrt_delegated_ifaces = openwrt_delegated_interfaces();
-    choose_ipv6(
-        &candidates6,
-        default6.as_deref(),
-        &openwrt_delegated_ifaces,
-    )
+        None
+    })
+    .await
+    .ok()
+    .flatten()
 }
 
 fn command_text(program: &str, args: &[&str]) -> Result<String> {
@@ -203,20 +184,6 @@ fn default_interface(text: &str) -> Option<String> {
         .windows(2)
         .find(|pair| pair[0] == "dev")
         .map(|pair| pair[1].split('@').next().unwrap_or(pair[1]).to_string())
-}
-
-fn parse_route_ipv6_source(text: &str) -> Option<(Ipv6Addr, String)> {
-    let fields: Vec<&str> = text.split_whitespace().collect();
-    let iface = fields
-        .windows(2)
-        .find(|pair| pair[0] == "dev")
-        .map(|pair| pair[1].split('@').next().unwrap_or(pair[1]).to_string())?;
-    let raw = fields
-        .windows(2)
-        .find(|pair| pair[0] == "src")
-        .map(|pair| pair[1])?;
-    let ip = raw.parse::<Ipv6Addr>().ok()?;
-    Some((ip, iface))
 }
 
 fn parse_ipv4(text: &str) -> Vec<Candidate4> {
@@ -269,9 +236,10 @@ fn parse_ipv6(text: &str) -> Vec<Candidate6> {
         let fields: Vec<&str> = trimmed.split_whitespace().collect();
         if fields.first() == Some(&"valid_lft") {
             if let Some(index) = last_candidate {
-                if fields.windows(2).any(|pair| {
-                    pair == ["valid_lft", "0sec"] || pair == ["preferred_lft", "0sec"]
-                }) {
+                if fields
+                    .windows(2)
+                    .any(|pair| pair == ["valid_lft", "0sec"] || pair == ["preferred_lft", "0sec"])
+                {
                     out[index].deprecated = true;
                 }
             }
@@ -296,6 +264,25 @@ fn parse_ipv6(text: &str) -> Vec<Candidate6> {
         last_candidate = Some(out.len() - 1);
     }
     out
+}
+
+fn parse_ipv6_route_get(text: &str) -> Option<Candidate6> {
+    let fields: Vec<&str> = text.split_whitespace().collect();
+    let ip = fields
+        .windows(2)
+        .find(|pair| pair[0] == "src")
+        .and_then(|pair| pair[1].parse::<Ipv6Addr>().ok())?;
+    let interface = fields
+        .windows(2)
+        .find(|pair| pair[0] == "dev")
+        .map(|pair| pair[1].split('@').next().unwrap_or(pair[1]).to_string())?;
+    Some(Candidate6 {
+        ip,
+        interface,
+        temporary: false,
+        deprecated: false,
+        tentative: false,
+    })
 }
 
 fn virtual_interface(name: &str) -> bool {
@@ -325,8 +312,8 @@ fn ipv4_cgnat(ip: Ipv4Addr) -> bool {
     octets[0] == 100 && (64..=127).contains(&octets[1])
 }
 
-fn ipv6_unique_local(ip: Ipv6Addr) -> bool {
-    (ip.segments()[0] & 0xfe00) == 0xfc00
+fn ipv6_ula(ip: Ipv6Addr) -> bool {
+    ip.segments()[0] & 0xfe00 == 0xfc00
 }
 
 fn ipv6_public(ip: Ipv6Addr) -> bool {
@@ -334,13 +321,18 @@ fn ipv6_public(ip: Ipv6Addr) -> bool {
         && !ip.is_unspecified()
         && !ip.is_multicast()
         && !ip.is_unicast_link_local()
-        && !ipv6_unique_local(ip)
+        && !ipv6_ula(ip)
 }
 
-fn choose_ipv4(
-    candidates: &[Candidate4],
-    default_if: Option<&str>,
-) -> (String, String, String) {
+fn ipv6_public_candidate(candidate: &Candidate6) -> bool {
+    ipv6_public(candidate.ip)
+        && !candidate.temporary
+        && !candidate.deprecated
+        && !candidate.tentative
+        && !virtual_interface(&candidate.interface)
+}
+
+fn choose_ipv4(candidates: &[Candidate4], default_if: Option<&str>) -> (String, String, String) {
     let cgnat = candidates
         .iter()
         .any(|candidate| ipv4_cgnat(candidate.ip) && !virtual_interface(&candidate.interface));
@@ -397,13 +389,7 @@ fn choose_ipv6(
 ) -> (String, String, String) {
     let stable: Vec<&Candidate6> = candidates
         .iter()
-        .filter(|candidate| {
-            ipv6_public(candidate.ip)
-                && !candidate.temporary
-                && !candidate.deprecated
-                && !candidate.tentative
-                && !virtual_interface(&candidate.interface)
-        })
+        .filter(|candidate| ipv6_public_candidate(candidate))
         .collect();
     if let Some(iface) = default_if {
         let preferred: Vec<&Candidate6> = stable
@@ -455,10 +441,7 @@ fn openwrt_delegated_interfaces() -> Vec<String> {
     let Ok(root) = serde_json::from_str::<serde_json::Value>(&text) else {
         return Vec::new();
     };
-    let Some(interfaces) = root
-        .get("interface")
-        .and_then(serde_json::Value::as_array)
-    else {
+    let Some(interfaces) = root.get("interface").and_then(serde_json::Value::as_array) else {
         return Vec::new();
     };
     interfaces
@@ -534,7 +517,7 @@ mod tests {
     }
 
     #[test]
-    fn private_and_cgnat_ipv4_are_not_publishable_as_local_fallback() {
+    fn private_and_cgnat_ipv4_are_not_publishable() {
         assert_eq!(
             choose_ipv4(&[v4("192.168.1.1", "eth0")], Some("eth0")).1,
             "unavailable"
@@ -552,15 +535,12 @@ mod tests {
     #[test]
     fn stable_ipv6_wins_and_bad_flags_are_excluded() {
         let candidates = vec![
-            v6("2606:4700::1", "wan0", true, false, false),
-            v6("2606:4700::2", "wan0", false, true, false),
-            v6("2606:4700::3", "wan0", false, false, false),
+            v6("2001:db8::1", "wan0", true, false, false),
+            v6("2001:db8::2", "wan0", false, true, false),
+            v6("2001:db8::3", "wan0", false, false, false),
             v6("fe80::1", "wan0", false, false, false),
         ];
-        assert_eq!(
-            choose_ipv6(&candidates, Some("wan0"), &[]).0,
-            "2606:4700::3"
-        );
+        assert_eq!(choose_ipv6(&candidates, Some("wan0"), &[]).0, "2001:db8::3");
         assert_eq!(
             choose_ipv6(&candidates, Some("wan0"), &[]).2,
             "default-route:wan0"
@@ -570,7 +550,7 @@ mod tests {
     #[test]
     fn ipv6_preferred_lifetime_zero_is_deprecated() {
         let candidates = parse_ipv6(
-            "2: wan0@if3: <UP>\n    inet6 2606:4700::4/64 scope global\n       valid_lft 0sec preferred_lft 0sec\n",
+            "2: wan0@if3: <UP>\n    inet6 2001:db8::4/64 scope global\n       valid_lft 0sec preferred_lft 0sec\n",
         );
         assert_eq!(candidates.len(), 1);
         assert!(candidates[0].deprecated);
@@ -578,32 +558,38 @@ mod tests {
     }
 
     #[test]
+    fn ipv6_route_get_source_is_parsed_with_interface() {
+        let candidate = parse_ipv6_route_get(
+            "2001:4860:4860::8888 from :: via fe80::1 dev pppoe-wan src 2409:8a50::123 metric 1024",
+        )
+        .unwrap();
+        assert_eq!(candidate.ip, "2409:8a50::123".parse::<Ipv6Addr>().unwrap());
+        assert_eq!(candidate.interface, "pppoe-wan");
+        assert!(ipv6_public_candidate(&candidate));
+    }
+
+    #[test]
+    fn ula_ipv6_is_not_publishable_even_when_global_scope_is_reported() {
+        let candidate = v6("fd00::10", "br-lan", false, false, false);
+        assert!(ipv6_ula(candidate.ip));
+        assert!(!ipv6_public_candidate(&candidate));
+        assert_eq!(
+            choose_ipv6(&[candidate], Some("br-lan"), &[]).1,
+            "unavailable"
+        );
+    }
+
+    #[test]
     fn delegated_lan_is_used_when_no_default_route_address_exists() {
-        let candidates = vec![v6("2409:8a50:1::10", "br-lan", false, false, false)];
+        let candidates = vec![v6("2001:db8:1::10", "br-lan", false, false, false)];
         assert_eq!(
             choose_ipv6(&candidates, Some("pppoe0"), &["br-lan".into()]),
             (
-                "2409:8a50:1::10".into(),
+                "2001:db8:1::10".into(),
                 "public".into(),
                 "delegated-lan:br-lan".into()
             )
         );
-    }
-
-    #[test]
-    fn route_source_ipv6_is_parsed() {
-        assert_eq!(
-            parse_route_ipv6_source(
-                "2001:4860:4860::8888 from :: via fe80::1 dev br-lan src 2409:8a50::123 metric 1024"
-            ),
-            Some(("2409:8a50::123".parse().unwrap(), "br-lan".into()))
-        );
-    }
-
-    #[test]
-    fn unique_local_ipv6_is_not_public() {
-        assert!(!ipv6_public("fd00::1".parse().unwrap()));
-        assert!(ipv6_public("2409:8a50::1".parse().unwrap()));
     }
 
     #[test]
@@ -619,8 +605,8 @@ mod tests {
         assert_eq!(
             choose_ipv6(
                 &[
-                    v6("2606:4700::1", "eth0", false, false, false),
-                    v6("2606:4700::2", "eth1", false, false, false)
+                    v6("2001:db8::1", "eth0", false, false, false),
+                    v6("2001:db8::2", "eth1", false, false, false)
                 ],
                 None,
                 &[]
