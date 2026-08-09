@@ -123,7 +123,7 @@ fn parse_ipv4(text: &str) -> Vec<Candidate4> {
 
 fn parse_ipv6(text: &str) -> Vec<Candidate6> {
     let mut interface = String::new();
-    let mut out = Vec::new();
+    let mut out: Vec<Candidate6> = Vec::new();
     let mut last_candidate: Option<usize> = None;
     for line in text.lines() {
         let trimmed = line.trim_start();
