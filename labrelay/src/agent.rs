@@ -1142,7 +1142,7 @@ fn details_from_sources(
     Value::Object(details)
 }
 
-fn collect_dashboard_payload(
+async fn collect_dashboard_payload(
     config: &AgentConfig,
     state: &mut AgentState,
     force_details: bool,
@@ -1242,7 +1242,7 @@ fn collect_dashboard_payload(
         || now.saturating_sub(state.last_ddns_address_at) >= 30
         || force_details;
     if ddns_due {
-        state.ddns_address = serde_json::to_value(ddns_address::detect()).ok();
+        state.ddns_address = serde_json::to_value(ddns_address::detect().await).ok();
         state.last_ddns_address_at = now;
     }
     payload["ddnsAddress"] = state.ddns_address.clone().unwrap_or(Value::Null);
@@ -1284,11 +1284,11 @@ async fn sync_router_credentials(
 }
 
 async fn sync_router_dashboard(client: &Client, config: &AgentConfig, state: &mut AgentState, force: bool) -> Result<()> {
-    let payload = collect_dashboard_payload(config, state, force, if force { state.last_dashboard_refresh_nonce } else { 0 })?;
+    let payload = collect_dashboard_payload(config, state, force, if force { state.last_dashboard_refresh_nonce } else { 0 }).await?;
     let response = post_json(client, config, "/api/router/dashboard/push", &payload).await?;
     let requested = response.get("refreshNonce").and_then(Value::as_u64).unwrap_or(0);
     if requested > state.last_dashboard_refresh_nonce {
-        let full = collect_dashboard_payload(config, state, true, requested)?;
+        let full = collect_dashboard_payload(config, state, true, requested).await?;
         post_json(client, config, "/api/router/dashboard/push", &full).await?;
         state.last_dashboard_refresh_nonce = requested;
     }
