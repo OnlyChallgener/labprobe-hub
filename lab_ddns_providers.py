@@ -106,7 +106,46 @@ class _HttpProvider(DdnsProvider):
             return None, _failure(self.provider_id, record_type, f"http_{response.status_code}", "provider returned invalid JSON")
         if response.status_code in (401, 403):
             return None, _failure(self.provider_id, record_type, f"http_{response.status_code}", "provider authentication failed")
+        if response.status_code == 429:
+            return None, _failure(self.provider_id, record_type, "http_429", "provider rate limited")
         return payload, None
+
+    def _request_text(self, method: str, url: str, record_type: str, **kwargs: Any) -> Tuple[Optional[str], Optional[ProviderResult]]:
+        try:
+            response = self.session.request(method, url, timeout=(4, 8), **kwargs)
+        except requests.RequestException:
+            return None, _failure(self.provider_id, record_type, "network_error", "provider request failed")
+        if response.status_code in (401, 403):
+            return None, _failure(self.provider_id, record_type, f"http_{response.status_code}", "provider authentication failed")
+        if response.status_code == 429:
+            return None, _failure(self.provider_id, record_type, "http_429", "provider rate limited")
+        text = getattr(response, "text", None)
+        if text is None:
+            try:
+                text = json.dumps(response.json(), ensure_ascii=False)
+            except (ValueError, TypeError):
+                text = ""
+        return str(text or "").strip(), None
+
+
+def _text_update_result(
+    provider: str,
+    record_type: str,
+    body: str,
+    status_code: int,
+    credentials: Mapping[str, str],
+    success_words: Tuple[str, ...] = ("good", "ok", "success", "updated", "nochg"),
+) -> ProviderResult:
+    """Normalize the small text responses used by DynDNS-compatible APIs."""
+    normalized = (body or "").strip().splitlines()[0].strip().lower() if body else ""
+    if status_code in (401, 403):
+        return _failure(provider, record_type, f"http_{status_code}", "provider authentication failed", secret_values=credentials.values())
+    if normalized in {word.lower() for word in success_words} or any(normalized.startswith(f"{word.lower()} ") for word in success_words):
+        return _success(provider, record_type, normalized not in {"ok", "nochg"})
+    auth_words = {"badauth", "unauthorized", "forbidden", "invalid token", "invalid_token", "authentication failed"}
+    code = "authentication_failed" if normalized in auth_words else f"http_{status_code}" if status_code >= 400 else "provider_error"
+    message = "provider authentication failed" if code == "authentication_failed" else "provider update failed"
+    return _failure(provider, record_type, code, message, secret_values=credentials.values())
 
 
 class AliDnsProvider(_HttpProvider):
@@ -305,3 +344,139 @@ class CloudflareProvider(_HttpProvider):
         if error:
             return error
         return _success(self.provider_id, record_type, True, str(((updated or {}).get("result") or {}).get("id", record_id)))
+
+
+class Dynv6Provider(_HttpProvider):
+    """dynv6 single-host A/AAAA update endpoint."""
+
+    ENDPOINT = "https://dynv6.com/api/update"
+
+    def __init__(self, session: Optional[requests.Session] = None):
+        super().__init__(ProviderSpec("dynv6", ("token",)), session)
+
+    def validate_credentials(self, credentials: Mapping[str, str]) -> ProviderResult:
+        return ProviderResult(True, "valid", provider=self.provider_id) if str(credentials.get("token") or "").strip() else _failure(self.provider_id, "", "credential_error", "provider credentials are not configured")
+
+    def sync_record(self, hostname: str, record_type: str, value: str, ttl: int, credentials: Mapping[str, str]) -> ProviderResult:
+        token = str(credentials.get("token") or "").strip()
+        if not token:
+            return _failure(self.provider_id, record_type, "credential_error", "provider credentials are not configured")
+        params = {"zone": hostname.rstrip("."), "token": token, "ipv4" if record_type == "A" else "ipv6": value}
+        body, error = self._request_text("GET", self.ENDPOINT, record_type, params=params)
+        if error:
+            return error
+        return _text_update_result(self.provider_id, record_type, body or "", 200, credentials)
+
+
+class DuckDnsProvider(_HttpProvider):
+    """DuckDNS update endpoint; A and AAAA are issued as separate calls."""
+
+    ENDPOINT = "https://www.duckdns.org/update"
+
+    def __init__(self, session: Optional[requests.Session] = None):
+        super().__init__(ProviderSpec("duckdns", ("token",)), session)
+
+    def validate_credentials(self, credentials: Mapping[str, str]) -> ProviderResult:
+        return ProviderResult(True, "valid", provider=self.provider_id) if str(credentials.get("token") or "").strip() else _failure(self.provider_id, "", "credential_error", "provider credentials are not configured")
+
+    @staticmethod
+    def _domain(hostname: str) -> str:
+        value = hostname.rstrip(".")
+        suffix = ".duckdns.org"
+        return value[:-len(suffix)] if value.lower().endswith(suffix) else value
+
+    def sync_record(self, hostname: str, record_type: str, value: str, ttl: int, credentials: Mapping[str, str]) -> ProviderResult:
+        token = str(credentials.get("token") or "").strip()
+        if not token:
+            return _failure(self.provider_id, record_type, "credential_error", "provider credentials are not configured")
+        params = {"domains": self._domain(hostname), "token": token, "ipv6" if record_type == "AAAA" else "ip": value}
+        body, error = self._request_text("GET", self.ENDPOINT, record_type, params=params)
+        if error:
+            return error
+        return _text_update_result(self.provider_id, record_type, body or "", 200, credentials, ("OK", "nochg"))
+
+
+class DeSecProvider(_HttpProvider):
+    """deSEC/dedyn.io dynDNS update endpoint."""
+
+    ENDPOINT = "https://update.dedyn.io/"
+
+    def __init__(self, session: Optional[requests.Session] = None):
+        super().__init__(ProviderSpec("desec", ("token",)), session)
+
+    def validate_credentials(self, credentials: Mapping[str, str]) -> ProviderResult:
+        return ProviderResult(True, "valid", provider=self.provider_id) if str(credentials.get("token") or "").strip() else _failure(self.provider_id, "", "credential_error", "provider credentials are not configured")
+
+    def sync_record(self, hostname: str, record_type: str, value: str, ttl: int, credentials: Mapping[str, str]) -> ProviderResult:
+        token = str(credentials.get("token") or "").strip()
+        if not token:
+            return _failure(self.provider_id, record_type, "credential_error", "provider credentials are not configured")
+        params = {"hostname": hostname.rstrip("."), "myipv4": value if record_type == "A" else "preserve", "myipv6": value if record_type == "AAAA" else "preserve"}
+        body, error = self._request_text("GET", self.ENDPOINT, record_type, params=params, headers={"Authorization": f"Token {token}"})
+        if error:
+            return error
+        return _text_update_result(self.provider_id, record_type, body or "", 200, credentials)
+
+
+class DynuProvider(_HttpProvider):
+    """Dynu official DynDNS IP update protocol."""
+
+    ENDPOINT = "https://api.dynu.com/nic/update"
+
+    def __init__(self, session: Optional[requests.Session] = None):
+        super().__init__(ProviderSpec("dynu", ("username", "password")), session)
+
+    def validate_credentials(self, credentials: Mapping[str, str]) -> ProviderResult:
+        missing = _required(credentials, ("username", "password"), self.provider_id, "")
+        return missing or ProviderResult(True, "valid", provider=self.provider_id)
+
+    def sync_record(self, hostname: str, record_type: str, value: str, ttl: int, credentials: Mapping[str, str]) -> ProviderResult:
+        missing = _required(credentials, ("username", "password"), self.provider_id, record_type)
+        if missing:
+            return missing
+        params = {"hostname": hostname.rstrip("."), "myip": value if record_type == "A" else "no", "myipv6": value if record_type == "AAAA" else "no"}
+        body, error = self._request_text(
+            "GET",
+            self.ENDPOINT,
+            record_type,
+            params=params,
+            auth=(str(credentials["username"]), str(credentials["password"])),
+            headers={"User-Agent": "LabProbe-Hub-DDNS"},
+        )
+        if error:
+            return error
+        return _text_update_result(self.provider_id, record_type, body or "", 200, credentials)
+
+
+class IPv64Provider(_HttpProvider):
+    """IPv64.net DynDNS2 updater with Bearer token authentication."""
+
+    ENDPOINT = "https://ipv64.net/nic/update"
+
+    def __init__(self, session: Optional[requests.Session] = None):
+        super().__init__(ProviderSpec("ipv64", ("token",)), session)
+
+    def validate_credentials(self, credentials: Mapping[str, str]) -> ProviderResult:
+        return ProviderResult(True, "valid", provider=self.provider_id) if str(credentials.get("token") or "").strip() else _failure(self.provider_id, "", "credential_error", "provider credentials are not configured")
+
+    def sync_record(self, hostname: str, record_type: str, value: str, ttl: int, credentials: Mapping[str, str]) -> ProviderResult:
+        token = str(credentials.get("token") or "").strip()
+        if not token:
+            return _failure(self.provider_id, record_type, "credential_error", "provider credentials are not configured")
+        params = {"host": hostname.rstrip("."), "ip" if record_type == "A" else "ip6": value}
+        body, error = self._request_text("GET", self.ENDPOINT, record_type, params=params, headers={"Authorization": f"Bearer {token}"})
+        if error:
+            return error
+        raw = (body or "").strip()
+        try:
+            payload = json.loads(raw)
+        except (ValueError, TypeError):
+            payload = None
+        if isinstance(payload, dict):
+            status = str(payload.get("status") or payload.get("Status") or payload.get("info") or "").lower()
+            if status in {"success", "good", "ok", "updated", "nochg"}:
+                return _success(self.provider_id, record_type, status not in {"ok", "nochg"})
+            if status in {"401", "403", "unauthorized", "forbidden"}:
+                return _failure(self.provider_id, record_type, "authentication_failed", "provider authentication failed", secret_values=credentials.values())
+            return _failure(self.provider_id, record_type, f"http_{200}", "provider update failed", secret_values=credentials.values())
+        return _text_update_result(self.provider_id, record_type, raw, 200, credentials)

@@ -95,12 +95,26 @@ PROVIDERS: Dict[str, DdnsProvider] = {
 
 
 def _install_provider_adapters() -> None:
-    from lab_ddns_providers import AliDnsProvider, CloudflareProvider, DnsPodProvider
+    from lab_ddns_providers import (
+        AliDnsProvider,
+        CloudflareProvider,
+        DeSecProvider,
+        DnsPodProvider,
+        DuckDnsProvider,
+        DynuProvider,
+        Dynv6Provider,
+        IPv64Provider,
+    )
 
     PROVIDERS.update({
         "alidns": AliDnsProvider(),
         "dnspod": DnsPodProvider(),
         "cloudflare": CloudflareProvider(),
+        "dynv6": Dynv6Provider(),
+        "duckdns": DuckDnsProvider(),
+        "desec": DeSecProvider(),
+        "dynu": DynuProvider(),
+        "ipv64": IPv64Provider(),
     })
 
 
