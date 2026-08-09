@@ -19,6 +19,7 @@ use tokio::task::JoinHandle;
 use tokio::time::{sleep, timeout};
 
 mod agent;
+mod ddns_address;
 mod wireguard;
 
 const VERSION: &str = env!("CARGO_PKG_VERSION");

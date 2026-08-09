@@ -470,6 +470,11 @@ class RouterRpcCompatibilitySync:
     def ignored_relay_dashboard_push(self):
         if not self.hub.check_hook_token():
             return jsonify({"ok": False, "error": "bad agent token"}), 401
+        ddns_store = getattr(self.hub, "LAB_DDNS", None)
+        if ddns_store is not None:
+            payload = request.get_json(silent=True) or {}
+            if isinstance(payload, dict):
+                ddns_store.accept_address(payload.get("ddnsAddress"))
         return jsonify({
             "ok": True,
             "ignored": True,

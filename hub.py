@@ -2845,6 +2845,9 @@ def api_router_dashboard_push():
     payload = request.get_json(silent=True) or {}
     if not isinstance(payload, dict):
         return jsonify({"ok": False, "error": "invalid payload"}), 400
+    ddns_store = globals().get("LAB_DDNS")
+    if ddns_store is not None:
+        ddns_store.accept_address(payload.get("ddnsAddress"))
     now_epoch = time.time()
     router_name = clean_saved_value(payload.get("router")) or primary_router_name() or "router"
     hub_exit_ipv4 = _cached_hub_exit_ipv4()

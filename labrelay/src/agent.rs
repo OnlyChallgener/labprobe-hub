@@ -12,6 +12,7 @@ use std::time::{Duration, SystemTime, UNIX_EPOCH};
 use tokio::time::sleep;
 
 use crate::ctl_request;
+use crate::ddns_address;
 
 const DEFAULT_AGENT_CONFIG: &str = "/etc/labprobe/agent.json";
 const DEFAULT_AGENT_STATE: &str = "/tmp/labprobe/agent-state.json";
@@ -75,6 +76,8 @@ struct AgentState {
     last_credentials_refresh_nonce: u64,
     last_wireguard_at: u64,
     wireguard_status: Option<Value>,
+    last_ddns_address_at: u64,
+    ddns_address: Option<Value>,
 }
 
 fn now_epoch() -> u64 {
@@ -1235,6 +1238,14 @@ fn collect_dashboard_payload(
     if refresh_nonce > 0 {
         payload["refreshNonce"] = json!(refresh_nonce);
     }
+    let ddns_due = state.last_ddns_address_at == 0
+        || now.saturating_sub(state.last_ddns_address_at) >= 30
+        || force_details;
+    if ddns_due {
+        state.ddns_address = serde_json::to_value(ddns_address::detect()).ok();
+        state.last_ddns_address_at = now;
+    }
+    payload["ddnsAddress"] = state.ddns_address.clone().unwrap_or(Value::Null);
     Ok(payload)
 }
 

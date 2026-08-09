@@ -13,6 +13,7 @@ from hub0935_sync_fix import (
 )
 from hub_realtime_ws import install_hub_realtime_ws
 from labrelay_sync_patch import install_labrelay_sync_patch
+from lab_ddns import install_lab_ddns
 from portmap_persistence_patch import install_portmap_persistence_patch
 from router_be72_auth_patch import install_router_be72_auth_patch
 from router_be72_sid_wire_patch import install_router_be72_sid_wire_patch
@@ -67,6 +68,7 @@ install_router_status_localization(hub, router_sync)
 router_lite_realtime = install_router_lite_realtime_patch(hub, router_sync)
 install_hub_realtime_ws(hub, router_lite_realtime)
 install_router_config_sync_patch(hub, hub.ROUTER_TASK_MANAGER.client)
+install_lab_ddns(hub)
 install_agent_presence_patch(hub)
 install_device_history_patch(hub)
 install_hub0935_device_sync_fix(hub)
