@@ -34,7 +34,7 @@ PROVIDER_IDS = (
 FLOW_STATUSES = {"disabled", "waiting", "detected", "updating", "published", "error"}
 IPV4_STATES = {"public", "cgnat", "unavailable", "ambiguous"}
 IPV6_STATES = {"public", "unavailable", "ambiguous"}
-RECORD_TYPES = ("A", "AAAA")
+RECORD_TYPES = ("A", "AAAA", "CNAME", "TXT")
 RETRY_DELAYS = (30, 120, 600, 1800)
 
 
@@ -44,6 +44,21 @@ class ProviderSpec:
     credential_schema: tuple[str, ...]
     supports_a: bool = True
     supports_aaaa: bool = True
+    supports_cname: bool = False
+    supports_txt: bool = False
+
+    @property
+    def record_types(self) -> tuple[str, ...]:
+        return tuple(
+            record_type
+            for record_type, supported in (
+                ("A", self.supports_a),
+                ("AAAA", self.supports_aaaa),
+                ("CNAME", self.supports_cname),
+                ("TXT", self.supports_txt),
+            )
+            if supported
+        )
 
 
 @dataclass(frozen=True)
@@ -68,6 +83,20 @@ class DdnsProvider:
     @property
     def provider_id(self) -> str:
         return self.spec.provider_id
+
+    def supports_record_type(self, record_type: str) -> bool:
+        return record_type.upper() in self.spec.record_types
+
+    def unsupported_result(self, record_type: str) -> ProviderResult:
+        return ProviderResult(
+            False,
+            "unsupported_record_type",
+            "provider does not support this record type",
+            provider=self.provider_id,
+            record_type=record_type,
+            error_code="unsupported_record_type",
+            error_message="provider does not support this record type",
+        )
 
     def validate_credentials(self, credentials: Mapping[str, str]) -> ProviderResult:
         return ProviderResult(True, "valid", provider=self.provider_id)
@@ -130,6 +159,7 @@ def provider_specs() -> List[Dict[str, Any]]:
             "id": provider.spec.provider_id,
             "supportsA": provider.spec.supports_a,
             "supportsAAAA": provider.spec.supports_aaaa,
+            "recordTypes": list(provider.spec.record_types),
         }
         for provider in PROVIDERS.values()
     ]
@@ -162,6 +192,57 @@ def _ip_text(value: Any, version: int) -> str:
     except ValueError:
         return ""
     return text if parsed.version == version else ""
+
+
+def _record_values(value: Any) -> Dict[str, str]:
+    if not isinstance(value, dict):
+        return {}
+    result: Dict[str, str] = {}
+    for record_type in ("CNAME", "TXT"):
+        raw = value.get(record_type)
+        if raw is None:
+            continue
+        text = str(raw).strip() if record_type == "CNAME" else str(raw)
+        if text.strip():
+            result[record_type] = text
+    return result
+
+
+def _domain_value(value: Any) -> str:
+    return _text(value).rstrip(".")
+
+
+def _valid_cname(value: str, hostname: str) -> bool:
+    target = _domain_value(value).lower()
+    owner = _domain_value(hostname).lower()
+    if not target or not owner or target == owner or "://" in target or "/" in target or any(char.isspace() for char in target):
+        return False
+    labels = target.split(".")
+    return len(labels) >= 2 and all(
+        label and len(label) <= 63 and label[0].isalnum() and label[-1].isalnum() and all(char.isalnum() or char == "-" for char in label)
+        for label in labels
+    )
+
+
+def _validate_record_input(value: Mapping[str, Any], record: Mapping[str, Any]) -> None:
+    raw_types = value.get("recordTypes")
+    if isinstance(raw_types, str):
+        raw_types = [raw_types]
+    if isinstance(raw_types, list):
+        requested = {_text(item).upper() for item in raw_types if _text(item)}
+        if "CNAME" in requested and len(requested) > 1:
+            raise ValueError("CNAME cannot be combined with another record type")
+    provider = PROVIDERS.get(record.get("provider", ""))
+    if provider is None:
+        raise ValueError("unknown provider")
+    unsupported = [record_type for record_type in record.get("recordTypes", []) if not provider.supports_record_type(record_type)]
+    if unsupported:
+        raise ValueError(f"provider does not support record type: {unsupported[0]}")
+    values = record.get("recordValues", {})
+    if "CNAME" in record.get("recordTypes", []) and not _valid_cname(values.get("CNAME", ""), record.get("hostname", "")):
+        raise ValueError("CNAME target must be a different domain name")
+    if "TXT" in record.get("recordTypes", []) and not _text(values.get("TXT")):
+        raise ValueError("TXT value is required")
 
 
 def _safe_int(value: Any, default: int = 0) -> int:
@@ -208,7 +289,7 @@ def _normal_tracker(value: Any) -> Dict[str, Dict[str, Any]]:
         if not isinstance(item, dict):
             continue
         result[record_type] = {
-            "candidate": _ip_text(item.get("candidate"), 4 if record_type == "A" else 6),
+            "candidate": _ip_text(item.get("candidate"), 4 if record_type == "A" else 6) if record_type in {"A", "AAAA"} else "",
             "stableCount": min(2, _safe_int(item.get("stableCount"))),
             "retryAttempt": min(len(RETRY_DELAYS), _safe_int(item.get("retryAttempt"))),
             "nextRetryAt": _safe_int(item.get("nextRetryAt")),
@@ -273,6 +354,14 @@ def _normal_record(value: Any) -> Optional[Dict[str, Any]]:
     record_types = [item for item in (_text(item).upper() for item in record_types) if item in set(RECORD_TYPES)]
     if not record_types:
         record_types = ["A", "AAAA"]
+    if "CNAME" in record_types:
+        record_types = ["CNAME"]
+    record_values = _record_values(value.get("recordValues"))
+    published_values = _record_values(value.get("publishedValues"))
+    if "CNAME" in record_values:
+        record_values["CNAME"] = _domain_value(record_values["CNAME"])
+    if "CNAME" in published_values:
+        published_values["CNAME"] = _domain_value(published_values["CNAME"])
     record_id = _text(value.get("id")) or uuid.uuid4().hex
     enabled = _bool(value.get("enabled", True))
     status = _text(value.get("status"))
@@ -293,6 +382,8 @@ def _normal_record(value: Any) -> Optional[Dict[str, Any]]:
         "ipv6State": _text(value.get("ipv6State")) if _text(value.get("ipv6State")) in IPV6_STATES else "unavailable",
         "publishedIpv4": _ip_text(value.get("publishedIpv4"), 4) or None,
         "publishedIpv6": _ip_text(value.get("publishedIpv6"), 6) or None,
+        "recordValues": {key: item for key, item in record_values.items() if key in record_types},
+        "publishedValues": {key: item for key, item in published_values.items() if key in record_types},
         "source": _text(value.get("source")),
         "status": status,
         "lastDetectedAt": _safe_int(value.get("lastDetectedAt")),
@@ -494,7 +585,11 @@ class LabDdnsStore:
                         ("AAAA", "ipv6State", "detectedIpv6", "publishedIpv6"),
                     )
                 )
-                has_published = any(record.get(key) for key in ("publishedIpv4", "publishedIpv6"))
+                has_published = any(record.get(key) for key in ("publishedIpv4", "publishedIpv6")) or bool(record.get("publishedValues"))
+                has_direct_values = any(
+                    record_type in record.get("recordTypes", RECORD_TYPES) and _text(record.get("recordValues", {}).get(record_type))
+                    for record_type in ("CNAME", "TXT")
+                )
                 if not record.get("enabled", True):
                     new_status, new_error = "disabled", record.get("lastError")
                 elif record.get("status") in {"error", "updating"}:
@@ -503,6 +598,8 @@ class LabDdnsStore:
                     new_status, new_error = "detected", None
                 elif has_published:
                     new_status, new_error = "published", None
+                elif has_direct_values:
+                    new_status, new_error = "detected", None
                 else:
                     new_status, new_error = "waiting", None
                 if record.get("status") != new_status or record.get("lastError") != new_error:
@@ -516,19 +613,25 @@ class LabDdnsStore:
         record = _normal_record(dict(value))
         if record is None or not record["hostname"]:
             raise ValueError("provider and hostname are required")
+        _validate_record_input(value, record)
         with self.lock:
             if record_id:
                 for index, old in enumerate(self.root["records"]):
                     if old["id"] == record_id:
                         record["id"] = record_id
-                        for key in ("detectedIpv4", "detectedIpv6", "ipv4State", "ipv6State", "publishedIpv4", "publishedIpv6", "source", "status", "lastDetectedAt", "lastUpdatedAt", "lastError", "stability", "lastRecordResults"):
+                        types_changed = old.get("recordTypes") != record.get("recordTypes")
+                        values_changed = old.get("recordValues", {}) != record.get("recordValues", {})
+                        for key in ("detectedIpv4", "detectedIpv6", "ipv4State", "ipv6State", "publishedIpv4", "publishedIpv6", "publishedValues", "source", "status", "lastDetectedAt", "lastUpdatedAt", "lastError", "stability", "lastRecordResults"):
                             record[key] = old.get(key, record[key])
+                        if "recordValues" not in value:
+                            record["recordValues"] = {key: item for key, item in old.get("recordValues", {}).items() if key in record["recordTypes"]}
+                        record["publishedValues"] = {key: item for key, item in old.get("publishedValues", {}).items() if key in record["recordTypes"]}
                         record["ttl"] = record["ttl"] if "ttl" in value else old.get("ttl", record["ttl"])
                         record["enabled"] = _bool(value.get("enabled", old.get("enabled", True)))
                         if not record["enabled"]:
                             record["status"] = "disabled"
-                        elif old.get("status") == "disabled":
-                            record["status"] = "detected" if record["detectedIpv4"] or record["detectedIpv6"] else "waiting"
+                        elif types_changed or values_changed or old.get("status") == "disabled":
+                            record["status"] = "detected" if record["detectedIpv4"] or record["detectedIpv6"] or record["recordValues"] else "waiting"
                         self.root["records"][index] = record
                         self._save_locked()
                         return dict(record)
@@ -543,7 +646,7 @@ class LabDdnsStore:
             if not record["enabled"]:
                 record["status"] = "disabled"
             else:
-                record["status"] = "detected" if record["detectedIpv4"] or record["detectedIpv6"] else "waiting"
+                record["status"] = "detected" if record["detectedIpv4"] or record["detectedIpv6"] or record["recordValues"] else "waiting"
             self.root["records"].append(record)
             self._save_locked()
             return dict(record)
@@ -588,15 +691,37 @@ class LabDdnsStore:
                         work.append((record_type, detected, tracker))
                 else:
                     results[record_type] = {"success": True, "status": "noop", "provider": provider.provider_id, "recordType": record_type, "recordId": "", "changed": False, "errorCode": "", "errorMessage": ""}
+            for record_type in ("CNAME", "TXT"):
+                if record_type not in record.get("recordTypes", RECORD_TYPES):
+                    continue
+                raw_value = record.get("recordValues", {}).get(record_type)
+                raw_published = record.get("publishedValues", {}).get(record_type)
+                value = "" if raw_value is None else str(raw_value)
+                published = "" if raw_published is None else str(raw_published)
+                tracker = record["stability"][record_type]
+                if not provider.supports_record_type(record_type):
+                    results[record_type] = {"success": False, "status": "error", "provider": provider.provider_id, "recordType": record_type, "recordId": "", "changed": False, "errorCode": "unsupported_record_type", "errorMessage": "provider does not support this record type"}
+                elif not value:
+                    results[record_type] = {"success": False, "status": "error", "provider": provider.provider_id, "recordType": record_type, "recordId": "", "changed": False, "errorCode": "value_required", "errorMessage": "record value is required"}
+                elif value == published:
+                    results[record_type] = {"success": True, "status": "noop", "provider": provider.provider_id, "recordType": record_type, "recordId": "", "changed": False, "errorCode": "", "errorMessage": ""}
+                elif tracker.get("authError") and not force:
+                    results[record_type] = {"success": False, "status": "credential_error", "provider": provider.provider_id, "recordType": record_type, "recordId": "", "changed": False, "errorCode": "credential_error", "errorMessage": "credentials require correction"}
+                elif _safe_int(tracker.get("nextRetryAt")) > now and not force:
+                    results[record_type] = {"success": False, "status": "retry_backoff", "provider": provider.provider_id, "recordType": record_type, "recordId": "", "changed": False, "errorCode": "retry_backoff", "errorMessage": "retry is deferred"}
+                else:
+                    work.append((record_type, value, tracker))
             if not work:
                 record["lastRecordResults"] = results
                 if any(item.get("status") in {"waiting_for_stability", "retry_backoff", "credential_error"} for item in results.values()):
                     record["status"] = "detected" if record.get("status") != "error" else "error"
-                elif any(record.get(key) for key in ("publishedIpv4", "publishedIpv6")):
+                elif any(item.get("status") == "error" for item in results.values()):
+                    record["status"] = "error"
+                elif any(record.get(key) for key in ("publishedIpv4", "publishedIpv6")) or record.get("publishedValues"):
                     record["status"] = "published"
                     record["lastError"] = None
                 self._save_locked()
-                return {"ok": True, "status": record["status"], "results": results}
+                return {"ok": not any(item.get("status") == "error" for item in results.values()), "status": record["status"], "results": results}
             record["status"] = "updating"
             self._save_locked()
         for record_type, detected, _tracker in work:
@@ -618,15 +743,22 @@ class LabDdnsStore:
             current = next(item for item in self.root["records"] if item["id"] == record_id)
             now = _now()
             any_error = False
+            pending = False
             for record_type, result in results.items():
                 if result.get("success"):
-                    detected_key = "detectedIpv4" if record_type == "A" else "detectedIpv6"
-                    published_key = "publishedIpv4" if record_type == "A" else "publishedIpv6"
-                    current[published_key] = current.get(detected_key) or None
+                    if record_type in {"A", "AAAA"}:
+                        detected_key = "detectedIpv4" if record_type == "A" else "detectedIpv6"
+                        published_key = "publishedIpv4" if record_type == "A" else "publishedIpv6"
+                        current[published_key] = current.get(detected_key) or None
+                    else:
+                        current.setdefault("publishedValues", {})[record_type] = current.get("recordValues", {}).get(record_type, "")
                     current["lastUpdatedAt"] = now
                     tracker = current["stability"][record_type]
                     tracker.update({"candidate": "", "stableCount": 0, "retryAttempt": 0, "nextRetryAt": 0, "authError": False})
                 else:
+                    if result.get("status") in {"waiting_for_stability", "retry_backoff"}:
+                        pending = True
+                        continue
                     any_error = True
                     tracker = current["stability"][record_type]
                     code = _text(result.get("errorCode"))
@@ -637,8 +769,8 @@ class LabDdnsStore:
                     tracker["nextRetryAt"] = 0 if auth_error else now + RETRY_DELAYS[min(attempt - 1, len(RETRY_DELAYS) - 1)]
                     current["lastError"] = _redact_error(result.get("errorMessage"), credentials) or code or "provider update failed"
             current["lastRecordResults"] = results
-            current["status"] = "error" if any_error else "published"
-            if not any_error:
+            current["status"] = "error" if any_error else "detected" if pending else "published"
+            if not any_error and not pending:
                 current["lastError"] = None
             self._save_locked()
             return {"ok": not any_error, "status": current["status"], "results": results}
@@ -661,6 +793,14 @@ def install_lab_ddns(hub: Any) -> LabDdnsStore:
     store = LabDdnsStore(Path(hub.DATA_DIR) / "lab_ddns.json", hub.LOGGER, secrets)
     hub.LAB_DDNS = store
     blueprint = Blueprint("lab_ddns", __name__, url_prefix="/api/ddns")
+
+    def sync_direct_values(record: Dict[str, Any]) -> Dict[str, Any]:
+        """Saving a CNAME/TXT record may publish it without an IP sample."""
+        if not any(record_type in record.get("recordTypes", []) for record_type in ("CNAME", "TXT")):
+            return record
+        store.run_update(record["id"])
+        current = next((item for item in store.snapshot().get("records", []) if item.get("id") == record["id"]), None)
+        return current or record
 
     @blueprint.get("")
     def get_ddns():
@@ -688,6 +828,7 @@ def install_lab_ddns(hub: Any) -> LabDdnsStore:
             return jsonify({"ok": False, "error": "invalid_record", "message": str(exc)}), 400
         if isinstance(credentials, dict):
             store.save_credentials(record["id"], credentials)
+        record = sync_direct_values(record)
         record["credentialsConfigured"] = store.secrets.configured(record["id"])
         return jsonify({"ok": True, "record": record})
 
@@ -707,6 +848,7 @@ def install_lab_ddns(hub: Any) -> LabDdnsStore:
             return jsonify({"ok": False, "error": "invalid_record", "message": str(exc)}), 400
         if isinstance(credentials, dict):
             store.save_credentials(record_id, credentials)
+        record = sync_direct_values(record)
         record["credentialsConfigured"] = store.secrets.configured(record_id)
         return jsonify({"ok": True, "record": record})
 

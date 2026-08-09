@@ -152,7 +152,7 @@ class AliDnsProvider(_HttpProvider):
     ENDPOINT = "https://alidns.aliyuncs.com/"
 
     def __init__(self, session: Optional[requests.Session] = None):
-        super().__init__(ProviderSpec("alidns", ("AccessKeyId", "AccessKeySecret", "zone")), session)
+        super().__init__(ProviderSpec("alidns", ("AccessKeyId", "AccessKeySecret", "zone"), supports_cname=True, supports_txt=True), session)
 
     def validate_credentials(self, credentials: Mapping[str, str]) -> ProviderResult:
         error = _required(credentials, ("AccessKeyId", "AccessKeySecret"), self.provider_id, "")
@@ -193,6 +193,8 @@ class AliDnsProvider(_HttpProvider):
         return payload, None
 
     def sync_record(self, hostname: str, record_type: str, value: str, ttl: int, credentials: Mapping[str, str]) -> ProviderResult:
+        if not self.supports_record_type(record_type):
+            return self.unsupported_result(record_type)
         error = _required(credentials, ("AccessKeyId", "AccessKeySecret"), self.provider_id, record_type)
         if error:
             return error
@@ -223,7 +225,7 @@ class DnsPodProvider(_HttpProvider):
     ENDPOINT = "https://dnspod.tencentcloudapi.com"
 
     def __init__(self, session: Optional[requests.Session] = None):
-        super().__init__(ProviderSpec("dnspod", ("SecretId", "SecretKey", "zone")), session)
+        super().__init__(ProviderSpec("dnspod", ("SecretId", "SecretKey", "zone"), supports_cname=True, supports_txt=True), session)
 
     def validate_credentials(self, credentials: Mapping[str, str]) -> ProviderResult:
         error = _required(credentials, ("SecretId", "SecretKey"), self.provider_id, "")
@@ -269,6 +271,8 @@ class DnsPodProvider(_HttpProvider):
         return response, None
 
     def sync_record(self, hostname: str, record_type: str, value: str, ttl: int, credentials: Mapping[str, str]) -> ProviderResult:
+        if not self.supports_record_type(record_type):
+            return self.unsupported_result(record_type)
         error = _required(credentials, ("SecretId", "SecretKey"), self.provider_id, record_type)
         if error:
             return error
@@ -300,7 +304,7 @@ class CloudflareProvider(_HttpProvider):
     BASE = "https://api.cloudflare.com/client/v4"
 
     def __init__(self, session: Optional[requests.Session] = None):
-        super().__init__(ProviderSpec("cloudflare", ("apiToken", "zoneId")), session)
+        super().__init__(ProviderSpec("cloudflare", ("apiToken", "zoneId"), supports_cname=True, supports_txt=True), session)
 
     def validate_credentials(self, credentials: Mapping[str, str]) -> ProviderResult:
         if not str(credentials.get("apiToken") or credentials.get("token") or "").strip() or not str(credentials.get("zoneId") or "").strip():
@@ -321,6 +325,8 @@ class CloudflareProvider(_HttpProvider):
         return payload, None
 
     def sync_record(self, hostname: str, record_type: str, value: str, ttl: int, credentials: Mapping[str, str]) -> ProviderResult:
+        if not self.supports_record_type(record_type):
+            return self.unsupported_result(record_type)
         if not str(credentials.get("apiToken") or credentials.get("token") or "").strip() or not str(credentials.get("zoneId") or "").strip():
             return _failure(self.provider_id, record_type, "credential_error", "provider credentials are not configured")
         zone_id = str(credentials.get("zoneId"))
@@ -330,7 +336,10 @@ class CloudflareProvider(_HttpProvider):
         records = (payload or {}).get("result") or []
         found = next((item for item in records if str(item.get("name", "")).rstrip(".").lower() == hostname.rstrip(".").lower() and str(item.get("type", "")).upper() == record_type), None)
         if found is None:
-            created, error = self._api("POST", f"/zones/{quote(zone_id, safe='')}/dns_records", record_type, credentials, json={"type": record_type, "name": hostname.rstrip("."), "content": value, "ttl": ttl, "proxied": False})
+            body = {"type": record_type, "name": hostname.rstrip("."), "content": value, "ttl": ttl}
+            if record_type in {"A", "AAAA", "CNAME"}:
+                body["proxied"] = False
+            created, error = self._api("POST", f"/zones/{quote(zone_id, safe='')}/dns_records", record_type, credentials, json=body)
             if error:
                 return error
             return _success(self.provider_id, record_type, True, str(((created or {}).get("result") or {}).get("id", "")))
@@ -358,6 +367,8 @@ class Dynv6Provider(_HttpProvider):
         return ProviderResult(True, "valid", provider=self.provider_id) if str(credentials.get("token") or "").strip() else _failure(self.provider_id, "", "credential_error", "provider credentials are not configured")
 
     def sync_record(self, hostname: str, record_type: str, value: str, ttl: int, credentials: Mapping[str, str]) -> ProviderResult:
+        if not self.supports_record_type(record_type):
+            return self.unsupported_result(record_type)
         token = str(credentials.get("token") or "").strip()
         if not token:
             return _failure(self.provider_id, record_type, "credential_error", "provider credentials are not configured")
@@ -374,7 +385,7 @@ class DuckDnsProvider(_HttpProvider):
     ENDPOINT = "https://www.duckdns.org/update"
 
     def __init__(self, session: Optional[requests.Session] = None):
-        super().__init__(ProviderSpec("duckdns", ("token",)), session)
+        super().__init__(ProviderSpec("duckdns", ("token",), supports_txt=True), session)
 
     def validate_credentials(self, credentials: Mapping[str, str]) -> ProviderResult:
         return ProviderResult(True, "valid", provider=self.provider_id) if str(credentials.get("token") or "").strip() else _failure(self.provider_id, "", "credential_error", "provider credentials are not configured")
@@ -386,10 +397,18 @@ class DuckDnsProvider(_HttpProvider):
         return value[:-len(suffix)] if value.lower().endswith(suffix) else value
 
     def sync_record(self, hostname: str, record_type: str, value: str, ttl: int, credentials: Mapping[str, str]) -> ProviderResult:
+        if not self.supports_record_type(record_type):
+            return self.unsupported_result(record_type)
         token = str(credentials.get("token") or "").strip()
         if not token:
             return _failure(self.provider_id, record_type, "credential_error", "provider credentials are not configured")
-        params = {"domains": self._domain(hostname), "token": token, "ipv6" if record_type == "AAAA" else "ip": value}
+        params = {"domains": self._domain(hostname), "token": token}
+        if record_type == "TXT":
+            params["txt"] = value
+        elif record_type == "AAAA":
+            params["ipv6"] = value
+        else:
+            params["ip"] = value
         body, error = self._request_text("GET", self.ENDPOINT, record_type, params=params)
         if error:
             return error
@@ -408,6 +427,8 @@ class DeSecProvider(_HttpProvider):
         return ProviderResult(True, "valid", provider=self.provider_id) if str(credentials.get("token") or "").strip() else _failure(self.provider_id, "", "credential_error", "provider credentials are not configured")
 
     def sync_record(self, hostname: str, record_type: str, value: str, ttl: int, credentials: Mapping[str, str]) -> ProviderResult:
+        if not self.supports_record_type(record_type):
+            return self.unsupported_result(record_type)
         token = str(credentials.get("token") or "").strip()
         if not token:
             return _failure(self.provider_id, record_type, "credential_error", "provider credentials are not configured")
@@ -431,6 +452,8 @@ class DynuProvider(_HttpProvider):
         return missing or ProviderResult(True, "valid", provider=self.provider_id)
 
     def sync_record(self, hostname: str, record_type: str, value: str, ttl: int, credentials: Mapping[str, str]) -> ProviderResult:
+        if not self.supports_record_type(record_type):
+            return self.unsupported_result(record_type)
         missing = _required(credentials, ("username", "password"), self.provider_id, record_type)
         if missing:
             return missing
@@ -460,6 +483,8 @@ class IPv64Provider(_HttpProvider):
         return ProviderResult(True, "valid", provider=self.provider_id) if str(credentials.get("token") or "").strip() else _failure(self.provider_id, "", "credential_error", "provider credentials are not configured")
 
     def sync_record(self, hostname: str, record_type: str, value: str, ttl: int, credentials: Mapping[str, str]) -> ProviderResult:
+        if not self.supports_record_type(record_type):
+            return self.unsupported_result(record_type)
         token = str(credentials.get("token") or "").strip()
         if not token:
             return _failure(self.provider_id, record_type, "credential_error", "provider credentials are not configured")
