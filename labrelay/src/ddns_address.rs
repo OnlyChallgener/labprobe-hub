@@ -502,7 +502,7 @@ mod tests {
     ) -> Candidate6 {
         Candidate6 {
             ip: ip.parse().unwrap(),
-            interface,
+            interface: interface.into(),
             temporary,
             deprecated,
             tentative,
