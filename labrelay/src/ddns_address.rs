@@ -259,7 +259,10 @@ fn parse_ipv6(text: &str) -> Vec<Candidate6> {
     let mut last_candidate: Option<usize> = None;
     for line in text.lines() {
         let trimmed = line.trim_start();
-        if !line.starts_with(' ') && !line.starts_with('\t') {
+        let is_interface_line = line
+            .split_once(':')
+            .is_some_and(|(index, _)| index.trim().parse::<u32>().is_ok());
+        if is_interface_line {
             last_candidate = None;
             interface = line
                 .split(':')
