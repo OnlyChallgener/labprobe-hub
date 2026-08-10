@@ -40,10 +40,10 @@ jobs:
       - name: Run Hub tests
         run: python -m pytest -q
 
-      - name: Verify Hub 0.9.35 corrections
+      - name: Verify Hub 0.10.0 corrections
         run: |
           set -e
-          grep -q 'HUB_VERSION = "0.9.35"' hub_entry.py
+          grep -q 'HUB_VERSION = "0.10.0"' hub_entry.py
           grep -q 'install_hub0934_fixes(hub)' hub_entry.py
           grep -q 'install_router_ws_passive_fix()' hub_entry.py
           grep -q 'install_hub0935_device_sync_fix(hub)' hub_entry.py
@@ -69,6 +69,6 @@ jobs:
 
       - name: Build Hub Docker image
         run: |
-          docker build --pull=false -t labprobe-hub:0.9.35 .
-          docker run --rm --entrypoint python labprobe-hub:0.9.35 -c \
-            'import hub_entry, hub0934_fixes, hub0935_sync_fix, labrelay_sync_patch; print("Hub 0.9.35 imports OK")'
+          docker build --pull=false -t labprobe-hub:0.10.0 .
+          docker run --rm --entrypoint python labprobe-hub:0.10.0 -c \
+            'import hub_entry, hub0934_fixes, hub0935_sync_fix, labrelay_sync_patch; print("Hub 0.10.0 imports OK")'
