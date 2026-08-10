@@ -27,6 +27,7 @@ def _dashboard_ack_hub(*, hook_token=True, ddns_store=None):
     return SimpleNamespace(
         check_hook_token=lambda: hook_token,
         ROUTER_DASHBOARD_LOCK=threading.RLock(),
+        ROUTER_DASHBOARD_CACHE={},
         ROUTER_DASHBOARD_REFRESH_NONCE=17,
         ROUTER_CREDENTIALS_LOCK=threading.RLock(),
         ROUTER_CREDENTIALS_REFRESH_NONCE=1784730000123,
@@ -59,6 +60,19 @@ def test_relay_dashboard_ack_forwards_ddns_address_without_restoring_telemetry()
     assert payload["refreshNonce"] == 17
     assert payload["credentialsRefreshNonce"] == 1784730000123
     assert payload["time"] == "2026-07-23 10:00:00"
+
+
+def test_relay_dashboard_ack_marks_the_requested_dashboard_refresh_complete():
+    app = Flask(__name__)
+    hub = _dashboard_ack_hub()
+    with app.test_request_context(
+        "/api/router/dashboard/push", method="POST", json={"refreshNonce": 18}
+    ):
+        response = _relay_dashboard_ack(SimpleNamespace(hub=hub))
+
+    assert response.status_code == 200
+    assert hub.ROUTER_DASHBOARD_CACHE["refreshCompletedNonce"] == 18
+    assert hub.ROUTER_DASHBOARD_CACHE["refreshCompletedAt"] == "2026-07-23 10:00:00"
 
 
 def test_relay_dashboard_ack_keeps_ordinary_telemetry_ignored():

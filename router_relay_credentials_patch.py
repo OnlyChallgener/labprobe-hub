@@ -205,6 +205,10 @@ def _relay_dashboard_ack(self: Any):
             ddns_store.accept_address(payload.get("ddnsAddress"))
 
     with self.hub.ROUTER_DASHBOARD_LOCK:
+        completed = _safe_int(payload.get("refreshNonce"), 0) if isinstance(payload, dict) else 0
+        if completed > _safe_int(self.hub.ROUTER_DASHBOARD_CACHE.get("refreshCompletedNonce"), 0):
+            self.hub.ROUTER_DASHBOARD_CACHE["refreshCompletedNonce"] = completed
+            self.hub.ROUTER_DASHBOARD_CACHE["refreshCompletedAt"] = self.hub.now_str()
         dashboard_nonce = self.hub.ROUTER_DASHBOARD_REFRESH_NONCE
     with self.hub.ROUTER_CREDENTIALS_LOCK:
         credentials_nonce = self.hub.ROUTER_CREDENTIALS_REFRESH_NONCE

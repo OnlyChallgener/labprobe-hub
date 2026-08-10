@@ -194,6 +194,29 @@ class LabDdnsPhase1BTests(unittest.TestCase):
         finally:
             lab_ddns.PROVIDERS["cloudflare"] = old
 
+    def test_stale_detected_address_is_never_sent_to_provider(self):
+        store = self.new_store()
+        record = store.save_record({"provider": "cloudflare", "hostname": "home.example.com", "recordTypes": ["AAAA"]})
+        store.save_credentials(record["id"], {"apiToken": "secret-token", "zoneId": "zone-1"})
+        provider = FakeProvider([])
+        old = lab_ddns.PROVIDERS["cloudflare"]
+        lab_ddns.PROVIDERS["cloudflare"] = provider
+        try:
+            stale_at = 1_786_325_000
+            address = {"detectedIpv6": "2409:db8::7", "ipv6State": "public", "detectedAt": stale_at}
+            store.accept_address(address)
+            store.accept_address({**address, "detectedAt": stale_at + 1})
+            with patch("lab_ddns._now", return_value=stale_at + lab_ddns.ADDRESS_STALE_SECONDS + 2):
+                result = store.run_update(record["id"])
+            saved = store.snapshot()["records"][0]
+            self.assertFalse(result["ok"])
+            self.assertEqual(result["results"]["AAAA"]["status"], "stale_address")
+            self.assertEqual(saved["status"], "detected")
+            self.assertIsNone(saved["publishedIpv6"])
+            self.assertEqual(len(provider.calls), 0)
+        finally:
+            lab_ddns.PROVIDERS["cloudflare"] = old
+
     def test_restart_restores_stability_and_secrets_stay_private(self):
         store = self.new_store()
         record = store.save_record({"provider": "cloudflare", "hostname": "home.example.com", "recordTypes": ["AAAA"]})

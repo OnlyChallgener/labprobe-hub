@@ -13,7 +13,7 @@ use std::net::{IpAddr, Ipv4Addr, Ipv6Addr};
 use std::path::Path;
 use std::process::Command;
 use std::time::{SystemTime, UNIX_EPOCH};
-use tokio::time::{timeout, Duration};
+use tokio::time::Duration;
 
 const IPV4_EGRESS_ENDPOINTS: [(&str, &str); 2] = [
     ("api.ipify.org", "https://api.ipify.org"),
@@ -133,69 +133,68 @@ pub async fn detect() -> DdnsAddressSnapshot {
 }
 
 async fn detect_external_ipv4() -> Option<(Ipv4Addr, String)> {
-    timeout(Duration::from_secs(6), async {
-        let client = Client::builder()
-            .local_address(Some(IpAddr::V4(Ipv4Addr::UNSPECIFIED)))
-            .connect_timeout(Duration::from_secs(2))
-            .timeout(Duration::from_secs(3))
-            .user_agent(concat!("labrelay/", env!("CARGO_PKG_VERSION")))
-            .build()
-            .ok()?;
-        for (name, url) in IPV4_EGRESS_ENDPOINTS {
-            let Ok(response) = client.get(url).send().await else {
-                continue;
-            };
-            if !response.status().is_success() {
-                continue;
-            }
-            let Ok(body) = response.text().await else {
-                continue;
-            };
-            let Ok(ip) = body.trim().parse::<Ipv4Addr>() else {
-                continue;
-            };
-            if ipv4_public(ip) {
-                return Some((ip, format!("egress-http:{name}")));
-            }
-        }
-        None
-    })
-    .await
-    .ok()
-    .flatten()
+    let client = Client::builder()
+        .local_address(Some(IpAddr::V4(Ipv4Addr::UNSPECIFIED)))
+        .connect_timeout(Duration::from_secs(1))
+        .timeout(Duration::from_secs(2))
+        .user_agent(concat!("labrelay/", env!("CARGO_PKG_VERSION")))
+        .build()
+        .ok()?;
+    // Probe both independent public services concurrently. The dashboard keeps
+    // its two-second cadence, so address discovery must not serially consume
+    // six seconds before local fallback can run.
+    let (primary, fallback) = tokio::join!(
+        query_external_ipv4(client.clone(), IPV4_EGRESS_ENDPOINTS[0]),
+        query_external_ipv4(client, IPV4_EGRESS_ENDPOINTS[1]),
+    );
+    primary.or(fallback)
 }
 
 async fn detect_external_ipv6() -> Option<(Ipv6Addr, String)> {
-    timeout(Duration::from_secs(6), async {
-        let client = Client::builder()
-            .local_address(Some(IpAddr::V6(Ipv6Addr::UNSPECIFIED)))
-            .connect_timeout(Duration::from_secs(2))
-            .timeout(Duration::from_secs(3))
-            .user_agent(concat!("labrelay/", env!("CARGO_PKG_VERSION")))
-            .build()
-            .ok()?;
-        for (name, url) in IPV6_EGRESS_ENDPOINTS {
-            let Ok(response) = client.get(url).send().await else {
-                continue;
-            };
-            if !response.status().is_success() {
-                continue;
-            }
-            let Ok(body) = response.text().await else {
-                continue;
-            };
-            let Ok(ip) = body.trim().parse::<Ipv6Addr>() else {
-                continue;
-            };
-            if ipv6_public(ip) {
-                return Some((ip, format!("egress-http:{name}")));
-            }
-        }
-        None
-    })
-    .await
-    .ok()
-    .flatten()
+    let client = Client::builder()
+        .local_address(Some(IpAddr::V6(Ipv6Addr::UNSPECIFIED)))
+        .connect_timeout(Duration::from_secs(1))
+        .timeout(Duration::from_secs(2))
+        .user_agent(concat!("labrelay/", env!("CARGO_PKG_VERSION")))
+        .build()
+        .ok()?;
+    let (primary, fallback) = tokio::join!(
+        query_external_ipv6(client.clone(), IPV6_EGRESS_ENDPOINTS[0]),
+        query_external_ipv6(client, IPV6_EGRESS_ENDPOINTS[1]),
+    );
+    primary.or(fallback)
+}
+
+async fn query_external_ipv4(client: Client, endpoint: (&str, &str)) -> Option<(Ipv4Addr, String)> {
+    let (name, url) = endpoint;
+    let response = client.get(url).send().await.ok()?;
+    if !response.status().is_success() {
+        return None;
+    }
+    let ip = response
+        .text()
+        .await
+        .ok()?
+        .trim()
+        .parse::<Ipv4Addr>()
+        .ok()?;
+    ipv4_public(ip).then(|| (ip, format!("egress-http:{name}")))
+}
+
+async fn query_external_ipv6(client: Client, endpoint: (&str, &str)) -> Option<(Ipv6Addr, String)> {
+    let (name, url) = endpoint;
+    let response = client.get(url).send().await.ok()?;
+    if !response.status().is_success() {
+        return None;
+    }
+    let ip = response
+        .text()
+        .await
+        .ok()?
+        .trim()
+        .parse::<Ipv6Addr>()
+        .ok()?;
+    ipv6_public(ip).then(|| (ip, format!("egress-http:{name}")))
 }
 
 fn command_text(program: &str, args: &[&str]) -> Result<String> {

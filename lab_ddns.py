@@ -36,6 +36,7 @@ IPV4_STATES = {"public", "cgnat", "unavailable", "ambiguous"}
 IPV6_STATES = {"public", "unavailable", "ambiguous"}
 RECORD_TYPES = ("A", "AAAA", "CNAME", "TXT")
 RETRY_DELAYS = (30, 120, 600, 1800)
+ADDRESS_STALE_SECONDS = 180
 
 
 @dataclass(frozen=True)
@@ -167,6 +168,17 @@ def provider_specs() -> List[Dict[str, Any]]:
 
 def _now() -> int:
     return int(time.time())
+
+
+def _address_is_fresh(record: Mapping[str, Any], now: Optional[int] = None) -> bool:
+    detected_at = _safe_int(record.get("lastDetectedAt"))
+    current = _now() if now is None else int(now)
+    # Relay reports Unix seconds. Older synthetic values are retained for
+    # backwards-compatible test/import fixtures; a real relay sample is always
+    # a modern Unix timestamp and must be recent before it can be published.
+    if 0 < detected_at < 1_000_000_000:
+        return True
+    return detected_at > 0 and detected_at <= current + 30 and current - detected_at <= ADDRESS_STALE_SECONDS
 
 
 def _text(value: Any) -> str:
@@ -681,7 +693,9 @@ class LabDdnsStore:
                 published = record.get(published_key) or ""
                 tracker = record["stability"][record_type]
                 if record.get(state_key) == "public" and detected and detected != published:
-                    if _safe_int(tracker.get("stableCount")) < 2:
+                    if not _address_is_fresh(record, now):
+                        results[record_type] = {"success": False, "status": "stale_address", "provider": provider.provider_id, "recordType": record_type, "recordId": "", "changed": False, "errorCode": "stale_address", "errorMessage": "检测地址已过期，请先刷新检测地址"}
+                    elif _safe_int(tracker.get("stableCount")) < 2:
                         results[record_type] = {"success": False, "status": "waiting_for_stability", "provider": provider.provider_id, "recordType": record_type, "recordId": "", "changed": False, "errorCode": "", "errorMessage": ""}
                     elif tracker.get("authError") and not force:
                         results[record_type] = {"success": False, "status": "credential_error", "provider": provider.provider_id, "recordType": record_type, "recordId": "", "changed": False, "errorCode": "credential_error", "errorMessage": "credentials require correction"}
@@ -713,15 +727,18 @@ class LabDdnsStore:
                     work.append((record_type, value, tracker))
             if not work:
                 record["lastRecordResults"] = results
-                if any(item.get("status") in {"waiting_for_stability", "retry_backoff", "credential_error"} for item in results.values()):
+                if any(item.get("status") in {"waiting_for_stability", "retry_backoff", "credential_error", "stale_address"} for item in results.values()):
                     record["status"] = "detected" if record.get("status") != "error" else "error"
+                    stale_error = next((item.get("errorMessage") for item in results.values() if item.get("status") == "stale_address"), "")
+                    if stale_error:
+                        record["lastError"] = stale_error
                 elif any(item.get("status") == "error" for item in results.values()):
                     record["status"] = "error"
                 elif any(record.get(key) for key in ("publishedIpv4", "publishedIpv6")) or record.get("publishedValues"):
                     record["status"] = "published"
                     record["lastError"] = None
                 self._save_locked()
-                return {"ok": not any(item.get("status") == "error" for item in results.values()), "status": record["status"], "results": results}
+                return {"ok": not any(item.get("status") in {"error", "stale_address"} for item in results.values()), "status": record["status"], "results": results}
             record["status"] = "updating"
             self._save_locked()
         for record_type, detected, _tracker in work:
@@ -744,6 +761,7 @@ class LabDdnsStore:
             now = _now()
             any_error = False
             pending = False
+            stale_pending = False
             for record_type, result in results.items():
                 if result.get("success"):
                     if record_type in {"A", "AAAA"}:
@@ -756,8 +774,11 @@ class LabDdnsStore:
                     tracker = current["stability"][record_type]
                     tracker.update({"candidate": "", "stableCount": 0, "retryAttempt": 0, "nextRetryAt": 0, "authError": False})
                 else:
-                    if result.get("status") in {"waiting_for_stability", "retry_backoff"}:
+                    if result.get("status") in {"waiting_for_stability", "retry_backoff", "stale_address"}:
                         pending = True
+                        if result.get("status") == "stale_address":
+                            stale_pending = True
+                            current["lastError"] = _text(result.get("errorMessage"))
                         continue
                     any_error = True
                     tracker = current["stability"][record_type]
@@ -773,7 +794,7 @@ class LabDdnsStore:
             if not any_error and not pending:
                 current["lastError"] = None
             self._save_locked()
-            return {"ok": not any_error, "status": current["status"], "results": results}
+            return {"ok": not any_error and not stale_pending, "status": current["status"], "results": results}
 
     def delete_record(self, record_id: str) -> bool:
         with self.lock:

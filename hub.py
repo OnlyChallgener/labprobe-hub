@@ -23,7 +23,7 @@ import paho.mqtt.client as mqtt
 from flask import Flask, request, jsonify, g
 from labprobe_storage import SQLiteStore
 
-APP_VERSION = "0.9.7"
+APP_VERSION = "0.10.1"
 PORT = int(os.environ.get("PORT", "58443"))
 BASE_DIR = Path(os.environ.get("LABPROBE_BASE_DIR", ".")).resolve()
 CONFIG_DIR = Path(os.environ.get("CONFIG_DIR", str(BASE_DIR / "config"))).resolve()
@@ -3529,15 +3529,47 @@ def _clean_portmap_rule(payload: Dict[str, Any], existing: Optional[Dict[str, An
     }
 
 
+def _load_portmap_rules_document() -> tuple[Dict[str, Any], bool]:
+    """Return the authoritative document and whether it was safely readable.
+
+    A malformed or missing document must never be interpreted as an intentional
+    empty desired set: status reconciliation would otherwise delete every rule
+    currently running on the router.
+    """
+    missing = object()
+    raw = load_json(PORTMAP_RULES_FILE, missing)
+    if raw is missing:
+        return {"version": 1, "revision": 0, "updatedAt": "", "rules": []}, False
+    if isinstance(raw, dict) and isinstance(raw.get("rules"), list):
+        document = dict(raw)
+        document["rules"] = [x for x in raw["rules"] if isinstance(x, dict) and clean_saved_value(x.get("id"))]
+        document["version"] = max(1, to_int(raw.get("version"), 1))
+        document["revision"] = max(1, to_int(raw.get("revision"), 1))
+        document["updatedAt"] = clean_saved_value(raw.get("updatedAt"))
+        return document, True
+    if isinstance(raw, list):
+        return {
+            "version": 1,
+            "revision": 1,
+            "updatedAt": "",
+            "rules": [x for x in raw if isinstance(x, dict) and clean_saved_value(x.get("id"))],
+        }, True
+    return {"version": 1, "revision": 0, "updatedAt": "", "rules": []}, False
+
+
 def _load_portmap_rules() -> List[Dict[str, Any]]:
-    raw = load_json(PORTMAP_RULES_FILE, {"rules": []})
-    rows = raw.get("rules", []) if isinstance(raw, dict) else raw if isinstance(raw, list) else []
-    return [x for x in rows if isinstance(x, dict) and clean_saved_value(x.get("id"))]
+    return _load_portmap_rules_document()[0]["rules"]
 
 
 def _save_portmap_rules(rows: List[Dict[str, Any]]) -> None:
     rows = sorted(rows[-100:], key=lambda x: (to_int(x.get("listenPort"), 0), clean_saved_value(x.get("name"))))
-    save_json(PORTMAP_RULES_FILE, {"version": 1, "updatedAt": now_str(), "rules": rows})
+    previous, _loaded = _load_portmap_rules_document()
+    save_json(PORTMAP_RULES_FILE, {
+        "version": 1,
+        "revision": max(0, to_int(previous.get("revision"), 0)) + 1,
+        "updatedAt": now_str(),
+        "rules": rows,
+    })
 
 
 def _portmap_check_conflict(rows: List[Dict[str, Any]], rule: Dict[str, Any]) -> None:
@@ -3583,6 +3615,27 @@ def _queue_portmap_command(action: str, payload: Dict[str, Any], router: Optiona
     commands.append(command)
     save_json(PORTMAP_COMMANDS_FILE, {"commands": commands})
     return command
+
+
+def _portmap_command_sync_states(router: str) -> Dict[str, str]:
+    """Expose the newest command result for each desired rule to the APP."""
+    data = load_json(PORTMAP_COMMANDS_FILE, {"commands": []})
+    commands = data.get("commands", []) if isinstance(data, dict) else []
+    states: Dict[str, str] = {}
+    for command in reversed(commands if isinstance(commands, list) else []):
+        if not isinstance(command, dict) or command.get("router") != router:
+            continue
+        rule_id = _portmap_command_rule_id(clean_saved_value(command.get("action")), command.get("payload") or {})
+        if not rule_id or rule_id in states:
+            continue
+        status = clean_saved_value(command.get("status"))
+        if status in {"pending", "delivered"}:
+            states[rule_id] = "syncing"
+        elif status == "failed":
+            states[rule_id] = "error"
+        elif status == "done":
+            states[rule_id] = "synced"
+    return states
 
 
 def _portmap_runtime_map(router_status: Dict[str, Any]) -> Dict[str, Dict[str, Any]]:
@@ -3638,17 +3691,24 @@ def api_portmaps():
     if request.method == "GET":
         if not check_read_token():
             return jsonify({"ok": False, "error": "unauthorized"}), 401
-        rules = _load_portmap_rules()
+        document, rules_loaded = _load_portmap_rules_document()
+        rules = document["rules"]
         router_status = load_json(PORTMAP_ROUTER_STATUS_FILE, {})
         runtime = _portmap_runtime_map(router_status)
-        rows = [{**r, "runtime": runtime.get(r.get("id"), {})} for r in rules]
+        router = router_status.get("router", _portmap_router_name()) if isinstance(router_status, dict) else _portmap_router_name()
+        sync_states = _portmap_command_sync_states(router)
+        rows = [{**r, "runtime": runtime.get(r.get("id"), {}), "syncState": sync_states.get(r.get("id"), "synced")} for r in rules]
         received_epoch = to_int(router_status.get("receivedEpoch"), 0) if isinstance(router_status, dict) else 0
         agent_online = bool(received_epoch and time.time() - received_epoch <= 35)
         return jsonify({
             "ok": True,
             "rules": rows,
+            "rulesLoaded": rules_loaded,
+            "rulesRevision": to_int(document.get("revision"), 0),
+            "rulesUpdatedAt": document.get("updatedAt", ""),
+            "revision": to_int(document.get("revision"), 0),
             "portRange": {"min": 20000, "max": 20020},
-            "router": router_status.get("router", _portmap_router_name()) if isinstance(router_status, dict) else _portmap_router_name(),
+            "router": router,
             "agentOnline": agent_online,
             "agentLastSeenAt": router_status.get("receivedAt", "") if isinstance(router_status, dict) else "",
         })
@@ -3806,7 +3866,8 @@ def api_router_portmap_status():
 
     # Reconcile Hub desired rules with router-local rules. This recovers from a
     # replaced binary/config or router reset without requiring APP to edit each rule.
-    desired = {clean_saved_value(x.get("id")): x for x in _load_portmap_rules() if clean_saved_value(x.get("id"))}
+    document, rules_loaded = _load_portmap_rules_document()
+    desired = {clean_saved_value(x.get("id")): x for x in document["rules"] if clean_saved_value(x.get("id"))}
     local_rows = payload.get("rules", []) if isinstance(payload.get("rules"), list) else []
     local = {}
     for row in local_rows:
@@ -3821,8 +3882,11 @@ def api_router_portmap_status():
         local_rule = local.get(rid)
         if not local_rule or any(local_rule.get(k) != rule.get(k) for k in compare_keys):
             _queue_portmap_command("upsert", {"rule": rule}, router)
-    for rid in set(local) - set(desired):
-        _queue_portmap_command("delete", {"id": rid}, router)
+    if rules_loaded:
+        for rid in set(local) - set(desired):
+            _queue_portmap_command("delete", {"id": rid}, router)
+    else:
+        LOGGER.warning("Port-map rules document unavailable; skip destructive router reconciliation")
 
     return jsonify({"ok": True, "receivedAt": record["receivedAt"]})
 
