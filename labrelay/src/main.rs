@@ -373,17 +373,22 @@ impl Manager {
     async fn stop_runtime(&self, id: &str, mark_stopped: bool) {
         let handle = self.runtimes.lock().await.remove(id);
         if let Some(handle) = handle {
-            let _ = handle.cancel.send(true);
-            match timeout(Duration::from_secs(3), handle.join).await {
+            let RuntimeHandle {
+                cancel,
+                mut join,
+                shared,
+            } = handle;
+            let _ = cancel.send(true);
+            match timeout(Duration::from_secs(3), &mut join).await {
                 Ok(_) => {}
-                Err(join) => {
+                Err(_) => {
                     // A listener that did not acknowledge cancellation must
                     // not keep the port occupied while a replacement binds.
                     join.abort();
                     let _ = join.await;
                 }
             }
-            let mut snap = handle.shared.snapshot().await;
+            let mut snap = shared.snapshot().await;
             if mark_stopped && snap.state != "expired" {
                 snap.state = "stopped".to_string();
             }
