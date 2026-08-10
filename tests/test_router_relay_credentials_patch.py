@@ -15,25 +15,86 @@ from router_relay_credentials_patch import (
 )
 
 
-def test_relay_dashboard_ack_contains_credential_refresh_nonce():
-    app = Flask(__name__)
-    hub = SimpleNamespace(
-        check_hook_token=lambda: True,
+class _DdnsStore:
+    def __init__(self):
+        self.accepted = []
+
+    def accept_address(self, address):
+        self.accepted.append(address)
+
+
+def _dashboard_ack_hub(*, hook_token=True, ddns_store=None):
+    return SimpleNamespace(
+        check_hook_token=lambda: hook_token,
         ROUTER_DASHBOARD_LOCK=threading.RLock(),
         ROUTER_DASHBOARD_REFRESH_NONCE=17,
         ROUTER_CREDENTIALS_LOCK=threading.RLock(),
         ROUTER_CREDENTIALS_REFRESH_NONCE=1784730000123,
         now_str=lambda: "2026-07-23 10:00:00",
+        LAB_DDNS=ddns_store,
     )
 
-    with app.app_context():
-        response = _relay_dashboard_ack(SimpleNamespace(hub=hub))
+
+def test_relay_dashboard_ack_forwards_ddns_address_without_restoring_telemetry():
+    app = Flask(__name__)
+    store = _DdnsStore()
+    address = {
+        "detectedIpv4": "36.157.252.33",
+        "detectedIpv6": "",
+        "ipv4State": "public",
+        "ipv6State": "unavailable",
+        "ipv4Source": "manual-test",
+        "ipv6Source": "",
+        "detectedAt": 1786325771,
+    }
+
+    with app.test_request_context("/api/router/dashboard/push", method="POST", json={"ddnsAddress": address}):
+        response = _relay_dashboard_ack(SimpleNamespace(hub=_dashboard_ack_hub(ddns_store=store)))
         payload = response.get_json()
 
+    assert store.accepted == [address]
     assert payload["ok"] is True
     assert payload["ignored"] is True
+    assert payload["source"] == "router_rpc"
     assert payload["refreshNonce"] == 17
     assert payload["credentialsRefreshNonce"] == 1784730000123
+    assert payload["time"] == "2026-07-23 10:00:00"
+
+
+def test_relay_dashboard_ack_keeps_ordinary_telemetry_ignored():
+    app = Flask(__name__)
+    store = _DdnsStore()
+
+    with app.test_request_context(
+        "/api/router/dashboard/push", method="POST", json={"telemetry": {"cpuPercent": 5}}
+    ):
+        response = _relay_dashboard_ack(SimpleNamespace(hub=_dashboard_ack_hub(ddns_store=store)))
+        payload = response.get_json()
+
+    assert response.status_code == 200
+    assert payload["ignored"] is True
+    assert payload["source"] == "router_rpc"
+    assert store.accepted == [None]
+
+
+def test_relay_dashboard_ack_without_ddns_address_returns_200():
+    app = Flask(__name__)
+
+    with app.test_request_context("/api/router/dashboard/push", method="POST", json={"router": "BE72"}):
+        response = _relay_dashboard_ack(SimpleNamespace(hub=_dashboard_ack_hub()))
+
+    assert response.status_code == 200
+
+
+def test_relay_dashboard_ack_rejects_wrong_hook_token():
+    app = Flask(__name__)
+
+    with app.test_request_context("/api/router/dashboard/push", method="POST", json={"ddnsAddress": {}}):
+        response = _relay_dashboard_ack(SimpleNamespace(hub=_dashboard_ack_hub(hook_token=False)))
+    payload, status = response
+
+    assert status == 401
+    assert payload.get_json()["error"] == "bad agent token"
 
 
 def test_extract_router_credentials_prefers_pppoe_wan_pair():

@@ -198,6 +198,12 @@ def _relay_dashboard_ack(self: Any):
     if not self.hub.check_hook_token():
         return jsonify({"ok": False, "error": "bad agent token"}), 401
 
+    payload = request.get_json(silent=True)
+    if isinstance(payload, dict):
+        ddns_store = getattr(self.hub, "LAB_DDNS", None)
+        if ddns_store is not None:
+            ddns_store.accept_address(payload.get("ddnsAddress"))
+
     with self.hub.ROUTER_DASHBOARD_LOCK:
         dashboard_nonce = self.hub.ROUTER_DASHBOARD_REFRESH_NONCE
     with self.hub.ROUTER_CREDENTIALS_LOCK:
