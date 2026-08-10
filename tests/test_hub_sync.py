@@ -65,6 +65,30 @@ class HubSyncApiTests(unittest.TestCase):
         self.assertEqual(body["rulesUpdatedAt"], "2026-08-10 10:00:00")
         self.assertEqual(body["rules"][0]["syncState"], "syncing")
 
+    def test_portmap_service_type_is_preserved_by_the_hub_model(self):
+        payload = {
+            "id": "map-service-type",
+            "name": "NAS HTTPS",
+            "enabled": True,
+            "mode": "6to4",
+            "listenPort": 20000,
+            "targetMode": "ipv4",
+            "targetIpv4": "192.168.5.46",
+            "targetIpv6": "",
+            "targetIpv6Suffix": "",
+            "targetMac": "",
+            "targetPort": 443,
+            "serviceType": "HTTPS",
+            "expiresAt": None,
+            "leaseSeconds": 0,
+            "maxConnections": 32,
+            "idleTimeoutSec": 300,
+        }
+        created = hub._clean_portmap_rule(payload)
+        updated = hub._clean_portmap_rule({"name": "NAS Web"}, created)
+        self.assertEqual(created["serviceType"], "HTTPS")
+        self.assertEqual(updated["serviceType"], "HTTPS")
+
     def test_malformed_portmap_document_is_not_an_authoritative_empty_set(self):
         original = hub.PORTMAP_RULES_FILE.read_bytes() if hub.PORTMAP_RULES_FILE.exists() else None
         try:

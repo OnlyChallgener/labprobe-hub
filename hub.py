@@ -23,7 +23,7 @@ import paho.mqtt.client as mqtt
 from flask import Flask, request, jsonify, g
 from labprobe_storage import SQLiteStore
 
-APP_VERSION = "0.10.1"
+APP_VERSION = "0.10.2"
 PORT = int(os.environ.get("PORT", "58443"))
 BASE_DIR = Path(os.environ.get("LABPROBE_BASE_DIR", ".")).resolve()
 CONFIG_DIR = Path(os.environ.get("CONFIG_DIR", str(BASE_DIR / "config"))).resolve()
@@ -3469,6 +3469,7 @@ def _clean_portmap_rule(payload: Dict[str, Any], existing: Optional[Dict[str, An
     name = clean_saved_value(src.get("name"))[:64]
     if not name:
         raise ValueError("规则名称不能为空")
+    service_type = clean_saved_value(src.get("serviceType"))[:24]
 
     target_mode = clean_saved_value(src.get("targetMode")).lower()
     target_ipv4 = clean_saved_value(src.get("targetIpv4"))
@@ -3519,6 +3520,7 @@ def _clean_portmap_rule(payload: Dict[str, Any], existing: Optional[Dict[str, An
         "targetIpv6Suffix": target_suffix,
         "targetMac": target_mac,
         "targetPort": target_port,
+        "serviceType": service_type,
         "preferCurrentPrefix": bool(src.get("preferCurrentPrefix", True)),
         "expiresAt": expires_at,
         "leaseSeconds": lease_seconds,

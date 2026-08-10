@@ -38,7 +38,7 @@ fn default_idle_timeout() -> u64 {
     300
 }
 
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 #[serde(default, rename_all = "camelCase")]
 struct Rule {
     id: String,
@@ -56,6 +56,10 @@ struct Rule {
     expires_at: Option<u64>,
     max_connections: u32,
     idle_timeout_sec: u64,
+}
+
+fn rules_are_equal(left: &Rule, right: &Rule) -> bool {
+    left == right
 }
 
 impl Default for Rule {
@@ -170,6 +174,7 @@ struct RuntimeHandle {
 struct Manager {
     rules: Arc<RwLock<HashMap<String, Rule>>>,
     runtimes: Arc<Mutex<HashMap<String, RuntimeHandle>>>,
+    operation_lock: Arc<Mutex<()>>,
     last_status: Arc<RwLock<HashMap<String, RuntimeSnapshot>>>,
     config_path: PathBuf,
     state_path: PathBuf,
@@ -191,6 +196,7 @@ impl Manager {
         Ok(Self {
             rules: Arc::new(RwLock::new(rules)),
             runtimes: Arc::new(Mutex::new(HashMap::new())),
+            operation_lock: Arc::new(Mutex::new(())),
             last_status: Arc::new(RwLock::new(HashMap::new())),
             config_path,
             state_path,
@@ -229,10 +235,36 @@ impl Manager {
         self.ensure_port_available(&rule).await?;
         let id = rule.id.clone();
         let enabled = rule.enabled;
+        let previous = self.rules.read().await.get(&id).cloned();
+        if enabled
+            && previous
+                .as_ref()
+                .is_some_and(|old| rules_are_equal(old, &rule))
+        {
+            let runtime_present = self.runtimes.lock().await.contains_key(&id);
+            if runtime_present {
+                return Ok(json!({"ok": true, "id": id, "state": "running", "unchanged": true}));
+            }
+        }
         self.rules.write().await.insert(id.clone(), rule);
         self.persist().await?;
         if enabled {
-            self.start_rule(&id).await?;
+            if let Err(error) = self.start_rule(&id).await {
+                // Do not leave a previously working rule replaced by a failed
+                // rebind. Restore its desired configuration and best-effort
+                // runtime so Hub reconciliation can observe the real state.
+                if let Some(old) = previous {
+                    self.rules.write().await.insert(id.clone(), old.clone());
+                    self.persist().await?;
+                    if old.enabled {
+                        let _ = self.start_rule(&id).await;
+                    }
+                } else {
+                    self.rules.write().await.remove(&id);
+                    self.persist().await?;
+                }
+                return Err(error);
+            }
         } else {
             self.stop_rule(&id, true).await?;
         }
@@ -342,7 +374,15 @@ impl Manager {
         let handle = self.runtimes.lock().await.remove(id);
         if let Some(handle) = handle {
             let _ = handle.cancel.send(true);
-            let _ = timeout(Duration::from_secs(3), handle.join).await;
+            match timeout(Duration::from_secs(3), handle.join).await {
+                Ok(_) => {}
+                Err(join) => {
+                    // A listener that did not acknowledge cancellation must
+                    // not keep the port occupied while a replacement binds.
+                    join.abort();
+                    let _ = join.await;
+                }
+            }
             let mut snap = handle.shared.snapshot().await;
             if mark_stopped && snap.state != "expired" {
                 snap.state = "stopped".to_string();
@@ -931,6 +971,14 @@ async fn handle_command_fixed(manager: Manager, raw: &str) -> Value {
         Err(_) => return json!({"ok": false, "error": "invalid JSON"}),
     };
     let action = v.get("action").and_then(Value::as_str).unwrap_or("");
+    // Dashboard reconciliation can submit the same rule more than once while
+    // a previous rebind is still stopping. Serialize mutating RPCs so only
+    // one listener owns a port at a time; status/list remain concurrent.
+    let _operation_guard = if matches!(action, "upsert" | "start" | "stop" | "delete") {
+        Some(manager.operation_lock.lock().await)
+    } else {
+        None
+    };
     let result = match action {
         "status" | "list" => Ok(manager.status_value().await),
         "upsert" => {
