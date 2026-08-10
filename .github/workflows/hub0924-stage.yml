@@ -57,7 +57,7 @@ jobs:
           grep -q 'install_router_device_live_sync_patch' hub_entry.py
           grep -q '"devices_snapshot"' router_device_live_sync_patch.py
           grep -q '/api/realtime/ws' hub_realtime_ws.py
-          grep -q 'version = "0.2.16"' labrelay/Cargo.toml
+          grep -q 'version = "0.2.17"' labrelay/Cargo.toml
           sh -n agent/install.sh
           sh -n scripts/labprobe-install.sh
 
