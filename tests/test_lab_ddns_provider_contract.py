@@ -228,6 +228,50 @@ def test_alidns_ttl_contract_is_valid_for_create_and_update(
     assert AliDnsProvider.MIN_TTL <= int(params["TTL"]) <= AliDnsProvider.MAX_TTL
 
 
+@pytest.mark.parametrize(
+    "record_type,operation,input_ttl",
+    tuple(itertools.product(RECORD_TYPES, ("create", "update"), (60, 86401))),
+)
+def test_dnspod_ttl_contract_delegates_to_plan_default(record_type, operation, input_ttl):
+    case = CASES["dnspod"]
+    value = "198.51.100.30" if record_type == "A" else "2001:db8::30"
+    if operation == "create":
+        responses = [
+            FakeResponse({"Response": {"RecordList": []}}),
+            FakeResponse({"Response": {"RecordId": "created"}}),
+        ]
+        expected_action = "CreateRecord"
+    else:
+        responses = [
+            FakeResponse(
+                {
+                    "Response": {
+                        "RecordList": [
+                            {
+                                "RecordId": "existing",
+                                "Name": "home",
+                                "Type": record_type,
+                                "Value": "198.51.100.1" if record_type == "A" else "2001:db8::1",
+                            }
+                        ]
+                    }
+                }
+            ),
+            FakeResponse({"Response": {}}),
+        ]
+        expected_action = "ModifyRecord"
+
+    session = FakeSession(responses)
+    result = DnsPodProvider(session).sync_record(
+        case["hostname"], record_type, value, input_ttl, case["credentials"]
+    )
+
+    assert result.ok is True
+    request = session.calls[1][2]
+    assert request["headers"]["X-TC-Action"] == expected_action
+    assert "TTL" not in request["json"]
+
+
 @pytest.mark.parametrize("provider_id", ("alidns", "dnspod", "cloudflare"))
 def test_record_oriented_noop_contract(provider_id):
     case = CASES[provider_id]

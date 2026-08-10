@@ -297,14 +297,16 @@ class DnsPodProvider(_HttpProvider):
         records = (response or {}).get("RecordList") or []
         found = next((item for item in records if str(item.get("Type", "")).upper() == record_type and str(item.get("Name", rr)) == rr), None)
         if found is None:
-            created, error = self._rpc("CreateRecord", {**body, "Value": value, "TTL": ttl}, credentials, record_type)
+            # DNSPod's minimum TTL varies by domain plan. TTL is optional for
+            # record writes, so let DNSPod apply its plan-valid default.
+            created, error = self._rpc("CreateRecord", {**body, "Value": value}, credentials, record_type)
             if error:
                 return error
             return _success(self.provider_id, record_type, True, str((created or {}).get("RecordId", "")))
         record_id = str(found.get("RecordId", ""))
         if str(found.get("Value", "")) == value:
             return _success(self.provider_id, record_type, False, record_id)
-        updated, error = self._rpc("ModifyRecord", {**body, "RecordId": record_id, "Value": value, "TTL": ttl}, credentials, record_type)
+        updated, error = self._rpc("ModifyRecord", {**body, "RecordId": record_id, "Value": value}, credentials, record_type)
         if error:
             return error
         return _success(self.provider_id, record_type, True, record_id)
