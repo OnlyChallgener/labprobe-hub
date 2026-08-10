@@ -173,6 +173,61 @@ def test_success_contract_is_record_type_specific(provider_id, record_type):
     assert result.record_type == record_type
 
 
+@pytest.mark.parametrize(
+    "record_type,operation,input_ttl,expected_ttl",
+    tuple(
+        (record_type, operation, input_ttl, expected_ttl)
+        for record_type, operation, (input_ttl, expected_ttl) in itertools.product(
+            RECORD_TYPES,
+            ("create", "update"),
+            ((60, 600), (600, 600), (86400, 86400), (86401, 86400)),
+        )
+    ),
+)
+def test_alidns_ttl_contract_is_valid_for_create_and_update(
+    record_type, operation, input_ttl, expected_ttl
+):
+    case = CASES["alidns"]
+    value = "198.51.100.30" if record_type == "A" else "2001:db8::30"
+    if operation == "create":
+        responses = [
+            FakeResponse({"DomainRecords": {"Record": []}}),
+            FakeResponse({"RecordId": "created"}),
+        ]
+        expected_action = "AddDomainRecord"
+    else:
+        responses = [
+            FakeResponse(
+                {
+                    "DomainRecords": {
+                        "Record": [
+                            {
+                                "RecordId": "existing",
+                                "RR": "home",
+                                "Type": record_type,
+                                "Value": "198.51.100.1" if record_type == "A" else "2001:db8::1",
+                            }
+                        ]
+                    }
+                }
+            ),
+            FakeResponse({"RecordId": "existing"}),
+        ]
+        expected_action = "UpdateDomainRecord"
+
+    session = FakeSession(responses)
+    result = AliDnsProvider(session).sync_record(
+        case["hostname"], record_type, value, input_ttl, case["credentials"]
+    )
+
+    assert result.ok is True
+    params = session.calls[1][2]["params"]
+    assert params["Action"] == expected_action
+    assert params["Type"] == record_type
+    assert int(params["TTL"]) == expected_ttl
+    assert AliDnsProvider.MIN_TTL <= int(params["TTL"]) <= AliDnsProvider.MAX_TTL
+
+
 @pytest.mark.parametrize("provider_id", ("alidns", "dnspod", "cloudflare"))
 def test_record_oriented_noop_contract(provider_id):
     case = CASES[provider_id]

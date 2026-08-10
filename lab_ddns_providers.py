@@ -150,6 +150,8 @@ def _text_update_result(
 
 class AliDnsProvider(_HttpProvider):
     ENDPOINT = "https://alidns.aliyuncs.com/"
+    MIN_TTL = 600
+    MAX_TTL = 86400
 
     def __init__(self, session: Optional[requests.Session] = None):
         super().__init__(ProviderSpec("alidns", ("AccessKeyId", "AccessKeySecret", "zone"), supports_cname=True, supports_txt=True), session)
@@ -165,6 +167,13 @@ class AliDnsProvider(_HttpProvider):
     @staticmethod
     def _encode(value: Any) -> str:
         return quote(str(value), safe="~-_.")
+
+    @classmethod
+    def _normalize_ttl(cls, ttl: int) -> int:
+        try:
+            return min(cls.MAX_TTL, max(cls.MIN_TTL, int(ttl)))
+        except (TypeError, ValueError):
+            return cls.MIN_TTL
 
     def _signed_params(self, action: str, extra: Mapping[str, Any], credentials: Mapping[str, str]) -> Dict[str, str]:
         params = {
@@ -195,6 +204,7 @@ class AliDnsProvider(_HttpProvider):
     def sync_record(self, hostname: str, record_type: str, value: str, ttl: int, credentials: Mapping[str, str]) -> ProviderResult:
         if not self.supports_record_type(record_type):
             return self.unsupported_result(record_type)
+        ttl = self._normalize_ttl(ttl)
         error = _required(credentials, ("AccessKeyId", "AccessKeySecret"), self.provider_id, record_type)
         if error:
             return error
