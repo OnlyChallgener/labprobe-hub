@@ -3471,10 +3471,8 @@ def _clean_portmap_rule(payload: Dict[str, Any], existing: Optional[Dict[str, An
         raise ValueError("规则名称不能为空")
     service_type = clean_saved_value(src.get("serviceType"))[:24]
     transport_protocol = clean_saved_value(src.get("transportProtocol") or "TCP").upper()
-    if transport_protocol != "TCP":
-        # UDP has no relay forwarding implementation yet.  Reject it here so a
-        # future client cannot create a rule that only looks enabled in the UI.
-        raise ValueError("当前版本仅支持 TCP 映射")
+    if transport_protocol not in ["TCP", "UDP"]:
+        raise ValueError("传输协议只能是 TCP 或 UDP")
 
     target_mode = clean_saved_value(src.get("targetMode")).lower()
     target_ipv4 = clean_saved_value(src.get("targetIpv4"))
@@ -3579,7 +3577,7 @@ def _load_portmap_rules() -> List[Dict[str, Any]]:
 
 
 def _save_portmap_rules(rows: List[Dict[str, Any]]) -> None:
-    rows = sorted(rows[-100:], key=lambda x: (to_int(x.get("listenPort"), 0), clean_saved_value(x.get("name"))))
+    rows = sorted(rows[-100:], key=lambda x: (to_int(x.get("listenPort"), 0), clean_saved_value(x.get("transportProtocol") or "TCP"), clean_saved_value(x.get("name"))))
     previous, _loaded = _load_portmap_rules_document()
     save_json(PORTMAP_RULES_FILE, {
         "version": 1,
@@ -3591,8 +3589,12 @@ def _save_portmap_rules(rows: List[Dict[str, Any]]) -> None:
 
 def _portmap_check_conflict(rows: List[Dict[str, Any]], rule: Dict[str, Any]) -> None:
     for item in rows:
-        if item.get("id") != rule.get("id") and to_int(item.get("listenPort"), 0) == to_int(rule.get("listenPort"), 0):
-            raise ValueError(f"监听端口 {rule.get('listenPort')} 已被规则 {item.get('name')} 使用")
+        if (
+            item.get("id") != rule.get("id")
+            and to_int(item.get("listenPort"), 0) == to_int(rule.get("listenPort"), 0)
+            and clean_saved_value(item.get("transportProtocol") or "TCP").upper() == clean_saved_value(rule.get("transportProtocol") or "TCP").upper()
+        ):
+            raise ValueError(f"{rule.get('transportProtocol')} 监听端口 {rule.get('listenPort')} 已被规则 {item.get('name')} 使用")
 
 
 def _portmap_command_rule_id(action: str, payload: Dict[str, Any]) -> str:
@@ -3693,8 +3695,11 @@ def _append_portmap_history(status_payload: Dict[str, Any]) -> None:
         samples.append({
             "time": now_epoch,
             "activeConnections": to_int(runtime.get("activeConnections"), 0),
+            "activePeers": to_int(runtime.get("activePeers"), 0),
             "uploadBytes": to_int(runtime.get("totalUploadBytes"), 0),
             "downloadBytes": to_int(runtime.get("totalDownloadBytes"), 0),
+            "uploadPackets": to_int(runtime.get("totalUploadPackets"), 0),
+            "downloadPackets": to_int(runtime.get("totalDownloadPackets"), 0),
             "state": clean_saved_value(runtime.get("state")),
         })
         history[rid] = samples[-1440:]

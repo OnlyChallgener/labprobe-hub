@@ -112,13 +112,35 @@ class HubSyncApiTests(unittest.TestCase):
         self.assertEqual(cleaned["transportProtocol"], "TCP")
         self.assertEqual(cleaned["targetIpv6Snapshot"], payload["targetIpv6Snapshot"])
 
-    def test_portmap_rejects_udp_until_relay_forwarding_exists(self):
+    def test_portmap_udp_is_persisted_and_shares_port_only_with_tcp(self):
+        udp = hub._clean_portmap_rule({
+            "id": "map-udp", "name": "UDP", "enabled": True, "mode": "6to4",
+            "listenPort": 20000, "targetMode": "ipv4", "targetIpv4": "192.168.5.46",
+            "targetPort": 53, "transportProtocol": "UDP",
+        })
+        tcp = hub._clean_portmap_rule({
+            "id": "map-tcp", "name": "TCP", "enabled": True, "mode": "6to4",
+            "listenPort": 20000, "targetMode": "ipv4", "targetIpv4": "192.168.5.46",
+            "targetPort": 53, "transportProtocol": "TCP",
+        })
+        self.assertEqual(udp["transportProtocol"], "UDP")
+        hub._portmap_check_conflict([udp], tcp)
         with self.assertRaises(ValueError):
-            hub._clean_portmap_rule({
-                "id": "map-udp", "name": "UDP", "enabled": True, "mode": "6to4",
-                "listenPort": 20000, "targetMode": "ipv4", "targetIpv4": "192.168.5.46",
-                "targetPort": 53, "transportProtocol": "UDP",
-            })
+            hub._portmap_check_conflict([udp], {**udp, "id": "map-udp-2"})
+
+    def test_portmap_udp_rule_survives_hub_document_reload(self):
+        udp = hub._clean_portmap_rule({
+            "id": "map-udp-reload", "name": "UDP reload", "enabled": True, "mode": "6to6",
+            "listenPort": 20000, "targetMode": "ipv6_full", "targetIpv6": "2001:db8::53",
+            "targetPort": 53, "transportProtocol": "UDP",
+        })
+        # The storage layer intentionally permits documents only below DATA_DIR.
+        path = hub.DATA_DIR / "udp-portmaps-reload.json"
+        with patch.object(hub, "PORTMAP_RULES_FILE", path):
+            hub._save_portmap_rules([udp])
+            document, loaded = hub._load_portmap_rules_document()
+        self.assertTrue(loaded)
+        self.assertEqual(document["rules"][0]["transportProtocol"], "UDP")
 
     def test_malformed_portmap_document_is_not_an_authoritative_empty_set(self):
         original = hub.PORTMAP_RULES_FILE.read_bytes() if hub.PORTMAP_RULES_FILE.exists() else None
