@@ -3470,10 +3470,16 @@ def _clean_portmap_rule(payload: Dict[str, Any], existing: Optional[Dict[str, An
     if not name:
         raise ValueError("规则名称不能为空")
     service_type = clean_saved_value(src.get("serviceType"))[:24]
+    transport_protocol = clean_saved_value(src.get("transportProtocol") or "TCP").upper()
+    if transport_protocol != "TCP":
+        # UDP has no relay forwarding implementation yet.  Reject it here so a
+        # future client cannot create a rule that only looks enabled in the UI.
+        raise ValueError("当前版本仅支持 TCP 映射")
 
     target_mode = clean_saved_value(src.get("targetMode")).lower()
     target_ipv4 = clean_saved_value(src.get("targetIpv4"))
     target_ipv6 = clean_saved_value(src.get("targetIpv6")).strip("[]")
+    target_ipv6_snapshot = clean_saved_value(src.get("targetIpv6Snapshot")).strip("[]")
     target_suffix = clean_saved_value(src.get("targetIpv6Suffix")).lower()
     target_mac = norm_mac(src.get("targetMac"))
     if target_mac and not re.fullmatch(r"[0-9a-f]{2}(?::[0-9a-f]{2}){5}", target_mac):
@@ -3484,6 +3490,7 @@ def _clean_portmap_rule(payload: Dict[str, Any], existing: Optional[Dict[str, An
         if ip.version != 4 or not (ip.is_private or ip.is_loopback or ip.is_link_local):
             raise ValueError("6to4 目标必须是内网 IPv4")
         target_ipv6 = ""
+        target_ipv6_snapshot = ""
         target_suffix = ""
     else:
         if target_mode not in ["ipv6_full", "ipv6_suffix"]:
@@ -3494,12 +3501,18 @@ def _clean_portmap_rule(payload: Dict[str, Any], existing: Optional[Dict[str, An
             if ip.version != 6 or ip.is_link_local or ip.is_multicast or ip.is_loopback or ip.is_unspecified:
                 raise ValueError("目标 IPv6 无效")
             target_ipv6 = str(ip)
+            target_ipv6_snapshot = target_ipv6
             target_suffix = ""
         else:
             target_suffix = _normalize_ipv6_suffix(target_suffix)
             target_ipv6 = ""
             if not target_suffix:
                 raise ValueError("请输入目标 IPv6 后缀")
+            if target_ipv6_snapshot:
+                snapshot = ipaddress.ip_address(target_ipv6_snapshot)
+                if snapshot.version != 6 or snapshot.is_link_local or snapshot.is_multicast or snapshot.is_loopback or snapshot.is_unspecified:
+                    raise ValueError("目标 IPv6 快照无效")
+                target_ipv6_snapshot = str(snapshot)
 
     max_connections = max(1, min(256, to_int(src.get("maxConnections"), 32) or 32))
     idle_timeout = max(30, min(3600, to_int(src.get("idleTimeoutSec"), 300) or 300))
@@ -3517,10 +3530,12 @@ def _clean_portmap_rule(payload: Dict[str, Any], existing: Optional[Dict[str, An
         "targetMode": target_mode,
         "targetIpv4": target_ipv4,
         "targetIpv6": target_ipv6,
+        "targetIpv6Snapshot": target_ipv6_snapshot,
         "targetIpv6Suffix": target_suffix,
         "targetMac": target_mac,
         "targetPort": target_port,
         "serviceType": service_type,
+        "transportProtocol": transport_protocol,
         "preferCurrentPrefix": bool(src.get("preferCurrentPrefix", True)),
         "expiresAt": expires_at,
         "leaseSeconds": lease_seconds,
@@ -3879,7 +3894,7 @@ def api_router_portmap_status():
         rid = clean_saved_value(local_rule.get("id") or (row.get("runtime") or {}).get("id"))
         if rid:
             local[rid] = local_rule
-    compare_keys = ["enabled", "mode", "listenPort", "targetMode", "targetIpv4", "targetIpv6", "targetIpv6Suffix", "targetMac", "targetPort", "expiresAt", "leaseSeconds", "maxConnections", "idleTimeoutSec"]
+    compare_keys = ["enabled", "mode", "listenPort", "targetMode", "targetIpv4", "targetIpv6", "targetIpv6Suffix", "targetMac", "targetPort", "transportProtocol", "expiresAt", "leaseSeconds", "maxConnections", "idleTimeoutSec"]
     for rid, rule in desired.items():
         local_rule = local.get(rid)
         if not local_rule or any(local_rule.get(k) != rule.get(k) for k in compare_keys):

@@ -52,6 +52,7 @@ struct Rule {
     target_ipv6_suffix: String,
     target_mac: String,
     target_port: u16,
+    transport_protocol: String,
     prefer_current_prefix: bool,
     expires_at: Option<u64>,
     max_connections: u32,
@@ -76,6 +77,7 @@ impl Default for Rule {
             target_ipv6_suffix: String::new(),
             target_mac: String::new(),
             target_port: 0,
+            transport_protocol: "TCP".to_string(),
             prefer_current_prefix: default_true(),
             expires_at: None,
             max_connections: default_max_connections(),
@@ -853,6 +855,10 @@ fn normalize_rule(rule: &mut Rule) {
     rule.target_ipv6 = strip_brackets(&rule.target_ipv6).to_string();
     rule.target_ipv6_suffix = rule.target_ipv6_suffix.trim().to_ascii_lowercase();
     rule.target_mac = normalize_mac(&rule.target_mac);
+    rule.transport_protocol = rule.transport_protocol.trim().to_ascii_uppercase();
+    if rule.transport_protocol.is_empty() {
+        rule.transport_protocol = "TCP".to_string();
+    }
     rule.max_connections = rule.max_connections.clamp(1, 256);
     rule.idle_timeout_sec = rule.idle_timeout_sec.clamp(30, 3600);
 }
@@ -884,6 +890,9 @@ fn validate_rule(rule: &Rule, port_min: u16, port_max: u16) -> Result<()> {
     }
     if rule.target_port == 0 {
         bail!("invalid targetPort");
+    }
+    if rule.transport_protocol != "TCP" {
+        bail!("unsupported transportProtocol: {}", rule.transport_protocol);
     }
     if rule.mode == "6to4" {
         let ip = Ipv4Addr::from_str(&rule.target_ipv4).context("invalid targetIpv4")?;
@@ -1257,5 +1266,24 @@ mod tests {
             ..Rule::default()
         };
         assert!(validate_rule(&rule, 20000, 20020).is_err());
+    }
+
+    #[test]
+    fn legacy_rule_defaults_to_tcp_and_udp_is_rejected() {
+        let mut rule = Rule {
+            id: "udp".into(),
+            name: "UDP".into(),
+            mode: "6to4".into(),
+            listen_port: 20001,
+            target_mode: "ipv4".into(),
+            target_ipv4: "192.168.1.50".into(),
+            target_port: 53,
+            transport_protocol: "udp".into(),
+            ..Rule::default()
+        };
+        normalize_rule(&mut rule);
+        assert_eq!(rule.transport_protocol, "UDP");
+        assert!(validate_rule(&rule, 20000, 20020).is_err());
+        assert_eq!(Rule::default().transport_protocol, "TCP");
     }
 }

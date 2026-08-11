@@ -89,6 +89,37 @@ class HubSyncApiTests(unittest.TestCase):
         self.assertEqual(created["serviceType"], "HTTPS")
         self.assertEqual(updated["serviceType"], "HTTPS")
 
+    def test_portmap_transport_defaults_to_tcp_and_retains_ipv6_snapshot(self):
+        payload = {
+            "id": "map-ipv6-snapshot",
+            "name": "NAS HTTPS",
+            "enabled": True,
+            "mode": "6to6",
+            "listenPort": 20000,
+            "targetMode": "ipv6_suffix",
+            "targetIpv4": "",
+            "targetIpv6": "2409:8a50:2e40:8dc0:a9e5:169d:a7c8:9bfe",
+            "targetIpv6Snapshot": "2409:8a50:2e40:8dc0:a9e5:169d:a7c8:9bfe",
+            "targetIpv6Suffix": "::a9e5:169d:a7c8:9bfe",
+            "targetMac": "aa:bb:cc:dd:ee:ff",
+            "targetPort": 443,
+            "serviceType": "HTTPS",
+            "leaseSeconds": 0,
+            "maxConnections": 32,
+            "idleTimeoutSec": 300,
+        }
+        cleaned = hub._clean_portmap_rule(payload)
+        self.assertEqual(cleaned["transportProtocol"], "TCP")
+        self.assertEqual(cleaned["targetIpv6Snapshot"], payload["targetIpv6Snapshot"])
+
+    def test_portmap_rejects_udp_until_relay_forwarding_exists(self):
+        with self.assertRaises(ValueError):
+            hub._clean_portmap_rule({
+                "id": "map-udp", "name": "UDP", "enabled": True, "mode": "6to4",
+                "listenPort": 20000, "targetMode": "ipv4", "targetIpv4": "192.168.5.46",
+                "targetPort": 53, "transportProtocol": "UDP",
+            })
+
     def test_malformed_portmap_document_is_not_an_authoritative_empty_set(self):
         original = hub.PORTMAP_RULES_FILE.read_bytes() if hub.PORTMAP_RULES_FILE.exists() else None
         try:
