@@ -22,6 +22,7 @@ PORTMAP_COMPARE_KEYS = (
     "targetIpv6Suffix",
     "targetMac",
     "targetPort",
+    "transportProtocol",
     "expiresAt",
     "leaseSeconds",
     "maxConnections",
@@ -151,6 +152,8 @@ def _portmap_value(hub: Any, row: Dict[str, Any], key: str) -> Any:
         return max(0, hub.to_int(value, 0))
     if key == "expiresAt":
         return hub._portmap_epoch(value)
+    if key == "transportProtocol":
+        return _clean(hub, value or "TCP").upper()
     return _clean(hub, value)
 
 

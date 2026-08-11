@@ -571,8 +571,10 @@ fn rules_conflict(left: &Rule, right: &Rule) -> bool {
 #[derive(Clone)]
 struct UdpPeer {
     upstream: Arc<UdpSocket>,
+    target: SocketAddr,
     last_seen: Arc<AtomicU64>,
     token: u64,
+    cancel: watch::Sender<bool>,
 }
 
 fn create_ipv6_udp_listener(port: u16) -> Result<UdpSocket> {
@@ -688,6 +690,10 @@ fn udp_peer_expired(last_seen: u64, now: u64, idle_timeout_sec: u64) -> bool {
     now.saturating_sub(last_seen) >= idle_timeout_sec.max(30)
 }
 
+fn udp_peer_requires_replacement(peer: &UdpPeer, target: SocketAddr) -> bool {
+    peer.target != target
+}
+
 async fn run_udp_listener(
     socket: UdpSocket,
     rule: Rule,
@@ -746,22 +752,42 @@ async fn run_udp_listener(
                     continue;
                 };
                 let now = now_epoch();
+                let target_addr = SocketAddr::new(target_ip, rule.target_port);
                 let existing = peers.lock().await.get(&client).cloned();
-                let peer = if let Some(existing) = existing {
-                    existing.last_seen.store(now, Ordering::Relaxed);
-                    Some(existing)
+                if let Some(existing) = existing.as_ref().filter(|peer| udp_peer_requires_replacement(peer, target_addr)) {
+                    let _ = existing.cancel.send(true);
+                    let removed = {
+                        let mut current = peers.lock().await;
+                        current.get(&client).is_some_and(|peer| peer.token == existing.token)
+                            && current.remove(&client).is_some()
+                    };
+                    if removed {
+                        shared.active_peers.fetch_sub(1, Ordering::Relaxed);
+                    }
+                }
+                let peer = match existing {
+                    Some(existing) if !udp_peer_requires_replacement(&existing, target_addr) => {
+                        existing.last_seen.store(now, Ordering::Relaxed);
+                        Some(existing)
+                    }
+                    _ => None,
+                };
+                let peer = if peer.is_some() {
+                    peer
                 } else {
                     if peers.lock().await.len() >= rule.max_connections as usize {
                         shared.base.write().await.last_error = "maximum UDP peers reached".to_string();
                         None
                     } else {
-                        let target_addr = SocketAddr::new(target_ip, rule.target_port);
                         match udp_upstream_socket(target_addr).await {
                             Ok(upstream) => {
+                                let (peer_cancel_tx, peer_cancel_rx) = watch::channel(false);
                                 let peer = UdpPeer {
                                     upstream: Arc::new(upstream),
+                                    target: target_addr,
                                     last_seen: Arc::new(AtomicU64::new(now)),
                                     token: next_token.fetch_add(1, Ordering::Relaxed),
+                                    cancel: peer_cancel_tx,
                                 };
                                 peers.lock().await.insert(client, peer.clone());
                                 shared.active_peers.fetch_add(1, Ordering::Relaxed);
@@ -770,7 +796,7 @@ async fn run_udp_listener(
                                 let task_shared = shared.clone();
                                 let task_last_seen = peer.last_seen.clone();
                                 let task_upstream = peer.upstream.clone();
-                                let task_cancel = cancel.clone();
+                                let task_cancel = peer_cancel_rx;
                                 let task_token = peer.token;
                                 let idle = rule.idle_timeout_sec;
                                 peer_tasks.spawn(async move {
@@ -813,6 +839,8 @@ async fn run_udp_listener(
     }
     peer_tasks.abort_all();
     while peer_tasks.join_next().await.is_some() {}
+    peers.lock().await.clear();
+    shared.active_peers.store(0, Ordering::Relaxed);
     let mut base = shared.base.write().await;
     if base.state != "expired" {
         base.state = "stopped".to_string();
@@ -1632,6 +1660,28 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn udp_peer_target_change_requires_replacement() {
+        let upstream = Arc::new(UdpSocket::bind("127.0.0.1:0").await.unwrap());
+        let (cancel, _) = watch::channel(false);
+        let peer = UdpPeer {
+            upstream,
+            target: "[2409:8a50:2e40:8dc0::a]:53".parse().unwrap(),
+            last_seen: Arc::new(AtomicU64::new(0)),
+            token: 1,
+            cancel,
+        };
+
+        assert!(!udp_peer_requires_replacement(
+            &peer,
+            "[2409:8a50:2e40:8dc0::a]:53".parse().unwrap(),
+        ));
+        assert!(udp_peer_requires_replacement(
+            &peer,
+            "[2409:8a50:2e40:8dc0::b]:53".parse().unwrap(),
+        ));
+    }
+
+    #[tokio::test]
     async fn udp_6to4_forwards_two_clients_and_counts_packets() {
         let echo = UdpSocket::bind("127.0.0.1:0").await.unwrap();
         let echo_addr = echo.local_addr().unwrap();
@@ -1699,7 +1749,77 @@ mod tests {
             .await
             .unwrap()
             .unwrap();
+        assert_eq!(shared.snapshot().await.active_peers, 0);
         echo_task.abort();
+    }
+
+    #[tokio::test]
+    async fn udp_peer_target_change_routes_next_client_packet_to_new_target() {
+        let first_target = UdpSocket::bind("127.0.0.1:0").await.unwrap();
+        let target_port = first_target.local_addr().unwrap().port();
+        let second_target = UdpSocket::bind((Ipv4Addr::new(127, 0, 0, 2), target_port))
+            .await
+            .unwrap();
+        let first_task = tokio::spawn(async move {
+            let mut buffer = [0u8; 32];
+            let (_, peer) = first_target.recv_from(&mut buffer).await.unwrap();
+            first_target.send_to(b"first", peer).await.unwrap();
+        });
+        let second_task = tokio::spawn(async move {
+            let mut buffer = [0u8; 32];
+            let (_, peer) = second_target.recv_from(&mut buffer).await.unwrap();
+            second_target.send_to(b"second", peer).await.unwrap();
+        });
+        let inbound = create_ipv6_udp_listener(0).unwrap();
+        let listen_port = inbound.local_addr().unwrap().port();
+        let rule = Rule {
+            id: "udp-target-change".into(),
+            name: "UDP target change".into(),
+            enabled: true,
+            mode: "6to4".into(),
+            listen_port,
+            target_mode: "ipv4".into(),
+            target_ipv4: "127.0.0.1".into(),
+            target_port,
+            transport_protocol: "UDP".into(),
+            ..Rule::default()
+        };
+        let shared = Arc::new(RuntimeShared::new(RuntimeSnapshot::stopped(&rule)));
+        let target = Arc::new(RwLock::new(Some(IpAddr::V4(Ipv4Addr::LOCALHOST))));
+        let (cancel_tx, cancel_rx) = watch::channel(false);
+        let forwarder = tokio::spawn(run_udp_listener(
+            inbound,
+            rule,
+            String::new(),
+            target.clone(),
+            shared,
+            cancel_rx,
+        ));
+        let client = UdpSocket::bind("[::1]:0").await.unwrap();
+        let destination = format!("[::1]:{listen_port}");
+        let mut reply = [0u8; 16];
+        client.send_to(b"before", &destination).await.unwrap();
+        let (first_size, _) = timeout(Duration::from_secs(2), client.recv_from(&mut reply))
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(&reply[..first_size], b"first");
+
+        *target.write().await = Some(IpAddr::V4(Ipv4Addr::new(127, 0, 0, 2)));
+        client.send_to(b"after", &destination).await.unwrap();
+        let (second_size, _) = timeout(Duration::from_secs(2), client.recv_from(&mut reply))
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(&reply[..second_size], b"second");
+
+        let _ = cancel_tx.send(true);
+        timeout(Duration::from_secs(2), forwarder)
+            .await
+            .unwrap()
+            .unwrap();
+        first_task.await.unwrap();
+        second_task.await.unwrap();
     }
 
     #[tokio::test]

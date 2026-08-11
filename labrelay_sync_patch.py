@@ -81,9 +81,18 @@ def install_labrelay_sync_patch(hub: Any) -> None:
             rule_id = clean(local_rule.get("id") or runtime.get("id"))
             if rule_id:
                 local[rule_id] = local_rule
-        compare = ("enabled", "mode", "listenPort", "targetMode", "targetIpv4", "targetIpv6", "targetIpv6Suffix", "targetMac", "targetPort", "expiresAt", "leaseSeconds", "maxConnections", "idleTimeoutSec")
+        compare = ("enabled", "mode", "listenPort", "targetMode", "targetIpv4", "targetIpv6", "targetIpv6Suffix", "targetMac", "targetPort", "transportProtocol", "expiresAt", "leaseSeconds", "maxConnections", "idleTimeoutSec")
+
+        def compare_value(row: Dict[str, Any], key: str) -> Any:
+            # Rules persisted before UDP support have no transportProtocol and
+            # remain TCP rules.  Normalize only this legacy field so a TCP
+            # Relay report is not needlessly requeued.
+            if key == "transportProtocol":
+                return clean(row.get(key) or "TCP").upper()
+            return row.get(key)
+
         for rule_id, rule in desired.items():
-            if rule_id not in local or any(local[rule_id].get(key) != rule.get(key) for key in compare):
+            if rule_id not in local or any(compare_value(local[rule_id], key) != compare_value(rule, key) for key in compare):
                 hub._queue_portmap_command("upsert", {"rule": rule}, router)
         for rule_id in set(local) - set(desired):
             hub._queue_portmap_command("delete", {"id": rule_id}, router)
