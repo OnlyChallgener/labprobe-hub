@@ -39,7 +39,7 @@ from router_task_manager_patch import install_router_task_manager_patch
 from router_ws_patch import install_router_ws_patch
 
 PREVIOUS_HUB_VERSION = "0.9.35"
-HUB_VERSION = "0.10.4"
+HUB_VERSION = "0.10.5"
 hub.APP_VERSION = HUB_VERSION
 install_router_http_developer_transport_patch()
 install_router_developer_flow_patch()

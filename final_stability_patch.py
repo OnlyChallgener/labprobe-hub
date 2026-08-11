@@ -79,7 +79,7 @@ def _fallback_manifest(hub: Any) -> Dict[str, Any]:
         except Exception as exc:
             hub.LOGGER.warning("local agent manifest parse failed: %s", exc)
 
-    version = (os.environ.get("LABRELAY_RELEASE_VERSION") or "0.2.22").strip()
+    version = (os.environ.get("LABRELAY_RELEASE_VERSION") or "0.2.23").strip()
     public_root = (os.environ.get("UPDATE_REPOSITORY_ROOT") or "").strip().rstrip("/")
     fallback_root = "https://github.com/OnlyChallgener/labprobe-hub/releases/latest/download"
     if not public_root:
