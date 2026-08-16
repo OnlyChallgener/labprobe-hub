@@ -1,0 +1,80 @@
+name: CI
+
+on:
+  workflow_dispatch:
+  push:
+    branches:
+      - main
+  pull_request:
+    branches:
+      - main
+
+concurrency:
+  group: hub-ci-${{ github.ref }}
+  cancel-in-progress: true
+
+permissions:
+  contents: read
+
+jobs:
+  validate:
+    runs-on: ubuntu-latest
+    env:
+      APP_TOKEN: ci-app-token
+      HOOK_TOKEN: ci-hook-token
+      PYTHONPATH: ${{ github.workspace }}
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.12'
+
+      - name: Install Python dependencies
+        run: pip install --disable-pip-version-check -r requirements.txt pytest
+
+      - name: Compile Hub sources
+        run: |
+          python -m py_compile \
+            hub.py hub_entry.py hub_realtime_ws.py hub0934_fixes.py hub0935_sync_fix.py \
+            final_stability_patch.py followup_stability_patch.py \
+            device_history_patch.py portmap_persistence_patch.py agent_presence_patch.py \
+            router_task_manager_patch.py router_config_sync_patch.py \
+            router_device_live_sync_patch.py router_lite_realtime_patch.py \
+            labrelay_sync_patch.py
+
+      - name: Run Hub tests
+        run: python -m pytest -q
+
+      - name: Verify release versions
+        run: |
+          set -e
+          grep -q 'HUB_VERSION = "0.10.5"' hub_entry.py
+          grep -q 'install_hub0934_fixes(hub)' hub_entry.py
+          grep -q 'install_router_ws_passive_fix()' hub_entry.py
+          grep -q 'install_hub0935_device_sync_fix(hub)' hub_entry.py
+          grep -q 'labrelay_hook' hub0935_sync_fix.py
+          grep -q 'liveRouterPollPersistence' hub0935_sync_fix.py
+          grep -q '_run_router_connection_without_app_keepalive' hub0935_sync_fix.py
+          ! grep -q 'target=self._keepalive_loop' hub0935_sync_fix.py
+          grep -q 'canonical_watched_devices' hub0934_fixes.py
+          grep -q '_normalize_portmap_payload' hub0934_fixes.py
+          grep -q 'install_router_task_manager_patch(hub)' hub_entry.py
+          grep -q 'install_router_device_live_sync_patch' hub_entry.py
+          grep -q '"devices_snapshot"' router_device_live_sync_patch.py
+          grep -q '/api/realtime/ws' hub_realtime_ws.py
+          grep -q 'version = "0.2.23"' labrelay/Cargo.toml
+          sh -n agent/install.sh
+          sh -n scripts/labprobe-install.sh
+
+      - name: Test and build LabRelay
+        working-directory: labrelay
+        run: |
+          cargo test --all-targets
+          cargo build --release
+
+      - name: Build Hub Docker image
+        run: |
+          docker build --pull=false -t labprobe-hub:0.10.5 .
+          docker run --rm --entrypoint python labprobe-hub:0.10.5 -c \
+            'import hub_entry, hub0934_fixes, hub0935_sync_fix, labrelay_sync_patch; print("Hub 0.10.5 imports OK")'
