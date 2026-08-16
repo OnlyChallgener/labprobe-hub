@@ -23,7 +23,7 @@ import paho.mqtt.client as mqtt
 from flask import Flask, request, jsonify, g
 from labprobe_storage import SQLiteStore
 
-APP_VERSION = "0.9.7"
+APP_VERSION = "0.10.5"
 PORT = int(os.environ.get("PORT", "58443"))
 BASE_DIR = Path(os.environ.get("LABPROBE_BASE_DIR", ".")).resolve()
 CONFIG_DIR = Path(os.environ.get("CONFIG_DIR", str(BASE_DIR / "config"))).resolve()
@@ -75,6 +75,9 @@ MQTT_TOPIC_PREFIX = re.sub(r"[^A-Za-z0-9._/-]+", "-", (os.environ.get("MQTT_TOPI
 MQTT_REVISION_TOPIC = f"{MQTT_TOPIC_PREFIX}/sync/revision"
 MQTT_AVAILABILITY_TOPIC = f"{MQTT_TOPIC_PREFIX}/availability"
 MQTT_ROUTER_DASHBOARD_TOPIC = f"{MQTT_TOPIC_PREFIX}/router/dashboard"
+MQTT_ROUTER_REALTIME_TOPIC = f"{MQTT_TOPIC_PREFIX}/router/realtime"
+MQTT_DEVICES_REALTIME_TOPIC = f"{MQTT_TOPIC_PREFIX}/devices/realtime"
+MQTT_REALTIME_DEMAND_TOPIC = f"{MQTT_TOPIC_PREFIX}/app/realtime-demand"
 
 
 class SecretRedactionFilter(logging.Filter):
@@ -165,7 +168,7 @@ ROUTER_CREDENTIALS_TTL_SEC = max(30, int(os.environ.get("ROUTER_CREDENTIALS_TTL_
 
 
 class MqttRevisionPublisher:
-    """Publish retained revision and router dashboard signals; HTTP remains authoritative."""
+    """Publish sync signals and compact realtime samples over the single WSS path."""
 
     @staticmethod
     def _timestamp() -> str:
@@ -185,6 +188,7 @@ class MqttRevisionPublisher:
         self._last_publish_at = None
         self._last_published_revision = 0
         self._latest_dashboard: Dict[str, Any] = dict(ROUTER_DASHBOARD_CACHE)
+        self._realtime_demand_handler = None
 
     def start(self) -> None:
         if not self.enabled:
@@ -210,6 +214,7 @@ class MqttRevisionPublisher:
                 self._last_error = ""
                 self._connected_at = self._timestamp()
             LOGGER.info("mqtt realtime connected host=%s port=%s topic=%s", MQTT_INTERNAL_HOST, MQTT_INTERNAL_PORT, MQTT_REVISION_TOPIC)
+            active.subscribe(f"{MQTT_REALTIME_DEMAND_TOPIC}/+", qos=1)
             active.publish(MQTT_AVAILABILITY_TOPIC, payload="online", qos=1, retain=True)
             with self._lock:
                 revision = max(self._latest_revision, STORE.revision_info()["revision"])
@@ -241,6 +246,26 @@ class MqttRevisionPublisher:
 
         client.on_connect = on_connect
         client.on_disconnect = on_disconnect
+
+        def on_message(_active, _userdata, message):
+            topic = str(getattr(message, "topic", "") or "")
+            prefix = f"{MQTT_REALTIME_DEMAND_TOPIC}/"
+            if not topic.startswith(prefix):
+                return
+            client_id = topic[len(prefix):].strip()
+            if not client_id:
+                return
+            payload = bytes(getattr(message, "payload", b"") or b"").decode("utf-8", errors="replace")
+            active = payload.strip().lower() not in {"", "0", "false", "offline", "stop"}
+            with self._lock:
+                handler = self._realtime_demand_handler
+            if handler is not None:
+                try:
+                    handler(client_id, active)
+                except Exception as exc:
+                    LOGGER.warning("mqtt realtime demand rejected client=%s error=%s", client_id[:32], exc)
+
+        client.on_message = on_message
         client.reconnect_delay_set(min_delay=1, max_delay=60)
         client.connect_async(MQTT_INTERNAL_HOST, MQTT_INTERNAL_PORT, keepalive=25)
         client.loop_start()
@@ -285,6 +310,30 @@ class MqttRevisionPublisher:
                 with self._lock:
                     self._last_error = f"dashboard publish failed rc={info.rc}"
 
+    def set_realtime_demand_handler(self, handler) -> None:
+        with self._lock:
+            self._realtime_demand_handler = handler
+
+    def _publish_realtime(self, topic: str, payload: Dict[str, Any]) -> None:
+        if not isinstance(payload, dict) or not payload:
+            return
+        if self.enabled and self.connected and self._client is not None:
+            info = self._client.publish(
+                topic,
+                json.dumps(payload, ensure_ascii=False, separators=(",", ":")),
+                qos=0,
+                retain=False,
+            )
+            if info.rc != mqtt.MQTT_ERR_SUCCESS:
+                with self._lock:
+                    self._last_error = f"realtime publish failed rc={info.rc}"
+
+    def publish_router_realtime(self, payload: Dict[str, Any]) -> None:
+        self._publish_realtime(MQTT_ROUTER_REALTIME_TOPIC, payload)
+
+    def publish_devices_realtime(self, payload: Dict[str, Any]) -> None:
+        self._publish_realtime(MQTT_DEVICES_REALTIME_TOPIC, payload)
+
     def status(self) -> Dict[str, Any]:
         with self._lock:
             return {
@@ -293,6 +342,9 @@ class MqttRevisionPublisher:
                 "publicUrlConfigured": bool(MQTT_PUBLIC_URL),
                 "revisionTopic": MQTT_REVISION_TOPIC if self.enabled else "",
                 "dashboardTopic": MQTT_ROUTER_DASHBOARD_TOPIC if self.enabled else "",
+                "routerRealtimeTopic": MQTT_ROUTER_REALTIME_TOPIC if self.enabled else "",
+                "devicesRealtimeTopic": MQTT_DEVICES_REALTIME_TOPIC if self.enabled else "",
+                "realtimeDemandTopic": MQTT_REALTIME_DEMAND_TOPIC if self.enabled else "",
                 "connectedAt": self._connected_at,
                 "disconnectedAt": self._disconnected_at,
                 "lastPublishAt": self._last_publish_at,
@@ -309,7 +361,13 @@ MQTT_PUBLISHER.start()
 def lock_request_data():
     # High-frequency router telemetry uses a dedicated in-memory lock and must not
     # block SQLite-backed device/event synchronization.
-    if request.path.startswith("/api/router/dashboard"):
+    if (
+        request.path.startswith("/api/router/dashboard")
+        or request.path.startswith("/api/router/realtime")
+        or request.path.startswith("/api/devices/realtime")
+        or request.path == "/api/realtime"
+        or request.path.startswith("/api/realtime/ws")
+    ):
         g.data_lock_acquired = False
         return
     DATA_LOCK.acquire()
@@ -479,19 +537,36 @@ def _auth_tokens_from_request() -> List[str]:
     return [t for t in tokens if t]
 
 
+def _token_matches(candidate: Any, expected: Any) -> bool:
+    """Compare tokens without allowing malformed Unicode input to crash Flask.
+
+    Python's ``hmac.compare_digest`` rejects non-ASCII ``str`` inputs. Router
+    requests must receive a normal authentication failure in that case, rather
+    than turning every protected endpoint into an HTTP 500 response. Comparing
+    UTF-8 bytes retains constant-time comparison and also supports an existing
+    non-ASCII token during a controlled token rotation.
+    """
+    if not isinstance(candidate, str) or not isinstance(expected, str):
+        return False
+    try:
+        return hmac.compare_digest(candidate.encode("utf-8"), expected.encode("utf-8"))
+    except UnicodeError:
+        return False
+
+
 def check_app_token() -> bool:
     app_token = get_app_token()
-    return any(hmac.compare_digest(t, app_token) for t in _auth_tokens_from_request())
+    return any(_token_matches(t, app_token) for t in _auth_tokens_from_request())
 
 
 def check_hook_token() -> bool:
     hook_token = get_hook_token()
-    return any(hmac.compare_digest(t, hook_token) for t in _auth_tokens_from_request())
+    return any(_token_matches(t, hook_token) for t in _auth_tokens_from_request())
 
 
 def check_read_token() -> bool:
     allowed = {get_app_token(), get_hook_token()}
-    return any(any(hmac.compare_digest(t, token) for token in allowed) for t in _auth_tokens_from_request())
+    return any(any(_token_matches(t, token) for token in allowed) for t in _auth_tokens_from_request())
 
 
 def add_event(event: Dict[str, Any]) -> Dict[str, Any]:
@@ -2293,6 +2368,9 @@ def mqtt_client_config(include_secret: bool = True) -> Dict[str, Any]:
         "revisionTopic": MQTT_REVISION_TOPIC if enabled else "",
         "availabilityTopic": MQTT_AVAILABILITY_TOPIC if enabled else "",
         "dashboardTopic": MQTT_ROUTER_DASHBOARD_TOPIC if enabled else "",
+        "routerRealtimeTopic": MQTT_ROUTER_REALTIME_TOPIC if enabled else "",
+        "devicesRealtimeTopic": MQTT_DEVICES_REALTIME_TOPIC if enabled else "",
+        "realtimeDemandTopic": MQTT_REALTIME_DEMAND_TOPIC if enabled else "",
         "transport": "wss" if MQTT_PUBLIC_URL.lower().startswith("wss://") else "mqtt",
         "keepAliveSeconds": 25,
     }
@@ -2464,6 +2542,19 @@ def api_agent_update_request():
     commands.append(command)
     save_json(AGENT_UPDATE_COMMANDS_FILE, {"commands": commands[-100:]})
     return jsonify({"ok": True, "commandId": command["id"], "targetVersion": target, "message": "Rust Agent 更新指令已发送"})
+
+
+@app.route("/api/agent/update/check", methods=["POST"])
+def api_agent_update_check():
+    """Refresh the release manifest for the APP's explicit check action."""
+    if not check_app_token():
+        return jsonify({"ok": False, "error": "unauthorized"}), 401
+    try:
+        agent_release_manifest(force=True)
+    except Exception as exc:
+        LOGGER.warning("agent manifest refresh failed: %s", exc)
+        return jsonify({"ok": False, "error": "manifest_unavailable", "message": f"更新仓检查失败：{exc}"}), 502
+    return api_agent_update_status()
 
 
 @app.route("/api/agent/cleanup", methods=["POST"])
@@ -2754,6 +2845,9 @@ def api_router_dashboard_push():
     payload = request.get_json(silent=True) or {}
     if not isinstance(payload, dict):
         return jsonify({"ok": False, "error": "invalid payload"}), 400
+    ddns_store = globals().get("LAB_DDNS")
+    if ddns_store is not None:
+        ddns_store.accept_address(payload.get("ddnsAddress"))
     now_epoch = time.time()
     router_name = clean_saved_value(payload.get("router")) or primary_router_name() or "router"
     hub_exit_ipv4 = _cached_hub_exit_ipv4()
@@ -2807,6 +2901,11 @@ def api_router_dashboard_push():
                 ROUTER_DASHBOARD_CACHE["details"] = merged_details
             ROUTER_DASHBOARD_CACHE["detailsAt"] = now_str()
             ROUTER_DASHBOARD_CACHE["detailsEpoch"] = _dashboard_epoch(payload.get("detailsEpoch")) or now_epoch
+        wireguard = payload.get("wireguard")
+        if isinstance(wireguard, dict):
+            # Phase 1 read-only status; old Hubs simply ignore the field and old
+            # Apps keep working because it is additive.
+            ROUTER_DASHBOARD_CACHE["wireguard"] = wireguard
         completed = int(_dashboard_number(payload.get("refreshNonce"), 0))
         if completed > int(_dashboard_number(ROUTER_DASHBOARD_CACHE.get("refreshCompletedNonce"), 0)):
             ROUTER_DASHBOARD_CACHE["refreshCompletedNonce"] = completed
@@ -3370,10 +3469,15 @@ def _clean_portmap_rule(payload: Dict[str, Any], existing: Optional[Dict[str, An
     name = clean_saved_value(src.get("name"))[:64]
     if not name:
         raise ValueError("规则名称不能为空")
+    service_type = clean_saved_value(src.get("serviceType"))[:24]
+    transport_protocol = clean_saved_value(src.get("transportProtocol") or "TCP").upper()
+    if transport_protocol not in ["TCP", "UDP"]:
+        raise ValueError("传输协议只能是 TCP 或 UDP")
 
     target_mode = clean_saved_value(src.get("targetMode")).lower()
     target_ipv4 = clean_saved_value(src.get("targetIpv4"))
     target_ipv6 = clean_saved_value(src.get("targetIpv6")).strip("[]")
+    target_ipv6_snapshot = clean_saved_value(src.get("targetIpv6Snapshot")).strip("[]")
     target_suffix = clean_saved_value(src.get("targetIpv6Suffix")).lower()
     target_mac = norm_mac(src.get("targetMac"))
     if target_mac and not re.fullmatch(r"[0-9a-f]{2}(?::[0-9a-f]{2}){5}", target_mac):
@@ -3384,6 +3488,7 @@ def _clean_portmap_rule(payload: Dict[str, Any], existing: Optional[Dict[str, An
         if ip.version != 4 or not (ip.is_private or ip.is_loopback or ip.is_link_local):
             raise ValueError("6to4 目标必须是内网 IPv4")
         target_ipv6 = ""
+        target_ipv6_snapshot = ""
         target_suffix = ""
     else:
         if target_mode not in ["ipv6_full", "ipv6_suffix"]:
@@ -3394,12 +3499,18 @@ def _clean_portmap_rule(payload: Dict[str, Any], existing: Optional[Dict[str, An
             if ip.version != 6 or ip.is_link_local or ip.is_multicast or ip.is_loopback or ip.is_unspecified:
                 raise ValueError("目标 IPv6 无效")
             target_ipv6 = str(ip)
+            target_ipv6_snapshot = target_ipv6
             target_suffix = ""
         else:
             target_suffix = _normalize_ipv6_suffix(target_suffix)
             target_ipv6 = ""
             if not target_suffix:
                 raise ValueError("请输入目标 IPv6 后缀")
+            if target_ipv6_snapshot:
+                snapshot = ipaddress.ip_address(target_ipv6_snapshot)
+                if snapshot.version != 6 or snapshot.is_link_local or snapshot.is_multicast or snapshot.is_loopback or snapshot.is_unspecified:
+                    raise ValueError("目标 IPv6 快照无效")
+                target_ipv6_snapshot = str(snapshot)
 
     max_connections = max(1, min(256, to_int(src.get("maxConnections"), 32) or 32))
     idle_timeout = max(30, min(3600, to_int(src.get("idleTimeoutSec"), 300) or 300))
@@ -3417,9 +3528,12 @@ def _clean_portmap_rule(payload: Dict[str, Any], existing: Optional[Dict[str, An
         "targetMode": target_mode,
         "targetIpv4": target_ipv4,
         "targetIpv6": target_ipv6,
+        "targetIpv6Snapshot": target_ipv6_snapshot,
         "targetIpv6Suffix": target_suffix,
         "targetMac": target_mac,
         "targetPort": target_port,
+        "serviceType": service_type,
+        "transportProtocol": transport_protocol,
         "preferCurrentPrefix": bool(src.get("preferCurrentPrefix", True)),
         "expiresAt": expires_at,
         "leaseSeconds": lease_seconds,
@@ -3430,21 +3544,57 @@ def _clean_portmap_rule(payload: Dict[str, Any], existing: Optional[Dict[str, An
     }
 
 
+def _load_portmap_rules_document() -> tuple[Dict[str, Any], bool]:
+    """Return the authoritative document and whether it was safely readable.
+
+    A malformed or missing document must never be interpreted as an intentional
+    empty desired set: status reconciliation would otherwise delete every rule
+    currently running on the router.
+    """
+    missing = object()
+    raw = load_json(PORTMAP_RULES_FILE, missing)
+    if raw is missing:
+        return {"version": 1, "revision": 0, "updatedAt": "", "rules": []}, False
+    if isinstance(raw, dict) and isinstance(raw.get("rules"), list):
+        document = dict(raw)
+        document["rules"] = [x for x in raw["rules"] if isinstance(x, dict) and clean_saved_value(x.get("id"))]
+        document["version"] = max(1, to_int(raw.get("version"), 1))
+        document["revision"] = max(1, to_int(raw.get("revision"), 1))
+        document["updatedAt"] = clean_saved_value(raw.get("updatedAt"))
+        return document, True
+    if isinstance(raw, list):
+        return {
+            "version": 1,
+            "revision": 1,
+            "updatedAt": "",
+            "rules": [x for x in raw if isinstance(x, dict) and clean_saved_value(x.get("id"))],
+        }, True
+    return {"version": 1, "revision": 0, "updatedAt": "", "rules": []}, False
+
+
 def _load_portmap_rules() -> List[Dict[str, Any]]:
-    raw = load_json(PORTMAP_RULES_FILE, {"rules": []})
-    rows = raw.get("rules", []) if isinstance(raw, dict) else raw if isinstance(raw, list) else []
-    return [x for x in rows if isinstance(x, dict) and clean_saved_value(x.get("id"))]
+    return _load_portmap_rules_document()[0]["rules"]
 
 
 def _save_portmap_rules(rows: List[Dict[str, Any]]) -> None:
-    rows = sorted(rows[-100:], key=lambda x: (to_int(x.get("listenPort"), 0), clean_saved_value(x.get("name"))))
-    save_json(PORTMAP_RULES_FILE, {"version": 1, "updatedAt": now_str(), "rules": rows})
+    rows = sorted(rows[-100:], key=lambda x: (to_int(x.get("listenPort"), 0), clean_saved_value(x.get("transportProtocol") or "TCP"), clean_saved_value(x.get("name"))))
+    previous, _loaded = _load_portmap_rules_document()
+    save_json(PORTMAP_RULES_FILE, {
+        "version": 1,
+        "revision": max(0, to_int(previous.get("revision"), 0)) + 1,
+        "updatedAt": now_str(),
+        "rules": rows,
+    })
 
 
 def _portmap_check_conflict(rows: List[Dict[str, Any]], rule: Dict[str, Any]) -> None:
     for item in rows:
-        if item.get("id") != rule.get("id") and to_int(item.get("listenPort"), 0) == to_int(rule.get("listenPort"), 0):
-            raise ValueError(f"监听端口 {rule.get('listenPort')} 已被规则 {item.get('name')} 使用")
+        if (
+            item.get("id") != rule.get("id")
+            and to_int(item.get("listenPort"), 0) == to_int(rule.get("listenPort"), 0)
+            and clean_saved_value(item.get("transportProtocol") or "TCP").upper() == clean_saved_value(rule.get("transportProtocol") or "TCP").upper()
+        ):
+            raise ValueError(f"{rule.get('transportProtocol')} 监听端口 {rule.get('listenPort')} 已被规则 {item.get('name')} 使用")
 
 
 def _portmap_command_rule_id(action: str, payload: Dict[str, Any]) -> str:
@@ -3486,6 +3636,27 @@ def _queue_portmap_command(action: str, payload: Dict[str, Any], router: Optiona
     return command
 
 
+def _portmap_command_sync_states(router: str) -> Dict[str, str]:
+    """Expose the newest command result for each desired rule to the APP."""
+    data = load_json(PORTMAP_COMMANDS_FILE, {"commands": []})
+    commands = data.get("commands", []) if isinstance(data, dict) else []
+    states: Dict[str, str] = {}
+    for command in reversed(commands if isinstance(commands, list) else []):
+        if not isinstance(command, dict) or command.get("router") != router:
+            continue
+        rule_id = _portmap_command_rule_id(clean_saved_value(command.get("action")), command.get("payload") or {})
+        if not rule_id or rule_id in states:
+            continue
+        status = clean_saved_value(command.get("status"))
+        if status in {"pending", "delivered"}:
+            states[rule_id] = "syncing"
+        elif status == "failed":
+            states[rule_id] = "error"
+        elif status == "done":
+            states[rule_id] = "synced"
+    return states
+
+
 def _portmap_runtime_map(router_status: Dict[str, Any]) -> Dict[str, Dict[str, Any]]:
     out: Dict[str, Dict[str, Any]] = {}
     status = router_status.get("status") if isinstance(router_status.get("status"), dict) else router_status
@@ -3524,8 +3695,11 @@ def _append_portmap_history(status_payload: Dict[str, Any]) -> None:
         samples.append({
             "time": now_epoch,
             "activeConnections": to_int(runtime.get("activeConnections"), 0),
+            "activePeers": to_int(runtime.get("activePeers"), 0),
             "uploadBytes": to_int(runtime.get("totalUploadBytes"), 0),
             "downloadBytes": to_int(runtime.get("totalDownloadBytes"), 0),
+            "uploadPackets": to_int(runtime.get("totalUploadPackets"), 0),
+            "downloadPackets": to_int(runtime.get("totalDownloadPackets"), 0),
             "state": clean_saved_value(runtime.get("state")),
         })
         history[rid] = samples[-1440:]
@@ -3539,17 +3713,24 @@ def api_portmaps():
     if request.method == "GET":
         if not check_read_token():
             return jsonify({"ok": False, "error": "unauthorized"}), 401
-        rules = _load_portmap_rules()
+        document, rules_loaded = _load_portmap_rules_document()
+        rules = document["rules"]
         router_status = load_json(PORTMAP_ROUTER_STATUS_FILE, {})
         runtime = _portmap_runtime_map(router_status)
-        rows = [{**r, "runtime": runtime.get(r.get("id"), {})} for r in rules]
+        router = router_status.get("router", _portmap_router_name()) if isinstance(router_status, dict) else _portmap_router_name()
+        sync_states = _portmap_command_sync_states(router)
+        rows = [{**r, "runtime": runtime.get(r.get("id"), {}), "syncState": sync_states.get(r.get("id"), "synced")} for r in rules]
         received_epoch = to_int(router_status.get("receivedEpoch"), 0) if isinstance(router_status, dict) else 0
         agent_online = bool(received_epoch and time.time() - received_epoch <= 35)
         return jsonify({
             "ok": True,
             "rules": rows,
+            "rulesLoaded": rules_loaded,
+            "rulesRevision": to_int(document.get("revision"), 0),
+            "rulesUpdatedAt": document.get("updatedAt", ""),
+            "revision": to_int(document.get("revision"), 0),
             "portRange": {"min": 20000, "max": 20020},
-            "router": router_status.get("router", _portmap_router_name()) if isinstance(router_status, dict) else _portmap_router_name(),
+            "router": router,
             "agentOnline": agent_online,
             "agentLastSeenAt": router_status.get("receivedAt", "") if isinstance(router_status, dict) else "",
         })
@@ -3707,7 +3888,8 @@ def api_router_portmap_status():
 
     # Reconcile Hub desired rules with router-local rules. This recovers from a
     # replaced binary/config or router reset without requiring APP to edit each rule.
-    desired = {clean_saved_value(x.get("id")): x for x in _load_portmap_rules() if clean_saved_value(x.get("id"))}
+    document, rules_loaded = _load_portmap_rules_document()
+    desired = {clean_saved_value(x.get("id")): x for x in document["rules"] if clean_saved_value(x.get("id"))}
     local_rows = payload.get("rules", []) if isinstance(payload.get("rules"), list) else []
     local = {}
     for row in local_rows:
@@ -3717,13 +3899,16 @@ def api_router_portmap_status():
         rid = clean_saved_value(local_rule.get("id") or (row.get("runtime") or {}).get("id"))
         if rid:
             local[rid] = local_rule
-    compare_keys = ["enabled", "mode", "listenPort", "targetMode", "targetIpv4", "targetIpv6", "targetIpv6Suffix", "targetMac", "targetPort", "expiresAt", "leaseSeconds", "maxConnections", "idleTimeoutSec"]
+    compare_keys = ["enabled", "mode", "listenPort", "targetMode", "targetIpv4", "targetIpv6", "targetIpv6Suffix", "targetMac", "targetPort", "transportProtocol", "expiresAt", "leaseSeconds", "maxConnections", "idleTimeoutSec"]
     for rid, rule in desired.items():
         local_rule = local.get(rid)
         if not local_rule or any(local_rule.get(k) != rule.get(k) for k in compare_keys):
             _queue_portmap_command("upsert", {"rule": rule}, router)
-    for rid in set(local) - set(desired):
-        _queue_portmap_command("delete", {"id": rid}, router)
+    if rules_loaded:
+        for rid in set(local) - set(desired):
+            _queue_portmap_command("delete", {"id": rid}, router)
+    else:
+        LOGGER.warning("Port-map rules document unavailable; skip destructive router reconciliation")
 
     return jsonify({"ok": True, "receivedAt": record["receivedAt"]})
 

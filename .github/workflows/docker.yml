@@ -9,10 +9,41 @@ on:
 jobs:
   docker:
     runs-on: ubuntu-latest
+    env:
+      PYTHONPATH: ${{ github.workspace }}
 
     steps:
       - name: Checkout
         uses: actions/checkout@v4
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: '3.12'
+
+      - name: Test Hub runtime
+        working-directory: ${{ github.workspace }}
+        shell: bash
+        run: |
+          python -m pip install --upgrade pip
+          python -m pip install -r requirements.txt pytest
+          python -m py_compile \
+            hub.py hub_entry.py hub_realtime_ws.py \
+            hub0934_fixes.py hub0935_sync_fix.py \
+            final_stability_patch.py followup_stability_patch.py \
+            agent_presence_patch.py device_history_patch.py portmap_persistence_patch.py \
+            labrelay_sync_patch.py lab_ddns.py lab_ddns_providers.py \
+            labprobe_storage.py \
+            router_rpc.py router_rpc_v099.py router_rpc_v010.py \
+            router_developer_flow_patch.py router_http_developer_transport_patch.py \
+            router_be72_auth_patch.py router_be72_sid_wire_patch.py \
+            router_native_features_patch.py router_ws_patch.py router_fast_watchdog_patch.py \
+            router_build024_fix.py router_compat.py router_realtime_stability_patch.py \
+            router_relay_credentials_patch.py router_lite_realtime_patch.py \
+            router_device_live_sync_patch.py router_slow_cache_patch.py \
+            router_control_scheduler_patch.py router_control_actor_patch.py \
+            router_task_manager_patch.py router_config_sync_patch.py
+          python -m pytest -q
 
       - name: Set up QEMU
         uses: docker/setup-qemu-action@v3
@@ -26,7 +57,7 @@ jobs:
           username: ${{ secrets.DOCKERHUB_USERNAME }}
           password: ${{ secrets.DOCKERHUB_TOKEN }}
 
-      - name: Build and Push
+      - name: Build and Push Hub
         uses: docker/build-push-action@v6
         with:
           context: .
@@ -35,4 +66,4 @@ jobs:
           platforms: linux/amd64,linux/arm64
           tags: |
             ${{ secrets.DOCKERHUB_USERNAME }}/labprobe-hub:latest
-            ${{ secrets.DOCKERHUB_USERNAME }}/labprobe-hub:0.9.12
+            ${{ secrets.DOCKERHUB_USERNAME }}/labprobe-hub:0.10.5

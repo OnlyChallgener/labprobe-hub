@@ -1,0 +1,174 @@
+name: Publish LabRelay Router Bundle
+
+on:
+  workflow_dispatch:
+
+concurrency:
+  group: publish-labrelay-${{ github.ref }}
+  cancel-in-progress: true
+
+permissions:
+  contents: write
+
+jobs:
+  release:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Read LabRelay version
+        id: version
+        shell: bash
+        run: |
+          set -euo pipefail
+          VERSION="$(sed -n 's/^version = "\([^"]*\)"/\1/p' labrelay/Cargo.toml | head -n 1)"
+          test -n "$VERSION"
+          echo "version=$VERSION" >> "$GITHUB_OUTPUT"
+          echo "tag=labrelay-v$VERSION" >> "$GITHUB_OUTPUT"
+
+      - name: Test LabRelay and refresh lock metadata
+        run: |
+          set -euo pipefail
+          cargo test --manifest-path labrelay/Cargo.toml --all-targets
+          VERSION="${{ steps.version.outputs.version }}"
+          python3 - <<'PY'
+          import os
+          import re
+          from pathlib import Path
+
+          version = os.environ['VERSION']
+          lock = Path('labrelay/Cargo.lock').read_text(encoding='utf-8')
+          match = re.search(r'\[\[package\]\]\nname = "labrelay"\nversion = "([^"]+)"', lock)
+          if not match:
+              raise SystemExit('labrelay package missing from Cargo.lock')
+          if match.group(1) != version:
+              raise SystemExit(f'Cargo.lock version {match.group(1)} != Cargo.toml {version}')
+          print(f'Cargo metadata aligned at {version}')
+          PY
+        env:
+          VERSION: ${{ steps.version.outputs.version }}
+
+      - name: Keep CLI version aligned with Cargo package
+        run: |
+          set -euo pipefail
+          python3 - <<'PY'
+          from pathlib import Path
+          path = Path('labrelay/src/main.rs')
+          text = path.read_text(encoding='utf-8')
+          text = text.replace('const VERSION: &str = "0.2.4";', 'const VERSION: &str = env!("CARGO_PKG_VERSION");')
+          if 'const VERSION: &str = env!("CARGO_PKG_VERSION");' not in text:
+              raise SystemExit('unable to align LabRelay CLI version')
+          path.write_text(text, encoding='utf-8')
+          PY
+
+      - name: Install cross and QEMU
+        run: |
+          cargo install cross --locked
+          sudo apt-get update
+          sudo apt-get install -y qemu-user-static
+
+      - name: Build static ARM64 router binary
+        env:
+          CARGO_TARGET_DIR: ${{ runner.temp }}/labrelay-cross-target
+        run: cross build --manifest-path labrelay/Cargo.toml --release --target aarch64-unknown-linux-musl
+
+      - name: Verify binary self-reported version
+        env:
+          VERSION: ${{ steps.version.outputs.version }}
+        run: |
+          set -euo pipefail
+          BINARY="$RUNNER_TEMP/labrelay-cross-target/aarch64-unknown-linux-musl/release/labrelay"
+          test -x "$BINARY"
+          OUTPUT="$(qemu-aarch64-static "$BINARY" version)"
+          printf '%s\n' "$OUTPUT"
+          test "$OUTPUT" = "labrelay $VERSION"
+
+      - name: Assemble complete installer repository
+        env:
+          VERSION: ${{ steps.version.outputs.version }}
+          TAG: ${{ steps.version.outputs.tag }}
+        run: |
+          set -euo pipefail
+          OUT="$RUNNER_TEMP/agent"
+          BINARY="$RUNNER_TEMP/labrelay-cross-target/aarch64-unknown-linux-musl/release/labrelay"
+          test -x "$BINARY"
+          mkdir -p "$OUT"
+          cp "$BINARY" "$OUT/labrelay-linux-arm64"
+          cp scripts/labprobe-install.sh "$OUT/install.sh"
+          cp scripts/labprobe-install.sh "$OUT/labprobe-install.sh"
+          chmod 755 "$OUT/labrelay-linux-arm64" "$OUT/install.sh" "$OUT/labprobe-install.sh"
+          file "$OUT/labrelay-linux-arm64" > "$RUNNER_TEMP/labrelay-file.txt"
+          grep -Eqi 'aarch64|ARM aarch64|ARM64' "$RUNNER_TEMP/labrelay-file.txt"
+          python3 - <<'PY'
+          import hashlib
+          import json
+          import os
+          from pathlib import Path
+
+          out = Path(os.environ['RUNNER_TEMP']) / 'agent'
+          version = os.environ['VERSION']
+          tag = os.environ['TAG']
+          release_root = f'https://github.com/OnlyChallgener/labprobe-hub/releases/download/{tag}'
+          public_root = 'https://lab.net86.dynv6.net:27772/agent'
+
+          def metadata(name: str):
+              data = (out / name).read_bytes()
+              return {
+                  'url': f'{release_root}/{name}',
+                  'fallbackUrl': f'{public_root}/{name}',
+                  'sha256': hashlib.sha256(data).hexdigest(),
+                  'sizeBytes': len(data),
+              }
+
+          manifest = {
+              'schemaVersion': 1,
+              'versionName': version,
+              'changelog': 'Fix permanent IPv6 mapping runtime stability and Relay update reporting.',
+              'installUrl': f'{release_root}/install.sh',
+              'checksumsUrl': f'{release_root}/checksums.txt',
+              'installer': metadata('install.sh'),
+              'binaries': {'arm64': metadata('labrelay-linux-arm64')},
+          }
+          (out / 'latest.json').write_text(json.dumps(manifest, ensure_ascii=False, indent=2) + '\n', encoding='utf-8')
+          names = ['labrelay-linux-arm64', 'install.sh', 'labprobe-install.sh', 'latest.json']
+          lines = []
+          for name in names:
+              data = (out / name).read_bytes()
+              lines.append(f'{hashlib.sha256(data).hexdigest()}  {name}')
+          (out / 'checksums.txt').write_text('\n'.join(lines) + '\n', encoding='utf-8')
+          PY
+          (cd "$OUT" && sha256sum -c checksums.txt)
+          tar -C "$RUNNER_TEMP" -czf "$RUNNER_TEMP/labrelay-router-arm64-v$VERSION.tar.gz" agent
+
+      - name: Upload complete router bundle artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: labrelay-router-arm64-v${{ steps.version.outputs.version }}
+          path: |
+            ${{ runner.temp }}/agent/**
+            ${{ runner.temp }}/labrelay-router-arm64-v${{ steps.version.outputs.version }}.tar.gz
+          if-no-files-found: error
+
+      - name: Publish or update GitHub release assets
+        uses: softprops/action-gh-release@v2
+        with:
+          tag_name: ${{ steps.version.outputs.tag }}
+          name: LabRelay v${{ steps.version.outputs.version }}
+          make_latest: true
+          prerelease: false
+          generate_release_notes: false
+          body: |
+            LabRelay OpenWrt/BE72 router bundle.
+
+            First install:
+            `sh install.sh HUB_URL HOOK_TOKEN BE72Pro`
+
+            Existing installation upgrade:
+            `sh install.sh`
+          files: |
+            ${{ runner.temp }}/agent/labrelay-linux-arm64
+            ${{ runner.temp }}/agent/install.sh
+            ${{ runner.temp }}/agent/labprobe-install.sh
+            ${{ runner.temp }}/agent/latest.json
+            ${{ runner.temp }}/agent/checksums.txt
+            ${{ runner.temp }}/labrelay-router-arm64-v${{ steps.version.outputs.version }}.tar.gz

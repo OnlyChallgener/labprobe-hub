@@ -15,6 +15,13 @@ TMP_SUM="/tmp/labrelay.new.sha256"
 UPDATE_ROOT="${LABPROBE_UPDATE_ROOT:-https://lab.net86.dynv6.net:27772}"
 AGENT_BASE="${UPDATE_ROOT%/}/agent"
 NONINTERACTIVE="${LABPROBE_NONINTERACTIVE:-0}"
+# Present only for an APP-initiated update. Manual installation never sends a
+# command acknowledgement, while a background update can report its real
+# result even after the old Agent process has been replaced.
+COMMAND_ID="${LABPROBE_COMMAND_ID:-}"
+COMMAND_HUB_URL="${LABPROBE_COMMAND_HUB_URL:-}"
+COMMAND_HOOK_TOKEN="${LABPROBE_COMMAND_HOOK_TOKEN:-}"
+INSTALL_STAGE="准备安装"
 
 case "$ACTION" in
   install|upgrade|repair|configure|uninstall) ;;
@@ -22,7 +29,26 @@ case "$ACTION" in
 esac
 
 say() { echo "[LabProbe] $*"; }
-fail() { say "ERROR: $*" >&2; exit 1; }
+fail() {
+  say "ERROR: $*" >&2
+  # Failures before a backup exists (for example download or checksum errors)
+  # must still settle an APP-triggered command instead of leaving it "accepted".
+  command_ack "failed" "installer failed before service replacement"
+  exit 1
+}
+command_ack() {
+  state="$1"; message="$2"
+  [ -n "$COMMAND_ID" ] && [ -n "$COMMAND_HUB_URL" ] && [ -n "$COMMAND_HOOK_TOKEN" ] || return 0
+  # Command identifiers are Hub-generated hexadecimal values and messages here
+  # are installer-owned constants, so the compact JSON body is safe for ash.
+  body="{\"id\":\"$COMMAND_ID\",\"state\":\"$state\",\"message\":\"$message\"}"
+  if command -v curl >/dev/null 2>&1; then
+    curl -fsS --connect-timeout 4 --max-time 12 -X POST \
+      -H "X-LabProbe-Token: $COMMAND_HOOK_TOKEN" \
+      -H 'Content-Type: application/json' \
+      --data "$body" "${COMMAND_HUB_URL%/}/api/router/agent/ack" >/dev/null 2>&1 || true
+  fi
+}
 ask_yes() {
   [ "$NONINTERACTIVE" = "1" ] && return 0
   prompt="$1"; default="${2:-Y}"; printf "%s " "$prompt"; read answer || answer=""
@@ -203,7 +229,7 @@ EOF
 }
 
 rollback() {
-  say "安装失败，正在回滚"
+  say "安装失败（阶段：$INSTALL_STAGE），正在回滚"
   if [ "${HAD_OLD_BIN:-0}" = "1" ]; then cp "$BACKUP/labrelay" "$BIN"; else rm -f "$BIN"; fi
   if [ "${HAD_OLD_CONFIG:-0}" = "1" ]; then cp "$BACKUP/agent.json" "$CONFIG"; else rm -f "$CONFIG"; fi
   if [ "${HAD_OLD_RELAY:-0}" = "1" ]; then cp "$BACKUP/relay.json" "$RELAY_CONFIG"; else rm -f "$RELAY_CONFIG"; fi
@@ -222,8 +248,40 @@ rollback() {
     "/etc/init.d/$old_name" enable >/dev/null 2>&1 || true
     "/etc/init.d/$old_name" start >/dev/null 2>&1 || true
   done
-  "$INIT_SCRIPT" restart >/dev/null 2>&1 || true
+  [ -x "$INIT_SCRIPT" ] && "$INIT_SCRIPT" restart >/dev/null 2>&1 || true
+  command_ack "failed" "安装失败：$INSTALL_STAGE"
   exit 1
+}
+
+show_stage_log() {
+  file="$1"
+  [ -s "$file" ] || return 0
+  say "$INSTALL_STAGE 的诊断输出："
+  tail -n 30 "$file" 2>/dev/null || cat "$file" 2>/dev/null || true
+}
+
+wait_for_relay() {
+  attempt=1
+  while [ "$attempt" -le 12 ]; do
+    if "$BIN" ctl --socket /tmp/labrelay.sock '{"action":"status"}' >/tmp/labprobe/relay-ready.json 2>/dev/null; then
+      return 0
+    fi
+    sleep 1
+    attempt=$((attempt + 1))
+  done
+  return 1
+}
+
+wait_for_hub() {
+  attempt=1
+  while [ "$attempt" -le 6 ]; do
+    if "$BIN" test-hub --config "$CONFIG" >/tmp/labprobe/install-test.log 2>&1; then
+      return 0
+    fi
+    sleep 2
+    attempt=$((attempt + 1))
+  done
+  return 1
 }
 
 uninstall_agent() {
@@ -257,10 +315,13 @@ say "架构=$ARCH，Hub=$HUB_URL，将安装采集、事件、IPv6、端口映�
 ask_yes "确认安装？[Y/n]" Y || exit 0
 
 mkdir -p "$INSTALL_DIR/backups" /tmp/labprobe
+INSTALL_STAGE="备份现有 Agent"
 backup_old
 prune_backups
+INSTALL_STAGE="下载并校验 ARM64 Agent"
 download_binary
 [ -x "$INIT_SCRIPT" ] && "$INIT_SCRIPT" stop >/dev/null 2>&1 || true
+INSTALL_STAGE="替换 Agent 程序"
 cp "$TMP_BIN" "$BIN" || rollback
 chmod 0755 "$BIN"
 [ -f "$RELAY_CONFIG" ] || echo '{"version":1,"rules":[]}' >"$RELAY_CONFIG"
@@ -269,20 +330,29 @@ chmod 600 "$RELAY_CONFIG"
 if [ -n "$HOOK_TOKEN_INPUT" ]; then
   ROUTER_NAME="${PRIMARY_ROUTER_NAME:-$(hostname 2>/dev/null || echo router)}"
   [ -n "$ROUTER_NAME" ] || ROUTER_NAME="router"
+  INSTALL_STAGE="写入 Agent 配置"
   "$BIN" configure --hub "$HUB_URL" --hook-token "$HOOK_TOKEN_INPUT" --name "$ROUTER_NAME" --config "$CONFIG" || rollback
 fi
 [ -s "$CONFIG" ] || rollback
 chmod 600 "$CONFIG"
+INSTALL_STAGE="迁移旧服务"
 cleanup_legacy
+INSTALL_STAGE="生成 OpenWrt procd 服务"
 write_service
-"$INIT_SCRIPT" enable >/dev/null 2>&1 || rollback
-"$INIT_SCRIPT" start >/dev/null 2>&1 || rollback
-sleep 3
-"$BIN" test-hub --config "$CONFIG" >/tmp/labprobe/install-test.log 2>&1 || rollback
+INSTALL_STAGE="启用 OpenWrt 服务"
+"$INIT_SCRIPT" enable >/tmp/labprobe/service-enable.log 2>&1 || { show_stage_log /tmp/labprobe/service-enable.log; rollback; }
+INSTALL_STAGE="启动 Relay 与 Agent 服务"
+"$INIT_SCRIPT" start >/tmp/labprobe/service-start.log 2>&1 || { show_stage_log /tmp/labprobe/service-start.log; rollback; }
+INSTALL_STAGE="等待 Relay 控制套接字"
+wait_for_relay || { show_stage_log /tmp/labprobe/service-start.log; rollback; }
+INSTALL_STAGE="校验 Hub 连通性"
+wait_for_hub || { show_stage_log /tmp/labprobe/install-test.log; rollback; }
 if [ "$0" != "$INSTALL_DIR/labprobe-install.sh" ]; then
+  INSTALL_STAGE="保存安装脚本"
   cp "$0" "$INSTALL_DIR/labprobe-install.sh" || rollback
 fi
 chmod 0755 "$INSTALL_DIR/labprobe-install.sh"
 say "安装完成"
 "$BIN" status --config "$CONFIG"
 say "诊断：labrelay doctor / status / test-hub"
+command_ack "completed" "Agent 已升级并通过 Relay 与 Hub 校验"
