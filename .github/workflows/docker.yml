@@ -3,7 +3,7 @@ name: Docker Image
 on:
   push:
     branches:
-      - hub0924
+      - main
   workflow_dispatch:
 
 jobs:
