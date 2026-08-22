@@ -25,6 +25,7 @@ from router_control_scheduler_patch import install_router_control_scheduler_patc
 from router_device_live_sync_patch import install_router_device_live_sync_patch
 from router_developer_flow_patch import install_router_developer_flow_patch
 from router_fast_watchdog_patch import install_router_fast_watchdog_patch
+from router.firewall_automation import install_firewall_automation
 from router_http_developer_transport_patch import install_router_http_developer_transport_patch
 from router_lite_realtime_patch import install_router_lite_realtime_patch
 from router_native_features_patch import install_router_native_features_patch
@@ -40,7 +41,7 @@ from router_ws_patch import install_router_ws_patch
 from router.ipv6 import create_ipv6_blueprint
 
 PREVIOUS_HUB_VERSION = "0.9.35"
-HUB_VERSION = "0.10.5"
+HUB_VERSION = "0.10.6"
 hub.APP_VERSION = HUB_VERSION
 install_router_http_developer_transport_patch()
 install_router_developer_flow_patch()
@@ -76,6 +77,7 @@ install_router_status_localization(hub, router_sync)
 router_lite_realtime = install_router_lite_realtime_patch(hub, router_sync)
 install_hub_realtime_ws(hub, router_lite_realtime)
 install_router_config_sync_patch(hub, hub.ROUTER_TASK_MANAGER.client)
+install_firewall_automation(hub, hub.ROUTER_TASK_MANAGER.client)
 install_lab_ddns(hub)
 install_agent_presence_patch(hub)
 install_device_history_patch(hub)

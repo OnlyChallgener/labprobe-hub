@@ -187,6 +187,14 @@ class RouterConfigSync:
         try:
             latest = loader()
             self.accept(resource, latest, source="sync")
+            if resource == "firewall":
+                automation = getattr(self.hub, "FIREWALL_AUTOMATION", None)
+                reconcile = getattr(automation, "reconcile", None)
+                if callable(reconcile):
+                    # Reuse the confirmed firewall refresh as the automation
+                    # heartbeat.  No extra polling thread or address cache is
+                    # introduced, and at most one verified rule is changed.
+                    reconcile(latest, blocking=False)
         except router_rpc.RouterRpcError as exc:
             if getattr(exc, "code", "") not in {"BACKGROUND_DEFERRED", "CONTROL_QUEUE_BUSY"}:
                 self.logger.debug("router config sync deferred resource=%s error=%s", resource, exc)
