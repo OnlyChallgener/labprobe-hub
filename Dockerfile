@@ -58,6 +58,7 @@ COPY router_control_scheduler_patch.py /app/router_control_scheduler_patch.py
 COPY router_control_actor_patch.py /app/router_control_actor_patch.py
 COPY router_task_manager_patch.py /app/router_task_manager_patch.py
 COPY router_config_sync_patch.py /app/router_config_sync_patch.py
+COPY router /app/router
 COPY labprobe_storage.py /app/labprobe_storage.py
 COPY scripts/repair_storage.py /app/scripts/repair_storage.py
 
@@ -96,8 +97,14 @@ RUN python -m py_compile \
         /app/router_control_actor_patch.py \
         /app/router_task_manager_patch.py \
         /app/router_config_sync_patch.py \
+        /app/router/__init__.py \
+        /app/router/ipv6/__init__.py \
+        /app/router/ipv6/models.py \
+        /app/router/ipv6/mapper.py \
+        /app/router/ipv6/service.py \
+        /app/router/ipv6/api.py \
         /app/labprobe_storage.py \
-    && python -c "import hub0934_fixes, hub0935_sync_fix, followup_stability_patch, final_stability_patch, labrelay_sync_patch, lab_ddns, lab_ddns_providers, agent_presence_patch, device_history_patch, portmap_persistence_patch, router_lite_realtime_patch, router_device_live_sync_patch, router_fast_watchdog_patch, router_build024_fix, router_slow_cache_patch, router_control_scheduler_patch, router_control_actor_patch, router_task_manager_patch, router_config_sync_patch, hub_realtime_ws" \
+    && python -c "import hub0934_fixes, hub0935_sync_fix, followup_stability_patch, final_stability_patch, labrelay_sync_patch, lab_ddns, lab_ddns_providers, agent_presence_patch, device_history_patch, portmap_persistence_patch, router_lite_realtime_patch, router_device_live_sync_patch, router_fast_watchdog_patch, router_build024_fix, router_slow_cache_patch, router_control_scheduler_patch, router_control_actor_patch, router_task_manager_patch, router_config_sync_patch, router.ipv6, hub_realtime_ws" \
     && mkdir -p /app/data /app/config /app/backups /app/logs /app/scripts /app/update-repository/agent \
     && chmod 755 /app/scripts/repair_storage.py /app/agent/install.sh
 

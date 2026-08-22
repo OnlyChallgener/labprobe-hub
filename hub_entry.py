@@ -37,6 +37,7 @@ from router_rpc_v010 import create_router_blueprint_v010
 from router_slow_cache_patch import install_router_slow_cache_patch
 from router_task_manager_patch import install_router_task_manager_patch
 from router_ws_patch import install_router_ws_patch
+from router.ipv6 import create_ipv6_blueprint
 
 PREVIOUS_HUB_VERSION = "0.9.35"
 HUB_VERSION = "0.10.5"
@@ -61,6 +62,13 @@ hub.app.register_blueprint(
         check_app_token=hub.check_app_token,
         logger=hub.LOGGER,
         config_dir=Path(hub.CONFIG_DIR),
+    )
+)
+hub.app.register_blueprint(
+    create_ipv6_blueprint(
+        check_app_token=hub.check_app_token,
+        logger=hub.LOGGER,
+        client=hub.ROUTER_TASK_MANAGER.client,
     )
 )
 router_sync = install_router_rpc_compat(hub)
