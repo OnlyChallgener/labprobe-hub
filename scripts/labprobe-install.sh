@@ -13,7 +13,10 @@ INIT_SCRIPT="/etc/init.d/labprobe"
 TMP_BIN="/tmp/labrelay.new"
 TMP_SUM="/tmp/labrelay.new.sha256"
 UPDATE_ROOT="${LABPROBE_UPDATE_ROOT:-https://lab.net86.dynv6.net:27772}"
-AGENT_BASE="${UPDATE_ROOT%/}/agent"
+case "${LABPROBE_AGENT_BASE:-$UPDATE_ROOT}" in
+  */releases/download/*) AGENT_BASE="${LABPROBE_AGENT_BASE:-${UPDATE_ROOT%/}}" ;;
+  *) AGENT_BASE="${LABPROBE_AGENT_BASE:-${UPDATE_ROOT%/}/agent}" ;;
+esac
 NONINTERACTIVE="${LABPROBE_NONINTERACTIVE:-0}"
 # Present only for an APP-initiated update. Manual installation never sends a
 # command acknowledgement, while a background update can report its real

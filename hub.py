@@ -65,6 +65,10 @@ STORE = SQLiteStore(DATA_DIR, BACKUPS_DIR, DB_PATH)
 UPDATE_REPOSITORY_ROOT = (os.environ.get("UPDATE_REPOSITORY_ROOT") or "").strip().rstrip("/") or "https://lab.net86.dynv6.net:27772"
 AGENT_MANIFEST_URL = f"{UPDATE_REPOSITORY_ROOT}/agent/latest.json"
 AGENT_INSTALLER_URL = f"{UPDATE_REPOSITORY_ROOT}/agent/install.sh"
+AGENT_GITHUB_MANIFEST_URL = (
+    os.environ.get("AGENT_GITHUB_MANIFEST_URL") or
+    "https://github.com/OnlyChallgener/labprobe-hub/releases/latest/download/latest.json"
+).strip()
 AGENT_RELEASE_CACHE: Dict[str, Any] = {"at": 0.0, "data": None}
 MQTT_PUBLIC_URL = (os.environ.get("MQTT_PUBLIC_URL") or "").strip()
 MQTT_INTERNAL_HOST = (os.environ.get("MQTT_INTERNAL_HOST") or "127.0.0.1").strip()
@@ -2417,20 +2421,59 @@ def version_parts(value: Any) -> Tuple[int, ...]:
     return tuple(parts[:4] or [0])
 
 
+def _normalized_agent_manifest(root: Any, source_url: str) -> Dict[str, Any]:
+    if not isinstance(root, dict):
+        raise ValueError("agent latest.json is invalid")
+    manifest = dict(root)
+    version = clean_saved_value(manifest.get("versionName") or manifest.get("version"))
+    binaries = manifest.get("binaries")
+    arm64 = binaries.get("arm64") if isinstance(binaries, dict) else None
+    if not version or not isinstance(arm64, dict):
+        raise ValueError("agent latest.json is invalid")
+
+    installer_url = clean_saved_value(manifest.get("installUrl")) or AGENT_INSTALLER_URL
+    binary_url = clean_saved_value(arm64.get("url"))
+    repository_root = UPDATE_REPOSITORY_ROOT
+    release_asset_url = binary_url or installer_url
+    if "/releases/download/" in release_asset_url and "/" in release_asset_url:
+        repository_root = release_asset_url.rsplit("/", 1)[0]
+
+    manifest["_manifestUrl"] = source_url
+    manifest["_installerUrl"] = installer_url
+    manifest["_repositoryRoot"] = repository_root
+    manifest["_stale"] = False
+    return manifest
+
+
 def agent_release_manifest(force: bool = False) -> Dict[str, Any]:
     now = time.time()
     cached = AGENT_RELEASE_CACHE.get("data")
     if not force and isinstance(cached, dict) and now - float(AGENT_RELEASE_CACHE.get("at") or 0) < 600:
         return cached
-    response = requests.get(AGENT_MANIFEST_URL, timeout=(4, 8), headers={"User-Agent": f"LabProbe-Hub/{APP_VERSION}"})
-    response.raise_for_status()
-    root = response.json()
-    version = clean_saved_value(root.get("versionName") or root.get("version"))
-    binaries = root.get("binaries")
-    if not version or not isinstance(binaries, dict) or not isinstance(binaries.get("arm64"), dict):
-        raise ValueError("agent latest.json is invalid")
-    AGENT_RELEASE_CACHE.update({"at": now, "data": root})
-    return root
+
+    errors = []
+    sources = list(dict.fromkeys(url for url in (AGENT_MANIFEST_URL, AGENT_GITHUB_MANIFEST_URL) if url))
+    for source_url in sources:
+        try:
+            response = requests.get(
+                source_url,
+                timeout=(4, 8),
+                headers={"User-Agent": f"LabProbe-Hub/{APP_VERSION}"},
+            )
+            response.raise_for_status()
+            manifest = _normalized_agent_manifest(response.json(), source_url)
+            AGENT_RELEASE_CACHE.update({"at": now, "data": manifest})
+            return manifest
+        except Exception as exc:
+            errors.append(f"{source_url}: {exc}")
+
+    if isinstance(cached, dict):
+        stale = dict(cached)
+        stale["_stale"] = True
+        AGENT_RELEASE_CACHE.update({"at": now, "data": stale})
+        LOGGER.warning("agent manifest sources unavailable; using stale cache: %s", " | ".join(errors))
+        return stale
+    raise RuntimeError("agent manifest sources unavailable: " + " | ".join(errors))
 
 
 def agent_status_for(router: str) -> Dict[str, Any]:
@@ -2508,7 +2551,9 @@ def api_agent_update_status():
             "ok": True, "router": router, "currentVersion": current, "latestVersion": latest,
             "updateAvailable": available, "state": command.get("state") or status.get("updateState") or "idle",
             "message": message, "lastSeenAt": status.get("lastSeenAt", ""),
-            "manifestUrl": AGENT_MANIFEST_URL, "installerUrl": AGENT_INSTALLER_URL,
+            "manifestUrl": manifest.get("_manifestUrl") or AGENT_MANIFEST_URL,
+            "installerUrl": manifest.get("_installerUrl") or AGENT_INSTALLER_URL,
+            "manifestStale": bool(manifest.get("_stale")),
         })
     except Exception as exc:
         LOGGER.warning("agent manifest check failed: %s", exc)
@@ -2533,8 +2578,9 @@ def api_agent_update_request():
     target = clean_saved_value(manifest.get("versionName") or manifest.get("version"))
     command = {
         "id": secrets.token_hex(12), "router": router, "action": "update", "state": "pending",
-        "targetVersion": target, "repositoryRoot": UPDATE_REPOSITORY_ROOT,
-        "manifestUrl": AGENT_MANIFEST_URL, "installerUrl": AGENT_INSTALLER_URL,
+        "targetVersion": target, "repositoryRoot": manifest.get("_repositoryRoot") or UPDATE_REPOSITORY_ROOT,
+        "manifestUrl": manifest.get("_manifestUrl") or AGENT_MANIFEST_URL,
+        "installerUrl": manifest.get("_installerUrl") or AGENT_INSTALLER_URL,
         "createdAt": now_str(), "updatedAt": now_str(), "message": "等待路由器领取更新指令",
     }
     data = load_json(AGENT_UPDATE_COMMANDS_FILE, {"commands": []})
