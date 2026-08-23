@@ -43,7 +43,7 @@ from stun_service import install_stun_service
 from wireguard_service import install_wireguard_service
 
 PREVIOUS_HUB_VERSION = "0.9.35"
-HUB_VERSION = "0.10.8"
+HUB_VERSION = "0.10.9"
 hub.APP_VERSION = HUB_VERSION
 install_router_http_developer_transport_patch()
 install_router_developer_flow_patch()

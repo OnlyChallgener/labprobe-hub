@@ -31,7 +31,7 @@ class FakeManifestResponse:
         return self.payload
 
 
-def release_manifest(version: str = "0.2.24"):
+def release_manifest(version: str = "0.2.25"):
     root = f"https://github.com/OnlyChallgener/labprobe-hub/releases/download/labrelay-v{version}"
     return {
         "schemaVersion": 1,
@@ -65,9 +65,9 @@ def test_agent_manifest_falls_back_to_github_release(monkeypatch):
     with mock.patch.object(hub.requests, "get", side_effect=fake_get):
         manifest = hub.agent_release_manifest(force=True)
 
-    release_root = "https://github.com/OnlyChallgener/labprobe-hub/releases/download/labrelay-v0.2.24"
+    release_root = "https://github.com/OnlyChallgener/labprobe-hub/releases/download/labrelay-v0.2.25"
     assert calls == [primary, github]
-    assert manifest["versionName"] == "0.2.24"
+    assert manifest["versionName"] == "0.2.25"
     assert manifest["_manifestUrl"] == github
     assert manifest["_installerUrl"] == f"{release_root}/install.sh"
     assert manifest["_repositoryRoot"] == release_root
