@@ -121,6 +121,8 @@ pub struct WireGuardServerDesired {
     pub address: String,
     #[serde(default = "default_listen_port")]
     pub listen_port: u16,
+    #[serde(default = "default_mtu")]
+    pub mtu: u16,
     #[serde(default = "default_true")]
     pub enabled: bool,
     #[serde(default)]
@@ -536,6 +538,10 @@ fn parse_cidr(value: &str) -> Result<(IpAddr, u8)> {
     Ok((address, prefix))
 }
 
+fn default_mtu() -> u16 {
+    1420
+}
+
 /// Validate an untrusted Hub document before it reaches the kernel API.
 /// Private/preshared keys are deliberately not part of this schema.
 pub fn validate_server_desired(config: &WireGuardServerDesired) -> Result<()> {
@@ -547,6 +553,9 @@ pub fn validate_server_desired(config: &WireGuardServerDesired) -> Result<()> {
     }
     if config.listen_port == 0 {
         bail!("WireGuard server requires a fixed UDP listen port");
+    }
+    if config.mtu != 0 && !(1280..=1500).contains(&config.mtu) {
+        bail!("WireGuard server MTU must be between 1280 and 1500 (received {})", config.mtu);
     }
     let (server_ip, _) = parse_cidr(&config.address)?;
     if !server_ip.is_ipv4() {
@@ -648,11 +657,14 @@ fn load_or_create_keypair(path: &Path) -> Result<KeyPair> {
 #[cfg(target_os = "linux")]
 fn configure_link(config: &WireGuardServerDesired) -> Result<()> {
     let ip = find_tool("ip").ok_or_else(|| anyhow::anyhow!("ip tool is required to assign the tunnel address"))?;
+    let mtu = if (1280..=1500).contains(&config.mtu) { config.mtu } else { 1420 };
+    let mtu_str = mtu.to_string();
     // No shell is involved; every argument is validated and passed directly.
     run_capture(&ip, &["address", "replace", &config.address, "dev", &config.interface_name])?;
-    run_capture(&ip, &["link", "set", "dev", &config.interface_name, if config.enabled { "up" } else { "down" }])?;
+    run_capture(&ip, &["link", "set", "dev", &config.interface_name, "mtu", &mtu_str, if config.enabled { "up" } else { "down" }])?;
     Ok(())
 }
+
 
 #[cfg(target_os = "linux")]
 fn ensure_interface(ip_tool: &str, interface_name: &str) -> Result<()> {

@@ -471,14 +471,20 @@ class WireGuardService:
             profiles.append(profile)
 
 
+        mtu = _int(payload.get("mtu"), _int(old.get("mtu"), 1420))
+        if not 1280 <= mtu <= 1500:
+            raise ValueError("WireGuard MTU 必须在 1280–1500 之间")
+
         return {
             "interfaceName": interface_name,
             "address": str(network_address),
             "listenPort": listen_port,
+            "mtu": mtu,
             "enabled": bool(payload.get("enabled", old.get("enabled", True))),
             "peers": peers,
             "endpointProfiles": profiles,
         }
+
 
     def commands(self) -> List[Dict[str, Any]]:
         raw = self.hub.load_json(self.commands_path, {"commands": []})
