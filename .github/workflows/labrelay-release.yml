@@ -123,7 +123,7 @@ jobs:
           manifest = {
               'schemaVersion': 1,
               'versionName': version,
-              'changelog': 'Fix permanent IPv6 mapping runtime stability and Relay update reporting.',
+              'changelog': 'Add Agent-managed WireGuard server, DDNS/STUN endpoint ownership, router Web firewall integration, and first-apply interface creation.',
               'installUrl': f'{release_root}/install.sh',
               'checksumsUrl': f'{release_root}/checksums.txt',
               'installer': metadata('install.sh'),
