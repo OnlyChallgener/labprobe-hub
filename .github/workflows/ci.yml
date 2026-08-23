@@ -42,6 +42,7 @@ jobs:
             router_task_manager_patch.py router_config_sync_patch.py \
             router_device_live_sync_patch.py router_lite_realtime_patch.py \
             labrelay_sync_patch.py router/firewall_automation.py
+          python -m py_compile assistant/*.py
 
       - name: Run Hub tests
         run: python -m pytest -q
