@@ -878,8 +878,27 @@ pub fn parse_uci_firewall_has_wg_forwarding(raw: &str) -> bool {
     has_src_wg && has_dest_lan
 }
 
-/// Non-blocking, idempotent setup of OpenWrt firewall `wg` zone and `wg -> lan`
-/// forwarding rule using `uci`. Safe on non-OpenWrt systems.
+/// Parse `uci show firewall` or `/etc/config/firewall` output to check if a
+/// forwarding rule from `wg` to `wan` is already configured.
+pub fn parse_uci_firewall_has_wg_wan_forwarding(raw: &str) -> bool {
+    let lower = raw.to_ascii_lowercase();
+    let has_src_wg = lower.contains("src='wg'")
+        || lower.contains("src=\"wg\"")
+        || lower.contains("src 'wg'")
+        || lower.contains("src \"wg\"")
+        || lower.contains("src='labprobe_wg'")
+        || lower.contains("src=\"labprobe_wg\"")
+        || lower.contains("src 'labprobe_wg'")
+        || lower.contains("src \"labprobe_wg\"");
+    let has_dest_wan = lower.contains("dest='wan'")
+        || lower.contains("dest=\"wan\"")
+        || lower.contains("dest 'wan'")
+        || lower.contains("dest \"wan\"");
+    has_src_wg && has_dest_wan
+}
+
+/// Non-blocking, idempotent setup of OpenWrt firewall `wg` zone and `wg -> lan` / `wg -> wan`
+/// forwarding rules using `uci`. Safe on non-OpenWrt systems.
 pub fn ensure_openwrt_wg_zone() -> Result<()> {
     let Some(uci) = find_tool("uci") else {
         return Ok(());
@@ -887,8 +906,9 @@ pub fn ensure_openwrt_wg_zone() -> Result<()> {
     let firewall_text = run_capture(&uci, &["show", "firewall"]).unwrap_or_default();
     let has_zone = parse_uci_firewall_has_wg_zone(&firewall_text);
     let has_forwarding = parse_uci_firewall_has_wg_forwarding(&firewall_text);
+    let has_wan_forwarding = parse_uci_firewall_has_wg_wan_forwarding(&firewall_text);
 
-    if has_zone && has_forwarding {
+    if has_zone && has_forwarding && has_wan_forwarding {
         return Ok(());
     }
 
@@ -897,6 +917,8 @@ pub fn ensure_openwrt_wg_zone() -> Result<()> {
         let _ = run_capture(&uci, &["add", "firewall", "zone"]);
         let _ = run_capture(&uci, &["set", "firewall.@zone[-1].name=wg"]);
         let _ = run_capture(&uci, &["set", "firewall.@zone[-1].network=labwg0"]);
+        let _ = run_capture(&uci, &["set", "firewall.@zone[-1].device=labwg0"]);
+        let _ = run_capture(&uci, &["set", "firewall.@zone[-1].masq=1"]);
         let _ = run_capture(&uci, &["set", "firewall.@zone[-1].input=ACCEPT"]);
         let _ = run_capture(&uci, &["set", "firewall.@zone[-1].output=ACCEPT"]);
         let _ = run_capture(&uci, &["set", "firewall.@zone[-1].forward=ACCEPT"]);
@@ -910,6 +932,13 @@ pub fn ensure_openwrt_wg_zone() -> Result<()> {
         changed = true;
     }
 
+    if !has_wan_forwarding {
+        let _ = run_capture(&uci, &["add", "firewall", "forwarding"]);
+        let _ = run_capture(&uci, &["set", "firewall.@forwarding[-1].src=wg"]);
+        let _ = run_capture(&uci, &["set", "firewall.@forwarding[-1].dest=wan"]);
+        changed = true;
+    }
+
     if changed {
         let _ = run_capture(&uci, &["commit", "firewall"]);
         if let Some(fw_init) = find_tool("/etc/init.d/firewall") {
@@ -918,6 +947,7 @@ pub fn ensure_openwrt_wg_zone() -> Result<()> {
     }
     Ok(())
 }
+
 
 /// Read-only UCI check: does the current network configuration contain a
 /// `proto wireguard` interface? Never writes to UCI.
