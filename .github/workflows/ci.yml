@@ -39,7 +39,7 @@ jobs:
             hub.py hub_entry.py hub_realtime_ws.py hub0934_fixes.py hub0935_sync_fix.py \
             final_stability_patch.py followup_stability_patch.py \
             device_history_patch.py portmap_persistence_patch.py agent_presence_patch.py \
-            router_task_manager_patch.py router_config_sync_patch.py \
+            router_task_manager_patch.py router_config_sync_patch.py stun_service.py \
             router_device_live_sync_patch.py router_lite_realtime_patch.py \
             labrelay_sync_patch.py router/firewall_automation.py
           python -m py_compile assistant/*.py

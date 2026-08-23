@@ -1,11 +1,11 @@
 use anyhow::{anyhow, bail, Context, Result};
 use serde::{Deserialize, Serialize};
 use serde_json::{json, Value};
-use socket2::{Domain, Protocol, Socket, Type};
+use socket2::{Domain, Protocol, SockAddr, Socket, Type};
 use std::collections::HashMap;
 use std::fs;
 use std::io::{BufRead, BufReader, Read, Write};
-use std::net::{IpAddr, Ipv4Addr, Ipv6Addr, SocketAddr, SocketAddrV6};
+use std::net::{IpAddr, Ipv4Addr, Ipv6Addr, SocketAddr, SocketAddrV4, SocketAddrV6};
 use std::path::{Path, PathBuf};
 use std::process::Command;
 use std::str::FromStr;
@@ -37,10 +37,17 @@ fn default_max_connections() -> u32 {
 fn default_idle_timeout() -> u64 {
     300
 }
+fn default_rule_kind() -> String {
+    "portmap".to_string()
+}
+fn default_stun_server() -> String {
+    "stun.cloudflare.com:3478".to_string()
+}
 
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 #[serde(default, rename_all = "camelCase")]
 struct Rule {
+    kind: String,
     id: String,
     name: String,
     enabled: bool,
@@ -53,6 +60,8 @@ struct Rule {
     target_mac: String,
     target_port: u16,
     transport_protocol: String,
+    service_type: String,
+    stun_server: String,
     prefer_current_prefix: bool,
     expires_at: Option<u64>,
     max_connections: u32,
@@ -66,6 +75,7 @@ fn rules_are_equal(left: &Rule, right: &Rule) -> bool {
 impl Default for Rule {
     fn default() -> Self {
         Self {
+            kind: default_rule_kind(),
             id: String::new(),
             name: String::new(),
             enabled: false,
@@ -78,6 +88,8 @@ impl Default for Rule {
             target_mac: String::new(),
             target_port: 0,
             transport_protocol: "TCP".to_string(),
+            service_type: "Custom".to_string(),
+            stun_server: default_stun_server(),
             prefer_current_prefix: default_true(),
             expires_at: None,
             max_connections: default_max_connections(),
@@ -112,6 +124,10 @@ struct RuntimeSnapshot {
     expires_at: Option<u64>,
     last_resolved_at: Option<u64>,
     last_error: String,
+    public_endpoint: String,
+    public_ip: String,
+    public_port: u16,
+    mapping_updated_at: Option<u64>,
 }
 
 impl RuntimeSnapshot {
@@ -126,7 +142,11 @@ impl RuntimeSnapshot {
                 "stopped"
             }
             .to_string(),
-            listen: format!("[::]:{}", rule.listen_port),
+            listen: if rule.kind == "stun" {
+                format!("0.0.0.0:{}", rule.listen_port)
+            } else {
+                format!("[::]:{}", rule.listen_port)
+            },
             resolved_target: String::new(),
             active_connections: 0,
             active_peers: 0,
@@ -138,6 +158,10 @@ impl RuntimeSnapshot {
             expires_at: rule.expires_at,
             last_resolved_at: None,
             last_error: String::new(),
+            public_endpoint: String::new(),
+            public_ip: String::new(),
+            public_port: 0,
+            mapping_updated_at: None,
         }
     }
 }
@@ -317,7 +341,11 @@ impl Manager {
             name: rule.name.clone(),
             mode: rule.mode.clone(),
             state: "starting".to_string(),
-            listen: format!("[::]:{}", rule.listen_port),
+            listen: if rule.kind == "stun" {
+                format!("0.0.0.0:{}", rule.listen_port)
+            } else {
+                format!("[::]:{}", rule.listen_port)
+            },
             resolved_target: previous
                 .as_ref()
                 .map(|x| x.resolved_target.clone())
@@ -341,6 +369,16 @@ impl Manager {
             expires_at: rule.expires_at,
             last_resolved_at: None,
             last_error: String::new(),
+            public_endpoint: previous
+                .as_ref()
+                .map(|x| x.public_endpoint.clone())
+                .unwrap_or_default(),
+            public_ip: previous
+                .as_ref()
+                .map(|x| x.public_ip.clone())
+                .unwrap_or_default(),
+            public_port: previous.as_ref().map(|x| x.public_port).unwrap_or(0),
+            mapping_updated_at: previous.as_ref().and_then(|x| x.mapping_updated_at),
         };
         let shared = Arc::new(RuntimeShared::new(snapshot));
         let target = Arc::new(RwLock::new(
@@ -354,7 +392,11 @@ impl Manager {
         let rule_task = rule.clone();
         let lan_if = self.lan_if.clone();
         let join = match rule.transport_protocol.as_str() {
-            "TCP" => match create_ipv6_listener(rule.listen_port) {
+            "TCP" => match if rule.kind == "stun" {
+                create_ipv4_listener(rule.listen_port)
+            } else {
+                create_ipv6_listener(rule.listen_port)
+            } {
                 Ok(listener) => tokio::spawn(async move {
                     run_tcp_listener(
                         listener,
@@ -372,7 +414,11 @@ impl Manager {
                     return Err(error);
                 }
             },
-            "UDP" => match create_ipv6_udp_listener(rule.listen_port) {
+            "UDP" => match if rule.kind == "stun" {
+                create_ipv4_udp_listener(rule.listen_port)
+            } else {
+                create_ipv6_udp_listener(rule.listen_port)
+            } {
                 Ok(socket) => tokio::spawn(async move {
                     run_udp_listener(
                         socket,
@@ -498,8 +544,15 @@ impl Manager {
         self.last_status.write().await.insert(rule.id.clone(), snap);
     }
 
-    async fn status_value(&self) -> Value {
-        let rules: Vec<Rule> = self.rules.read().await.values().cloned().collect();
+    async fn status_value(&self, scope: Option<&str>) -> Value {
+        let rules: Vec<Rule> = self
+            .rules
+            .read()
+            .await
+            .values()
+            .filter(|rule| scope.map(|value| rule.kind == value).unwrap_or(true))
+            .cloned()
+            .collect();
         let runtime_refs: HashMap<String, Arc<RuntimeShared>> = self
             .runtimes
             .lock()
@@ -539,11 +592,26 @@ impl Manager {
     }
 
     async fn write_state(&self) {
-        let value = self.status_value().await;
+        let value = self.status_value(None).await;
         if let Err(e) = atomic_value_write(&self.state_path, &value) {
             eprintln!("[labrelay] write state failed: {:#}", e);
         }
     }
+}
+
+fn create_ipv4_listener(port: u16) -> Result<TcpListener> {
+    let socket = Socket::new(Domain::IPV4, Type::STREAM, Some(Protocol::TCP))?;
+    socket.set_reuse_address(true)?;
+    #[cfg(unix)]
+    socket.set_reuse_port(true)?;
+    socket.set_nonblocking(true)?;
+    let addr = SocketAddrV4::new(Ipv4Addr::UNSPECIFIED, port);
+    socket
+        .bind(&addr.into())
+        .with_context(|| format!("bind 0.0.0.0:{}", port))?;
+    socket.listen(128)?;
+    let std_listener: std::net::TcpListener = socket.into();
+    Ok(TcpListener::from_std(std_listener)?)
 }
 
 fn create_ipv6_listener(port: u16) -> Result<TcpListener> {
@@ -590,6 +658,164 @@ fn create_ipv6_udp_listener(port: u16) -> Result<UdpSocket> {
     Ok(UdpSocket::from_std(std_socket)?)
 }
 
+fn create_ipv4_udp_listener(port: u16) -> Result<UdpSocket> {
+    let socket = Socket::new(Domain::IPV4, Type::DGRAM, Some(Protocol::UDP))?;
+    socket.set_reuse_address(true)?;
+    socket.set_nonblocking(true)?;
+    let addr = SocketAddrV4::new(Ipv4Addr::UNSPECIFIED, port);
+    socket
+        .bind(&addr.into())
+        .with_context(|| format!("bind UDP 0.0.0.0:{}", port))?;
+    let std_socket: std::net::UdpSocket = socket.into();
+    Ok(UdpSocket::from_std(std_socket)?)
+}
+
+static STUN_TRANSACTION_COUNTER: AtomicU64 = AtomicU64::new(1);
+const STUN_MAGIC_COOKIE: u32 = 0x2112_A442;
+
+fn stun_binding_request() -> [u8; 20] {
+    let mut request = [0u8; 20];
+    request[0..2].copy_from_slice(&0x0001u16.to_be_bytes());
+    request[2..4].copy_from_slice(&0u16.to_be_bytes());
+    request[4..8].copy_from_slice(&STUN_MAGIC_COOKIE.to_be_bytes());
+    let counter = STUN_TRANSACTION_COUNTER.fetch_add(1, Ordering::Relaxed);
+    let nanos = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .unwrap_or_default()
+        .as_nanos();
+    request[8..16].copy_from_slice(&(nanos as u64 ^ counter).to_be_bytes());
+    request[16..20].copy_from_slice(&((nanos >> 64) as u32 ^ counter as u32).to_be_bytes());
+    request
+}
+
+fn parse_stun_mapped_address(message: &[u8]) -> Result<SocketAddr> {
+    if message.len() < 20
+        || u16::from_be_bytes([message[0], message[1]]) != 0x0101
+        || u32::from_be_bytes([message[4], message[5], message[6], message[7]]) != STUN_MAGIC_COOKIE
+    {
+        bail!("invalid STUN binding response");
+    }
+    let body_len = u16::from_be_bytes([message[2], message[3]]) as usize;
+    if message.len() < 20 + body_len {
+        bail!("truncated STUN binding response");
+    }
+    let mut offset = 20usize;
+    while offset + 4 <= 20 + body_len {
+        let kind = u16::from_be_bytes([message[offset], message[offset + 1]]);
+        let len = u16::from_be_bytes([message[offset + 2], message[offset + 3]]) as usize;
+        let value = offset + 4;
+        if value + len > message.len() {
+            bail!("truncated STUN attribute");
+        }
+        if matches!(kind, 0x0001 | 0x0020) && len >= 8 && message[value + 1] == 0x01 {
+            let mut port = u16::from_be_bytes([message[value + 2], message[value + 3]]);
+            let mut octets = [message[value + 4], message[value + 5], message[value + 6], message[value + 7]];
+            if kind == 0x0020 {
+                port ^= (STUN_MAGIC_COOKIE >> 16) as u16;
+                let cookie = STUN_MAGIC_COOKIE.to_be_bytes();
+                for index in 0..4 {
+                    octets[index] ^= cookie[index];
+                }
+            }
+            return Ok(SocketAddr::V4(SocketAddrV4::new(Ipv4Addr::from(octets), port)));
+        }
+        offset = value + ((len + 3) & !3);
+    }
+    bail!("STUN response has no IPv4 mapped address")
+}
+
+async fn mark_stun_mapping(shared: &Arc<RuntimeShared>, endpoint: SocketAddr) {
+    let mut base = shared.base.write().await;
+    base.state = "mapped".to_string();
+    base.public_endpoint = endpoint.to_string();
+    base.public_ip = endpoint.ip().to_string();
+    base.public_port = endpoint.port();
+    base.mapping_updated_at = Some(now_epoch());
+    base.last_error.clear();
+}
+
+async fn resolve_stun_server(value: &str) -> Result<SocketAddr> {
+    tokio::net::lookup_host(value)
+        .await
+        .context("resolve STUN server")?
+        .find(SocketAddr::is_ipv4)
+        .ok_or_else(|| anyhow!("STUN server has no IPv4 address"))
+}
+
+async fn connect_tcp_stun(local_port: u16, server: SocketAddr) -> Result<TcpStream> {
+    let socket = Socket::new(Domain::IPV4, Type::STREAM, Some(Protocol::TCP))?;
+    socket.set_reuse_address(true)?;
+    #[cfg(unix)]
+    socket.set_reuse_port(true)?;
+    socket.set_nonblocking(true)?;
+    socket.bind(&SocketAddrV4::new(Ipv4Addr::UNSPECIFIED, local_port).into())?;
+    let server_addr = SockAddr::from(server);
+    match socket.connect(&server_addr) {
+        Ok(_) => {}
+        Err(error) if matches!(error.kind(), std::io::ErrorKind::WouldBlock | std::io::ErrorKind::Interrupted) => {}
+        Err(error) => return Err(error.into()),
+    }
+    let std_stream: std::net::TcpStream = socket.into();
+    let stream = TcpStream::from_std(std_stream)?;
+    timeout(Duration::from_secs(8), stream.writable())
+        .await
+        .context("STUN TCP connect timeout")??;
+    if let Some(error) = stream.take_error()? {
+        return Err(error.into());
+    }
+    Ok(stream)
+}
+
+async fn run_tcp_stun_keepalive(
+    rule: Rule,
+    shared: Arc<RuntimeShared>,
+    mut cancel: watch::Receiver<bool>,
+) {
+    loop {
+        if *cancel.borrow() {
+            return;
+        }
+        let result: Result<()> = async {
+            let server = resolve_stun_server(&rule.stun_server).await?;
+            let mut stream = connect_tcp_stun(rule.listen_port, server).await?;
+            let mut tick = tokio::time::interval(Duration::from_secs(20));
+            tick.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
+            loop {
+                tokio::select! {
+                    _ = cancel.changed() => {
+                        if *cancel.borrow() { return Ok(()); }
+                    }
+                    _ = tick.tick() => {
+                        let request = stun_binding_request();
+                        stream.write_all(&request).await?;
+                        let mut header = [0u8; 20];
+                        timeout(Duration::from_secs(8), stream.read_exact(&mut header))
+                            .await.context("STUN TCP response timeout")??;
+                        let length = u16::from_be_bytes([header[2], header[3]]) as usize;
+                        let mut message = Vec::with_capacity(20 + length);
+                        message.extend_from_slice(&header);
+                        message.resize(20 + length, 0);
+                        timeout(Duration::from_secs(8), stream.read_exact(&mut message[20..]))
+                            .await.context("STUN TCP body timeout")??;
+                        mark_stun_mapping(&shared, parse_stun_mapped_address(&message)?).await;
+                    }
+                }
+            }
+        }.await;
+        if let Err(error) = result {
+            let mut base = shared.base.write().await;
+            if base.public_endpoint.is_empty() {
+                base.state = "mapping".to_string();
+            }
+            base.last_error = error.to_string();
+        }
+        tokio::select! {
+            _ = cancel.changed() => if *cancel.borrow() { return; },
+            _ = sleep(Duration::from_secs(5)) => {}
+        }
+    }
+}
+
 async fn run_tcp_listener(
     listener: TcpListener,
     rule: Rule,
@@ -598,6 +824,15 @@ async fn run_tcp_listener(
     shared: Arc<RuntimeShared>,
     mut cancel: watch::Receiver<bool>,
 ) {
+    let stun_task = if rule.kind == "stun" {
+        Some(tokio::spawn(run_tcp_stun_keepalive(
+            rule.clone(),
+            shared.clone(),
+            cancel.clone(),
+        )))
+    } else {
+        None
+    };
     let semaphore = Arc::new(Semaphore::new(rule.max_connections as usize));
     let mut resolve_tick = tokio::time::interval(Duration::from_secs(30));
     resolve_tick.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
@@ -649,10 +884,17 @@ async fn run_tcp_listener(
                         let shared_conn = shared.clone();
                         let target_addr = SocketAddr::new(target_ip, rule.target_port);
                         let idle = rule.idle_timeout_sec;
+                        let preserve_mapped_state = rule.kind == "stun";
                         tokio::spawn(async move {
                             let _permit = permit;
                             shared_conn.active.fetch_add(1, Ordering::Relaxed);
-                            let result = proxy_connection(stream, target_addr, idle, shared_conn.clone()).await;
+                            let result = proxy_connection(
+                                stream,
+                                target_addr,
+                                idle,
+                                shared_conn.clone(),
+                                preserve_mapped_state,
+                            ).await;
                             shared_conn.active.fetch_sub(1, Ordering::Relaxed);
                             if let Err(e) = result {
                                 shared_conn.base.write().await.last_error = e.to_string();
@@ -666,6 +908,10 @@ async fn run_tcp_listener(
                 }
             }
         }
+    }
+    if let Some(task) = stun_task {
+        task.abort();
+        let _ = task.await;
     }
     let mut base = shared.base.write().await;
     if base.state != "expired" {
@@ -709,6 +955,9 @@ async fn run_udp_listener(
     let mut recv_buffer = vec![0u8; 65_535];
     let mut resolve_tick = tokio::time::interval(Duration::from_secs(30));
     resolve_tick.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
+    let mut stun_tick = tokio::time::interval(Duration::from_secs(20));
+    stun_tick.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
+    let mut stun_server: Option<SocketAddr> = None;
 
     loop {
         tokio::select! {
@@ -716,6 +965,22 @@ async fn run_udp_listener(
                 if *cancel.borrow() { break; }
             }
             _ = peer_tasks.join_next(), if !peer_tasks.is_empty() => {}
+            _ = stun_tick.tick(), if rule.kind == "stun" => {
+                match resolve_stun_server(&rule.stun_server).await {
+                    Ok(server) => {
+                        stun_server = Some(server);
+                        let request = stun_binding_request();
+                        if let Err(error) = listener.send_to(&request, server).await {
+                            shared.base.write().await.last_error = format!("STUN UDP send failed: {}", error);
+                        }
+                    }
+                    Err(error) => {
+                        let mut base = shared.base.write().await;
+                        if base.public_endpoint.is_empty() { base.state = "mapping".to_string(); }
+                        base.last_error = error.to_string();
+                    }
+                }
+            }
             _ = resolve_tick.tick() => {
                 if is_expired(&rule) {
                     let mut base = shared.base.write().await;
@@ -745,6 +1010,13 @@ async fn run_udp_listener(
                         continue;
                     }
                 };
+                if rule.kind == "stun" && stun_server == Some(client) {
+                    match parse_stun_mapped_address(&recv_buffer[..size]) {
+                        Ok(endpoint) => mark_stun_mapping(&shared, endpoint).await,
+                        Err(error) => shared.base.write().await.last_error = error.to_string(),
+                    }
+                    continue;
+                }
                 let Some(target_ip) = target.read().await.clone() else {
                     let mut base = shared.base.write().await;
                     base.state = "waiting_target".to_string();
@@ -828,7 +1100,9 @@ async fn run_udp_listener(
                             shared.upload.fetch_add(sent as u64, Ordering::Relaxed);
                             shared.upload_packets.fetch_add(1, Ordering::Relaxed);
                             let mut base = shared.base.write().await;
-                            base.state = "running".to_string();
+                            if rule.kind != "stun" {
+                                base.state = "running".to_string();
+                            }
                             base.last_error.clear();
                         }
                         Err(error) => shared.base.write().await.last_error = format!("UDP target send failed: {}", error),
@@ -907,6 +1181,7 @@ async fn proxy_connection(
     target: SocketAddr,
     idle_timeout_sec: u64,
     shared: Arc<RuntimeShared>,
+    preserve_mapped_state: bool,
 ) -> Result<()> {
     client.set_nodelay(true).ok();
     let mut upstream = timeout(Duration::from_secs(8), TcpStream::connect(target))
@@ -915,7 +1190,9 @@ async fn proxy_connection(
     upstream.set_nodelay(true).ok();
     {
         let mut base = shared.base.write().await;
-        base.state = "running".to_string();
+        if !preserve_mapped_state {
+            base.state = "running".to_string();
+        }
         base.last_error.clear();
     }
     let mut cbuf = vec![0u8; 32 * 1024];
@@ -963,7 +1240,7 @@ async fn update_target_status(
     if let Some(ip) = target {
         base.resolved_target = format_target(ip, rule.target_port);
         base.last_resolved_at = Some(now_epoch());
-        base.state = "running".to_string();
+        base.state = if rule.kind == "stun" { "mapping" } else { "running" }.to_string();
         base.last_error.clear();
     } else {
         base.state = "waiting_target".to_string();
@@ -973,7 +1250,7 @@ async fn update_target_status(
 
 async fn resolve_rule_target(rule: &Rule, lan_if: &str) -> Result<IpAddr> {
     match rule.mode.as_str() {
-        "6to4" => {
+        "6to4" | "stun" => {
             let ip = IpAddr::V4(Ipv4Addr::from_str(&rule.target_ipv4)?);
             let iface = lan_if.to_string();
             tokio::task::spawn_blocking(move || ensure_target_uses_lan(ip, &iface)).await??;
@@ -1155,6 +1432,10 @@ fn suffix_bytes(raw: &str) -> Result<[u8; 8]> {
 }
 
 fn normalize_rule(rule: &mut Rule) {
+    rule.kind = rule.kind.trim().to_ascii_lowercase();
+    if rule.kind.is_empty() {
+        rule.kind = default_rule_kind();
+    }
     rule.id = rule.id.trim().to_ascii_lowercase();
     rule.name = rule.name.trim().to_string();
     rule.mode = rule.mode.trim().to_ascii_lowercase();
@@ -1164,6 +1445,15 @@ fn normalize_rule(rule: &mut Rule) {
     rule.target_ipv6_suffix = rule.target_ipv6_suffix.trim().to_ascii_lowercase();
     rule.target_mac = normalize_mac(&rule.target_mac);
     rule.transport_protocol = rule.transport_protocol.trim().to_ascii_uppercase();
+    rule.service_type = rule.service_type.trim().to_string();
+    rule.stun_server = rule.stun_server.trim().to_string();
+    if rule.kind == "stun" {
+        rule.mode = "stun".to_string();
+        rule.target_mode = "ipv4".to_string();
+        if rule.stun_server.is_empty() {
+            rule.stun_server = default_stun_server();
+        }
+    }
     if rule.transport_protocol.is_empty() {
         rule.transport_protocol = "TCP".to_string();
     }
@@ -1202,7 +1492,13 @@ fn validate_rule(rule: &Rule, port_min: u16, port_max: u16) -> Result<()> {
     if !matches!(rule.transport_protocol.as_str(), "TCP" | "UDP") {
         bail!("unsupported transportProtocol: {}", rule.transport_protocol);
     }
-    if rule.mode == "6to4" {
+    if !matches!(rule.kind.as_str(), "portmap" | "stun") {
+        bail!("unsupported rule kind");
+    }
+    if rule.kind == "stun" && !rule.stun_server.contains(':') {
+        bail!("invalid STUN server");
+    }
+    if matches!(rule.mode.as_str(), "6to4" | "stun") {
         let ip = Ipv4Addr::from_str(&rule.target_ipv4).context("invalid targetIpv4")?;
         if !(ip.is_private() || ip.is_loopback() || ip.is_link_local()) {
             bail!("target IPv4 must be LAN/private");
@@ -1226,7 +1522,7 @@ fn validate_rule(rule: &Rule, port_min: u16, port_max: u16) -> Result<()> {
             _ => bail!("targetMode must be ipv6_full or ipv6_suffix"),
         }
     } else {
-        bail!("mode must be 6to4 or 6to6");
+        bail!("mode must be 6to4, 6to6 or stun");
     }
     Ok(())
 }
@@ -1302,7 +1598,9 @@ async fn handle_command_fixed(manager: Manager, raw: &str) -> Value {
         None
     };
     let result = match action {
-        "status" | "list" => Ok(manager.status_value().await),
+        "status" | "list" => Ok(manager
+            .status_value(v.get("scope").and_then(Value::as_str))
+            .await),
         "upsert" => {
             match serde_json::from_value::<Rule>(v.get("rule").cloned().unwrap_or(Value::Null)) {
                 Ok(rule) => manager.upsert(rule).await,
@@ -1882,5 +2180,43 @@ mod tests {
             .unwrap()
             .unwrap();
         echo_task.abort();
+    }
+
+    #[test]
+    fn stun_xor_mapped_address_is_decoded() {
+        let mut response = vec![0u8; 32];
+        response[0..2].copy_from_slice(&0x0101u16.to_be_bytes());
+        response[2..4].copy_from_slice(&12u16.to_be_bytes());
+        response[4..8].copy_from_slice(&STUN_MAGIC_COOKIE.to_be_bytes());
+        response[20..22].copy_from_slice(&0x0020u16.to_be_bytes());
+        response[22..24].copy_from_slice(&8u16.to_be_bytes());
+        response[25] = 0x01;
+        let port = 34789u16;
+        let encoded_port = port ^ (STUN_MAGIC_COOKIE >> 16) as u16;
+        response[26..28].copy_from_slice(&encoded_port.to_be_bytes());
+        let cookie = STUN_MAGIC_COOKIE.to_be_bytes();
+        let ip = [203u8, 0, 113, 9];
+        for index in 0..4 {
+            response[28 + index] = ip[index] ^ cookie[index];
+        }
+        assert_eq!(parse_stun_mapped_address(&response).unwrap().to_string(), "203.0.113.9:34789");
+    }
+
+    #[test]
+    fn stun_rule_is_ipv4_and_reserves_a_transport_port() {
+        let mut rule = Rule {
+            id: "stun-test".into(),
+            name: "STUN test".into(),
+            kind: "stun".into(),
+            target_ipv4: "192.168.5.46".into(),
+            target_port: 443,
+            listen_port: 20001,
+            transport_protocol: "TCP".into(),
+            ..Rule::default()
+        };
+        normalize_rule(&mut rule);
+        validate_rule(&rule, 20000, 20020).unwrap();
+        assert_eq!(rule.mode, "stun");
+        assert_eq!(rule.target_mode, "ipv4");
     }
 }
