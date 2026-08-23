@@ -114,7 +114,6 @@ RUN python -m py_compile \
         /app/assistant/security.py \
         /app/assistant/storage.py \
         /app/assistant/tools.py \
-        /app/assistant/wechat.py \
         /app/labprobe_storage.py \
     && python -c "import hub0934_fixes, hub0935_sync_fix, followup_stability_patch, final_stability_patch, labrelay_sync_patch, lab_ddns, lab_ddns_providers, agent_presence_patch, device_history_patch, portmap_persistence_patch, router_lite_realtime_patch, router_device_live_sync_patch, router_fast_watchdog_patch, router_build024_fix, router_slow_cache_patch, router_control_scheduler_patch, router_control_actor_patch, router_task_manager_patch, router_config_sync_patch, router.ipv6, hub_realtime_ws, assistant" \
     && mkdir -p /app/data /app/config /app/backups /app/logs /app/scripts /app/update-repository/agent \

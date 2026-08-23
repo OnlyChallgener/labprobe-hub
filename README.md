@@ -97,24 +97,11 @@ Hub 使用两个必须自行设置的独立令牌：
 
 设备、事件和状态与 revision 在同一 SQLite 事务中写入。APP首次、重连、前台恢复、网络切换和每 5 分钟完整校准，其余刷新仅应用增量。
 
-## AI 与微信 ClawBot
+## AI 助手
 
 AI API Key 由 Hub 加密托管，APP 不保存原文。首次配置时若没有单独设置 `LABPROBE_AI_MASTER_KEY`，Hub 会基于必填的 `APP_TOKEN` 安全派生凭证加密密钥，因此不会再因缺少额外环境变量拒绝 DeepSeek 配置。DeepSeek 默认使用官方兼容地址 `https://api.deepseek.com` 与模型 `deepseek-v4-flash`。`GET /api/ai/usage` 同时返回今日、累计和最近单次任务 Token 明细；每次对话任务记录模型、输入、输出、总 Token 以及成功/失败状态。
 
-微信使用腾讯微信团队维护的 OpenClaw 外部插件，Hub 不自行实现 iLink，也不保存微信 bot token。推荐先在运行 OpenClaw Gateway 的主机执行：
-
-```sh
-npx -y @tencent-weixin/openclaw-weixin-cli install
-```
-
-如果 Hub 进程能够访问同机 `openclaw` 命令，可设置 `OPENCLAW_CLI_PATH`。随后 APP 的“AI 与模型 → 微信 ClawBot”页面可以检查状态、在明确确认后安装插件、生成二维码并等待手机微信确认。扫码凭证只保存在 OpenClaw 状态目录。
-
-如需把 22:30 每日记录和关注设备上下线事件主动推送到微信，再设置 `WECHAT_NOTIFY_TO` 为 OpenClaw 微信通道的私信目标 ID。Hub 会为每条通知建立去重投递记录，失败时指数退避重试，最多五次。微信当前按官方插件能力只支持私聊；路由器写操作仍需在 APP 内二次确认。
-
-官方资料：
-
-- `https://docs.openclaw.ai/channels/wechat`
-- `https://github.com/Tencent/openclaw-weixin`
+AI 对话、工具确认、每日记录和 Token 统计均由 Hub 提供。APP 不保存 API Key 原文，涉及路由器写入的指令仍需在 APP 内二次确认。
 
 
 ## 锐捷 Rust Agent

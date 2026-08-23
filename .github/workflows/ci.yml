@@ -64,6 +64,8 @@ jobs:
           grep -q 'install_router_device_live_sync_patch' hub_entry.py
           grep -q '"devices_snapshot"' router_device_live_sync_patch.py
           grep -q '/api/realtime/ws' hub_realtime_ws.py
+          test ! -e assistant/wechat.py
+          ! git grep -qi -E 'wechat|clawbot|openclaw' -- '*.py' '*.md' '*.env*' 'Dockerfile'
           grep -q 'version = "0.2.23"' labrelay/Cargo.toml
           sh -n agent/install.sh
           sh -n scripts/labprobe-install.sh
