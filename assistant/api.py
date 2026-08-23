@@ -88,6 +88,25 @@ def create_ai_blueprint(*, check_app_token: Callable[[], bool], db_path, logger)
         denial = authorized()
         return denial or jsonify(store.usage_summary())
 
+    @bp.get("/conversations")
+    def list_conversations():
+        denial = authorized()
+        if denial:
+            return denial
+        try:
+            limit = min(max(int(request.args.get("limit", "20")), 1), 50)
+        except ValueError:
+            limit = 20
+        return jsonify({"conversations": store.list_conversations(limit)})
+
+    @bp.get("/conversations/<conversation_id>/messages")
+    def conversation_messages(conversation_id: str):
+        denial = authorized()
+        if denial:
+            return denial
+        messages = store.get_messages(conversation_id, limit=MAX_MESSAGES)
+        return jsonify({"conversationId": conversation_id, "messages": messages})
+
     @bp.get("/catalog")
     def get_catalog():
         denial = authorized()

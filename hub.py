@@ -4306,6 +4306,15 @@ def aggregate_daily(day: str) -> Dict[str, Any]:
         })
 
     note = get_daily_note(day)
+    try:
+        from assistant.storage import AIStore
+        ai_usage = AIStore(DB_PATH).usage_for_date(day)
+    except Exception:
+        # Daily records remain available before the optional AI tables exist.
+        ai_usage = {
+            "requests": 0, "prompt_tokens": 0, "completion_tokens": 0,
+            "total_tokens": 0, "unknown_usage_requests": 0,
+        }
     summary = {
         "deviceChanges": device_online_count + device_offline_count,
         "deviceOnline": device_online_count,
@@ -4318,7 +4327,7 @@ def aggregate_daily(day: str) -> Dict[str, Any]:
     }
     sections = {"devices": device_list, "vpn": vpn_items, "network": network_items, "ddns": ddns_items}
     sections = {k: v for k, v in sections.items() if v}
-    return {"date": day, "summary": summary, "sections": sections, "note": note}
+    return {"date": day, "summary": summary, "sections": sections, "note": note, "aiUsage": ai_usage}
 
 def recent_dates(days: int = 7) -> List[str]:
     from datetime import timedelta

@@ -86,6 +86,23 @@ class AIStore:
             conn.execute("INSERT OR IGNORE INTO conversations(id,title,created_at,updated_at) VALUES(?,?,?,?)",
                          (conversation_id, title, now, now))
 
+    def list_conversations(self, limit: int = 20) -> list[Dict[str, Any]]:
+        with self._connect() as conn:
+            rows = conn.execute(
+                "SELECT id, title, created_at, updated_at FROM conversations "
+                "ORDER BY updated_at DESC LIMIT ?", (int(limit),)
+            ).fetchall()
+        return [dict(row) for row in rows]
+
+    def get_messages(self, conversation_id: str, limit: int = 40) -> list[Dict[str, Any]]:
+        with self._connect() as conn:
+            rows = conn.execute(
+                "SELECT role, content, created_at FROM messages "
+                "WHERE conversation_id=? ORDER BY id DESC LIMIT ?",
+                (conversation_id, int(limit)),
+            ).fetchall()
+        return [dict(row) for row in reversed(rows)]
+
     def add_message(self, conversation_id: str, role: str, content: str) -> None:
         with self._connect() as conn:
             conn.execute("INSERT INTO messages(conversation_id,role,content,created_at) VALUES(?,?,?,?)",
@@ -114,3 +131,20 @@ class AIStore:
         result["today_requests"] = int(today["requests"] or 0)
         result["today_total_tokens"] = int(today["total_tokens"] or 0)
         return result
+
+    def usage_for_date(self, day: str) -> Dict[str, int]:
+        """Return usage for an Asia/Shanghai calendar date without exposing secrets."""
+        safe_day = str(day or "").strip()
+        with self._connect() as conn:
+            row = conn.execute(
+                "SELECT COUNT(*) AS requests, "
+                "COALESCE(SUM(prompt_tokens),0) AS prompt_tokens, "
+                "COALESCE(SUM(completion_tokens),0) AS completion_tokens, "
+                "COALESCE(SUM(total_tokens),0) AS total_tokens, "
+                "COALESCE(SUM(CASE WHEN usage_known=0 THEN 1 ELSE 0 END),0) AS unknown_usage_requests "
+                "FROM ai_usage WHERE date(datetime(created_at, '+8 hours')) = ?",
+                (safe_day,),
+            ).fetchone()
+        return {key: int(row[key] or 0) for key in (
+            "requests", "prompt_tokens", "completion_tokens", "total_tokens", "unknown_usage_requests"
+        )}

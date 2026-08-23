@@ -1,3 +1,5 @@
+from datetime import datetime, timedelta, timezone
+
 import pytest
 from flask import Flask
 
@@ -92,6 +94,24 @@ def test_usage_summary_exposes_today_totals(tmp_path, monkeypatch):
     assert response.status_code == 200
     assert response.json["today_requests"] == 0
     assert response.json["today_total_tokens"] == 0
+
+
+def test_conversation_history_and_date_usage_are_persisted(tmp_path, monkeypatch):
+    client = make_client(tmp_path, monkeypatch)
+    from assistant.storage import AIStore
+
+    store = AIStore(tmp_path / "ai.db")
+    store.create_conversation("conversation-1", "测试")
+    store.add_message("conversation-1", "user", "你好")
+    store.add_message("conversation-1", "assistant", "你好！")
+    store.add_usage("conversation-1", "deepseek", "deepseek-v4-flash", {
+        "prompt_tokens": 2, "completion_tokens": 3, "total_tokens": 5,
+    })
+    assert client.get("/api/ai/conversations").json["conversations"][0]["id"] == "conversation-1"
+    assert client.get("/api/ai/conversations/conversation-1/messages").json["messages"][0]["content"] == "你好"
+    shanghai = timezone(timedelta(hours=8))
+    usage = store.usage_for_date(datetime.now(timezone.utc).astimezone(shanghai).date().isoformat())
+    assert usage["total_tokens"] == 5
 
 
 def test_catalog_is_authenticated_and_versioned(tmp_path, monkeypatch):
