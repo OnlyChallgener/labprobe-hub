@@ -3,10 +3,12 @@
 from __future__ import annotations
 
 import threading
+import os
 from datetime import datetime, timedelta, timezone
 from typing import Any, Dict
 
 from .storage import AIStore
+from .wechat import OpenClawCommandError, OpenClawWeChatBridge
 
 SHANGHAI = timezone(timedelta(hours=8), name="Asia/Shanghai")
 
@@ -16,6 +18,8 @@ class AssistantNotificationService:
         self.hub = hub_runtime
         self.store = store
         self.logger = logger
+        self.wechat_target = str(os.environ.get("WECHAT_NOTIFY_TO") or "").strip()
+        self.wechat = OpenClawWeChatBridge(logger=logger) if self.wechat_target else None
         self.stop_event = threading.Event()
         self.thread = threading.Thread(target=self._run, name="assistant-notifications", daemon=True)
 
@@ -48,10 +52,12 @@ class AssistantNotificationService:
         if not online and event.get("onlineDurationText"):
             details.append("本次在线 " + str(event["onlineDurationText"]))
         event_id = event.get("id") or f"{event.get('type')}:{event.get('mac')}:{at}"
-        self.store.add_notification(
+        notification_id = self.store.add_notification(
             "device", title, title + " · " + " · ".join(details),
             f"event:{event_id}", {"event": event},
         )
+        if notification_id and self.wechat_target:
+            self.store.queue_notification_delivery(notification_id, "openclaw-weixin", self.wechat_target)
 
     def publish_daily(self, day: str) -> None:
         daily = self.hub.aggregate_daily(day)
@@ -65,9 +71,26 @@ class AssistantNotificationService:
             f" · 网络变化 {int(summary.get('networkChanges') or 0)} 次"
             f" · AI {int(ai_usage.get('requests') or 0)} 次 / {int(ai_usage.get('total_tokens') or 0)} Token"
         )
-        self.store.add_notification(
+        notification_id = self.store.add_notification(
             "daily", "22:30 每日网络记录", content, f"daily:{day}", {"daily": daily},
         )
+        if notification_id and self.wechat_target:
+            self.store.queue_notification_delivery(notification_id, "openclaw-weixin", self.wechat_target)
+
+    def deliver_wechat(self) -> None:
+        if self.wechat is None or not self.wechat_target:
+            return
+        for delivery in self.store.list_due_notification_deliveries(limit=3):
+            try:
+                text = str(delivery["content"])
+                self.wechat.send_message(str(delivery["target"]), text)
+                self.store.finish_notification_delivery(int(delivery["id"]), True)
+            except OpenClawCommandError as exc:
+                self.store.finish_notification_delivery(int(delivery["id"]), False, str(exc))
+            except Exception:
+                self.store.finish_notification_delivery(int(delivery["id"]), False, "发送失败")
+                if self.logger:
+                    self.logger.debug("assistant wechat delivery deferred", exc_info=True)
 
     def start(self) -> None:
         original = getattr(self.hub, "add_event", None)
@@ -94,6 +117,7 @@ class AssistantNotificationService:
                 now = datetime.now(SHANGHAI)
                 if (now.hour, now.minute) >= (22, 30):
                     self.publish_daily(now.date().isoformat())
+                self.deliver_wechat()
             except Exception:
                 if self.logger:
                     self.logger.debug("assistant daily notification deferred", exc_info=True)

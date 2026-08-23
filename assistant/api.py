@@ -107,7 +107,13 @@ def create_ai_blueprint(*, check_app_token: Callable[[], bool], db_path, logger,
     @bp.get("/usage")
     def get_usage():
         denial = authorized()
-        return denial or jsonify(store.usage_summary())
+        if denial:
+            return denial
+        try:
+            limit = int(request.args.get("limit", 50))
+        except (TypeError, ValueError):
+            return jsonify({"error": "limit must be an integer"}), 400
+        return jsonify({**store.usage_summary(), "recent": store.list_usage(limit)})
 
     @bp.get("/conversations")
     def list_conversations():

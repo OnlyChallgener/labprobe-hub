@@ -69,6 +69,16 @@ class AIStore:
                     dedupe_key TEXT NOT NULL UNIQUE, created_at TEXT NOT NULL
                 );
                 CREATE INDEX IF NOT EXISTS idx_ai_notifications_created_at ON ai_notifications(created_at);
+                CREATE TABLE IF NOT EXISTS ai_notification_deliveries (
+                    id INTEGER PRIMARY KEY AUTOINCREMENT,
+                    notification_id INTEGER NOT NULL, channel TEXT NOT NULL, target TEXT NOT NULL,
+                    status TEXT NOT NULL DEFAULT 'pending', attempts INTEGER NOT NULL DEFAULT 0,
+                    last_error TEXT, sent_at TEXT, next_attempt_at TEXT NOT NULL, updated_at TEXT NOT NULL,
+                    UNIQUE(notification_id, channel, target),
+                    FOREIGN KEY(notification_id) REFERENCES ai_notifications(id) ON DELETE CASCADE
+                );
+                CREATE INDEX IF NOT EXISTS idx_ai_deliveries_due
+                    ON ai_notification_deliveries(status,next_attempt_at);
             """)
             # Existing phase-one databases may predate these audit fields.
             columns = {row["name"] for row in conn.execute("PRAGMA table_info(ai_usage)")}
@@ -149,6 +159,22 @@ class AIStore:
         result["today_requests"] = int(today["requests"] or 0)
         result["today_total_tokens"] = int(today["total_tokens"] or 0)
         return result
+
+    def list_usage(self, limit: int = 50) -> list[Dict[str, Any]]:
+        """Return a bounded metadata-only task list for the usage API."""
+        try:
+            bounded_limit = max(1, min(int(limit), 100))
+        except (TypeError, ValueError):
+            bounded_limit = 50
+        fields = (
+            "id, conversation_id, provider, model, prompt_tokens, completion_tokens, "
+            "total_tokens, status, usage_known, created_at"
+        )
+        with self._connect() as conn:
+            rows = conn.execute(
+                f"SELECT {fields} FROM ai_usage ORDER BY id DESC LIMIT ?", (bounded_limit,)
+            ).fetchall()
+        return [dict(row) for row in rows]
 
     def usage_for_date(self, day: str) -> Dict[str, int]:
         """Return usage for an Asia/Shanghai calendar date without exposing secrets."""
@@ -239,3 +265,52 @@ class AIStore:
                 "WHERE id>? ORDER BY id ASC LIMIT ?", (max(int(after_id), 0), min(max(int(limit), 1), 200)),
             ).fetchall()
         return [dict(row) for row in rows]
+
+    def queue_notification_delivery(self, notification_id: int, channel: str, target: str) -> None:
+        now = utc_now()
+        with self._connect() as conn:
+            conn.execute(
+                "INSERT OR IGNORE INTO ai_notification_deliveries("
+                "notification_id,channel,target,status,attempts,next_attempt_at,updated_at) "
+                "VALUES(?,?,?,'pending',0,?,?)",
+                (int(notification_id), str(channel), str(target), now, now),
+            )
+
+    def list_due_notification_deliveries(self, limit: int = 5) -> list[Dict[str, Any]]:
+        bounded = max(1, min(int(limit), 20))
+        with self._connect() as conn:
+            rows = conn.execute(
+                "SELECT d.id,d.notification_id,d.channel,d.target,d.attempts,n.title,n.content "
+                "FROM ai_notification_deliveries d JOIN ai_notifications n ON n.id=d.notification_id "
+                "WHERE d.status IN ('pending','failed') AND d.attempts<5 AND d.next_attempt_at<=? "
+                "ORDER BY d.id ASC LIMIT ?",
+                (utc_now(), bounded),
+            ).fetchall()
+        return [dict(row) for row in rows]
+
+    def finish_notification_delivery(self, delivery_id: int, success: bool,
+                                     error: str = "") -> None:
+        now = datetime.now(timezone.utc)
+        with self._connect() as conn:
+            row = conn.execute(
+                "SELECT attempts FROM ai_notification_deliveries WHERE id=?", (int(delivery_id),)
+            ).fetchone()
+            if row is None:
+                return
+            attempts = int(row["attempts"] or 0) + 1
+            if success:
+                conn.execute(
+                    "UPDATE ai_notification_deliveries SET status='sent',attempts=?,last_error=NULL,"
+                    "sent_at=?,next_attempt_at=?,updated_at=? WHERE id=?",
+                    (attempts, now.isoformat(timespec="seconds"), now.isoformat(timespec="seconds"),
+                     now.isoformat(timespec="seconds"), int(delivery_id)),
+                )
+            else:
+                delay_seconds = min(900, 60 * (2 ** max(0, attempts - 1)))
+                next_attempt = now.timestamp() + delay_seconds
+                next_text = datetime.fromtimestamp(next_attempt, timezone.utc).isoformat(timespec="seconds")
+                conn.execute(
+                    "UPDATE ai_notification_deliveries SET status='failed',attempts=?,last_error=?,"
+                    "next_attempt_at=?,updated_at=? WHERE id=?",
+                    (attempts, str(error)[:500], next_text, now.isoformat(timespec="seconds"), int(delivery_id)),
+                )

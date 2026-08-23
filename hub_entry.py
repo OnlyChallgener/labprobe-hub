@@ -3,7 +3,7 @@ from pathlib import Path
 
 import hub
 from agent_presence_patch import install_agent_presence_patch
-from assistant import create_ai_blueprint
+from assistant import create_ai_blueprint, create_wechat_blueprint
 from device_history_patch import install_device_history_patch
 from final_stability_patch import install_final_stability_patch
 from followup_stability_patch import install_followup_stability_patch
@@ -81,6 +81,12 @@ hub.app.register_blueprint(
         logger=hub.LOGGER,
         hub_runtime=hub,
         enable_notifications=True,
+    )
+)
+hub.app.register_blueprint(
+    create_wechat_blueprint(
+        check_app_token=hub.check_app_token,
+        logger=hub.LOGGER,
     )
 )
 router_sync = install_router_rpc_compat(hub)

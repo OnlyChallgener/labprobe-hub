@@ -8,6 +8,7 @@ from flask import Flask
 from assistant.api import create_ai_blueprint
 from assistant.provider import ProviderError, usage_from_chunk
 from assistant.security import MasterKeyUnavailable, encrypt_secret
+from assistant.storage import AIStore
 from assistant.catalog import CATALOG_REVISION
 
 
@@ -75,6 +76,26 @@ def test_usage_parsing_handles_deepseek_stream_usage():
     }
     assert usage_from_chunk({"choices": []}) is None
     assert usage_from_chunk({"usage": {"total_tokens": 7}}) == {"total_tokens": 7}
+
+
+def test_usage_returns_bounded_recent_task_details(tmp_path, monkeypatch):
+    client = make_client(tmp_path, monkeypatch)
+    store = AIStore(tmp_path / "ai.db")
+    for index in range(102):
+        store.add_usage(
+            f"conversation-{index}", "deepseek", "deepseek-v4-flash",
+            {"prompt_tokens": 1, "completion_tokens": 2, "total_tokens": 3},
+        )
+    response = client.get("/api/ai/usage?limit=1000")
+    assert response.status_code == 200
+    assert response.json["requests"] == 102
+    assert len(response.json["recent"]) == 100
+    newest = response.json["recent"][0]
+    assert set(newest) == {
+        "id", "conversation_id", "provider", "model", "prompt_tokens", "completion_tokens",
+        "total_tokens", "status", "usage_known", "created_at",
+    }
+    assert newest["conversation_id"] == "conversation-101"
 
 
 def test_chat_returns_configuration_error_status(monkeypatch, tmp_path):
