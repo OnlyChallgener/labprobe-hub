@@ -1,0 +1,48 @@
+name: Build LabRelay ARM64 artifact
+
+on:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Run LabRelay tests
+        working-directory: labrelay
+        run: cargo test --all-targets
+
+      - name: Install cross and QEMU
+        run: |
+          cargo install cross --locked
+          sudo apt-get update
+          sudo apt-get install -y qemu-user-static
+
+      - name: Build static ARM64 router binary
+        env:
+          CARGO_TARGET_DIR: ${{ runner.temp }}/labrelay-cross-target
+        run: cross build --manifest-path labrelay/Cargo.toml --release --target aarch64-unknown-linux-musl
+
+      - name: Verify and package binary
+        env:
+          CARGO_TARGET_DIR: ${{ runner.temp }}/labrelay-cross-target
+        run: |
+          set -euo pipefail
+          binary="$CARGO_TARGET_DIR/aarch64-unknown-linux-musl/release/labrelay"
+          test -x "$binary"
+          qemu-aarch64-static "$binary" version
+          mkdir -p "$RUNNER_TEMP/labrelay-artifact"
+          cp "$binary" "$RUNNER_TEMP/labrelay-artifact/labrelay-linux-arm64"
+          sha256sum "$RUNNER_TEMP/labrelay-artifact/labrelay-linux-arm64" > "$RUNNER_TEMP/labrelay-artifact/checksums.txt"
+
+      - name: Upload ARM64 binary
+        uses: actions/upload-artifact@v4
+        with:
+          name: labrelay-linux-arm64-${{ github.sha }}
+          path: ${{ runner.temp }}/labrelay-artifact
+          if-no-files-found: error
+          retention-days: 14
