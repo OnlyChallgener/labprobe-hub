@@ -178,3 +178,60 @@ def test_legacy_relay_firewall_binding_refuses_to_overwrite_manual_changes(tmp_p
     assert client.rules[0]["destPort"] == str(rule["listenPort"])
     client.rules[0]["destPort"] = "9443"
     assert service.ensure_firewall(rule)["state"] == "manual_change"
+
+
+def test_wireguard_lan_firewall_uses_tunnel_source_and_lan_egress(tmp_path):
+    client = _Client()
+    service = StunService(_hub(tmp_path), client)
+    rule = {
+        "id": "wireguard-lan-labwg0",
+        "firewallMode": "wireguard_lan_forward",
+        "tunnelNetwork": "10.77.0.0/24",
+        "transportProtocol": "ALL",
+        "listenPort": 51820,
+    }
+
+    assert service.ensure_firewall(rule)["state"] == "ready"
+    assert client.rules[0] == {
+        "ruleName": "LabProbe WireGuard wireguard-lan-labwg0",
+        "direction": "forward",
+        "ipVersion": "ipv4",
+        "proto": "all",
+        "srcIP": "10.77.0.0/24",
+        "destIP": "",
+        "srcPort": "",
+        "destPort": "",
+        "target": "ACCEPT",
+        "enable": "1",
+        "ipv6SuffixSrc": "",
+        "ipv6SuffixDest": "",
+        "inIface": "",
+        "outIface": "lan",
+        "uuid": "fw-1",
+    }
+
+    client.rules[0]["outIface"] = "wan"
+    assert service.ensure_firewall(rule)["state"] == "manual_change"
+    service.remove_firewall(rule["id"])
+    assert client.rules[0]["uuid"] == "fw-1"
+
+
+def test_wireguard_lan_does_not_adopt_same_name_unowned_rule(tmp_path):
+    client = _Client()
+    client.rules.append({
+        "ruleName": "LabProbe WireGuard wireguard-lan-labwg0",
+        "uuid": "manual-1",
+        "direction": "forward",
+    })
+    service = StunService(_hub(tmp_path), client)
+    rule = {
+        "id": "wireguard-lan-labwg0",
+        "firewallMode": "wireguard_lan_forward",
+        "tunnelNetwork": "10.77.0.0/24",
+        "transportProtocol": "ALL",
+        "listenPort": 51820,
+    }
+
+    result = service.ensure_firewall(rule)
+    assert result["state"] == "manual_change"
+    assert [row["uuid"] for row in client.rules] == ["manual-1"]

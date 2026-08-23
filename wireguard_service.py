@@ -141,8 +141,101 @@ class WireGuardService:
     def _stun_lifecycle(self) -> Any:
         service = getattr(self.hub, "STUN_SERVICE", None)
         if service is None or not callable(getattr(service, "ensure_firewall", None)) or not callable(getattr(service, "remove_firewall", None)):
-            raise RuntimeError("WireGuard DDNS 防火墙生命周期不可用")
+            raise RuntimeError("WireGuard 防火墙生命周期不可用")
         return service
+
+    @staticmethod
+    def _wireguard_lan_firewall_rule(server: Dict[str, Any]) -> Dict[str, Any]:
+        """Build the router-owned LAN forwarding rule for one WG server.
+
+        The rule id is stable for the interface, and the source is the WG
+        tunnel network rather than an ephemeral peer address.  This lets the
+        router forward every configured peer to LAN without opening a WAN
+        firewall hole or depending on a local iptables/nft rule.
+        """
+        interface_name = _text(server.get("interfaceName")) or "labwg0"
+        try:
+            tunnel = ipaddress.ip_interface(_text(server.get("address")))
+        except ValueError as error:
+            raise ValueError("WireGuard 服务端地址无效，无法建立 LAN 防火墙规则") from error
+        return {
+            "id": f"wireguard-lan-{interface_name}",
+            "kind": "wireguard-lan-forward",
+            "firewallMode": "wireguard_lan_forward",
+            "enabled": bool(server.get("enabled", True)),
+            "tunnelNetwork": str(tunnel.network),
+            "transportProtocol": "ALL",
+            "listenPort": _int(server.get("listenPort")),
+        }
+
+    def _ensure_wireguard_lan_firewall(self, server: Dict[str, Any]) -> Dict[str, Any]:
+        lifecycle = self._stun_lifecycle()
+        rule = self._wireguard_lan_firewall_rule(server)
+        firewall_id = rule["id"]
+        if not bool(server.get("enabled", True)):
+            lifecycle.remove_firewall(firewall_id)
+            return {"state": "not_required", "ruleId": firewall_id}
+        result = lifecycle.ensure_firewall(rule)
+        if _text(result.get("state")) == "verify_failed":
+            # A changed tunnel network is a desired-state change.  Recreate
+            # only when the lifecycle still owns the old fingerprint; a
+            # manual_change result is never removed or overwritten.
+            lifecycle.remove_firewall(firewall_id)
+            result = lifecycle.ensure_firewall(rule)
+        state = _text(result.get("state"))
+        if state != "ready":
+            raise ValueError(_text(result.get("message")) or "WireGuard 到 LAN 防火墙规则未就绪")
+        return {**result, "ruleId": firewall_id, "sourceNetwork": rule["tunnelNetwork"]}
+
+    def _remove_wireguard_lan_firewall(self, server: Optional[Dict[str, Any]]) -> None:
+        if not server:
+            return
+        rule = self._wireguard_lan_firewall_rule(server)
+        self._stun_lifecycle().remove_firewall(rule["id"])
+
+    def _sync_wireguard_lan_firewall(self, old_server: Optional[Dict[str, Any]], new_server: Dict[str, Any]) -> Dict[str, Any]:
+        old_id = ""
+        if old_server:
+            old_id = self._wireguard_lan_firewall_rule(old_server)["id"]
+        new_rule = self._wireguard_lan_firewall_rule(new_server)
+        if old_id and old_id != new_rule["id"]:
+            self._stun_lifecycle().remove_firewall(old_id)
+        return self._ensure_wireguard_lan_firewall(new_server)
+
+    def lan_forward_status(self, server: Optional[Dict[str, Any]] = None) -> Dict[str, Any]:
+        """Report forwarding readiness without assuming router ip_forward.
+
+        Ruijie Web API versions deployed with supported routers do not expose
+        a stable read-only sysctl/ip_forward field.  Therefore the Hub must
+        report this as unknown and warn the operator instead of claiming that
+        kernel forwarding is enabled.
+        """
+        server = server if isinstance(server, dict) else self.document().get("server")
+        if not server:
+            return {
+                "state": "not_configured",
+                "firewall": {"state": "not_configured"},
+                "ipForward": {"state": "unknown", "warning": "WireGuard 尚未配置"},
+            }
+        rule = self._wireguard_lan_firewall_rule(server)
+        lifecycle = getattr(self.hub, "STUN_SERVICE", None)
+        bindings = getattr(lifecycle, "_firewall_bindings", None)
+        binding_rows = bindings() if callable(bindings) else {}
+        binding = binding_rows.get(rule["id"], {}) if isinstance(binding_rows, dict) else {}
+        firewall = {
+            "state": "ready" if _text(binding.get("uuid")) and _text(binding.get("fingerprint")) and bool(server.get("enabled", True)) else ("not_required" if not bool(server.get("enabled", True)) else "pending"),
+            "ruleId": rule["id"],
+            "sourceNetwork": rule["tunnelNetwork"],
+            "direction": "forward",
+            "outIface": "lan",
+            "target": "ACCEPT",
+        }
+        ip_forward = {
+            "state": "unknown",
+            "warning": "路由器 Web API 未提供可读的 ip_forward 状态，Hub 未假设内核转发已开启",
+        }
+        overall = "ready" if firewall["state"] == "ready" else firewall["state"]
+        return {"state": overall, "firewall": firewall, "ipForward": ip_forward}
 
     @staticmethod
     def _ddns_firewall_rule(profile: Dict[str, Any], server: Dict[str, Any]) -> Dict[str, Any]:
@@ -355,6 +448,7 @@ class WireGuardService:
             revision = document["revision"] + 1
             server["revision"] = revision
             self._sync_ddns_firewalls(document.get("server"), server)
+            self._sync_wireguard_lan_firewall(document.get("server"), server)
             saved = {
                 **document,
                 "revision": revision,
@@ -376,6 +470,7 @@ class WireGuardService:
             for profile in old.get("endpointProfiles", []):
                 if isinstance(profile, dict) and _text(profile.get("endpointSource")).lower() == "ddns":
                     self._remove_ddns_firewall(profile)
+            self._remove_wireguard_lan_firewall(old)
             tombstone = {"revision": revision, "deletedAt": _now_text(), "interfaceName": _text(old.get("interfaceName")) or "labwg0"}
             saved = {**document, "revision": revision, "updatedAt": tombstone["deletedAt"], "server": None, "tombstone": tombstone}
             self._save_document(saved)
@@ -445,7 +540,7 @@ def create_wireguard_blueprint(hub: Any, service: WireGuardService) -> Blueprint
                 return jsonify({"ok": False, "error": "unauthorized"}), 401
             document = service.document()
             status = hub.load_json(service.status_path, {})
-            return jsonify({"ok": True, **document, "agentStatus": status if isinstance(status, dict) else {}})
+            return jsonify({"ok": True, **document, "agentStatus": status if isinstance(status, dict) else {}, "lanForwarding": service.lan_forward_status(document.get("server"))})
         if not hub.check_app_token():
             return jsonify({"ok": False, "error": "unauthorized"}), 401
         payload = request.get_json(silent=True) or {}
@@ -453,7 +548,7 @@ def create_wireguard_blueprint(hub: Any, service: WireGuardService) -> Blueprint
         expected_revision = _int(expected) if expected is not None else None
         try:
             document = service.delete(expected_revision) if request.method == "DELETE" else service.put(payload, expected_revision)
-            return jsonify({"ok": True, **document})
+            return jsonify({"ok": True, **document, "lanForwarding": service.lan_forward_status(document.get("server"))})
         except RuntimeError as error:
             return jsonify({"ok": False, "error": str(error), "currentRevision": service.document()["revision"]}), 409
         except Exception as error:
