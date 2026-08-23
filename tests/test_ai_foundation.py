@@ -4,6 +4,7 @@ from flask import Flask
 from assistant.api import create_ai_blueprint
 from assistant.provider import ProviderError, usage_from_chunk
 from assistant.security import MasterKeyUnavailable, encrypt_secret
+from assistant.catalog import CATALOG_REVISION
 
 
 def make_client(tmp_path, monkeypatch, authorized=True):
@@ -91,3 +92,13 @@ def test_usage_summary_exposes_today_totals(tmp_path, monkeypatch):
     assert response.status_code == 200
     assert response.json["today_requests"] == 0
     assert response.json["today_total_tokens"] == 0
+
+
+def test_catalog_is_authenticated_and_versioned(tmp_path, monkeypatch):
+    client = make_client(tmp_path, monkeypatch)
+    response = client.get("/api/ai/catalog")
+    assert response.status_code == 200
+    assert response.json["revision"] == CATALOG_REVISION
+    wol = next(tool for tool in response.json["tools"] if tool["id"] == "device.wol")
+    assert wol["risk"] == "write"
+    assert wol["confirmation"] == "always"

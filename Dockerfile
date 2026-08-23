@@ -106,6 +106,7 @@ RUN python -m py_compile \
         /app/router/ipv6/api.py \
         /app/assistant/__init__.py \
         /app/assistant/api.py \
+        /app/assistant/catalog.py \
         /app/assistant/provider.py \
         /app/assistant/security.py \
         /app/assistant/storage.py \

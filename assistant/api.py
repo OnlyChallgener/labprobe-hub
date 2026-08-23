@@ -12,6 +12,7 @@ from flask import Blueprint, Response, jsonify, request, stream_with_context
 from .provider import OpenAICompatibleProvider, ProviderError, usage_from_chunk
 from .security import MasterKeyUnavailable, decrypt_secret, encrypt_secret, mask_secret
 from .storage import AIStore
+from .catalog import catalog
 
 DEFAULT_BASE_URL = "https://api.deepseek.com"
 DEFAULT_MODEL = "deepseek-v4-flash"
@@ -86,6 +87,11 @@ def create_ai_blueprint(*, check_app_token: Callable[[], bool], db_path, logger)
     def get_usage():
         denial = authorized()
         return denial or jsonify(store.usage_summary())
+
+    @bp.get("/catalog")
+    def get_catalog():
+        denial = authorized()
+        return denial or jsonify(catalog())
 
     @bp.post("/test")
     def test_config():
