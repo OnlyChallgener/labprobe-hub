@@ -69,6 +69,23 @@ def test_address_history_retains_only_latest_three_unique_endpoints(tmp_path):
     assert [row["endpoint"] for row in rows] == ["203.0.113.9:20004", "203.0.113.9:20003", "203.0.113.9:20002"]
 
 
+def test_dynamic_public_endpoint_never_changes_the_relay_to_lan_forward_target(tmp_path):
+    hub = _hub(tmp_path)
+    service = StunService(hub, _Client())
+    rule = service.clean_rule({"serviceType": "HTTPS", "targetIpv4": "192.168.5.46", "targetPort": 443})
+    service._save_rules([rule])
+
+    for endpoint in ("203.0.113.9:20001", "203.0.113.9:28764"):
+        hub.save_json(service.status_path, {
+            "receivedEpoch": 1,
+            "status": {"rules": [{"rule": rule, "runtime": {"id": rule["id"], "state": "mapped", "publicEndpoint": endpoint}}]},
+        })
+        current = service.rows()[0]
+        assert current["targetIpv4"] == "192.168.5.46"
+        assert current["targetPort"] == 443
+        assert current["runtime"]["publicEndpoint"] == endpoint
+
+
 def test_firewall_is_created_through_router_controller_and_manual_change_pauses_it(tmp_path):
     client = _Client()
     service = StunService(_hub(tmp_path), client)
