@@ -26,6 +26,7 @@ RUN pip install --no-cache-dir -r /app/requirements.txt \
 COPY hub.py /app/hub.py
 COPY hub_entry.py /app/hub_entry.py
 COPY stun_service.py /app/stun_service.py
+COPY wireguard_service.py /app/wireguard_service.py
 COPY hub_realtime_ws.py /app/hub_realtime_ws.py
 COPY hub0934_fixes.py /app/hub0934_fixes.py
 COPY hub0935_sync_fix.py /app/hub0935_sync_fix.py
@@ -67,6 +68,7 @@ RUN python -m py_compile \
         /app/hub.py \
         /app/hub_entry.py \
         /app/stun_service.py \
+        /app/wireguard_service.py \
         /app/hub_realtime_ws.py \
         /app/hub0934_fixes.py \
         /app/hub0935_sync_fix.py \
