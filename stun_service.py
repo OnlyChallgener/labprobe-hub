@@ -34,6 +34,12 @@ SERVICE_TEMPLATES = {
     "Custom": (None, {"TCP", "UDP"}, "TCP"),
 }
 
+# Cloudflare publishes its free STUN endpoint for UDP only. A TCP rule must
+# use a server that explicitly accepts STUN Binding requests over TCP.
+DEFAULT_STUN_UDP_SERVER = "stun.cloudflare.com:3478"
+DEFAULT_STUN_TCP_SERVER = "stunserver2025.stunprotocol.org:3478"
+LEGACY_TCP_STUN_SERVER = DEFAULT_STUN_UDP_SERVER
+
 
 def _text(value: Any) -> str:
     return str(value or "").strip()
@@ -54,6 +60,14 @@ def _now_text() -> str:
     return time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime())
 
 
+def _stun_server(protocol: str) -> str:
+    protocol = _text(protocol).upper()
+    configured = _text(os.environ.get(f"STUN_{protocol}_SERVER"))
+    if configured:
+        return configured
+    return DEFAULT_STUN_TCP_SERVER if protocol == "TCP" else DEFAULT_STUN_UDP_SERVER
+
+
 def _rule_fingerprint(row: Dict[str, Any]) -> str:
     data = {str(key): value for key, value in row.items() if str(key) not in {"stats", "uuid"}}
     return hashlib.sha256(json.dumps(data, ensure_ascii=False, sort_keys=True, separators=(",", ":"), default=str).encode()).hexdigest()
@@ -70,6 +84,7 @@ class StunService:
         self.status_path = Path(hub.DATA_DIR) / "stun_router_status.json"
         self.history_path = Path(hub.DATA_DIR) / "stun_address_history.json"
         self.firewall_path = Path(hub.DATA_DIR) / "stun_firewall.json"
+        self._migrate_legacy_tcp_server()
 
     def _document(self) -> Dict[str, Any]:
         raw = self.hub.load_json(self.rules_path, {"revision": 0, "rules": []})
@@ -90,6 +105,29 @@ class StunService:
         }
         self.hub.save_json(self.rules_path, document)
         return document
+
+    def _migrate_legacy_tcp_server(self) -> None:
+        """Repair saved TCP rules and queue the corrected rule for Agent."""
+        document = self._document()
+        migrated = []
+        changed = False
+        for raw in document["rules"]:
+            rule = dict(raw)
+            if (
+                _text(rule.get("kind")).lower() == "stun"
+                and _text(rule.get("transportProtocol")).upper() == "TCP"
+                and _text(rule.get("stunServer")) == LEGACY_TCP_STUN_SERVER
+            ):
+                rule["stunServer"] = _stun_server("TCP")
+                rule["updatedAt"] = _now_text()
+                changed = True
+            migrated.append(rule)
+        if not changed:
+            return
+        self._save_rules(migrated)
+        for rule in migrated:
+            if rule.get("enabled") and _text(rule.get("kind")).lower() == "stun":
+                self.queue("upsert", {"rule": rule})
 
     def _router_name(self) -> str:
         value = getattr(self.hub, "_portmap_router_name", None)
@@ -152,7 +190,7 @@ class StunService:
             "targetPort": target_port,
             "serviceType": service,
             "transportProtocol": protocol,
-            "stunServer": _text(os.environ.get(f"STUN_{protocol}_SERVER")) or "stun.cloudflare.com:3478",
+            "stunServer": _stun_server(protocol),
             "maxConnections": max(1, min(256, _int(payload.get("maxConnections"), _int(old.get("maxConnections"), 32)) or 32)),
             "idleTimeoutSec": max(30, min(3600, _int(payload.get("idleTimeoutSec"), _int(old.get("idleTimeoutSec"), 300)) or 300)),
             "createdAt": _text(old.get("createdAt")) or _now_text(),

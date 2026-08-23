@@ -4,7 +4,7 @@ import threading
 
 from flask import Flask
 
-from stun_service import StunService
+from stun_service import DEFAULT_STUN_TCP_SERVER, StunService
 
 
 class _Cache:
@@ -58,6 +58,28 @@ def test_service_templates_choose_protocol_and_skip_portmap_reservation(tmp_path
     assert https["listenPort"] == 20001
     assert wireguard["transportProtocol"] == "UDP"
     assert wireguard["listenPort"] == 20000
+    assert https["stunServer"] == DEFAULT_STUN_TCP_SERVER
+
+
+def test_legacy_tcp_rule_is_migrated_to_a_tcp_stun_server_and_queued(tmp_path):
+    hub = _hub(tmp_path)
+    legacy = {
+        "id": "stun-tcp",
+        "kind": "stun",
+        "name": "HTTPS · 192.168.5.46:443",
+        "enabled": True,
+        "targetIpv4": "192.168.5.46",
+        "targetPort": 443,
+        "transportProtocol": "TCP",
+        "stunServer": "stun.cloudflare.com:3478",
+    }
+    hub.save_json(tmp_path / "stun_rules.json", {"revision": 1, "rules": [legacy]})
+
+    service = StunService(hub, _Client())
+
+    assert service._document()["rules"][0]["stunServer"] == DEFAULT_STUN_TCP_SERVER
+    assert service._commands()[0]["action"] == "upsert"
+    assert service._commands()[0]["payload"]["rule"]["stunServer"] == DEFAULT_STUN_TCP_SERVER
 
 
 def test_address_history_retains_only_latest_three_unique_endpoints(tmp_path):
