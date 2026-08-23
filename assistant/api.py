@@ -14,6 +14,7 @@ from .provider import OpenAICompatibleProvider, ProviderError, usage_from_chunk
 from .security import MasterKeyUnavailable, decrypt_secret, encrypt_secret, mask_secret
 from .storage import AIStore
 from .catalog import catalog, provider_tools, tool_id_from_function, tool_spec
+from .notifications import AssistantNotificationService
 from .tools import ToolError, ToolExecutor
 
 DEFAULT_BASE_URL = "https://api.deepseek.com"
@@ -36,10 +37,14 @@ def merge_usage(total: Dict[str, int], usage: Dict[str, int]) -> Dict[str, int]:
 
 
 def create_ai_blueprint(*, check_app_token: Callable[[], bool], db_path, logger,
-                        hub_runtime: Any = None) -> Blueprint:
+                        hub_runtime: Any = None, enable_notifications: bool = False) -> Blueprint:
     store = AIStore(db_path)
     store.initialize()
     executor = ToolExecutor(hub_runtime) if hub_runtime is not None else None
+    notification_service = None
+    if hub_runtime is not None and enable_notifications:
+        notification_service = AssistantNotificationService(hub_runtime, store, logger)
+        notification_service.start()
     bp = Blueprint("hub_ai", __name__, url_prefix="/api/ai")
 
     def authorized():
@@ -127,6 +132,18 @@ def create_ai_blueprint(*, check_app_token: Callable[[], bool], db_path, logger,
     def get_catalog():
         denial = authorized()
         return denial or jsonify(catalog())
+
+    @bp.get("/notifications")
+    def notifications():
+        denial = authorized()
+        if denial:
+            return denial
+        try:
+            after = max(int(request.args.get("after", "0")), 0)
+        except ValueError:
+            after = 0
+        rows = store.list_notifications(after_id=after, limit=100)
+        return jsonify({"notifications": rows, "latestId": rows[-1]["id"] if rows else after})
 
     def require_executor():
         if executor is None:

@@ -63,6 +63,12 @@ class AIStore:
                     expires_at TEXT NOT NULL, created_at TEXT NOT NULL,
                     confirmed_at TEXT, result_json TEXT
                 );
+                CREATE TABLE IF NOT EXISTS ai_notifications (
+                    id INTEGER PRIMARY KEY AUTOINCREMENT, kind TEXT NOT NULL,
+                    title TEXT NOT NULL, content TEXT NOT NULL, payload_json TEXT,
+                    dedupe_key TEXT NOT NULL UNIQUE, created_at TEXT NOT NULL
+                );
+                CREATE INDEX IF NOT EXISTS idx_ai_notifications_created_at ON ai_notifications(created_at);
             """)
             # Existing phase-one databases may predate these audit fields.
             columns = {row["name"] for row in conn.execute("PRAGMA table_info(ai_usage)")}
@@ -214,3 +220,22 @@ class AIStore:
                 "UPDATE ai_tool_confirmations SET status=?, result_json=? WHERE id=?",
                 (status, result_json, confirmation_id),
             )
+
+    def add_notification(self, kind: str, title: str, content: str, dedupe_key: str,
+                         payload: Optional[Dict[str, Any]] = None) -> Optional[int]:
+        with self._connect() as conn:
+            cursor = conn.execute(
+                "INSERT OR IGNORE INTO ai_notifications(kind,title,content,payload_json,dedupe_key,created_at) "
+                "VALUES(?,?,?,?,?,?)",
+                (kind, title, content, json.dumps(payload, ensure_ascii=False) if payload else None,
+                 dedupe_key, utc_now()),
+            )
+            return int(cursor.lastrowid) if cursor.rowcount == 1 else None
+
+    def list_notifications(self, after_id: int = 0, limit: int = 100) -> list[Dict[str, Any]]:
+        with self._connect() as conn:
+            rows = conn.execute(
+                "SELECT id,kind,title,content,created_at FROM ai_notifications "
+                "WHERE id>? ORDER BY id ASC LIMIT ?", (max(int(after_id), 0), min(max(int(limit), 1), 200)),
+            ).fetchall()
+        return [dict(row) for row in rows]

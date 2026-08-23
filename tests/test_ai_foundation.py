@@ -243,3 +243,30 @@ def test_app_context_is_sanitized_and_local_write_is_one_time_confirmed(tmp_path
     assert confirmed.status_code == 200
     assert confirmed.json["clientAction"]["arguments"]["favorite"] == "fav-1"
     assert client.post("/api/ai/tools/confirm", json={"confirmationId": confirmation_id}).status_code == 409
+
+
+def test_notification_inbox_deduplicates_watched_events_and_daily_summary(tmp_path):
+    from assistant.notifications import AssistantNotificationService
+    from assistant.storage import AIStore
+
+    store = AIStore(tmp_path / "ai.db")
+    store.initialize()
+    runtime = SimpleNamespace(
+        cfg_get=lambda key, default: [{"name": "ANS", "mac": "AA:BB:CC:DD:EE:02"}],
+        norm_mac=lambda value: str(value or "").upper(),
+        now_str=lambda: "2026-08-23 22:30:00",
+        aggregate_daily=lambda day: {
+            "date": day,
+            "summary": {"deviceChanges": 1, "deviceOnline": 1, "deviceOffline": 0, "networkChanges": 0},
+            "aiUsage": {"requests": 2, "total_tokens": 30},
+        },
+    )
+    service = AssistantNotificationService(runtime, store, logger=None)
+    event = {"id": 7, "type": "device_online", "name": "ANS", "mac": "AA:BB:CC:DD:EE:02", "createdAt": "2026-08-23 21:00:00"}
+    service.publish_event(event)
+    service.publish_event(event)
+    service.publish_daily("2026-08-23")
+    service.publish_daily("2026-08-23")
+    rows = store.list_notifications()
+    assert [row["kind"] for row in rows] == ["device", "daily"]
+    assert "30 Token" in rows[1]["content"]

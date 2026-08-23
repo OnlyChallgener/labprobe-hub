@@ -110,6 +110,7 @@ RUN python -m py_compile \
         /app/assistant/api.py \
         /app/assistant/catalog.py \
         /app/assistant/provider.py \
+        /app/assistant/notifications.py \
         /app/assistant/security.py \
         /app/assistant/storage.py \
         /app/assistant/tools.py \

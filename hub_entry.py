@@ -80,6 +80,7 @@ hub.app.register_blueprint(
         db_path=hub.DB_PATH,
         logger=hub.LOGGER,
         hub_runtime=hub,
+        enable_notifications=True,
     )
 )
 router_sync = install_router_rpc_compat(hub)
