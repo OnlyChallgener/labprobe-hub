@@ -64,8 +64,15 @@ def test_config_masks_key_and_never_echoes_it(tmp_path, monkeypatch):
     assert secret.encode() not in (tmp_path / "ai.db").read_bytes()
 
 
-def test_rejects_persistent_plaintext_when_master_key_missing(monkeypatch):
+def test_derives_credential_key_from_required_app_token(monkeypatch):
     monkeypatch.delenv("LABPROBE_AI_MASTER_KEY", raising=False)
+    monkeypatch.setenv("APP_TOKEN", "long-app-token")
+    assert encrypt_secret("sk-secret").startswith("v1:")
+
+
+def test_rejects_persistent_plaintext_when_no_hub_secret_exists(monkeypatch):
+    monkeypatch.delenv("LABPROBE_AI_MASTER_KEY", raising=False)
+    monkeypatch.delenv("APP_TOKEN", raising=False)
     with pytest.raises(MasterKeyUnavailable):
         encrypt_secret("sk-secret")
 

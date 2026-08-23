@@ -99,7 +99,7 @@ Hub 使用两个必须自行设置的独立令牌：
 
 ## AI 与微信 ClawBot
 
-AI API Key 由 Hub 加密托管，APP 不保存原文。`GET /api/ai/usage` 同时返回今日、累计和最近单次任务 Token 明细；每次对话任务记录模型、输入、输出、总 Token 以及成功/失败状态。
+AI API Key 由 Hub 加密托管，APP 不保存原文。首次配置时若没有单独设置 `LABPROBE_AI_MASTER_KEY`，Hub 会基于必填的 `APP_TOKEN` 安全派生凭证加密密钥，因此不会再因缺少额外环境变量拒绝 DeepSeek 配置。DeepSeek 默认使用官方兼容地址 `https://api.deepseek.com` 与模型 `deepseek-v4-flash`。`GET /api/ai/usage` 同时返回今日、累计和最近单次任务 Token 明细；每次对话任务记录模型、输入、输出、总 Token 以及成功/失败状态。
 
 微信使用腾讯微信团队维护的 OpenClaw 外部插件，Hub 不自行实现 iLink，也不保存微信 bot token。推荐先在运行 OpenClaw Gateway 的主机执行：
 

@@ -15,12 +15,22 @@ class MasterKeyUnavailable(RuntimeError):
 
 
 def _master_key() -> bytes:
-    value = os.environ.get("LABPROBE_AI_MASTER_KEY", "")
-    if not value.strip():
+    """Return the credential-encryption key without making first-run unusable.
+
+    A Hub already requires ``APP_TOKEN`` before it accepts any APP request.  It is
+    therefore a suitable deployment-local secret for deriving the key used to
+    encrypt a provider key when the optional dedicated key has not been set.
+    Keeping ``LABPROBE_AI_MASTER_KEY`` as the first choice lets operators rotate
+    the AI credential boundary independently when they need to.
+    """
+    value = str(os.environ.get("LABPROBE_AI_MASTER_KEY") or "").strip()
+    if not value:
+        value = str(os.environ.get("APP_TOKEN") or "").strip()
+    if not value or value == "change-app-token":
         raise MasterKeyUnavailable(
-            "LABPROBE_AI_MASTER_KEY is required before an AI API key can be saved"
+            "Hub 缺少可用于加密 API Key 的 APP_TOKEN；请先在 Hub 配置中设置 APP_TOKEN"
         )
-    return hashlib.sha256(value.encode("utf-8")).digest()
+    return hashlib.sha256(("LabProbe AI credential v1\0" + value).encode("utf-8")).digest()
 
 
 def encrypt_secret(value: str) -> str:
