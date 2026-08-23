@@ -3,6 +3,7 @@ from pathlib import Path
 
 import hub
 from agent_presence_patch import install_agent_presence_patch
+from assistant import create_ai_blueprint
 from device_history_patch import install_device_history_patch
 from final_stability_patch import install_final_stability_patch
 from followup_stability_patch import install_followup_stability_patch
@@ -70,6 +71,13 @@ hub.app.register_blueprint(
         check_app_token=hub.check_app_token,
         logger=hub.LOGGER,
         client=hub.ROUTER_TASK_MANAGER.client,
+    )
+)
+hub.app.register_blueprint(
+    create_ai_blueprint(
+        check_app_token=hub.check_app_token,
+        db_path=hub.DB_PATH,
+        logger=hub.LOGGER,
     )
 )
 router_sync = install_router_rpc_compat(hub)
