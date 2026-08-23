@@ -11,8 +11,35 @@ from wireguard_service import WireGuardService, install_wireguard_service
 PUBLIC_KEY = base64.b64encode(bytes(range(32))).decode()
 
 
+class _StunLifecycleStub:
+    def __init__(self):
+        self.ensure_calls = []
+        self.remove_calls = []
+
+    def ensure_firewall(self, rule):
+        self.ensure_calls.append(dict(rule))
+        return {"state": "ready", "uuid": f"uuid-{rule['id']}"}
+
+    def remove_firewall(self, rule_id):
+        self.remove_calls.append(rule_id)
+
+
 def _hub(tmp_path):
     saved = {}
+    stun_lifecycle = _StunLifecycleStub()
+
+    saved[Path(tmp_path) / "stun_rules.json"] = {
+        "revision": 1,
+        "rules": [{
+            "id": "stun-wireguard",
+            "kind": "stun",
+            "enabled": True,
+            "transportProtocol": "UDP",
+            "forwardMode": "router_native",
+            "targetIpv4": "192.168.5.1",
+            "targetPort": 51820,
+        }],
+    }
 
     def load(path, default=None):
         return saved.get(Path(path), default)
@@ -29,6 +56,8 @@ def _hub(tmp_path):
         check_read_token=lambda: True,
         check_hook_token=lambda: True,
         _portmap_router_name=lambda: "Router",
+        STUN_SERVICE=stun_lifecycle,
+        _stun_lifecycle=stun_lifecycle,
         _saved=saved,
     )
 
@@ -78,13 +107,17 @@ def test_hub_rejects_private_and_preshared_keys(tmp_path):
 
 
 def test_ddns_and_stun_have_independent_endpoint_revisions(tmp_path):
-    service = WireGuardService(_hub(tmp_path))
+    hub = _hub(tmp_path)
+    service = WireGuardService(hub)
     saved = service.put(_server(), 0)
     assert saved["revision"] == 1
     assert saved["endpointRevision"] == 0
     assert saved["server"]["endpointProfiles"][0]["bindingMode"] == "fixed-port"
-    assert saved["server"]["endpointProfiles"][1]["bindingMode"] == "udp-sidecar"
+    assert saved["server"]["endpointProfiles"][1]["bindingMode"] == "router-native"
+    assert saved["server"]["endpointProfiles"][1]["forwardMode"] == "router_native"
     assert saved["server"]["endpointProfiles"][1]["localTargetPort"] == 51820
+    assert hub._stun_lifecycle.ensure_calls[0]["id"] == "wireguard-ddns-ddns-primary"
+    assert hub._stun_lifecycle.ensure_calls[0]["listenPort"] == 51820
 
     ddns = service.update_endpoint(
         "ddns-primary", "ddns", "ddns:ddns-primary", "wg.example.test", 0
@@ -121,6 +154,51 @@ def test_endpoint_updater_cannot_write_a_profile_owned_by_other_source(tmp_path)
         service.update_endpoint(
             "ddns-primary", "ddns", "ddns:ddns-primary", "wg.example.test", None
         )
+
+
+@pytest.mark.parametrize(
+    "change, message",
+    [
+        ({"enabled": False}, "必须已启用"),
+        ({"transportProtocol": "TCP"}, "必须关联 UDP"),
+        ({"targetPort": 443}, "目标端口"),
+        ({"forwardMode": "relay"}, "路由器原生"),
+    ],
+)
+def test_stun_profile_requires_enabled_udp_router_native_mapping(tmp_path, change, message):
+    hub = _hub(tmp_path)
+    rule_path = Path(tmp_path) / "stun_rules.json"
+    hub._saved[rule_path]["rules"][0].update(change)
+    service = WireGuardService(hub)
+    with pytest.raises(ValueError, match=message):
+        service.put(_server(), 0)
+
+
+def test_stun_profile_requires_existing_rule(tmp_path):
+    hub = _hub(tmp_path)
+    hub._saved[Path(tmp_path) / "stun_rules.json"]["rules"] = []
+    service = WireGuardService(hub)
+    with pytest.raises(ValueError, match="关联规则不存在"):
+        service.put(_server(), 0)
+
+
+def test_ddns_firewall_is_removed_when_profile_deleted_or_server_deleted(tmp_path):
+    hub = _hub(tmp_path)
+    service = WireGuardService(hub)
+    service.put(_server(), 0)
+    changed = _server()
+    changed["endpointProfiles"] = [changed["endpointProfiles"][1]]
+    service.put(changed, 1)
+    assert "wireguard-ddns-ddns-primary" in hub._stun_lifecycle.remove_calls
+
+    service.delete(2)
+    assert hub._stun_lifecycle.remove_calls.count("wireguard-ddns-ddns-primary") == 1
+
+    hub2 = _hub(tmp_path / "delete")
+    service2 = WireGuardService(hub2)
+    service2.put(_server(), 0)
+    service2.delete(1)
+    assert "wireguard-ddns-ddns-primary" in hub2._stun_lifecycle.remove_calls
 
 
 def test_manual_endpoint_is_immutable_to_automatic_updaters(tmp_path):

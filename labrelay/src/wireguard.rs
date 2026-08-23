@@ -39,6 +39,8 @@ pub struct WireGuardEndpointProfile {
     #[serde(default)]
     pub binding_mode: String,
     #[serde(default)]
+    pub forward_mode: String,
+    #[serde(default)]
     pub transport_protocol: String,
     #[serde(default)]
     pub local_target_port: u16,
@@ -503,6 +505,24 @@ fn is_ascii_interface_name(name: &str) -> bool {
             .all(|ch| ch.is_ascii_alphanumeric() || matches!(ch, '.' | '-' | '_' | '@'))
 }
 
+/// Return the parameterized `ip` arguments needed to create an interface.
+/// Keeping this decision pure makes first-apply behavior testable on CI hosts
+/// that do not have a WireGuard kernel module.
+pub fn interface_create_args(interface_exists: bool, interface_name: &str) -> Option<Vec<String>> {
+    if interface_exists {
+        None
+    } else {
+        Some(vec![
+            "link".into(),
+            "add".into(),
+            "dev".into(),
+            interface_name.into(),
+            "type".into(),
+            "wireguard".into(),
+        ])
+    }
+}
+
 fn parse_cidr(value: &str) -> Result<(IpAddr, u8)> {
     let (address, prefix) = value
         .split_once('/')
@@ -562,11 +582,12 @@ pub fn validate_server_desired(config: &WireGuardServerDesired) -> Result<()> {
         if profile.endpoint_source == "stun"
             && (profile.stun_rule_id.is_empty()
                 || profile.owner != format!("stun:{}", profile.stun_rule_id)
-                || profile.binding_mode != "udp-sidecar"
+                || profile.binding_mode != "router-native"
+                || profile.forward_mode != "router_native"
                 || profile.transport_protocol != "UDP"
                 || profile.local_target_port != config.listen_port)
         {
-            bail!("STUN endpoint profile requires a dedicated UDP sidecar to the fixed WireGuard port");
+            bail!("STUN endpoint profile requires an enabled UDP router-native mapping to the fixed WireGuard port");
         }
     }
     let mut peer_ids = std::collections::BTreeSet::new();
@@ -633,12 +654,44 @@ fn configure_link(config: &WireGuardServerDesired) -> Result<()> {
     Ok(())
 }
 
+#[cfg(target_os = "linux")]
+fn ensure_interface(ip_tool: &str, interface_name: &str) -> Result<()> {
+    let exists = Command::new(ip_tool)
+        .args(["link", "show", "dev", interface_name])
+        .output()
+        .with_context(|| format!("probe WireGuard interface {interface_name}"))?
+        .status
+        .success();
+    let Some(args) = interface_create_args(exists, interface_name) else {
+        return Ok(());
+    };
+    let output = Command::new(ip_tool)
+        .args(&args)
+        .output()
+        .with_context(|| format!("create WireGuard interface {interface_name}"))?;
+    if output.status.success() {
+        return Ok(());
+    }
+    // Another apply can win the create race between the probe and add.  An
+    // EEXIST-style response is therefore an idempotent success.
+    let stderr = String::from_utf8_lossy(&output.stderr).to_ascii_lowercase();
+    if stderr.contains("file exists") || stderr.contains("already exists") {
+        return Ok(());
+    }
+    bail!(
+        "ip failed to create WireGuard interface {interface_name}: {}",
+        stderr.trim()
+    )
+}
+
 /// Apply the desired server through the kernel Generic Netlink backend.  This
 /// does not invoke `wg` and therefore works on the BE72 firmware where the
 /// kernel module exists but wireguard-tools is absent.
 #[cfg(target_os = "linux")]
 pub fn apply_server(config: &WireGuardServerDesired) -> Result<WireGuardApplyResult> {
     validate_server_desired(config)?;
+    let ip = find_tool("ip").ok_or_else(|| anyhow::anyhow!("ip tool is required to create the WireGuard interface"))?;
+    ensure_interface(&ip, &config.interface_name)?;
     let keypair = load_or_create_keypair(&private_key_path())?;
     let interface: InterfaceName = config.interface_name.parse()
         .map_err(|_| anyhow::anyhow!("invalid WireGuard interface name"))?;
@@ -953,6 +1006,21 @@ mod tests {
     }
 
     #[test]
+    fn missing_interface_gets_parameterized_create_command() {
+        assert_eq!(
+            interface_create_args(false, "labwg0"),
+            Some(vec![
+                "link", "add", "dev", "labwg0", "type", "wireguard"
+            ].into_iter().map(String::from).collect())
+        );
+    }
+
+    #[test]
+    fn existing_interface_is_not_recreated() {
+        assert_eq!(interface_create_args(true, "labwg0"), None);
+    }
+
+    #[test]
     fn server_contract_keeps_endpoint_sources_separate() {
         let peer = KeyPair::generate();
         let desired = WireGuardServerDesired {
@@ -986,7 +1054,8 @@ mod tests {
                     hostname: String::new(),
                     public_endpoint: "203.0.113.8:24567".into(),
                     stun_rule_id: "stun-wireguard".into(),
-                    binding_mode: "udp-sidecar".into(),
+                    binding_mode: "router-native".into(),
+                    forward_mode: "router_native".into(),
                     transport_protocol: "UDP".into(),
                     local_target_port: 51820,
                     port: 24567,
@@ -1015,7 +1084,8 @@ mod tests {
                 hostname: "wg.example.test".into(),
                 public_endpoint: "203.0.113.8:24567".into(),
                 stun_rule_id: "stun-wireguard".into(),
-                binding_mode: "udp-sidecar".into(),
+                binding_mode: "router-native".into(),
+                forward_mode: "router_native".into(),
                 transport_protocol: "UDP".into(),
                 local_target_port: 51820,
                 ..WireGuardEndpointProfile::default()

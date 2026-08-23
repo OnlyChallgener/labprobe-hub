@@ -92,6 +92,107 @@ class WireGuardService:
             raise ValueError("Hub 不允许保存 WireGuard 私钥或预共享密钥")
         self.hub.save_json(self.document_path, document)
 
+    def _stun_rule(self, rule_id: str) -> Optional[Dict[str, Any]]:
+        """Read the STUN rule owned by the existing STUN service.
+
+        WireGuard STUN profiles use the same router-native port mapping as
+        normal STUN rules.  Keeping the lookup here read-only makes PUT
+        validation independent of the STUN service's private runtime state and
+        also keeps the test seam small.
+        """
+        service = getattr(self.hub, "STUN_SERVICE", None)
+        if service is not None:
+            document = getattr(service, "_document", None)
+            if callable(document):
+                raw = document()
+            else:
+                raw = self.hub.load_json(Path(self.hub.DATA_DIR) / "stun_rules.json", {})
+        else:
+            raw = self.hub.load_json(Path(self.hub.DATA_DIR) / "stun_rules.json", {})
+        rows = raw.get("rules", []) if isinstance(raw, dict) else []
+        return next(
+            (dict(row) for row in rows if isinstance(row, dict) and _text(row.get("id")) == rule_id),
+            None,
+        )
+
+    def _validate_stun_binding(self, rule_id: str, listen_port: int) -> Dict[str, Any]:
+        rule = self._stun_rule(rule_id)
+        if rule is None:
+            raise ValueError("STUN Profile 关联规则不存在")
+        if not bool(rule.get("enabled", False)):
+            raise ValueError("STUN Profile 关联规则必须已启用")
+        if _text(rule.get("kind")).lower() != "stun":
+            raise ValueError("STUN Profile 关联规则类型无效")
+        if _text(rule.get("transportProtocol")).upper() != "UDP":
+            raise ValueError("WireGuard STUN Profile 必须关联 UDP 规则")
+        if _text(rule.get("forwardMode")) != "router_native":
+            raise ValueError("WireGuard STUN Profile 必须使用路由器原生端口映射")
+        if _int(rule.get("targetPort")) != listen_port:
+            raise ValueError("STUN 规则目标端口必须等于 WireGuard 监听端口")
+        target = _text(rule.get("targetIpv4"))
+        try:
+            address = ipaddress.ip_address(target)
+        except ValueError as error:
+            raise ValueError("STUN 规则目标必须是有效的路由器/Agent IPv4 地址") from error
+        if address.version != 4 or not address.is_private:
+            raise ValueError("STUN 规则目标必须是路由器/Agent 私有 IPv4 地址")
+        return rule
+
+    def _stun_lifecycle(self) -> Any:
+        service = getattr(self.hub, "STUN_SERVICE", None)
+        if service is None or not callable(getattr(service, "ensure_firewall", None)) or not callable(getattr(service, "remove_firewall", None)):
+            raise RuntimeError("WireGuard DDNS 防火墙生命周期不可用")
+        return service
+
+    @staticmethod
+    def _ddns_firewall_rule(profile: Dict[str, Any], server: Dict[str, Any]) -> Dict[str, Any]:
+        profile_id = _text(profile.get("id"))
+        return {
+            "id": f"wireguard-ddns-{profile_id}",
+            "kind": "wireguard",
+            "enabled": bool(server.get("enabled", True)) and bool(profile.get("enabled", True)),
+            "listenPort": _int(server.get("listenPort")),
+            "transportProtocol": "UDP",
+            "targetPort": _int(server.get("listenPort")),
+            "forwardMode": "router_native",
+        }
+
+    def _ensure_ddns_firewall(self, profile: Dict[str, Any], server: Dict[str, Any]) -> None:
+        lifecycle = self._stun_lifecycle()
+        firewall_id = f"wireguard-ddns-{_text(profile.get('id'))}"
+        if not bool(server.get("enabled", True)) or not bool(profile.get("enabled", True)):
+            lifecycle.remove_firewall(firewall_id)
+            return
+        rule = self._ddns_firewall_rule(profile, server)
+        result = lifecycle.ensure_firewall(rule)
+        if _text(result.get("state")) == "verify_failed":
+            # A previous LabProbe-owned rule may have a changed listen port;
+            # remove it through the fingerprinted lifecycle before recreating.
+            lifecycle.remove_firewall(firewall_id)
+            result = lifecycle.ensure_firewall(rule)
+        if _text(result.get("state")) != "ready":
+            raise ValueError(_text(result.get("message")) or "WireGuard DDNS 防火墙规则未就绪")
+
+    def _remove_ddns_firewall(self, profile: Dict[str, Any]) -> None:
+        self._stun_lifecycle().remove_firewall(f"wireguard-ddns-{_text(profile.get('id'))}")
+
+    def _sync_ddns_firewalls(self, old_server: Optional[Dict[str, Any]], new_server: Dict[str, Any]) -> None:
+        old_profiles = {
+            _text(row.get("id")): dict(row)
+            for row in (old_server or {}).get("endpointProfiles", [])
+            if isinstance(row, dict) and _text(row.get("endpointSource")).lower() == "ddns"
+        }
+        new_profiles = {
+            _text(row.get("id")): dict(row)
+            for row in new_server.get("endpointProfiles", [])
+            if isinstance(row, dict) and _text(row.get("endpointSource")).lower() == "ddns"
+        }
+        for profile_id, profile in old_profiles.items():
+            if profile_id not in new_profiles:
+                self._remove_ddns_firewall(profile)
+        for profile in new_profiles.values():
+            self._ensure_ddns_firewall(profile, new_server)
+
     def clean_server(self, payload: Dict[str, Any], old: Optional[Dict[str, Any]] = None) -> Dict[str, Any]:
         if _has_secret(payload):
             raise ValueError("私钥只能保存在路由器 Agent 本地")
@@ -163,6 +264,7 @@ class WireGuardService:
                 "port": _int(raw.get("port"), listen_port),
                 "endpointRevision": max(0, _int(raw.get("endpointRevision"))),
                 "resolvedEndpoint": _text(raw.get("resolvedEndpoint")),
+                "forwardMode": _text(raw.get("forwardMode")),
             }
             if not 1 <= profile["port"] <= 65535:
                 raise ValueError("Endpoint 端口无效")
@@ -188,13 +290,15 @@ class WireGuardService:
                 stun_rule_id = _text(raw.get("stunRuleId"))
                 if not re.fullmatch(r"[A-Za-z0-9_-]{1,64}", stun_rule_id):
                     raise ValueError("STUN Profile 需要独立的 UDP 穿透规则")
-                # The sidecar owns the STUN channel port and forwards UDP to
-                # the local fixed WG port. It must never bind WG to that same
-                # dynamic/public STUN port.
+                self._validate_stun_binding(stun_rule_id, listen_port)
+                # STUN owns the public channel port; the router-native map
+                # forwards it to the Agent's fixed WireGuard listen port.
+                # WireGuard itself never binds the changing STUN port.
                 profile.update({
                     "hostname": "",
                     "stunRuleId": stun_rule_id,
-                    "bindingMode": "udp-sidecar",
+                    "bindingMode": "router-native",
+                    "forwardMode": "router_native",
                     "transportProtocol": "UDP",
                     "localTargetPort": listen_port,
                     "owner": f"stun:{stun_rule_id}",
@@ -250,6 +354,7 @@ class WireGuardService:
             server = self.clean_server(payload, document.get("server"))
             revision = document["revision"] + 1
             server["revision"] = revision
+            self._sync_ddns_firewalls(document.get("server"), server)
             saved = {
                 **document,
                 "revision": revision,
@@ -268,6 +373,9 @@ class WireGuardService:
                 raise RuntimeError("revision conflict")
             old = document.get("server") or {}
             revision = document["revision"] + 1
+            for profile in old.get("endpointProfiles", []):
+                if isinstance(profile, dict) and _text(profile.get("endpointSource")).lower() == "ddns":
+                    self._remove_ddns_firewall(profile)
             tombstone = {"revision": revision, "deletedAt": _now_text(), "interfaceName": _text(old.get("interfaceName")) or "labwg0"}
             saved = {**document, "revision": revision, "updatedAt": tombstone["deletedAt"], "server": None, "tombstone": tombstone}
             self._save_document(saved)

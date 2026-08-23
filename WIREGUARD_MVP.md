@@ -43,11 +43,13 @@ Manual, DDNS and STUN are distinct client profiles:
 - `endpointSource=manual`: immutable endpoint, no updater owner. Automatic
   endpoint commands are rejected by both Hub and Agent.
 - `endpointSource=ddns`: fixed WireGuard UDP port and one hostname.
-- `endpointSource=stun`: a dedicated UDP STUN rule and `udp-sidecar` binding.
+- `endpointSource=stun`: a dedicated enabled UDP STUN rule using the router's
+  native port mapping to the Agent's fixed WireGuard listen port.
 
-The STUN sidecar owns its NAT channel and forwards UDP to WireGuard's fixed
-local listen port. WireGuard must not bind to the same sidecar/STUN channel
-port. Consequently, DDNS and STUN updaters cannot overwrite the same endpoint.
+The STUN rule owns its NAT channel and the router-native mapping forwards that
+channel to WireGuard's fixed local listen port. WireGuard must not bind to the
+changing STUN channel port. Consequently, DDNS and STUN updaters cannot
+overwrite the same endpoint.
 Every automatic update carries `endpointSource`, the stable `owner` identity,
 and `expectedEndpointRevision`. Endpoint revision is independent of the server
 profile revision, so a stale DDNS/STUN result cannot overwrite a newer endpoint
@@ -65,10 +67,9 @@ or a manual value and does not reconfigure the kernel interface.
 
 ## Remaining deployment work
 
-- Wire the existing STUN runtime to update a WireGuard STUN profile and run the
-  dedicated UDP sidecar on the router. This MVP deliberately does not reuse or
-  steal WireGuard's fixed socket.
-- Add router eWeb firewall/port mapping lifecycle for the fixed DDNS mode.
+- Wire the existing STUN runtime to call the source-owned endpoint updater.
+- Add any remaining router eWeb port-mapping lifecycle for the fixed DDNS mode;
+  its inbound firewall rule is already owned and reconciled by the Hub.
 - Add routing/NAT policy for full-tunnel clients. The MVP only provisions the
   WireGuard interface, address, fixed listen port and peers.
 - Validate the ARM64 artifact on BE72, including Generic Netlink permissions,
