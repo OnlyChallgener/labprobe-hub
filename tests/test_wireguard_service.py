@@ -270,3 +270,165 @@ def test_agent_status_rejects_any_secret_material(tmp_path):
     )
     assert response.status_code == 400
     assert not (tmp_path / "wireguard_agent_status.json") in hub._saved
+
+
+def test_put_succeeds_and_queues_apply_command_when_firewall_fails(tmp_path):
+    hub = _hub(tmp_path)
+    class _FailingStunLifecycle:
+        def ensure_firewall(self, rule):
+            raise RuntimeError("防火墙规则创建失败")
+        def remove_firewall(self, rule_id):
+            raise RuntimeError("防火墙规则删除失败")
+
+    hub.STUN_SERVICE = _FailingStunLifecycle()
+    hub._stun_lifecycle = hub.STUN_SERVICE
+    service = WireGuardService(hub)
+
+    saved = service.put(_server(), 0)
+    assert saved["revision"] == 1
+    assert saved["server"]["interfaceName"] == "labwg0"
+    assert service.document()["server"]["interfaceName"] == "labwg0"
+
+    commands = service.commands()
+    assert len(commands) == 1
+    assert commands[0]["action"] == "apply"
+    assert commands[0]["revision"] == 1
+    assert commands[0]["payload"]["server"]["interfaceName"] == "labwg0"
+
+
+def test_delete_succeeds_and_queues_delete_command_when_firewall_removal_fails(tmp_path):
+    hub = _hub(tmp_path)
+    class _FailingStunLifecycle:
+        def ensure_firewall(self, rule):
+            return {"state": "ready"}
+        def remove_firewall(self, rule_id):
+            raise RuntimeError("防火墙规则删除失败")
+
+    hub.STUN_SERVICE = _FailingStunLifecycle()
+    hub._stun_lifecycle = hub.STUN_SERVICE
+    service = WireGuardService(hub)
+    service.put(_server(), 0)
+
+    deleted = service.delete(1)
+    assert deleted["revision"] == 2
+    assert deleted["server"] is None
+    assert deleted["tombstone"]["interfaceName"] == "labwg0"
+
+    commands = service.commands()
+    assert commands[-1]["action"] == "delete"
+    assert commands[-1]["revision"] == 2
+    assert commands[-1]["payload"]["tombstone"] is True
+
+
+def test_blueprint_put_returns_200_when_firewall_fails(tmp_path):
+    hub = _hub(tmp_path)
+    class _FailingStunLifecycle:
+        def ensure_firewall(self, rule):
+            raise RuntimeError("防火墙规则创建失败")
+        def remove_firewall(self, rule_id):
+            raise RuntimeError("防火墙规则删除失败")
+
+    hub.STUN_SERVICE = _FailingStunLifecycle()
+    hub._stun_lifecycle = hub.STUN_SERVICE
+    install_wireguard_service(hub)
+    client = hub.app.test_client()
+
+    response = client.put(
+        "/api/wireguard/server",
+        json=_server(),
+    )
+    assert response.status_code == 200
+    body = response.get_json()
+    assert body["ok"] is True
+    assert body["revision"] == 1
+    assert body["server"]["interfaceName"] == "labwg0"
+    assert "lanForwarding" in body
+
+
+def test_wireguard_provisioning_succeeds_without_stun_service_or_firewall_lifecycle(tmp_path):
+    hub = _hub(tmp_path)
+    hub.STUN_SERVICE = None
+    hub._stun_lifecycle = None
+    service = WireGuardService(hub)
+
+    saved = service.put(_server(), 0)
+    assert saved["revision"] == 1
+    assert saved["server"]["interfaceName"] == "labwg0"
+    assert len(service.commands()) == 1
+    assert service.commands()[0]["action"] == "apply"
+
+    deleted = service.delete(1)
+    assert deleted["revision"] == 2
+    assert deleted["server"] is None
+    assert service.commands()[-1]["action"] == "delete"
+
+
+def test_listen_port_customization_and_ddns_endpoint_sync(tmp_path):
+    hub = _hub(tmp_path)
+    service = WireGuardService(hub)
+    server_data = _server()
+    server_data["listenPort"] = 40000
+    server_data["endpointProfiles"] = [
+        p for p in server_data["endpointProfiles"] if p["endpointSource"] == "ddns"
+    ]
+
+    saved = service.put(server_data, 0)
+    assert saved["server"]["listenPort"] == 40000
+
+    ddns_profile = next(
+        p for p in saved["server"]["endpointProfiles"] if p["endpointSource"] == "ddns"
+    )
+    assert ddns_profile["port"] == 40000
+
+    # Verify apply command payload contains 40000
+    command = service.commands()[0]
+    assert command["payload"]["server"]["listenPort"] == 40000
+
+    # Updating DDNS endpoint formats with the customized listenPort 40000
+    updated_ddns = service.update_endpoint(
+        "ddns-primary", "ddns", "ddns:ddns-primary", "wg.example.test", 0
+    )
+    assert updated_ddns["resolvedEndpoint"] == "wg.example.test:40000"
+    assert updated_ddns["endpointRevision"] == 1
+
+
+def test_listen_port_customization_updates_stun_target_port(tmp_path):
+    hub = _hub(tmp_path)
+    service = WireGuardService(hub)
+    service.put(_server(), 0)
+
+    # Now update listenPort to 40000
+    server_data = _server()
+    server_data["listenPort"] = 40000
+    saved = service.put(server_data, 1)
+    assert saved["server"]["listenPort"] == 40000
+
+    # Verify stun_rules.json rule stun-wireguard was updated with targetPort = 40000
+    stun_rules_path = Path(tmp_path) / "stun_rules.json"
+    updated_stun_rules = hub.load_json(stun_rules_path, {})
+    rule = updated_stun_rules["rules"][0]
+    assert rule["targetPort"] == 40000
+
+
+def test_old_config_without_listen_port_defaults_to_51820(tmp_path):
+    hub = _hub(tmp_path)
+    service = WireGuardService(hub)
+    server_data = _server()
+    del server_data["listenPort"]
+
+    saved = service.put(server_data, 0)
+    assert saved["server"]["listenPort"] == 51820
+
+
+def test_invalid_listen_port_rejected(tmp_path):
+    hub = _hub(tmp_path)
+    service = WireGuardService(hub)
+    server_data = _server()
+    server_data["listenPort"] = 70000
+
+    with pytest.raises(ValueError, match="WireGuard UDP 监听端口无效"):
+        service.put(server_data, 0)
+
+
+
+
