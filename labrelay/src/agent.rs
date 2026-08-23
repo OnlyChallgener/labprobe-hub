@@ -1506,11 +1506,81 @@ async fn sync_portmaps(
         state.last_command_at = now_epoch();
     }
     if Path::new(&config.relay_socket).exists() {
-        let relay = ctl_request(Path::new(&config.relay_socket), &json!({"action":"status"}))?;
+        let relay = ctl_request(
+            Path::new(&config.relay_socket),
+            &json!({"action":"status", "scope":"portmap"}),
+        )?;
         post_json(
             client,
             config,
             &format!("/api/router/portmaps/status?router={}", router),
+            &relay,
+        )
+        .await?;
+    }
+    Ok(())
+}
+
+async fn sync_stun(
+    client: &Client,
+    config: &AgentConfig,
+    state: &mut AgentState,
+) -> Result<()> {
+    let router = url_encode(&config.router_name);
+    let root = get_json(
+        client,
+        config,
+        &format!("/api/router/stun/commands?router={}&limit=20", router),
+    )
+    .await?;
+    let commands = root
+        .get("commands")
+        .and_then(Value::as_array)
+        .cloned()
+        .unwrap_or_default();
+    if !commands.is_empty() {
+        let mut acks = Vec::new();
+        for command in commands {
+            let id = command.get("id").and_then(Value::as_str).unwrap_or("");
+            let action = command.get("action").and_then(Value::as_str).unwrap_or("");
+            let payload = command.get("payload").cloned().unwrap_or_else(|| json!({}));
+            let local = match action {
+                "upsert" => json!({
+                    "action":"upsert",
+                    "rule":payload.get("rule").cloned().unwrap_or(Value::Null)
+                }),
+                "start" | "stop" | "delete" => json!({
+                    "action":action,
+                    "id":payload.get("id").and_then(Value::as_str).unwrap_or("")
+                }),
+                _ => json!({"action":"invalid"}),
+            };
+            let result = ctl_request(Path::new(&config.relay_socket), &local)
+                .unwrap_or_else(|e| json!({"ok":false,"error":e.to_string()}));
+            acks.push(json!({
+                "id":id,
+                "ok":result.get("ok").and_then(Value::as_bool).unwrap_or(false),
+                "result":result
+            }));
+        }
+        post_json(
+            client,
+            config,
+            &format!("/api/router/stun/ack?router={}", router),
+            &json!({"acks":acks}),
+        )
+        .await?;
+        state.last_command_at = now_epoch();
+    }
+    if Path::new(&config.relay_socket).exists() {
+        let relay = ctl_request(
+            Path::new(&config.relay_socket),
+            &json!({"action":"status", "scope":"stun"}),
+        )?;
+        post_json(
+            client,
+            config,
+            &format!("/api/router/stun/status?router={}", router),
             &relay,
         )
         .await?;
@@ -1560,6 +1630,11 @@ pub async fn run(args: &[String], once: bool) -> Result<()> {
             if let Err(error) = sync_portmaps(&client, &config, &mut state).await {
                 let text = redact(&format!("portmap status: {:#}", error), &config.hook_token);
                 log_limited(&config, &mut state, "WARN", "portmap-status", &text);
+                errors.push(text);
+            }
+            if let Err(error) = sync_stun(&client, &config, &mut state).await {
+                let text = redact(&format!("stun status: {:#}", error), &config.hook_token);
+                log_limited(&config, &mut state, "WARN", "stun-status", &text);
                 errors.push(text);
             }
             last_status_at = now;
