@@ -377,6 +377,28 @@ class StunService:
         return next((dict(row) for row in rows if isinstance(row, dict) and _text(row.get("uuid")) == firewall_uuid), None)
 
     def _expected_firewall(self, rule: Dict[str, Any]) -> Dict[str, Any]:
+        if _text(rule.get("firewallMode")).lower() == "wireguard_lan_forward":
+            # WireGuard's tunnel is terminated by the router Agent, while LAN
+            # forwarding remains a router Web-firewall responsibility.  The
+            # router API does not expose a reliable labwg0 interface selector
+            # on all firmware versions, so match the tunnel source network and
+            # LAN egress only.  This deliberately does not touch iptables/nft.
+            return {
+                "ruleName": f"LabProbe WireGuard {rule['id']}",
+                "direction": "forward",
+                "ipVersion": "ipv4",
+                "proto": "all",
+                "srcIP": _text(rule["tunnelNetwork"]),
+                "destIP": "",
+                "srcPort": "",
+                "destPort": "",
+                "target": "ACCEPT",
+                "enable": "1",
+                "ipv6SuffixSrc": "",
+                "ipv6SuffixDest": "",
+                "inIface": "",
+                "outIface": "lan",
+            }
         return {
             "ruleName": f"LabProbe STUN {rule['id']}", "direction": "inbound", "ipVersion": "ipv4",
             "proto": _text(rule["transportProtocol"]).lower(), "srcIP": "", "destIP": "", "srcPort": "",
@@ -384,16 +406,34 @@ class StunService:
             "ipv6SuffixSrc": "", "ipv6SuffixDest": "", "inIface": "wan", "outIface": "",
         }
 
+    @staticmethod
+    def _firewall_matches(row: Dict[str, Any], expected: Dict[str, Any]) -> bool:
+        return all(_text(row.get(key)) == _text(value) for key, value in expected.items())
+
     def ensure_firewall(self, rule: Dict[str, Any]) -> Dict[str, Any]:
         expected = self._expected_firewall(rule)
         bindings = self._firewall_bindings()
         binding = bindings.get(rule["id"], {})
         current = self.client.firewall(True)
         existing = self._find_firewall(current, _text(binding.get("uuid")))
+        if not existing and _text(rule.get("firewallMode")).lower() == "wireguard_lan_forward":
+            # A same-name rule without our persisted fingerprint is not ours
+            # to adopt.  Refuse a duplicate so a manual/operator rule remains
+            # authoritative and cleanup can never target it accidentally.
+            same_name = next(
+                (
+                    dict(row)
+                    for row in current.get("list", [])
+                    if isinstance(row, dict) and _text(row.get("ruleName")) == expected["ruleName"]
+                ),
+                None,
+            )
+            if same_name:
+                return {"state": "manual_change", "message": "检测到同名但不属于 WireGuard 的防火墙规则，未接管"}
         if existing:
             if binding.get("fingerprint") and binding["fingerprint"] != _rule_fingerprint(existing):
                 return {"state": "manual_change", "message": "已检测到防火墙规则被手动修改"}
-            if any(_text(existing.get(key)) != _text(value) for key, value in expected.items()):
+            if not self._firewall_matches(existing, expected):
                 return {"state": "verify_failed", "message": "防火墙规则回读与穿透规则不一致"}
             bindings[rule["id"]] = {"uuid": _text(existing.get("uuid")), "fingerprint": _rule_fingerprint(existing)}
             self._save_firewall_bindings(bindings)
@@ -406,7 +446,7 @@ class StunService:
             lambda: self.client.firewall(True),
         )
         verified = written.get("data") if isinstance(written, dict) else {}
-        created = next((dict(row) for row in verified.get("list", []) if isinstance(row, dict) and _text(row.get("ruleName")) == expected["ruleName"] and _text(row.get("destPort")) == expected["destPort"] and _text(row.get("proto")).lower() == expected["proto"]), None)
+        created = next((dict(row) for row in verified.get("list", []) if isinstance(row, dict) and self._firewall_matches(row, expected)), None)
         if not created or not _text(created.get("uuid")):
             return {"state": "verify_failed", "message": "防火墙规则创建后未能确认"}
         bindings[rule["id"]] = {"uuid": _text(created.get("uuid")), "fingerprint": _rule_fingerprint(created)}

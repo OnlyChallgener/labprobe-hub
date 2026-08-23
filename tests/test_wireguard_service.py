@@ -118,6 +118,16 @@ def test_ddns_and_stun_have_independent_endpoint_revisions(tmp_path):
     assert saved["server"]["endpointProfiles"][1]["localTargetPort"] == 51820
     assert hub._stun_lifecycle.ensure_calls[0]["id"] == "wireguard-ddns-ddns-primary"
     assert hub._stun_lifecycle.ensure_calls[0]["listenPort"] == 51820
+    lan_calls = [row for row in hub._stun_lifecycle.ensure_calls if row["id"] == "wireguard-lan-labwg0"]
+    assert lan_calls == [{
+        "id": "wireguard-lan-labwg0",
+        "kind": "wireguard-lan-forward",
+        "firewallMode": "wireguard_lan_forward",
+        "enabled": True,
+        "tunnelNetwork": "10.77.0.0/24",
+        "transportProtocol": "ALL",
+        "listenPort": 51820,
+    }]
 
     ddns = service.update_endpoint(
         "ddns-primary", "ddns", "ddns:ddns-primary", "wg.example.test", 0
@@ -199,6 +209,20 @@ def test_ddns_firewall_is_removed_when_profile_deleted_or_server_deleted(tmp_pat
     service2.put(_server(), 0)
     service2.delete(1)
     assert "wireguard-ddns-ddns-primary" in hub2._stun_lifecycle.remove_calls
+    assert "wireguard-lan-labwg0" in hub2._stun_lifecycle.remove_calls
+
+
+def test_lan_forward_status_warns_when_router_ip_forward_is_not_readable(tmp_path):
+    hub = _hub(tmp_path)
+    service = WireGuardService(hub)
+    service.put(_server(), 0)
+
+    status = service.lan_forward_status(service.document()["server"])
+    assert status["firewall"]["sourceNetwork"] == "10.77.0.0/24"
+    assert status["firewall"]["direction"] == "forward"
+    assert status["firewall"]["outIface"] == "lan"
+    assert status["ipForward"]["state"] == "unknown"
+    assert "未提供可读" in status["ipForward"]["warning"]
 
 
 def test_manual_endpoint_is_immutable_to_automatic_updaters(tmp_path):
