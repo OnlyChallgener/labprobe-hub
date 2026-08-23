@@ -24,6 +24,10 @@ const DEFAULT_PRIVATE_KEY_PATH: &str = "/etc/labprobe/wireguard/private.key";
 pub struct WireGuardEndpointProfile {
     pub id: String,
     pub endpoint_source: String,
+    /// Stable updater identity (`ddns:<profile-id>` or `stun:<rule-id>`).
+    /// Manual profiles have no owner and reject automatic updates.
+    #[serde(default)]
+    pub owner: String,
     #[serde(default)]
     pub hostname: String,
     #[serde(default)]
@@ -42,6 +46,56 @@ pub struct WireGuardEndpointProfile {
     pub port: u16,
     #[serde(default)]
     pub endpoint_revision: u64,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+#[serde(rename_all = "camelCase")]
+pub struct WireGuardEndpointUpdate {
+    pub profile_id: String,
+    pub endpoint_source: String,
+    pub owner: String,
+    pub endpoint: String,
+    pub expected_endpoint_revision: u64,
+    pub endpoint_revision: u64,
+}
+
+/// Apply a public endpoint observation without changing the server/kernel
+/// revision. This is deliberately a separate state transition from applying
+/// WireGuard interface configuration.
+pub fn apply_endpoint_update(
+    profiles: &mut [WireGuardEndpointProfile],
+    update: &WireGuardEndpointUpdate,
+) -> Result<WireGuardEndpointProfile> {
+    let profile = profiles
+        .iter_mut()
+        .find(|profile| profile.id == update.profile_id)
+        .ok_or_else(|| anyhow::anyhow!("endpoint profile not found"))?;
+    if profile.endpoint_source == "manual" {
+        bail!("manual endpoint profile cannot be changed by an automatic updater");
+    }
+    if profile.endpoint_source != update.endpoint_source {
+        bail!("endpoint updater source does not match profile");
+    }
+    if profile.owner.is_empty() || profile.owner != update.owner {
+        bail!("endpoint updater owner does not match profile");
+    }
+    if profile.endpoint_revision == update.endpoint_revision
+        && profile.resolved_endpoint == update.endpoint
+    {
+        return Ok(profile.clone());
+    }
+    if profile.endpoint_revision != update.expected_endpoint_revision {
+        bail!("endpoint revision conflict");
+    }
+    if update.endpoint_revision != update.expected_endpoint_revision.saturating_add(1) {
+        bail!("endpoint revision must advance exactly once");
+    }
+    if update.endpoint.trim().is_empty() {
+        bail!("endpoint cannot be empty");
+    }
+    profile.resolved_endpoint = update.endpoint.clone();
+    profile.endpoint_revision = update.endpoint_revision;
+    Ok(profile.clone())
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
@@ -483,10 +537,20 @@ pub fn validate_server_desired(config: &WireGuardServerDesired) -> Result<()> {
         if profile.id.is_empty() || !profile_ids.insert(profile.id.as_str()) {
             bail!("endpoint profile ids must be unique");
         }
-        if !matches!(profile.endpoint_source.as_str(), "ddns" | "stun") {
-            bail!("endpointSource must be ddns or stun");
+        if !matches!(profile.endpoint_source.as_str(), "manual" | "ddns" | "stun") {
+            bail!("endpointSource must be manual, ddns or stun");
         }
-        if profile.endpoint_source == "ddns" && profile.hostname.trim().is_empty() {
+        if profile.endpoint_source == "manual"
+            && (!profile.owner.is_empty()
+                || profile.binding_mode != "manual"
+                || profile.resolved_endpoint.trim().is_empty())
+        {
+            bail!("manual endpoint profile requires an immutable endpoint and no updater owner");
+        }
+        if profile.endpoint_source == "ddns"
+            && (profile.hostname.trim().is_empty()
+                || profile.owner != format!("ddns:{}", profile.id))
+        {
             bail!("DDNS endpoint profile requires hostname");
         }
         if profile.endpoint_source == "ddns" && profile.binding_mode != "fixed-port" {
@@ -497,6 +561,7 @@ pub fn validate_server_desired(config: &WireGuardServerDesired) -> Result<()> {
         }
         if profile.endpoint_source == "stun"
             && (profile.stun_rule_id.is_empty()
+                || profile.owner != format!("stun:{}", profile.stun_rule_id)
                 || profile.binding_mode != "udp-sidecar"
                 || profile.transport_protocol != "UDP"
                 || profile.local_target_port != config.listen_port)
@@ -907,6 +972,7 @@ mod tests {
                 WireGuardEndpointProfile {
                     id: "wg-ddns".into(),
                     endpoint_source: "ddns".into(),
+                    owner: "ddns:wg-ddns".into(),
                     hostname: "wg.example.test".into(),
                     public_endpoint: String::new(),
                     binding_mode: "fixed-port".into(),
@@ -916,6 +982,7 @@ mod tests {
                 WireGuardEndpointProfile {
                     id: "wg-stun".into(),
                     endpoint_source: "stun".into(),
+                    owner: "stun:stun-wireguard".into(),
                     hostname: String::new(),
                     public_endpoint: "203.0.113.8:24567".into(),
                     stun_rule_id: "stun-wireguard".into(),
@@ -944,6 +1011,7 @@ mod tests {
             endpoint_profiles: vec![WireGuardEndpointProfile {
                 id: "bad".into(),
                 endpoint_source: "stun".into(),
+                owner: "stun:stun-wireguard".into(),
                 hostname: "wg.example.test".into(),
                 public_endpoint: "203.0.113.8:24567".into(),
                 stun_rule_id: "stun-wireguard".into(),
@@ -954,6 +1022,60 @@ mod tests {
             }],
         };
         assert!(validate_server_desired(&desired).is_err());
+    }
+
+    #[test]
+    fn automatic_endpoint_updates_are_owned_versioned_and_idempotent() {
+        let mut profiles = vec![WireGuardEndpointProfile {
+            id: "wg-ddns".into(),
+            endpoint_source: "ddns".into(),
+            owner: "ddns:wg-ddns".into(),
+            hostname: "wg.example.test".into(),
+            binding_mode: "fixed-port".into(),
+            port: 51820,
+            ..WireGuardEndpointProfile::default()
+        }];
+        let update = WireGuardEndpointUpdate {
+            profile_id: "wg-ddns".into(),
+            endpoint_source: "ddns".into(),
+            owner: "ddns:wg-ddns".into(),
+            endpoint: "wg.example.test:51820".into(),
+            expected_endpoint_revision: 0,
+            endpoint_revision: 1,
+        };
+        let first = apply_endpoint_update(&mut profiles, &update).unwrap();
+        assert_eq!(first.endpoint_revision, 1);
+        assert_eq!(first.resolved_endpoint, "wg.example.test:51820");
+        let repeated = apply_endpoint_update(&mut profiles, &update).unwrap();
+        assert_eq!(repeated, first);
+
+        let mut wrong_owner = update.clone();
+        wrong_owner.expected_endpoint_revision = 1;
+        wrong_owner.endpoint_revision = 2;
+        wrong_owner.owner = "ddns:someone-else".into();
+        assert!(apply_endpoint_update(&mut profiles, &wrong_owner).is_err());
+    }
+
+    #[test]
+    fn manual_endpoint_rejects_automatic_updates() {
+        let mut profiles = vec![WireGuardEndpointProfile {
+            id: "office".into(),
+            endpoint_source: "manual".into(),
+            binding_mode: "manual".into(),
+            resolved_endpoint: "198.51.100.20:51820".into(),
+            port: 51820,
+            ..WireGuardEndpointProfile::default()
+        }];
+        let update = WireGuardEndpointUpdate {
+            profile_id: "office".into(),
+            endpoint_source: "ddns".into(),
+            owner: "ddns:office".into(),
+            endpoint: "other.example.test:51820".into(),
+            expected_endpoint_revision: 0,
+            endpoint_revision: 1,
+        };
+        assert!(apply_endpoint_update(&mut profiles, &update).is_err());
+        assert_eq!(profiles[0].resolved_endpoint, "198.51.100.20:51820");
     }
 
     #[test]

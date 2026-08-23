@@ -79,6 +79,7 @@ struct AgentState {
     wireguard_revision: u64,
     wireguard_interface: String,
     wireguard_apply_result: Option<Value>,
+    wireguard_endpoint_profiles: Vec<crate::wireguard::WireGuardEndpointProfile>,
     last_ddns_address_at: u64,
     ddns_address: Option<Value>,
 }
@@ -1619,7 +1620,25 @@ async fn sync_wireguard(
                 .or_else(|| payload.get("revision"))
                 .and_then(Value::as_u64)
                 .unwrap_or(0);
-            let result: Result<Value> = if revision < state.wireguard_revision {
+            let endpoint_action = action == "endpoint";
+            let result: Result<Value> = if endpoint_action {
+                (|| -> Result<Value> {
+                    let update: crate::wireguard::WireGuardEndpointUpdate =
+                        serde_json::from_value(payload.clone()).context("invalid WireGuard endpoint update")?;
+                    let updated = crate::wireguard::apply_endpoint_update(
+                        &mut state.wireguard_endpoint_profiles,
+                        &update,
+                    )?;
+                    Ok(json!({
+                        "ok": true,
+                        "profileId": updated.id,
+                        "endpointSource": updated.endpoint_source,
+                        "owner": updated.owner,
+                        "endpointRevision": updated.endpoint_revision,
+                        "resolvedEndpoint": updated.resolved_endpoint,
+                    }))
+                })()
+            } else if revision < state.wireguard_revision {
                 Err(anyhow!("stale WireGuard revision"))
             } else if revision == state.wireguard_revision && revision > 0 {
                 Ok(state.wireguard_apply_result.clone().unwrap_or_else(|| json!({
@@ -1638,6 +1657,7 @@ async fn sync_wireguard(
                         let applied = crate::wireguard::apply_server(&desired)?;
                         let value = serde_json::to_value(&applied)?;
                         state.wireguard_interface = applied.interface_name.clone();
+                        state.wireguard_endpoint_profiles = desired.endpoint_profiles.clone();
                         Ok(value)
                     }
                     "stop" => {
@@ -1663,7 +1683,7 @@ async fn sync_wireguard(
             };
             match result {
                 Ok(value) => {
-                    if revision > state.wireguard_revision {
+                    if !endpoint_action && revision > state.wireguard_revision {
                         state.wireguard_revision = revision;
                         state.wireguard_apply_result = Some(value.clone());
                     }

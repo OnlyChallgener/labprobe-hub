@@ -86,8 +86,12 @@ def test_ddns_and_stun_have_independent_endpoint_revisions(tmp_path):
     assert saved["server"]["endpointProfiles"][1]["bindingMode"] == "udp-sidecar"
     assert saved["server"]["endpointProfiles"][1]["localTargetPort"] == 51820
 
-    ddns = service.update_endpoint("ddns-primary", "ddns", "wg.example.test", 0)
-    stun = service.update_endpoint("stun-fallback", "stun", "203.0.113.8:24567", 0)
+    ddns = service.update_endpoint(
+        "ddns-primary", "ddns", "ddns:ddns-primary", "wg.example.test", 0
+    )
+    stun = service.update_endpoint(
+        "stun-fallback", "stun", "stun:stun-wireguard", "203.0.113.8:24567", 0
+    )
     current = service.document()
     assert current["revision"] == 1
     assert current["endpointRevision"] == 2
@@ -95,13 +99,48 @@ def test_ddns_and_stun_have_independent_endpoint_revisions(tmp_path):
     assert stun["endpointRevision"] == 1
     assert ddns["resolvedEndpoint"] == "wg.example.test:51820"
     assert stun["resolvedEndpoint"] == "203.0.113.8:24567"
+    endpoint_commands = [row for row in service.commands() if row["action"] == "endpoint"]
+    assert [row["revisionScope"] for row in endpoint_commands] == [
+        "endpoint:ddns-primary",
+        "endpoint:stun-fallback",
+    ]
 
 
 def test_endpoint_updater_cannot_write_a_profile_owned_by_other_source(tmp_path):
     service = WireGuardService(_hub(tmp_path))
     service.put(_server(), 0)
     with pytest.raises(ValueError, match="does not own"):
-        service.update_endpoint("ddns-primary", "stun", "203.0.113.8:24567", 0)
+        service.update_endpoint(
+            "ddns-primary", "stun", "stun:stun-wireguard", "203.0.113.8:24567", 0
+        )
+    with pytest.raises(ValueError, match="owner does not match"):
+        service.update_endpoint(
+            "ddns-primary", "ddns", "ddns:some-other-profile", "wg.example.test", 0
+        )
+    with pytest.raises(ValueError, match="expectedEndpointRevision is required"):
+        service.update_endpoint(
+            "ddns-primary", "ddns", "ddns:ddns-primary", "wg.example.test", None
+        )
+
+
+def test_manual_endpoint_is_immutable_to_automatic_updaters(tmp_path):
+    service = WireGuardService(_hub(tmp_path))
+    payload = _server()
+    payload["endpointProfiles"].append({
+        "id": "manual-office",
+        "endpointSource": "manual",
+        "resolvedEndpoint": "198.51.100.20:51820",
+        "port": 51820,
+    })
+    saved = service.put(payload, 0)
+    manual = saved["server"]["endpointProfiles"][2]
+    assert manual["owner"] == ""
+    assert manual["resolvedEndpoint"] == "198.51.100.20:51820"
+    with pytest.raises(ValueError, match="manual endpoint profile"):
+        service.update_endpoint(
+            "manual-office", "ddns", "ddns:manual-office", "other.example.test", 0
+        )
+    assert service.document()["server"]["endpointProfiles"][2] == manual
 
 
 def test_expected_revision_and_delete_tombstone_prevent_resurrection(tmp_path):

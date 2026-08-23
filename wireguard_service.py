@@ -153,11 +153,11 @@ class WireGuardService:
             source = _text(raw.get("endpointSource")).lower()
             if not re.fullmatch(r"[A-Za-z0-9_-]{1,48}", profile_id) or profile_id in profile_ids:
                 raise ValueError("Endpoint Profile ID 无效或重复")
-            if source not in {"ddns", "stun"}:
-                raise ValueError("Endpoint Source 只能是 ddns 或 stun")
+            if source not in {"manual", "ddns", "stun"}:
+                raise ValueError("Endpoint Source 只能是 manual、ddns 或 stun")
             profile = {
                 "id": profile_id,
-                "name": _text(raw.get("name"))[:64] or ("DDNS 直连" if source == "ddns" else "STUN 穿透"),
+                "name": _text(raw.get("name"))[:64] or ({"manual": "手动地址", "ddns": "DDNS 直连", "stun": "STUN 穿透"}[source]),
                 "endpointSource": source,
                 "enabled": bool(raw.get("enabled", True)),
                 "port": _int(raw.get("port"), listen_port),
@@ -166,11 +166,22 @@ class WireGuardService:
             }
             if not 1 <= profile["port"] <= 65535:
                 raise ValueError("Endpoint 端口无效")
-            if source == "ddns":
+            if source == "manual":
+                endpoint = _text(raw.get("resolvedEndpoint"))
+                if not endpoint:
+                    raise ValueError("Manual Profile 需要固定 Endpoint")
+                profile.update({
+                    "hostname": "",
+                    "stunRuleId": "",
+                    "bindingMode": "manual",
+                    "owner": "",
+                    "resolvedEndpoint": endpoint,
+                })
+            elif source == "ddns":
                 hostname = _text(raw.get("hostname")).lower().rstrip(".")
                 if not hostname or len(hostname) > 253 or ":" in hostname:
                     raise ValueError("DDNS Profile 需要独立域名")
-                profile.update({"hostname": hostname, "stunRuleId": "", "bindingMode": "fixed-port"})
+                profile.update({"hostname": hostname, "stunRuleId": "", "bindingMode": "fixed-port", "owner": f"ddns:{profile_id}"})
             else:
                 if _text(raw.get("hostname")):
                     raise ValueError("STUN Profile 不能复用 DDNS 域名字段")
@@ -186,6 +197,7 @@ class WireGuardService:
                     "bindingMode": "udp-sidecar",
                     "transportProtocol": "UDP",
                     "localTargetPort": listen_port,
+                    "owner": f"stun:{stun_rule_id}",
                 })
             profile_ids.add(profile_id)
             profiles.append(profile)
@@ -205,12 +217,13 @@ class WireGuardService:
     def _save_commands(self, rows: Iterable[Dict[str, Any]]) -> None:
         self.hub.save_json(self.commands_path, {"commands": list(rows)})
 
-    def queue(self, action: str, revision: int, payload: Dict[str, Any], router: str = "") -> Dict[str, Any]:
+    def queue(self, action: str, revision: int, payload: Dict[str, Any], router: str = "", revision_scope: str = "server") -> Dict[str, Any]:
         router = router or self._router_name() or "router"
         with self.lock:
             rows = self.commands()
             rows = [row for row in rows if not (
                 row.get("router") == router
+                and _text(row.get("revisionScope")) in {"", revision_scope}
                 and _int(row.get("revision")) <= revision
                 and row.get("status") in {"pending", "delivered"}
             )]
@@ -219,6 +232,7 @@ class WireGuardService:
                 "router": router,
                 "action": action,
                 "revision": revision,
+                "revisionScope": revision_scope,
                 "payload": {**payload, "revision": revision},
                 "status": "pending",
                 "attempts": 0,
@@ -260,7 +274,7 @@ class WireGuardService:
             self.queue("delete", revision, {"interfaceName": tombstone["interfaceName"], "tombstone": True})
             return saved
 
-    def update_endpoint(self, profile_id: str, source: str, endpoint: str, expected_revision: Optional[int]) -> Dict[str, Any]:
+    def update_endpoint(self, profile_id: str, source: str, owner: str, endpoint: str, expected_revision: Optional[int]) -> Dict[str, Any]:
         with self.lock:
             document = self.document()
             server = dict(document.get("server") or {})
@@ -268,10 +282,16 @@ class WireGuardService:
             profile = next((row for row in profiles if _text(row.get("id")) == profile_id), None)
             if profile is None:
                 raise ValueError("endpoint profile not found")
+            if _text(profile.get("endpointSource")) == "manual":
+                raise ValueError("manual endpoint profile cannot be changed by an automatic updater")
             if _text(profile.get("endpointSource")) != _text(source).lower():
                 raise ValueError("endpoint updater does not own this profile")
+            if not owner or _text(profile.get("owner")) != _text(owner):
+                raise ValueError("endpoint owner does not match this profile")
             current = _int(profile.get("endpointRevision"))
-            if expected_revision is not None and expected_revision != current:
+            if expected_revision is None:
+                raise ValueError("expectedEndpointRevision is required")
+            if expected_revision != current:
                 raise RuntimeError("endpoint revision conflict")
             if source == "stun":
                 try:
@@ -291,6 +311,19 @@ class WireGuardService:
             document["endpointRevision"] += 1
             document["updatedAt"] = _now_text()
             self._save_document(document)
+            self.queue(
+                "endpoint",
+                profile["endpointRevision"],
+                {
+                    "profileId": profile_id,
+                    "endpointSource": source,
+                    "owner": owner,
+                    "endpoint": endpoint,
+                    "expectedEndpointRevision": current,
+                    "endpointRevision": profile["endpointRevision"],
+                },
+                revision_scope=f"endpoint:{profile_id}",
+            )
             return profile
 
 
@@ -328,6 +361,7 @@ def create_wireguard_blueprint(hub: Any, service: WireGuardService) -> Blueprint
             profile = service.update_endpoint(
                 profile_id,
                 _text(payload.get("endpointSource")),
+                _text(payload.get("owner")),
                 _text(payload.get("endpoint")),
                 _int(expected) if expected is not None else None,
             )

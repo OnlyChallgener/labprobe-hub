@@ -38,14 +38,20 @@ App writes should include `expectedRevision`; endpoint updaters should include
 
 ## Endpoint profiles
 
-DDNS and STUN are distinct client profiles:
+Manual, DDNS and STUN are distinct client profiles:
 
+- `endpointSource=manual`: immutable endpoint, no updater owner. Automatic
+  endpoint commands are rejected by both Hub and Agent.
 - `endpointSource=ddns`: fixed WireGuard UDP port and one hostname.
 - `endpointSource=stun`: a dedicated UDP STUN rule and `udp-sidecar` binding.
 
 The STUN sidecar owns its NAT channel and forwards UDP to WireGuard's fixed
 local listen port. WireGuard must not bind to the same sidecar/STUN channel
 port. Consequently, DDNS and STUN updaters cannot overwrite the same endpoint.
+Every automatic update carries `endpointSource`, the stable `owner` identity,
+and `expectedEndpointRevision`. Endpoint revision is independent of the server
+profile revision, so a stale DDNS/STUN result cannot overwrite a newer endpoint
+or a manual value and does not reconfigure the kernel interface.
 
 ## API contract
 
