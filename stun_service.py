@@ -1,10 +1,9 @@
 """Small STUN control-plane for LabProbe Relay.
 
-TCP follows Lucky's native-forwarding path: Hub creates one stable router
-port-map (channel port -> selected LAN service) and the Agent uses that same
-channel port only for STUN keepalive/address discovery.  A changing STUN
-public endpoint never changes the router port-map.  UDP remains a relay proxy
-because Lucky does not support disabling its built-in UDP forwarder.
+Both TCP and UDP follow Lucky's native-forwarding path: Hub creates one
+stable router port-map (channel port -> selected LAN service) and the Agent
+uses that same channel port only for STUN keepalive/address discovery.  A
+changing STUN public endpoint never changes the router port-map.
 
 All router writes use the Hub's eWeb controller; this module never calls
 router iptables directly.
@@ -120,7 +119,7 @@ class StunService:
             rule = dict(raw)
             if _text(rule.get("kind")).lower() == "stun":
                 protocol = _text(rule.get("transportProtocol")).upper() or "TCP"
-                forward_mode = "router_native" if protocol == "TCP" else "relay_proxy"
+                forward_mode = "router_native"
                 if _text(rule.get("forwardMode")) != forward_mode:
                     rule["forwardMode"] = forward_mode
                     rule["updatedAt"] = _now_text()
@@ -198,10 +197,10 @@ class StunService:
             "targetPort": target_port,
             "serviceType": service,
             "transportProtocol": protocol,
-            # Lucky's documented high-performance mode is available for TCP:
-            # the router owns forwarding while the STUN client only keeps the
-            # public NAT mapping alive.  UDP needs LabRelay's proxy socket.
-            "forwardMode": "router_native" if protocol == "TCP" else "relay_proxy",
+            # The router owns forwarding while the STUN client only keeps the
+            # public NAT mapping alive.  This is Lucky's direct mode and
+            # works for either selected transport on current Lucky releases.
+            "forwardMode": "router_native",
             "stunServer": _stun_server(protocol),
             "maxConnections": max(1, min(256, _int(payload.get("maxConnections"), _int(old.get("maxConnections"), 32)) or 32)),
             "idleTimeoutSec": max(30, min(3600, _int(payload.get("idleTimeoutSec"), _int(old.get("idleTimeoutSec"), 300)) or 300)),
@@ -294,7 +293,7 @@ class StunService:
             "srcPort": str(rule["listenPort"]),
             "destIp": _text(rule["targetIpv4"]),
             "destPort": str(rule["targetPort"]),
-            "proto": "tcp",
+            "proto": _text(rule["transportProtocol"]).lower(),
         }
 
     @staticmethod

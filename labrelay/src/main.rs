@@ -441,6 +441,11 @@ impl Manager {
             } else {
                 create_ipv6_udp_listener(rule.listen_port)
             } {
+                Ok(socket) if rule.kind == "stun" && rule.forward_mode == "router_native" => {
+                    tokio::spawn(async move {
+                        run_udp_stun_keepalive(socket, rule_task, shared_task, cancel_rx).await;
+                    })
+                }
                 Ok(socket) => tokio::spawn(async move {
                     run_udp_listener(
                         socket,
@@ -961,6 +966,68 @@ async fn run_tcp_listener(
     }
 }
 
+// Lucky's direct UDP mode follows the same split as direct TCP: the router
+// owns WAN -> LAN delivery, while this socket uses the channel port only to
+// maintain the upstream NAT mapping and learn the current public endpoint.
+// Packets from arbitrary visitors are deliberately ignored here; the router's
+// native DNAT rule sends those directly to the selected LAN service.
+async fn run_udp_stun_keepalive(
+    socket: UdpSocket,
+    rule: Rule,
+    shared: Arc<RuntimeShared>,
+    mut cancel: watch::Receiver<bool>,
+) {
+    let mut recv_buffer = vec![0u8; 65_535];
+    let mut stun_tick = tokio::time::interval(Duration::from_secs(20));
+    stun_tick.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
+    let mut stun_server: Option<SocketAddr> = None;
+
+    loop {
+        tokio::select! {
+            _ = cancel.changed() => {
+                if *cancel.borrow() { break; }
+            }
+            _ = stun_tick.tick() => {
+                match resolve_stun_server(&rule.stun_server).await {
+                    Ok(server) => {
+                        stun_server = Some(server);
+                        let request = stun_binding_request();
+                        if let Err(error) = socket.send_to(&request, server).await {
+                            shared.base.write().await.last_error = format!("STUN UDP send failed: {}", error);
+                        }
+                    }
+                    Err(error) => {
+                        let mut base = shared.base.write().await;
+                        if base.public_endpoint.is_empty() { base.state = "mapping".to_string(); }
+                        base.last_error = error.to_string();
+                    }
+                }
+            }
+            received = socket.recv_from(&mut recv_buffer) => {
+                match received {
+                    Ok((size, peer)) if stun_server == Some(peer) => {
+                        match parse_stun_mapped_address(&recv_buffer[..size]) {
+                            Ok(endpoint) => mark_stun_mapping(&shared, endpoint).await,
+                            Err(error) => shared.base.write().await.last_error = error.to_string(),
+                        }
+                    }
+                    Ok(_) => {
+                        // Direct forwarding bypasses LabRelay, so neither
+                        // consume nor account visitor traffic here.
+                    }
+                    Err(error) => {
+                        shared.base.write().await.last_error = format!("STUN UDP receive failed: {}", error);
+                    }
+                }
+            }
+        }
+    }
+    let mut base = shared.base.write().await;
+    if base.state != "expired" {
+        base.state = "stopped".to_string();
+    }
+}
+
 async fn udp_upstream_socket(target: SocketAddr) -> Result<UdpSocket> {
     let bind = if target.is_ipv4() {
         "0.0.0.0:0"
@@ -1007,7 +1074,7 @@ async fn run_udp_listener(
                 if *cancel.borrow() { break; }
             }
             _ = peer_tasks.join_next(), if !peer_tasks.is_empty() => {}
-            _ = stun_tick.tick(), if rule.kind == "stun" => {
+            _ = stun_tick.tick(), if rule.kind == "stun" && rule.forward_mode == "relay_proxy" => {
                 match resolve_stun_server(&rule.stun_server).await {
                     Ok(server) => {
                         stun_server = Some(server);
@@ -1052,7 +1119,7 @@ async fn run_udp_listener(
                         continue;
                     }
                 };
-                if rule.kind == "stun" && stun_server == Some(client) {
+                if rule.kind == "stun" && rule.forward_mode == "relay_proxy" && stun_server == Some(client) {
                     match parse_stun_mapped_address(&recv_buffer[..size]) {
                         Ok(endpoint) => mark_stun_mapping(&shared, endpoint).await,
                         Err(error) => shared.base.write().await.last_error = error.to_string(),
@@ -1493,11 +1560,7 @@ fn normalize_rule(rule: &mut Rule) {
     if rule.kind == "stun" {
         rule.mode = "stun".to_string();
         rule.target_mode = "ipv4".to_string();
-        rule.forward_mode = if rule.transport_protocol == "TCP" {
-            "router_native".to_string()
-        } else {
-            "relay_proxy".to_string()
-        };
+        rule.forward_mode = "router_native".to_string();
         if rule.stun_server.is_empty()
             || (rule.transport_protocol == "TCP" && rule.stun_server == LEGACY_TCP_STUN_SERVER)
         {
@@ -2275,7 +2338,7 @@ mod tests {
     }
 
     #[test]
-    fn udp_stun_normalizes_to_relay_proxy() {
+    fn udp_stun_normalizes_to_router_native() {
         let mut rule = Rule {
             id: "stun-udp".into(),
             name: "STUN UDP".into(),
@@ -2288,7 +2351,7 @@ mod tests {
         };
         normalize_rule(&mut rule);
         validate_rule(&rule, 20000, 20020).unwrap();
-        assert_eq!(rule.forward_mode, "relay_proxy");
+        assert_eq!(rule.forward_mode, "router_native");
     }
 
     #[test]
