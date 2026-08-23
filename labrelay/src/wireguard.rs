@@ -690,6 +690,7 @@ fn ensure_interface(ip_tool: &str, interface_name: &str) -> Result<()> {
 #[cfg(target_os = "linux")]
 pub fn apply_server(config: &WireGuardServerDesired) -> Result<WireGuardApplyResult> {
     validate_server_desired(config)?;
+    let _ = ensure_openwrt_wg_zone();
     let ip = find_tool("ip").ok_or_else(|| anyhow::anyhow!("ip tool is required to create the WireGuard interface"))?;
     ensure_interface(&ip, &config.interface_name)?;
     let keypair = load_or_create_keypair(&private_key_path())?;
@@ -835,6 +836,89 @@ fn kernel_support_status(wg_tool: &Option<String>) -> (bool, Vec<String>) {
     (false, errors)
 }
 
+/// Parse `uci show firewall` or `/etc/config/firewall` output to check if a
+/// zone named `wg` associated with network `labwg0` is already configured.
+pub fn parse_uci_firewall_has_wg_zone(raw: &str) -> bool {
+    let lower = raw.to_ascii_lowercase();
+    let has_wg_name = lower.contains("name='wg'")
+        || lower.contains("name=\"wg\"")
+        || lower.contains("name 'wg'")
+        || lower.contains("name \"wg\"")
+        || lower.contains("name='labprobe_wg'")
+        || lower.contains("name=\"labprobe_wg\"")
+        || lower.contains("name 'labprobe_wg'")
+        || lower.contains("name \"labprobe_wg\"");
+    let has_wg_net = lower.contains("network='labwg0'")
+        || lower.contains("network=\"labwg0\"")
+        || lower.contains("network 'labwg0'")
+        || lower.contains("network \"labwg0\"")
+        || lower.contains("device='labwg0'")
+        || lower.contains("device=\"labwg0\"")
+        || lower.contains("device 'labwg0'")
+        || lower.contains("device \"labwg0\"");
+    has_wg_name || has_wg_net
+}
+
+/// Parse `uci show firewall` or `/etc/config/firewall` output to check if a
+/// forwarding rule from `wg` to `lan` is already configured.
+pub fn parse_uci_firewall_has_wg_forwarding(raw: &str) -> bool {
+    let lower = raw.to_ascii_lowercase();
+    let has_src_wg = lower.contains("src='wg'")
+        || lower.contains("src=\"wg\"")
+        || lower.contains("src 'wg'")
+        || lower.contains("src \"wg\"")
+        || lower.contains("src='labprobe_wg'")
+        || lower.contains("src=\"labprobe_wg\"")
+        || lower.contains("src 'labprobe_wg'")
+        || lower.contains("src \"labprobe_wg\"");
+    let has_dest_lan = lower.contains("dest='lan'")
+        || lower.contains("dest=\"lan\"")
+        || lower.contains("dest 'lan'")
+        || lower.contains("dest \"lan\"");
+    has_src_wg && has_dest_lan
+}
+
+/// Non-blocking, idempotent setup of OpenWrt firewall `wg` zone and `wg -> lan`
+/// forwarding rule using `uci`. Safe on non-OpenWrt systems.
+pub fn ensure_openwrt_wg_zone() -> Result<()> {
+    let Some(uci) = find_tool("uci") else {
+        return Ok(());
+    };
+    let firewall_text = run_capture(&uci, &["show", "firewall"]).unwrap_or_default();
+    let has_zone = parse_uci_firewall_has_wg_zone(&firewall_text);
+    let has_forwarding = parse_uci_firewall_has_wg_forwarding(&firewall_text);
+
+    if has_zone && has_forwarding {
+        return Ok(());
+    }
+
+    let mut changed = false;
+    if !has_zone {
+        let _ = run_capture(&uci, &["add", "firewall", "zone"]);
+        let _ = run_capture(&uci, &["set", "firewall.@zone[-1].name=wg"]);
+        let _ = run_capture(&uci, &["set", "firewall.@zone[-1].network=labwg0"]);
+        let _ = run_capture(&uci, &["set", "firewall.@zone[-1].input=ACCEPT"]);
+        let _ = run_capture(&uci, &["set", "firewall.@zone[-1].output=ACCEPT"]);
+        let _ = run_capture(&uci, &["set", "firewall.@zone[-1].forward=ACCEPT"]);
+        changed = true;
+    }
+
+    if !has_forwarding {
+        let _ = run_capture(&uci, &["add", "firewall", "forwarding"]);
+        let _ = run_capture(&uci, &["set", "firewall.@forwarding[-1].src=wg"]);
+        let _ = run_capture(&uci, &["set", "firewall.@forwarding[-1].dest=lan"]);
+        changed = true;
+    }
+
+    if changed {
+        let _ = run_capture(&uci, &["commit", "firewall"]);
+        if let Some(fw_init) = find_tool("/etc/init.d/firewall") {
+            let _ = run_capture(&fw_init, &["reload"]);
+        }
+    }
+    Ok(())
+}
+
 /// Read-only UCI check: does the current network configuration contain a
 /// `proto wireguard` interface? Never writes to UCI.
 fn uci_wireguard_configured() -> (bool, Option<String>) {
@@ -847,6 +931,7 @@ fn uci_wireguard_configured() -> (bool, Option<String>) {
         Err(error) => (false, Some(format!("uci show network failed: {error:#}"))),
     }
 }
+
 
 /// Collect link state and CIDR addresses for an interface with a single
 /// `ip link show` call. `link_up` is `None` only when the command failed.
@@ -1434,4 +1519,39 @@ network.wg0.private_key='REDACTED-BY-TOOL'
         let roundtrip = serde_json::from_value::<serde_json::Value>(old).unwrap();
         assert!(roundtrip.get("wireguard").is_none());
     }
+
+    #[test]
+    fn uci_firewall_wg_zone_and_forwarding_detected() {
+        let raw = "\
+firewall.cfg01e345=zone
+firewall.cfg01e345.name='wg'
+firewall.cfg01e345.network='labwg0'
+firewall.cfg01e345.input='ACCEPT'
+firewall.cfg01e345.output='ACCEPT'
+firewall.cfg01e345.forward='ACCEPT'
+firewall.cfg02f678=forwarding
+firewall.cfg02f678.src='wg'
+firewall.cfg02f678.dest='lan'
+";
+        assert!(parse_uci_firewall_has_wg_zone(raw));
+        assert!(parse_uci_firewall_has_wg_forwarding(raw));
+    }
+
+    #[test]
+    fn uci_firewall_existing_user_zones_unaffected() {
+        let raw = "\
+firewall.cfg01=zone
+firewall.cfg01.name='lan'
+firewall.cfg01.network='lan'
+firewall.cfg02=zone
+firewall.cfg02.name='wan'
+firewall.cfg02.network='wan'
+firewall.cfg03=forwarding
+firewall.cfg03.src='lan'
+firewall.cfg03.dest='wan'
+";
+        assert!(!parse_uci_firewall_has_wg_zone(raw));
+        assert!(!parse_uci_firewall_has_wg_forwarding(raw));
+    }
 }
+

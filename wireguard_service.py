@@ -9,6 +9,7 @@ from __future__ import annotations
 
 import base64
 import ipaddress
+import logging
 import re
 import threading
 import time
@@ -17,6 +18,8 @@ from pathlib import Path
 from typing import Any, Dict, Iterable, List, Optional
 
 from flask import Blueprint, jsonify, request
+
+logger = logging.getLogger("wireguard_service")
 
 
 def _text(value: Any) -> str:
@@ -115,6 +118,36 @@ class WireGuardService:
             None,
         )
 
+    def _sync_stun_rule_target_port(self, rule_id: str, listen_port: int) -> None:
+        rule_id = _text(rule_id)
+        if not rule_id:
+            return
+        service = getattr(self.hub, "STUN_SERVICE", None)
+        path = Path(self.hub.DATA_DIR) / "stun_rules.json"
+        raw = self.hub.load_json(path, {"revision": 0, "rules": []})
+        if not isinstance(raw, dict):
+            return
+        rules = [dict(row) for row in raw.get("rules", []) if isinstance(row, dict)]
+        updated = False
+        for rule in rules:
+            if _text(rule.get("id")) == rule_id:
+                if _int(rule.get("targetPort")) != listen_port:
+                    rule["targetPort"] = listen_port
+                    updated = True
+        if updated:
+            saved = {
+                **raw,
+                "rules": rules,
+                "revision": _int(raw.get("revision")) + 1,
+                "updatedAt": _now_text(),
+            }
+            self.hub.save_json(path, saved)
+            if service is not None and hasattr(service, "reload"):
+                try:
+                    service.reload()
+                except Exception:
+                    pass
+
     def _validate_stun_binding(self, rule_id: str, listen_port: int) -> Dict[str, Any]:
         rule = self._stun_rule(rule_id)
         if rule is None:
@@ -137,6 +170,7 @@ class WireGuardService:
         if address.version != 4 or not address.is_private:
             raise ValueError("STUN 规则目标必须是路由器/Agent 私有 IPv4 地址")
         return rule
+
 
     def _stun_lifecycle(self) -> Any:
         service = getattr(self.hub, "STUN_SERVICE", None)
@@ -169,37 +203,47 @@ class WireGuardService:
         }
 
     def _ensure_wireguard_lan_firewall(self, server: Dict[str, Any]) -> Dict[str, Any]:
-        lifecycle = self._stun_lifecycle()
-        rule = self._wireguard_lan_firewall_rule(server)
-        firewall_id = rule["id"]
-        if not bool(server.get("enabled", True)):
-            lifecycle.remove_firewall(firewall_id)
-            return {"state": "not_required", "ruleId": firewall_id}
-        result = lifecycle.ensure_firewall(rule)
-        if _text(result.get("state")) == "verify_failed":
-            # A changed tunnel network is a desired-state change.  Recreate
-            # only when the lifecycle still owns the old fingerprint; a
-            # manual_change result is never removed or overwritten.
-            lifecycle.remove_firewall(firewall_id)
+        try:
+            lifecycle = self._stun_lifecycle()
+            rule = self._wireguard_lan_firewall_rule(server)
+            firewall_id = rule["id"]
+            if not bool(server.get("enabled", True)):
+                lifecycle.remove_firewall(firewall_id)
+                return {"state": "not_required", "ruleId": firewall_id}
             result = lifecycle.ensure_firewall(rule)
-        state = _text(result.get("state"))
-        if state != "ready":
-            raise ValueError(_text(result.get("message")) or "WireGuard 到 LAN 防火墙规则未就绪")
-        return {**result, "ruleId": firewall_id, "sourceNetwork": rule["tunnelNetwork"]}
+            if _text(result.get("state")) == "verify_failed":
+                # A changed tunnel network is a desired-state change.  Recreate
+                # only when the lifecycle still owns the old fingerprint; a
+                # manual_change result is never removed or overwritten.
+                lifecycle.remove_firewall(firewall_id)
+                result = lifecycle.ensure_firewall(rule)
+            state = _text(result.get("state"))
+            if state != "ready":
+                logger.warning("WireGuard LAN firewall rule not ready: state=%s message=%s", state, result.get("message"))
+            return {**result, "ruleId": firewall_id, "sourceNetwork": rule["tunnelNetwork"]}
+        except Exception as error:
+            logger.warning("WireGuard LAN firewall sync failed (non-fatal): %s", error)
+            return {"state": "error", "message": str(error)}
 
     def _remove_wireguard_lan_firewall(self, server: Optional[Dict[str, Any]]) -> None:
         if not server:
             return
-        rule = self._wireguard_lan_firewall_rule(server)
-        self._stun_lifecycle().remove_firewall(rule["id"])
+        try:
+            rule = self._wireguard_lan_firewall_rule(server)
+            self._stun_lifecycle().remove_firewall(rule["id"])
+        except Exception as error:
+            logger.warning("WireGuard LAN firewall removal failed (non-fatal): %s", error)
 
     def _sync_wireguard_lan_firewall(self, old_server: Optional[Dict[str, Any]], new_server: Dict[str, Any]) -> Dict[str, Any]:
         old_id = ""
-        if old_server:
-            old_id = self._wireguard_lan_firewall_rule(old_server)["id"]
-        new_rule = self._wireguard_lan_firewall_rule(new_server)
-        if old_id and old_id != new_rule["id"]:
-            self._stun_lifecycle().remove_firewall(old_id)
+        try:
+            if old_server:
+                old_id = self._wireguard_lan_firewall_rule(old_server)["id"]
+            new_rule = self._wireguard_lan_firewall_rule(new_server)
+            if old_id and old_id != new_rule["id"]:
+                self._stun_lifecycle().remove_firewall(old_id)
+        except Exception as error:
+            logger.warning("WireGuard LAN firewall cleanup failed (non-fatal): %s", error)
         return self._ensure_wireguard_lan_firewall(new_server)
 
     def lan_forward_status(self, server: Optional[Dict[str, Any]] = None) -> Dict[str, Any]:
@@ -250,24 +294,33 @@ class WireGuardService:
             "forwardMode": "router_native",
         }
 
-    def _ensure_ddns_firewall(self, profile: Dict[str, Any], server: Dict[str, Any]) -> None:
-        lifecycle = self._stun_lifecycle()
-        firewall_id = f"wireguard-ddns-{_text(profile.get('id'))}"
-        if not bool(server.get("enabled", True)) or not bool(profile.get("enabled", True)):
-            lifecycle.remove_firewall(firewall_id)
-            return
-        rule = self._ddns_firewall_rule(profile, server)
-        result = lifecycle.ensure_firewall(rule)
-        if _text(result.get("state")) == "verify_failed":
-            # A previous LabProbe-owned rule may have a changed listen port;
-            # remove it through the fingerprinted lifecycle before recreating.
-            lifecycle.remove_firewall(firewall_id)
+    def _ensure_ddns_firewall(self, profile: Dict[str, Any], server: Dict[str, Any]) -> Dict[str, Any]:
+        try:
+            lifecycle = self._stun_lifecycle()
+            firewall_id = f"wireguard-ddns-{_text(profile.get('id'))}"
+            if not bool(server.get("enabled", True)) or not bool(profile.get("enabled", True)):
+                lifecycle.remove_firewall(firewall_id)
+                return {"state": "not_required", "ruleId": firewall_id}
+            rule = self._ddns_firewall_rule(profile, server)
             result = lifecycle.ensure_firewall(rule)
-        if _text(result.get("state")) != "ready":
-            raise ValueError(_text(result.get("message")) or "WireGuard DDNS 防火墙规则未就绪")
+            if _text(result.get("state")) == "verify_failed":
+                # A previous LabProbe-owned rule may have a changed listen port;
+                # remove it through the fingerprinted lifecycle before recreating.
+                lifecycle.remove_firewall(firewall_id)
+                result = lifecycle.ensure_firewall(rule)
+            state = _text(result.get("state"))
+            if state != "ready":
+                logger.warning("WireGuard DDNS firewall rule not ready: state=%s message=%s", state, result.get("message"))
+            return result
+        except Exception as error:
+            logger.warning("WireGuard DDNS firewall sync failed (non-fatal): %s", error)
+            return {"state": "error", "message": str(error)}
 
     def _remove_ddns_firewall(self, profile: Dict[str, Any]) -> None:
-        self._stun_lifecycle().remove_firewall(f"wireguard-ddns-{_text(profile.get('id'))}")
+        try:
+            self._stun_lifecycle().remove_firewall(f"wireguard-ddns-{_text(profile.get('id'))}")
+        except Exception as error:
+            logger.warning("WireGuard DDNS firewall removal failed (non-fatal): %s", error)
 
     def _sync_ddns_firewalls(self, old_server: Optional[Dict[str, Any]], new_server: Dict[str, Any]) -> None:
         old_profiles = {
@@ -285,6 +338,7 @@ class WireGuardService:
                 self._remove_ddns_firewall(profile)
         for profile in new_profiles.values():
             self._ensure_ddns_firewall(profile, new_server)
+
 
     def clean_server(self, payload: Dict[str, Any], old: Optional[Dict[str, Any]] = None) -> Dict[str, Any]:
         if _has_secret(payload):
@@ -340,6 +394,11 @@ class WireGuardService:
 
         profiles = []
         profile_ids = set()
+        old_profiles = {
+            _text(row.get("id")): dict(row)
+            for row in (old.get("endpointProfiles") or [])
+            if isinstance(row, dict)
+        }
         for raw in payload.get("endpointProfiles", old.get("endpointProfiles", [])) or []:
             if not isinstance(raw, dict):
                 raise ValueError("Endpoint Profile 无效")
@@ -349,13 +408,14 @@ class WireGuardService:
                 raise ValueError("Endpoint Profile ID 无效或重复")
             if source not in {"manual", "ddns", "stun"}:
                 raise ValueError("Endpoint Source 只能是 manual、ddns 或 stun")
+            old_profile = old_profiles.get(profile_id)
             profile = {
                 "id": profile_id,
                 "name": _text(raw.get("name"))[:64] or ({"manual": "手动地址", "ddns": "DDNS 直连", "stun": "STUN 穿透"}[source]),
                 "endpointSource": source,
                 "enabled": bool(raw.get("enabled", True)),
                 "port": _int(raw.get("port"), listen_port),
-                "endpointRevision": max(0, _int(raw.get("endpointRevision"))),
+                "endpointRevision": max(0, _int(raw.get("endpointRevision", (old_profile.get("endpointRevision", 0) if old_profile else 0)))),
                 "resolvedEndpoint": _text(raw.get("resolvedEndpoint")),
                 "forwardMode": _text(raw.get("forwardMode")),
             }
@@ -376,13 +436,24 @@ class WireGuardService:
                 hostname = _text(raw.get("hostname")).lower().rstrip(".")
                 if not hostname or len(hostname) > 253 or ":" in hostname:
                     raise ValueError("DDNS Profile 需要独立域名")
-                profile.update({"hostname": hostname, "stunRuleId": "", "bindingMode": "fixed-port", "owner": f"ddns:{profile_id}"})
+                profile["port"] = listen_port
+                profile.update({
+                    "hostname": hostname,
+                    "stunRuleId": "",
+                    "bindingMode": "fixed-port",
+                    "owner": f"ddns:{profile_id}",
+                    "resolvedEndpoint": _text(raw.get("resolvedEndpoint")),
+                })
             else:
                 if _text(raw.get("hostname")):
                     raise ValueError("STUN Profile 不能复用 DDNS 域名字段")
                 stun_rule_id = _text(raw.get("stunRuleId"))
                 if not re.fullmatch(r"[A-Za-z0-9_-]{1,64}", stun_rule_id):
                     raise ValueError("STUN Profile 需要独立的 UDP 穿透规则")
+                if old and _int(old.get("listenPort")) != listen_port:
+                    rule = self._stun_rule(stun_rule_id)
+                    if rule and _int(rule.get("targetPort")) == _int(old.get("listenPort")):
+                        self._sync_stun_rule_target_port(stun_rule_id, listen_port)
                 self._validate_stun_binding(stun_rule_id, listen_port)
                 # STUN owns the public channel port; the router-native map
                 # forwards it to the Agent's fixed WireGuard listen port.
@@ -398,6 +469,8 @@ class WireGuardService:
                 })
             profile_ids.add(profile_id)
             profiles.append(profile)
+
+
         return {
             "interfaceName": interface_name,
             "address": str(network_address),
@@ -447,8 +520,6 @@ class WireGuardService:
             server = self.clean_server(payload, document.get("server"))
             revision = document["revision"] + 1
             server["revision"] = revision
-            self._sync_ddns_firewalls(document.get("server"), server)
-            self._sync_wireguard_lan_firewall(document.get("server"), server)
             saved = {
                 **document,
                 "revision": revision,
@@ -458,6 +529,11 @@ class WireGuardService:
             }
             self._save_document(saved)
             self.queue("apply", revision, {"server": server})
+            try:
+                self._sync_ddns_firewalls(document.get("server"), server)
+                self._sync_wireguard_lan_firewall(document.get("server"), server)
+            except Exception as error:
+                logger.warning("WireGuard firewall sync failed (non-fatal): %s", error)
             return saved
 
     def delete(self, expected_revision: Optional[int]) -> Dict[str, Any]:
@@ -467,15 +543,19 @@ class WireGuardService:
                 raise RuntimeError("revision conflict")
             old = document.get("server") or {}
             revision = document["revision"] + 1
-            for profile in old.get("endpointProfiles", []):
-                if isinstance(profile, dict) and _text(profile.get("endpointSource")).lower() == "ddns":
-                    self._remove_ddns_firewall(profile)
-            self._remove_wireguard_lan_firewall(old)
             tombstone = {"revision": revision, "deletedAt": _now_text(), "interfaceName": _text(old.get("interfaceName")) or "labwg0"}
             saved = {**document, "revision": revision, "updatedAt": tombstone["deletedAt"], "server": None, "tombstone": tombstone}
             self._save_document(saved)
             self.queue("delete", revision, {"interfaceName": tombstone["interfaceName"], "tombstone": True})
+            try:
+                for profile in old.get("endpointProfiles", []):
+                    if isinstance(profile, dict) and _text(profile.get("endpointSource")).lower() == "ddns":
+                        self._remove_ddns_firewall(profile)
+                self._remove_wireguard_lan_firewall(old)
+            except Exception as error:
+                logger.warning("WireGuard firewall removal failed (non-fatal): %s", error)
             return saved
+
 
     def update_endpoint(self, profile_id: str, source: str, owner: str, endpoint: str, expected_revision: Optional[int]) -> Dict[str, Any]:
         with self.lock:
