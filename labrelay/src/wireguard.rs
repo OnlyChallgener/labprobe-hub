@@ -1190,6 +1190,7 @@ mod tests {
             interface_name: "labwg0".into(),
             address: "10.77.0.1/24".into(),
             listen_port: 51820,
+            mtu: 1420,
             enabled: true,
             revision: 7,
             peers: vec![WireGuardPeerDesired {
@@ -1237,6 +1238,7 @@ mod tests {
             interface_name: "labwg0".into(),
             address: "10.77.0.1/24".into(),
             listen_port: 51820,
+            mtu: 1420,
             enabled: true,
             revision: 1,
             peers: Vec::new(),
@@ -1251,11 +1253,13 @@ mod tests {
                 forward_mode: "router_native".into(),
                 transport_protocol: "UDP".into(),
                 local_target_port: 51820,
+                port: 24567,
                 ..WireGuardEndpointProfile::default()
             }],
         };
         assert!(validate_server_desired(&desired).is_err());
     }
+
 
     #[test]
     fn automatic_endpoint_updates_are_owned_versioned_and_idempotent() {
