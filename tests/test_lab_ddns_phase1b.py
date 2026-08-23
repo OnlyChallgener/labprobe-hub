@@ -115,6 +115,50 @@ class LabDdnsPhase1BTests(unittest.TestCase):
         finally:
             lab_ddns.PROVIDERS["cloudflare"] = old
 
+    def test_confirmed_change_is_published_by_auto_worker_path(self):
+        store = self.new_store()
+        record = store.save_record({"provider": "cloudflare", "hostname": "auto.example.com", "recordTypes": ["AAAA"]})
+        store.save_credentials(record["id"], {"apiToken": "secret-token", "zoneId": "zone-1"})
+        provider = FakeProvider([
+            lab_ddns.ProviderResult(True, "success", provider="fake", record_type="AAAA", record_id="auto-1", changed=True),
+        ])
+        old = lab_ddns.PROVIDERS["cloudflare"]
+        lab_ddns.PROVIDERS["cloudflare"] = provider
+        try:
+            address = {"detectedIpv6": "2409:db8::88", "ipv6State": "public", "ipv6Source": "default-route:wan6"}
+            store.accept_address({**address, "detectedAt": 700})
+            self.assertEqual(store.run_pending_updates(), 0)
+            store.accept_address({**address, "detectedAt": 701})
+
+            self.assertEqual(store.run_pending_updates(), 1)
+            saved = store.snapshot()["records"][0]
+            self.assertEqual(saved["publishedIpv6"], "2409:db8::88")
+            self.assertEqual(saved["status"], "published")
+            self.assertEqual(len(provider.calls), 1)
+        finally:
+            lab_ddns.PROVIDERS["cloudflare"] = old
+
+    def test_repeated_same_address_samples_do_not_rewrite_state(self):
+        store = self.new_store()
+        store.save_record({"provider": "cloudflare", "hostname": "quiet.example.com", "recordTypes": ["AAAA"]})
+        writes = 0
+        original_save = store._save_locked
+
+        def counted_save():
+            nonlocal writes
+            writes += 1
+            original_save()
+
+        store._save_locked = counted_save
+        address = {"detectedIpv6": "2409:db8::99", "ipv6State": "public", "ipv6Source": "default-route:wan6"}
+        store.accept_address({**address, "detectedAt": 800})
+        first_writes = writes
+        store.accept_address({**address, "detectedAt": 801})
+        store.accept_address({**address, "detectedAt": 802})
+
+        self.assertEqual(first_writes, 1)
+        self.assertEqual(writes, first_writes)
+
     def test_error_keeps_old_published_and_a_aaaa_are_independent(self):
         store = self.new_store()
         record = store.save_record({"provider": "cloudflare", "hostname": "home.example.com", "recordTypes": ["A", "AAAA"]})

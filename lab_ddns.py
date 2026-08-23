@@ -1,8 +1,8 @@
-"""Phase 1A LabProbe DDNS state and provider abstraction.
+"""LabProbe-owned DDNS with stable address detection and provider updates.
 
-This module intentionally does not make provider network calls. It stores the
-Relay's detected address separately from the address last published by a
-future provider adapter.
+Relay remains the address source.  Samples are deduplicated in memory, two
+matching observations are required, and one background worker publishes only
+confirmed changes.  Per-second samples are never written as history.
 """
 from __future__ import annotations
 
@@ -488,7 +488,76 @@ class LabDdnsStore:
         self.secrets = secrets or LabDdnsSecretsStore(path.parent / "lab_ddns_secrets.json", logger)
         self.lock = threading.RLock()
         self.root = _empty_root()
+        self.auto_event = threading.Event()
+        self.auto_stop = threading.Event()
+        self.auto_thread: Optional[threading.Thread] = None
         self._load()
+
+    def start_auto_update(self) -> None:
+        with self.lock:
+            if self.auto_thread is not None and self.auto_thread.is_alive():
+                return
+            self.auto_stop.clear()
+            self.auto_thread = threading.Thread(target=self._auto_loop, name="lab-ddns-auto-update", daemon=True)
+            self.auto_thread.start()
+
+    def stop_auto_update(self) -> None:
+        self.auto_stop.set()
+        self.auto_event.set()
+
+    def _auto_due(self) -> tuple[List[str], Optional[int]]:
+        now = _now()
+        due: List[str] = []
+        next_retry: Optional[int] = None
+        with self.lock:
+            for record in self.root.get("records", []):
+                if not record.get("enabled", True):
+                    continue
+                ready = False
+                for record_type, state_key, detected_key, published_key in (
+                    ("A", "ipv4State", "detectedIpv4", "publishedIpv4"),
+                    ("AAAA", "ipv6State", "detectedIpv6", "publishedIpv6"),
+                ):
+                    if record_type not in record.get("recordTypes", RECORD_TYPES):
+                        continue
+                    detected = _text(record.get(detected_key))
+                    published = _text(record.get(published_key))
+                    tracker = record.get("stability", {}).get(record_type, {})
+                    if (
+                        record.get(state_key) != "public"
+                        or not detected
+                        or detected == published
+                        or _safe_int(tracker.get("stableCount")) < 2
+                        or tracker.get("authError")
+                        or not _address_is_fresh(record, now)
+                    ):
+                        continue
+                    retry_at = _safe_int(tracker.get("nextRetryAt"))
+                    if retry_at <= now:
+                        ready = True
+                    elif next_retry is None or retry_at < next_retry:
+                        next_retry = retry_at
+                if ready:
+                    due.append(_text(record.get("id")))
+        return [record_id for record_id in due if record_id], next_retry
+
+    def run_pending_updates(self) -> int:
+        record_ids, _next_retry = self._auto_due()
+        for record_id in record_ids:
+            try:
+                self.run_update(record_id)
+            except Exception as exc:
+                if self.logger:
+                    self.logger.warning("LabProbe DDNS automatic update deferred record=%s error=%s", record_id, type(exc).__name__)
+        return len(record_ids)
+
+    def _auto_loop(self) -> None:
+        while not self.auto_stop.is_set():
+            self.run_pending_updates()
+            _due, next_retry = self._auto_due()
+            timeout = 300.0 if next_retry is None else max(1.0, min(300.0, float(next_retry - _now())))
+            self.auto_event.wait(timeout)
+            self.auto_event.clear()
 
     def _load(self) -> None:
         try:
@@ -546,8 +615,12 @@ class LabDdnsStore:
                 )
             previous_address = self.root.get("address", {})
             sample_changed = previous_address.get("detectedAt") != address.get("detectedAt")
-            changed = previous_address != address
+            semantic_keys = ("detectedIpv4", "detectedIpv6", "ipv4State", "ipv6State", "ipv4Source", "ipv6Source")
+            # detectedAt changes every sample.  It stays current in memory but is
+            # not, by itself, a reason to rewrite durable state every second.
+            changed = any(previous_address.get(key) != address.get(key) for key in semantic_keys)
             self.root["address"] = address
+            auto_ready = False
             for record in self.root["records"]:
                 source = ",".join(filter(None, [address["ipv4Source"], address["ipv6Source"]]))
                 values = {
@@ -558,15 +631,14 @@ class LabDdnsStore:
                     "source": source,
                     "lastDetectedAt": address["detectedAt"],
                 }
-                if any(record.get(key) != item for key, item in values.items()):
+                if any(record.get(key) != item for key, item in values.items() if key != "lastDetectedAt"):
                     changed = True
-                    record.update(values)
+                record.update(values)
                 for record_type, state_key, detected_key, published_key in (
                     ("A", "ipv4State", "detectedIpv4", "publishedIpv4"),
                     ("AAAA", "ipv6State", "detectedIpv6", "publishedIpv6"),
                 ):
                     tracker = record.setdefault("stability", _empty_tracker()).setdefault(record_type, _empty_tracker()[record_type])
-                    tracker_before = dict(tracker)
                     detected = address[detected_key]
                     published = record.get(published_key) or ""
                     if not sample_changed:
@@ -578,15 +650,14 @@ class LabDdnsStore:
                             tracker["stableCount"] = min(2, _safe_int(tracker.get("stableCount")) + 1)
                         else:
                             tracker.update({"candidate": detected, "stableCount": 1, "retryAttempt": 0, "nextRetryAt": 0, "authError": False})
-                            changed = True
                     else:
                         if tracker.get("candidate") or tracker.get("stableCount"):
                             changed = True
                         tracker.update({"candidate": "", "stableCount": 0})
                         if detected == published:
                             tracker.update({"retryAttempt": 0, "nextRetryAt": 0, "authError": False})
-                    if tracker != tracker_before:
-                        changed = True
+                    if _safe_int(tracker.get("stableCount")) >= 2 and detected and detected != published:
+                        auto_ready = True
                 pending = any(
                     record_type in record.get("recordTypes", RECORD_TYPES)
                     and address[state_key] == "public"
@@ -619,6 +690,8 @@ class LabDdnsStore:
                     record["status"], record["lastError"] = new_status, new_error
             if changed:
                 self._save_locked()
+            if auto_ready:
+                self.auto_event.set()
         return True
 
     def save_record(self, value: Mapping[str, Any], record_id: str = "") -> Dict[str, Any]:
@@ -646,6 +719,7 @@ class LabDdnsStore:
                             record["status"] = "detected" if record["detectedIpv4"] or record["detectedIpv6"] or record["recordValues"] else "waiting"
                         self.root["records"][index] = record
                         self._save_locked()
+                        self.auto_event.set()
                         return dict(record)
                 raise KeyError(record_id)
             address = self.root.get("address", {})
@@ -661,10 +735,14 @@ class LabDdnsStore:
                 record["status"] = "detected" if record["detectedIpv4"] or record["detectedIpv6"] or record["recordValues"] else "waiting"
             self.root["records"].append(record)
             self._save_locked()
+            self.auto_event.set()
             return dict(record)
 
     def save_credentials(self, record_id: str, credentials: Mapping[str, Any]) -> bool:
-        return self.secrets.save(record_id, credentials)
+        saved = self.secrets.save(record_id, credentials)
+        if saved:
+            self.auto_event.set()
+        return saved
 
     def run_update(self, record_id: str, force: bool = False) -> Dict[str, Any]:
         """Explicit execution path; dashboard ingestion never calls providers."""
@@ -809,10 +887,14 @@ class LabDdnsStore:
 def install_lab_ddns(hub: Any) -> LabDdnsStore:
     existing = getattr(hub, "LAB_DDNS", None)
     if existing is not None:
+        start = getattr(existing, "start_auto_update", None)
+        if callable(start):
+            start()
         return existing
     secrets = LabDdnsSecretsStore(Path(hub.DATA_DIR) / "lab_ddns_secrets.json", hub.LOGGER)
     store = LabDdnsStore(Path(hub.DATA_DIR) / "lab_ddns.json", hub.LOGGER, secrets)
     hub.LAB_DDNS = store
+    store.start_auto_update()
     blueprint = Blueprint("lab_ddns", __name__, url_prefix="/api/ddns")
 
     def sync_direct_values(record: Dict[str, Any]) -> Dict[str, Any]:

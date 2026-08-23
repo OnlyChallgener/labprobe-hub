@@ -41,7 +41,7 @@ from router_ws_patch import install_router_ws_patch
 from router.ipv6 import create_ipv6_blueprint
 
 PREVIOUS_HUB_VERSION = "0.9.35"
-HUB_VERSION = "0.10.6"
+HUB_VERSION = "0.10.7"
 hub.APP_VERSION = HUB_VERSION
 install_router_http_developer_transport_patch()
 install_router_developer_flow_patch()

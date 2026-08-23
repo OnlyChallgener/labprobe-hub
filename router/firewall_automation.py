@@ -1,14 +1,17 @@
-"""Safe address-follow automation for existing Ruijie Web firewall rules.
+"""Safe mapping-only automation for existing Ruijie Web firewall rules.
 
 The router remains the only firewall authority.  A binding merely adopts an
-existing rule UUID and allows Hub to update one explicitly selected destination
-address field through ``devConfig.update/ip_firewall``.  Every other raw router
-field is copied back unchanged and the write is force-read for verification.
+existing rule UUID for a Relay IPv6 mapping or router-native port mapping and
+allows Hub to update one explicitly selected destination address field through
+``devConfig.update/ip_firewall``.  Every other raw router field is copied back
+unchanged and the write is force-read for verification.  Out-of-band/manual
+changes suspend automation instead of being overwritten.
 """
 from __future__ import annotations
 
 import ipaddress
-import re
+import hashlib
+import json
 import threading
 import time
 from pathlib import Path
@@ -102,11 +105,50 @@ def _target_from_endpoint(value: Any) -> str:
     return raw
 
 
+def _rule_fingerprint(rule: Dict[str, Any], controlled_field: str) -> str:
+    """Fingerprint every user-controlled field except the one automation owns."""
+    clean = {
+        str(key): value
+        for key, value in rule.items()
+        if str(key) not in {"stats", controlled_field}
+    }
+    wire = json.dumps(clean, ensure_ascii=False, sort_keys=True, separators=(",", ":"), default=str)
+    return hashlib.sha256(wire.encode("utf-8")).hexdigest()
+
+
+def _port_contains(value: Any, target: Any) -> bool:
+    try:
+        port = int(str(target or "").strip())
+    except (TypeError, ValueError):
+        return False
+    if not 1 <= port <= 65535:
+        return False
+    for item in (_text(value).replace("-", ":").split(",") if _text(value) else []):
+        part = item.strip()
+        if part.isdigit() and int(part) == port:
+            return True
+        if ":" in part:
+            left, right = part.split(":", 1)
+            if left.strip().isdigit() and right.strip().isdigit() and int(left) <= port <= int(right):
+                return True
+    return False
+
+
+def _protocol_matches(rule_protocol: Any, mapping_protocol: Any) -> bool:
+    rule = _text(rule_protocol).lower()
+    mapping = _text(mapping_protocol).lower().replace("/", "+")
+    if mapping in {"tcp+udp", "udp+tcp", "both"}:
+        return rule in {"tcp", "udp"}
+    return rule == mapping and rule in {"tcp", "udp"}
+
+
 class FirewallAutomationService:
-    VERSION = 1
-    TARGETS = {"router", "device", "mapping"}
+    VERSION = 2
+    TARGETS = {"mapping"}
+    MAPPING_KINDS = {"relay", "native"}
     FAMILIES = {"ipv4", "ipv6"}
     FIELDS = {"destIP", "ipv6SuffixDest"}
+    STABLE_OBSERVATIONS = 2
 
     def __init__(self, hub: Any, client: Any):
         self.hub = hub
@@ -116,6 +158,8 @@ class FirewallAutomationService:
         self.path = Path(hub.DATA_DIR) / "firewall_automation.json"
         self.config_lock = threading.RLock()
         self.reconcile_lock = threading.Lock()
+        self.candidate_lock = threading.RLock()
+        self.candidates: Dict[str, Dict[str, Any]] = {}
 
     def _document(self) -> Dict[str, Any]:
         with self.config_lock:
@@ -148,7 +192,14 @@ class FirewallAutomationService:
     def _normalize_binding(self, firewall_uuid: str, body: Dict[str, Any], rule: Dict[str, Any]) -> Dict[str, Any]:
         target_type = _text(body.get("targetType")).lower()
         if target_type not in self.TARGETS:
-            raise FirewallAutomationError("请选择路由器、终端设备或映射规则作为跟随目标")
+            raise FirewallAutomationError("自动化仅支持路由器 IPv6 映射和端口映射")
+
+        mapping_kind = _text(body.get("mappingKind") or "relay").lower()
+        if mapping_kind not in self.MAPPING_KINDS:
+            raise FirewallAutomationError("映射类型无效")
+        mapping_id = _text(body.get("mappingId"))
+        if not mapping_id:
+            raise FirewallAutomationError("请选择需要关联的映射规则")
 
         family = _text(body.get("addressFamily") or rule.get("ipVersion")).lower()
         if family not in self.FAMILIES:
@@ -167,21 +218,44 @@ class FirewallAutomationService:
             label = "目的 IPv6 后缀" if field == "ipv6SuffixDest" else "目的 IP"
             raise FirewallAutomationError(f"请先在原防火墙规则中填写有效的{label}，自动跟随不会改变匹配模式")
 
-        target_mac = self.hub.norm_mac(body.get("targetMac")) if target_type == "device" else ""
-        mapping_id = _text(body.get("mappingId")) if target_type == "mapping" else ""
-        if target_type == "device" and not re.fullmatch(r"[0-9a-f]{2}(?::[0-9a-f]{2}){5}", target_mac):
-            raise FirewallAutomationError("请选择需要跟随的终端设备")
-        if target_type == "mapping" and not mapping_id:
-            raise FirewallAutomationError("请选择需要跟随的映射规则")
+        if _text(rule.get("target")).upper() != "ACCEPT":
+            raise FirewallAutomationError("丢弃规则不参与映射自动化")
+        if _text(rule.get("direction")).lower() != "forward":
+            raise FirewallAutomationError("映射只能关联 WAN 到 LAN 的转发规则")
+        if _text(rule.get("inIface")).lower() != "wan" or _text(rule.get("outIface")).lower() != "lan":
+            raise FirewallAutomationError("映射防火墙规则必须使用 WAN 入接口和 LAN 出接口")
+
+        provisional = {
+            "mappingKind": mapping_kind,
+            "mappingId": mapping_id,
+            "addressFamily": family,
+        }
+        mapping = self._mapping_spec(provisional, fresh=True)
+        if mapping is None:
+            raise FirewallAutomationError("关联的映射规则不存在或暂不可读取", "MAPPING_NOT_FOUND", 404)
+        if _text(mapping.get("addressFamily")) != family:
+            raise FirewallAutomationError("防火墙规则与映射的 IP 版本不一致")
+        if not _protocol_matches(rule.get("proto"), mapping.get("protocol")):
+            raise FirewallAutomationError("防火墙规则与映射的协议不一致")
+        if not _port_contains(rule.get("destPort"), mapping.get("targetPort")):
+            raise FirewallAutomationError("目的端口未覆盖映射的目标端口")
+
+        current = _field_value(field, rule.get(field), family)
 
         return {
             "firewallUuid": firewall_uuid,
             "enabled": _enabled(body.get("enabled"), True),
-            "targetType": target_type,
-            "targetMac": target_mac,
+            "targetType": "mapping",
+            "mappingKind": mapping_kind,
             "mappingId": mapping_id,
             "addressFamily": family,
             "matchField": field,
+            "ownership": _text(body.get("ownership") or "adopted"),
+            "lastAppliedValue": current,
+            "ruleFingerprint": _rule_fingerprint(rule, field),
+            "suspended": False,
+            "suspendedReason": "",
+            "lastAppliedAt": int(time.time()),
         }
 
     def upsert(self, firewall_uuid: str, body: Dict[str, Any]) -> Dict[str, Any]:
@@ -204,91 +278,87 @@ class FirewallAutomationService:
         after = [row for row in before if _text(row.get("firewallUuid")) != firewall_uuid]
         if len(after) != len(before):
             self._save(after)
+            with self.candidate_lock:
+                self.candidates.pop(firewall_uuid, None)
             return True
         return False
 
-    def _router_address(self, family: str) -> Tuple[str, str]:
-        state = self.hub.load_json(self.hub.STATE_FILE, {})
-        router = state.get("router") if isinstance(state, dict) and isinstance(state.get("router"), dict) else {}
-        if family == "ipv6":
-            candidates = [router.get("wanIpv6")]
-            for row in router.get("wanIpv6List", []) if isinstance(router.get("wanIpv6List"), list) else []:
-                if isinstance(row, dict) and row.get("primary"):
-                    candidates.insert(0, row.get("ip"))
-            for candidate in candidates:
-                value = _ip(candidate, family)
-                if value:
-                    return value, _text(router.get("name")) or "路由器"
-            return "", _text(router.get("name")) or "路由器"
-
-        with self.hub.ROUTER_DASHBOARD_LOCK:
-            root = self.hub.ROUTER_DASHBOARD_CACHE
-            details = root.get("details") if isinstance(root, dict) and isinstance(root.get("details"), dict) else {}
-            wan = details.get("wan") if isinstance(details.get("wan"), dict) else {}
-            value = _ip(wan.get("ipv4"), family)
-            name = _text(root.get("router")) if isinstance(root, dict) else ""
-        return value, name or _text(router.get("name")) or "路由器"
-
-    def _online_device(self, target_mac: str) -> Optional[Dict[str, Any]]:
-        document = self.hub.load_json(self.hub.DEVICES_FILE, {})
-        rows = document.get("online") if isinstance(document, dict) else []
-        for row in rows if isinstance(rows, list) else []:
-            if isinstance(row, dict) and self.hub.norm_mac(row.get("mac")) == target_mac:
-                return dict(row)
-        return None
-
-    def _device_address(self, binding: Dict[str, Any]) -> Tuple[str, str]:
-        target_mac = _text(binding.get("targetMac"))
-        family = _text(binding.get("addressFamily"))
-        row = self._online_device(target_mac)
-        archive = self.hub.load_device_archive()
-        stored = archive.get(target_mac) if isinstance(archive, dict) and isinstance(archive.get(target_mac), dict) else {}
-        name = _text((row or {}).get("name") or (row or {}).get("hostName") or stored.get("name") or stored.get("hostName")) or target_mac
-        if row is None:
-            return "", name
-        if family == "ipv4":
-            return _ip(row.get("ip"), family), name
-
-        state = self.hub.load_json(self.hub.STATE_FILE, {})
-        router = state.get("router") if isinstance(state, dict) and isinstance(state.get("router"), dict) else {}
-        prefixes = self.hub.normalize_ipv6_prefixes(router.get("lanIpv6Prefixes") or [])
-        records = self.hub.normalize_ipv6_records(row.get("ipv6Records") or stored.get("ipv6Records") or [], prefixes)
-        safe_records = [
-            record for record in records
-            if not record.get("historical")
-            and _text(record.get("state")).upper() != "FAILED"
-            and (not prefixes or record.get("currentPrefix"))
-        ]
-        value = self.hub.pick_primary_ipv6(safe_records) if safe_records else ""
-        if not value:
-            candidates = [row.get("ipv6"), row.get("ipv6Address"), row.get("globalIpv6")]
-            if not prefixes:
-                value = next((_ip(candidate, family) for candidate in candidates if _ip(candidate, family)), "")
-        return _ip(value, family), name
-
-    def _mapping_address(self, binding: Dict[str, Any]) -> Tuple[str, str]:
+    def _relay_mapping_spec(self, binding: Dict[str, Any]) -> Optional[Dict[str, Any]]:
         mapping_id = _text(binding.get("mappingId"))
         document, readable = self.hub._load_portmap_rules_document()
         rule = next((row for row in document.get("rules", []) if _text(row.get("id")) == mapping_id), None) if readable else None
-        name = _text((rule or {}).get("name")) or mapping_id
+        if not isinstance(rule, dict):
+            return None
+        mode = _text(rule.get("mode")).lower()
+        family = "ipv4" if mode == "6to4" else "ipv6"
         status = self.hub.load_json(self.hub.PORTMAP_ROUTER_STATUS_FILE, {})
         runtime = self.hub._portmap_runtime_map(status).get(mapping_id, {})
-        if _text(runtime.get("state")).lower() not in {"running", "active"}:
-            return "", name
-        candidate = _target_from_endpoint(runtime.get("resolvedTarget"))
-        return _ip(candidate, _text(binding.get("addressFamily"))), name
+        candidate = ""
+        if _text(runtime.get("state")).lower() in {"running", "active"}:
+            candidate = _target_from_endpoint(runtime.get("resolvedTarget"))
+        if not candidate and family == "ipv4":
+            candidate = rule.get("targetIpv4")
+        if not candidate and _text(rule.get("targetMode")) == "ipv6_full":
+            candidate = rule.get("targetIpv6")
+        if not candidate:
+            candidate = rule.get("targetIpv6Snapshot")
+        return {
+            "mappingKind": "relay",
+            "mappingId": mapping_id,
+            "name": _text(rule.get("name")) or mapping_id,
+            "addressFamily": family,
+            "address": _ip(candidate, family),
+            "protocol": _text(rule.get("transportProtocol") or "TCP").lower(),
+            "targetPort": rule.get("targetPort"),
+        }
+
+    @staticmethod
+    def _native_rows(data: Any) -> List[Dict[str, Any]]:
+        if not isinstance(data, dict):
+            return []
+        rows = data.get("portMapping") or data.get("list") or []
+        return [dict(row) for row in rows if isinstance(row, dict)] if isinstance(rows, list) else []
+
+    def _native_mapping_spec(self, binding: Dict[str, Any], fresh: bool = False) -> Optional[Dict[str, Any]]:
+        mapping_id = _text(binding.get("mappingId"))
+        data: Any = None
+        snapshot = getattr(self.hub, "ROUTER_CONFIG_SYNC", None)
+        frame = snapshot.snapshot("portMappings") if snapshot is not None else {}
+        if isinstance(frame, dict):
+            data = frame.get("data")
+        if fresh and not self._native_rows(data):
+            data = self.client.native_port_mapping(True)
+        rule = next((row for row in self._native_rows(data) if _text(row.get("ruleName")) == mapping_id), None)
+        if not isinstance(rule, dict):
+            return None
+        return {
+            "mappingKind": "native",
+            "mappingId": mapping_id,
+            "name": _text(rule.get("ruleName")) or mapping_id,
+            "addressFamily": "ipv4",
+            "address": _ip(rule.get("destIp"), "ipv4"),
+            "protocol": _text(rule.get("proto") or "tcp").lower(),
+            "targetPort": rule.get("destPort"),
+        }
+
+    def _mapping_spec(self, binding: Dict[str, Any], fresh: bool = False) -> Optional[Dict[str, Any]]:
+        kind = _text(binding.get("mappingKind") or "relay").lower()
+        if kind == "relay":
+            return self._relay_mapping_spec(binding)
+        if kind == "native":
+            return self._native_mapping_spec(binding, fresh=fresh)
+        return None
 
     def resolve(self, binding: Dict[str, Any]) -> Tuple[str, str]:
         target_type = _text(binding.get("targetType"))
         family = _text(binding.get("addressFamily"))
-        if target_type == "router":
-            address, name = self._router_address(family)
-        elif target_type == "device":
-            address, name = self._device_address(binding)
-        elif target_type == "mapping":
-            address, name = self._mapping_address(binding)
-        else:
+        if target_type != "mapping":
             return "", ""
+        mapping = self._mapping_spec(binding)
+        if mapping is None:
+            return "", _text(binding.get("mappingId"))
+        address = _ip(mapping.get("address"), family)
+        name = _text(mapping.get("name"))
         if address and _text(binding.get("matchField")) == "ipv6SuffixDest":
             address = _suffix(address)
         return address, name
@@ -296,13 +366,23 @@ class FirewallAutomationService:
     def _rule_compatible(self, rule: Optional[Dict[str, Any]], binding: Dict[str, Any]) -> bool:
         if rule is None:
             return False
+        if _text(binding.get("targetType")) != "mapping":
+            return False
         family = _text(binding.get("addressFamily"))
         field = _text(binding.get("matchField"))
-        return (
+        mapping = self._mapping_spec(binding)
+        return bool(mapping) and (
             _text(rule.get("ipVersion")).lower() == family
             and field in self.FIELDS
             and not (family == "ipv4" and field != "destIP")
             and bool(_field_value(field, rule.get(field), family))
+            and _text(rule.get("target")).upper() == "ACCEPT"
+            and _text(rule.get("direction")).lower() == "forward"
+            and _text(rule.get("inIface")).lower() == "wan"
+            and _text(rule.get("outIface")).lower() == "lan"
+            and _text(mapping.get("addressFamily")) == family
+            and _protocol_matches(rule.get("proto"), mapping.get("protocol"))
+            and _port_contains(rule.get("destPort"), mapping.get("targetPort"))
         )
 
     def _state(self, binding: Dict[str, Any], firewall: Any) -> Dict[str, Any]:
@@ -313,9 +393,32 @@ class FirewallAutomationService:
             (rule or {}).get(_text(binding.get("matchField"))),
             _text(binding.get("addressFamily")),
         )
-        if not _enabled(binding.get("enabled"), True):
+        fingerprint = _rule_fingerprint(rule, _text(binding.get("matchField"))) if rule else ""
+        last_applied = _field_value(
+            _text(binding.get("matchField")),
+            binding.get("lastAppliedValue"),
+            _text(binding.get("addressFamily")),
+        )
+        legacy_scope = _text(binding.get("targetType")) != "mapping"
+        manual_drift = bool(
+            rule
+            and not legacy_scope
+            and (
+                not _text(binding.get("ruleFingerprint"))
+                or not last_applied
+                or fingerprint != _text(binding.get("ruleFingerprint"))
+                or current != last_applied
+            )
+        )
+        if legacy_scope:
+            status = "out_of_scope"
+            message = "该旧绑定不属于路由器映射，已停止自动操作"
+        elif not _enabled(binding.get("enabled"), True):
             status = "disabled"
             message = "自动跟随已暂停"
+        elif _enabled(binding.get("suspended"), False) or manual_drift:
+            status = "manual_override"
+            message = "检测到人工修改，自动跟随已暂停，不会覆盖当前规则"
         elif rule is None:
             status = "missing_rule"
             message = "原规则已不存在，不会自动新建"
@@ -341,6 +444,39 @@ class FirewallAutomationService:
             "status": status,
             "statusMessage": message,
         }
+
+    def _replace_binding(self, replacement: Dict[str, Any]) -> None:
+        firewall_uuid = _text(replacement.get("firewallUuid"))
+        rows = [row for row in self.bindings() if _text(row.get("firewallUuid")) != firewall_uuid]
+        rows.append(dict(replacement))
+        self._save(rows)
+
+    def _suspend(self, binding: Dict[str, Any], reason: str) -> None:
+        if _enabled(binding.get("suspended"), False) and _text(binding.get("suspendedReason")) == reason:
+            return
+        replacement = {
+            **binding,
+            "suspended": True,
+            "suspendedReason": reason,
+            "suspendedAt": int(time.time()),
+        }
+        self._replace_binding(replacement)
+        with self.candidate_lock:
+            self.candidates.pop(_text(binding.get("firewallUuid")), None)
+
+    def _candidate_confirmed(self, firewall_uuid: str, desired: str) -> bool:
+        now = time.monotonic()
+        with self.candidate_lock:
+            previous = self.candidates.get(firewall_uuid)
+            if not isinstance(previous, dict) or _text(previous.get("value")) != desired:
+                self.candidates[firewall_uuid] = {"value": desired, "count": 1, "firstSeen": now}
+                return False
+            previous["count"] = min(self.STABLE_OBSERVATIONS, int(previous.get("count") or 0) + 1)
+            return int(previous["count"]) >= self.STABLE_OBSERVATIONS
+
+    def _clear_candidate(self, firewall_uuid: str) -> None:
+        with self.candidate_lock:
+            self.candidates.pop(firewall_uuid, None)
 
     def describe(self, firewall_uuid: str = "", firewall: Any = None) -> Any:
         if firewall is None:
@@ -374,16 +510,36 @@ class FirewallAutomationService:
             if firewall_uuid:
                 bindings = [row for row in bindings if _text(row.get("firewallUuid")) == firewall_uuid]
             for binding in bindings:
-                if not _enabled(binding.get("enabled"), True):
+                uuid = _text(binding.get("firewallUuid"))
+                if _text(binding.get("targetType")) != "mapping":
                     continue
-                rule = _find_rule(current, _text(binding.get("firewallUuid")))
-                if not self._rule_compatible(rule, binding):
+                if not _enabled(binding.get("enabled"), True) or _enabled(binding.get("suspended"), False):
+                    continue
+                rule = _find_rule(current, uuid)
+                if rule is None:
                     continue
                 field = _text(binding.get("matchField"))
                 family = _text(binding.get("addressFamily"))
-                desired, _target_name = self.resolve(binding)
                 actual = _field_value(field, rule.get(field), family)
+                last_applied = _field_value(field, binding.get("lastAppliedValue"), family)
+                fingerprint = _rule_fingerprint(rule, field)
+                if (
+                    not last_applied
+                    or not _text(binding.get("ruleFingerprint"))
+                    or actual != last_applied
+                    or fingerprint != _text(binding.get("ruleFingerprint"))
+                ):
+                    self._suspend(binding, "manual_change" if last_applied else "confirmation_required")
+                    self.logger.info("firewall automation paused after external change uuid=%s", uuid)
+                    return {"ok": True, "changed": False, "suspended": True, "firewallUuid": uuid}
+                if not self._rule_compatible(rule, binding):
+                    continue
+                desired, _target_name = self.resolve(binding)
                 if not desired or not actual or actual == desired:
+                    if actual == desired:
+                        self._clear_candidate(uuid)
+                    continue
+                if not self._candidate_confirmed(uuid, desired):
                     continue
 
                 # Preserve the complete raw Web rule.  Only synthetic runtime stats
@@ -399,9 +555,20 @@ class FirewallAutomationService:
                 )
                 verified = result.get("data") if isinstance(result, dict) else None
                 self._verify(verified, binding, desired)
+                updated_rule = _find_rule(verified, uuid)
+                replacement = {
+                    **binding,
+                    "lastAppliedValue": desired,
+                    "ruleFingerprint": _rule_fingerprint(updated_rule or payload, field),
+                    "lastAppliedAt": int(time.time()),
+                    "suspended": False,
+                    "suspendedReason": "",
+                }
+                self._replace_binding(replacement)
+                self._clear_candidate(uuid)
                 self.logger.info(
                     "firewall address follow updated uuid=%s field=%s from=%s to=%s",
-                    binding.get("firewallUuid"),
+                    uuid,
                     field,
                     actual,
                     desired,
@@ -411,7 +578,7 @@ class FirewallAutomationService:
                 return {
                     "ok": True,
                     "changed": True,
-                    "firewallUuid": binding.get("firewallUuid"),
+                    "firewallUuid": uuid,
                     "field": field,
                     "oldAddress": actual,
                     "newAddress": desired,
