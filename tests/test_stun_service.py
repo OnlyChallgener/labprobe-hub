@@ -4,7 +4,7 @@ import threading
 
 from flask import Flask
 
-from stun_service import StunService
+from stun_service import DEFAULT_STUN_TCP_SERVER, StunService
 
 
 class _Cache:
@@ -17,17 +17,31 @@ class _Client:
         self.write_lock = threading.RLock()
         self.cache = _Cache()
         self.rules = []
+        self.native_rules = []
 
     def firewall(self, _force=False):
         return {"list": [dict(row) for row in self.rules], "maxLen": 20}
 
+    def native_port_mapping(self, _force=False):
+        return {"portMapping": [dict(row) for row in self.native_rules]}
+
     def rpc(self, operation, module, payload):
-        assert module == "ip_firewall"
-        if operation == "devConfig.add":
-            for row in payload["list"]:
-                self.rules.append({**row, "uuid": f"fw-{len(self.rules) + 1}"})
-        elif operation == "devConfig.del":
-            self.rules = [row for row in self.rules if row["uuid"] not in payload["uuid"]]
+        if module == "ip_firewall":
+            if operation == "devConfig.add":
+                for row in payload["list"]:
+                    self.rules.append({**row, "uuid": f"fw-{len(self.rules) + 1}"})
+            elif operation == "devConfig.del":
+                self.rules = [row for row in self.rules if row["uuid"] not in payload["uuid"]]
+        elif module == "port_mapping":
+            if operation == "devConfig.add":
+                self.native_rules.extend(dict(row) for row in payload["list"])
+            elif operation == "devConfig.update":
+                old, new = payload["old"], payload["new"]
+                self.native_rules = [dict(new) if row.get("ruleName") == old.get("ruleName") else row for row in self.native_rules]
+            elif operation == "devConfig.del":
+                self.native_rules = [row for row in self.native_rules if row.get("ruleName") not in payload["ruleName"]]
+        else:
+            raise AssertionError(module)
         return {"ok": True}
 
 
@@ -58,6 +72,28 @@ def test_service_templates_choose_protocol_and_skip_portmap_reservation(tmp_path
     assert https["listenPort"] == 20001
     assert wireguard["transportProtocol"] == "UDP"
     assert wireguard["listenPort"] == 20000
+    assert https["stunServer"] == DEFAULT_STUN_TCP_SERVER
+
+
+def test_legacy_tcp_rule_is_migrated_to_a_tcp_stun_server_and_queued(tmp_path):
+    hub = _hub(tmp_path)
+    legacy = {
+        "id": "stun-tcp",
+        "kind": "stun",
+        "name": "HTTPS · 192.168.5.46:443",
+        "enabled": True,
+        "targetIpv4": "192.168.5.46",
+        "targetPort": 443,
+        "transportProtocol": "TCP",
+        "stunServer": "stun.cloudflare.com:3478",
+    }
+    hub.save_json(tmp_path / "stun_rules.json", {"revision": 1, "rules": [legacy]})
+
+    service = StunService(hub, _Client())
+
+    assert service._document()["rules"][0]["stunServer"] == DEFAULT_STUN_TCP_SERVER
+    assert service._commands()[0]["action"] == "upsert"
+    assert service._commands()[0]["payload"]["rule"]["stunServer"] == DEFAULT_STUN_TCP_SERVER
 
 
 def test_address_history_retains_only_latest_three_unique_endpoints(tmp_path):
@@ -86,11 +122,55 @@ def test_dynamic_public_endpoint_never_changes_the_relay_to_lan_forward_target(t
         assert current["runtime"]["publicEndpoint"] == endpoint
 
 
-def test_firewall_is_created_through_router_controller_and_manual_change_pauses_it(tmp_path):
+def test_tcp_stun_uses_one_router_native_map_while_public_endpoint_changes(tmp_path):
     client = _Client()
     service = StunService(_hub(tmp_path), client)
     rule = service.clean_rule({"serviceType": "HTTPS", "targetIpv4": "192.168.5.46", "targetPort": 443})
 
+    assert rule["forwardMode"] == "router_native"
+    assert service.ensure_native_mapping(rule)["state"] == "ready"
+    created = dict(client.native_rules[0])
+    assert created == {
+        "ruleName": f"LabProbe STUN {rule['id']}",
+        "src": "wan", "srcIp": "", "srcPort": str(rule["listenPort"]),
+        "destIp": "192.168.5.46", "destPort": "443", "proto": "tcp",
+    }
+
+    for endpoint in ("203.0.113.9:20001", "203.0.113.9:28764"):
+        service._remember_endpoint(rule["id"], {"publicEndpoint": endpoint})
+        assert service.ensure_native_mapping(rule)["state"] == "ready"
+        assert client.native_rules == [created]
+
+
+def test_tcp_native_map_updates_only_when_the_selected_target_changes(tmp_path):
+    client = _Client()
+    service = StunService(_hub(tmp_path), client)
+    old = service.clean_rule({"serviceType": "HTTPS", "targetIpv4": "192.168.5.46", "targetPort": 443})
+    assert service.ensure_native_mapping(old)["state"] == "ready"
+    updated = service.clean_rule({"targetIpv4": "192.168.5.47", "targetPort": 8443}, old)
+
+    assert service.ensure_native_mapping(updated)["state"] == "ready"
+    assert client.native_rules[0]["srcPort"] == str(old["listenPort"])
+    assert client.native_rules[0]["destIp"] == "192.168.5.47"
+    assert client.native_rules[0]["destPort"] == "8443"
+
+
+def test_udp_stun_keeps_relay_proxy_mode_and_does_not_create_a_router_map(tmp_path):
+    client = _Client()
+    service = StunService(_hub(tmp_path), client)
+    rule = service.clean_rule({"serviceType": "WireGuard", "targetIpv4": "192.168.5.47", "targetPort": 51820})
+
+    assert rule["forwardMode"] == "relay_proxy"
+    assert service.ensure_native_mapping(rule)["state"] == "not_required"
+    assert client.native_rules == []
+
+
+def test_udp_relay_firewall_is_created_through_router_controller_and_manual_change_pauses_it(tmp_path):
+    client = _Client()
+    service = StunService(_hub(tmp_path), client)
+    rule = service.clean_rule({"serviceType": "WireGuard", "targetIpv4": "192.168.5.46", "targetPort": 51820})
+
+    assert rule["forwardMode"] == "relay_proxy"
     assert service.ensure_firewall(rule)["state"] == "ready"
     assert client.rules[0]["direction"] == "inbound"
     assert client.rules[0]["destPort"] == str(rule["listenPort"])

@@ -27,6 +27,9 @@ const DEFAULT_CONFIG: &str = "/etc/labprobe/relay.json";
 const DEFAULT_SOCKET: &str = "/tmp/labrelay.sock";
 const DEFAULT_STATE: &str = "/tmp/labrelay/state.json";
 const DEFAULT_PID: &str = "/tmp/labrelay.pid";
+const DEFAULT_UDP_STUN_SERVER: &str = "stun.cloudflare.com:3478";
+const DEFAULT_TCP_STUN_SERVER: &str = "stunserver2025.stunprotocol.org:3478";
+const LEGACY_TCP_STUN_SERVER: &str = DEFAULT_UDP_STUN_SERVER;
 
 fn default_true() -> bool {
     true
@@ -40,8 +43,15 @@ fn default_idle_timeout() -> u64 {
 fn default_rule_kind() -> String {
     "portmap".to_string()
 }
-fn default_stun_server() -> String {
-    "stun.cloudflare.com:3478".to_string()
+fn default_forward_mode() -> String {
+    "relay_proxy".to_string()
+}
+fn default_stun_server(protocol: &str) -> String {
+    if protocol.eq_ignore_ascii_case("TCP") {
+        DEFAULT_TCP_STUN_SERVER.to_string()
+    } else {
+        DEFAULT_UDP_STUN_SERVER.to_string()
+    }
 }
 
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
@@ -61,6 +71,7 @@ struct Rule {
     target_port: u16,
     transport_protocol: String,
     service_type: String,
+    forward_mode: String,
     stun_server: String,
     prefer_current_prefix: bool,
     expires_at: Option<u64>,
@@ -89,7 +100,8 @@ impl Default for Rule {
             target_port: 0,
             transport_protocol: "TCP".to_string(),
             service_type: "Custom".to_string(),
-            stun_server: default_stun_server(),
+            forward_mode: default_forward_mode(),
+            stun_server: default_stun_server("TCP"),
             prefer_current_prefix: default_true(),
             expires_at: None,
             max_connections: default_max_connections(),
@@ -392,6 +404,16 @@ impl Manager {
         let rule_task = rule.clone();
         let lan_if = self.lan_if.clone();
         let join = match rule.transport_protocol.as_str() {
+            // Lucky's direct TCP path deliberately does not listen/proxy on
+            // this port.  The router's native port mapping delivers inbound
+            // traffic straight to the selected LAN service, while this socket
+            // keeps that same channel port alive at the upstream NAT and
+            // observes its current public endpoint.
+            "TCP" if rule.kind == "stun" && rule.forward_mode == "router_native" => {
+                tokio::spawn(async move {
+                    run_tcp_stun_keepalive(rule_task, shared_task, cancel_rx).await;
+                })
+            }
             "TCP" => match if rule.kind == "stun" {
                 create_ipv4_listener(rule.listen_port)
             } else {
@@ -742,6 +764,26 @@ async fn resolve_stun_server(value: &str) -> Result<SocketAddr> {
         .ok_or_else(|| anyhow!("STUN server has no IPv4 address"))
 }
 
+fn connect_is_in_progress(error: &std::io::Error) -> bool {
+    if matches!(
+        error.kind(),
+        std::io::ErrorKind::WouldBlock | std::io::ErrorKind::Interrupted
+    ) {
+        return true;
+    }
+    // BusyBox/musl on the router reports the first nonblocking connect as raw
+    // EINPROGRESS (115), rather than mapping it to WouldBlock. EALREADY is
+    // also a pending connect, so wait for writable in both cases.
+    #[cfg(target_os = "linux")]
+    {
+        matches!(error.raw_os_error(), Some(114 | 115))
+    }
+    #[cfg(not(target_os = "linux"))]
+    {
+        false
+    }
+}
+
 async fn connect_tcp_stun(local_port: u16, server: SocketAddr) -> Result<TcpStream> {
     let socket = Socket::new(Domain::IPV4, Type::STREAM, Some(Protocol::TCP))?;
     socket.set_reuse_address(true)?;
@@ -752,7 +794,7 @@ async fn connect_tcp_stun(local_port: u16, server: SocketAddr) -> Result<TcpStre
     let server_addr = SockAddr::from(server);
     match socket.connect(&server_addr) {
         Ok(_) => {}
-        Err(error) if matches!(error.kind(), std::io::ErrorKind::WouldBlock | std::io::ErrorKind::Interrupted) => {}
+        Err(error) if connect_is_in_progress(&error) => {}
         Err(error) => return Err(error.into()),
     }
     let std_stream: std::net::TcpStream = socket.into();
@@ -824,7 +866,7 @@ async fn run_tcp_listener(
     shared: Arc<RuntimeShared>,
     mut cancel: watch::Receiver<bool>,
 ) {
-    let stun_task = if rule.kind == "stun" {
+    let stun_task = if rule.kind == "stun" && rule.forward_mode == "relay_proxy" {
         Some(tokio::spawn(run_tcp_stun_keepalive(
             rule.clone(),
             shared.clone(),
@@ -1446,12 +1488,20 @@ fn normalize_rule(rule: &mut Rule) {
     rule.target_mac = normalize_mac(&rule.target_mac);
     rule.transport_protocol = rule.transport_protocol.trim().to_ascii_uppercase();
     rule.service_type = rule.service_type.trim().to_string();
+    rule.forward_mode = rule.forward_mode.trim().to_ascii_lowercase();
     rule.stun_server = rule.stun_server.trim().to_string();
     if rule.kind == "stun" {
         rule.mode = "stun".to_string();
         rule.target_mode = "ipv4".to_string();
-        if rule.stun_server.is_empty() {
-            rule.stun_server = default_stun_server();
+        rule.forward_mode = if rule.transport_protocol == "TCP" {
+            "router_native".to_string()
+        } else {
+            "relay_proxy".to_string()
+        };
+        if rule.stun_server.is_empty()
+            || (rule.transport_protocol == "TCP" && rule.stun_server == LEGACY_TCP_STUN_SERVER)
+        {
+            rule.stun_server = default_stun_server(&rule.transport_protocol);
         }
     }
     if rule.transport_protocol.is_empty() {
@@ -1497,6 +1547,9 @@ fn validate_rule(rule: &Rule, port_min: u16, port_max: u16) -> Result<()> {
     }
     if rule.kind == "stun" && !rule.stun_server.contains(':') {
         bail!("invalid STUN server");
+    }
+    if rule.kind == "stun" && !matches!(rule.forward_mode.as_str(), "router_native" | "relay_proxy") {
+        bail!("unsupported STUN forwardMode: {}", rule.forward_mode);
     }
     if matches!(rule.mode.as_str(), "6to4" | "stun") {
         let ip = Ipv4Addr::from_str(&rule.target_ipv4).context("invalid targetIpv4")?;
@@ -2218,5 +2271,68 @@ mod tests {
         validate_rule(&rule, 20000, 20020).unwrap();
         assert_eq!(rule.mode, "stun");
         assert_eq!(rule.target_mode, "ipv4");
+        assert_eq!(rule.forward_mode, "router_native");
+    }
+
+    #[test]
+    fn udp_stun_normalizes_to_relay_proxy() {
+        let mut rule = Rule {
+            id: "stun-udp".into(),
+            name: "STUN UDP".into(),
+            kind: "stun".into(),
+            target_ipv4: "192.168.5.46".into(),
+            target_port: 51820,
+            listen_port: 20001,
+            transport_protocol: "UDP".into(),
+            ..Rule::default()
+        };
+        normalize_rule(&mut rule);
+        validate_rule(&rule, 20000, 20020).unwrap();
+        assert_eq!(rule.forward_mode, "relay_proxy");
+    }
+
+    #[test]
+    #[cfg(target_os = "linux")]
+    fn tcp_stun_connect_treats_einprogress_as_pending() {
+        assert!(connect_is_in_progress(&std::io::Error::from_raw_os_error(115)));
+        assert!(connect_is_in_progress(&std::io::Error::from_raw_os_error(114)));
+    }
+
+    #[tokio::test]
+    async fn tcp_stun_connect_keeps_the_same_port_as_the_listener() {
+        let inbound = create_ipv4_listener(0).unwrap();
+        let source_port = inbound.local_addr().unwrap().port();
+        let server = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let server_addr = server.local_addr().unwrap();
+
+        let stream = timeout(Duration::from_secs(2), connect_tcp_stun(source_port, server_addr))
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(stream.local_addr().unwrap().port(), source_port);
+        let (_, peer) = timeout(Duration::from_secs(2), server.accept())
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(peer.port(), source_port);
+        drop(stream);
+        drop(inbound);
+    }
+
+    #[test]
+    fn tcp_stun_uses_a_tcp_capable_default() {
+        let mut rule = Rule {
+            id: "tcp-default".into(),
+            name: "TCP default".into(),
+            kind: "stun".into(),
+            target_ipv4: "192.168.5.46".into(),
+            target_port: 443,
+            listen_port: 20001,
+            transport_protocol: "TCP".into(),
+            stun_server: LEGACY_TCP_STUN_SERVER.into(),
+            ..Rule::default()
+        };
+        normalize_rule(&mut rule);
+        assert_eq!(rule.stun_server, DEFAULT_TCP_STUN_SERVER);
     }
 }
