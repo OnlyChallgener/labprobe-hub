@@ -1,7 +1,7 @@
 use anyhow::{anyhow, bail, Context, Result};
 use serde::{Deserialize, Serialize};
 use serde_json::{json, Value};
-use socket2::{Domain, Protocol, SockAddr, Socket, Type};
+use socket2::{Domain, Protocol, Socket, Type};
 use std::collections::HashMap;
 use std::fs;
 use std::io::{BufRead, BufReader, Read, Write};
@@ -13,7 +13,7 @@ use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::Arc;
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 use tokio::io::{AsyncBufReadExt, AsyncReadExt, AsyncWriteExt, BufReader as TokioBufReader};
-use tokio::net::{TcpListener, TcpStream, UdpSocket, UnixListener};
+use tokio::net::{TcpListener, TcpSocket, TcpStream, UdpSocket, UnixListener};
 use tokio::sync::{watch, Mutex, RwLock, Semaphore};
 use tokio::task::{JoinHandle, JoinSet};
 use tokio::time::{sleep, timeout};
@@ -769,48 +769,21 @@ async fn resolve_stun_server(value: &str) -> Result<SocketAddr> {
         .ok_or_else(|| anyhow!("STUN server has no IPv4 address"))
 }
 
-fn connect_is_in_progress(error: &std::io::Error) -> bool {
-    if matches!(
-        error.kind(),
-        std::io::ErrorKind::WouldBlock | std::io::ErrorKind::Interrupted
-    ) {
-        return true;
-    }
-    // BusyBox/musl on the router reports the first nonblocking connect as raw
-    // EINPROGRESS (115), rather than mapping it to WouldBlock. EALREADY is
-    // also a pending connect, so wait for writable in both cases.
-    #[cfg(target_os = "linux")]
-    {
-        matches!(error.raw_os_error(), Some(114 | 115))
-    }
-    #[cfg(not(target_os = "linux"))]
-    {
-        false
-    }
-}
-
 async fn connect_tcp_stun(local_port: u16, server: SocketAddr) -> Result<TcpStream> {
-    let socket = Socket::new(Domain::IPV4, Type::STREAM, Some(Protocol::TCP))?;
-    socket.set_reuse_address(true)?;
-    #[cfg(unix)]
-    socket.set_reuse_port(true)?;
-    socket.set_nonblocking(true)?;
-    socket.bind(&SocketAddrV4::new(Ipv4Addr::UNSPECIFIED, local_port).into())?;
-    let server_addr = SockAddr::from(server);
-    match socket.connect(&server_addr) {
-        Ok(_) => {}
-        Err(error) if connect_is_in_progress(&error) => {}
-        Err(error) => return Err(error.into()),
-    }
-    let std_stream: std::net::TcpStream = socket.into();
-    let stream = TcpStream::from_std(std_stream)?;
-    timeout(Duration::from_secs(8), stream.writable())
+    // TcpSocket owns the nonblocking connect state and lets Tokio handle
+    // EINPROGRESS/EALREADY consistently on musl/BusyBox routers.  The old
+    // socket2 + writable()/SO_ERROR sequence could surface raw errno 115
+    // after the initial connect had already been accepted as pending.
+    let socket = TcpSocket::new_v4()?;
+    socket.set_reuseaddr(true)?;
+    socket.bind(SocketAddr::V4(SocketAddrV4::new(
+        Ipv4Addr::UNSPECIFIED,
+        local_port,
+    )))?;
+    timeout(Duration::from_secs(8), socket.connect(server))
         .await
-        .context("STUN TCP connect timeout")??;
-    if let Some(error) = stream.take_error()? {
-        return Err(error.into());
-    }
-    Ok(stream)
+        .context("STUN TCP connect timeout")?
+        .context("STUN TCP connect")
 }
 
 async fn run_tcp_stun_keepalive(
@@ -2354,17 +2327,14 @@ mod tests {
         assert_eq!(rule.forward_mode, "router_native");
     }
 
-    #[test]
-    #[cfg(target_os = "linux")]
-    fn tcp_stun_connect_treats_einprogress_as_pending() {
-        assert!(connect_is_in_progress(&std::io::Error::from_raw_os_error(115)));
-        assert!(connect_is_in_progress(&std::io::Error::from_raw_os_error(114)));
-    }
-
     #[tokio::test]
     async fn tcp_stun_connect_keeps_the_same_port_as_the_listener() {
-        let inbound = create_ipv4_listener(0).unwrap();
+        // Reserve a port briefly, then release it before the outbound socket
+        // binds. The production path has only the STUN socket on this port;
+        // keeping this helper listener alive would create a false conflict.
+        let inbound = TcpListener::bind("127.0.0.1:0").await.unwrap();
         let source_port = inbound.local_addr().unwrap().port();
+        drop(inbound);
         let server = TcpListener::bind("127.0.0.1:0").await.unwrap();
         let server_addr = server.local_addr().unwrap();
 
@@ -2379,7 +2349,6 @@ mod tests {
             .unwrap();
         assert_eq!(peer.port(), source_port);
         drop(stream);
-        drop(inbound);
     }
 
     #[test]
