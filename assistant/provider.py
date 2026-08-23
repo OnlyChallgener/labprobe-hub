@@ -39,12 +39,13 @@ def usage_from_chunk(chunk: Dict[str, Any]) -> Optional[Dict[str, int]]:
 class ChatResult:
     content: str
     usage: Dict[str, int]
+    message: Optional[Dict[str, Any]] = None
 
 
 class ChatProvider(Protocol):
     """Provider boundary; additional vendors need only implement these calls."""
-    def chat(self, messages: List[Dict[str, str]]) -> ChatResult: ...
-    def stream(self, messages: List[Dict[str, str]]) -> Iterator[Dict[str, Any]]: ...
+    def chat(self, messages: List[Dict[str, Any]], tools: Optional[List[Dict[str, Any]]] = None) -> ChatResult: ...
+    def stream(self, messages: List[Dict[str, Any]]) -> Iterator[Dict[str, Any]]: ...
 
 
 class OpenAICompatibleProvider:
@@ -54,8 +55,12 @@ class OpenAICompatibleProvider:
         self.model = model
         self.session = session
 
-    def _request(self, messages: List[Dict[str, str]], stream: bool):
+    def _request(self, messages: List[Dict[str, Any]], stream: bool,
+                 tools: Optional[List[Dict[str, Any]]] = None):
         payload: Dict[str, Any] = {"model": self.model, "messages": messages, "stream": stream}
+        if tools:
+            payload["tools"] = tools
+            payload["tool_choice"] = "auto"
         if stream:
             payload["stream_options"] = {"include_usage": True}
         try:
@@ -71,18 +76,24 @@ class OpenAICompatibleProvider:
             raise ProviderError("AI provider rejected the request", status_code)
         return response
 
-    def chat(self, messages: List[Dict[str, str]]) -> ChatResult:
-        response = self._request(messages, False)
+    def chat(self, messages: List[Dict[str, Any]],
+             tools: Optional[List[Dict[str, Any]]] = None) -> ChatResult:
+        response = self._request(messages, False, tools)
         try:
             body = response.json()
             choice = body["choices"][0]["message"]
-            return ChatResult(str(choice.get("content") or ""), usage_from_chunk(body) or {})
+            message = {
+                key: choice[key]
+                for key in ("role", "content", "reasoning_content", "tool_calls")
+                if key in choice
+            }
+            return ChatResult(str(choice.get("content") or ""), usage_from_chunk(body) or {}, message)
         except (KeyError, IndexError, ValueError, TypeError) as exc:
             raise ProviderError("AI provider returned an invalid response") from exc
         finally:
             response.close()
 
-    def stream(self, messages: List[Dict[str, str]]) -> Iterator[Dict[str, Any]]:
+    def stream(self, messages: List[Dict[str, Any]]) -> Iterator[Dict[str, Any]]:
         response = self._request(messages, True)
         try:
             for raw in response.iter_lines(decode_unicode=True):

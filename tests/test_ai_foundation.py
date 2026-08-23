@@ -1,4 +1,6 @@
 from datetime import datetime, timedelta, timezone
+import json
+from types import SimpleNamespace
 
 import pytest
 from flask import Flask
@@ -9,11 +11,46 @@ from assistant.security import MasterKeyUnavailable, encrypt_secret
 from assistant.catalog import CATALOG_REVISION
 
 
-def make_client(tmp_path, monkeypatch, authorized=True):
+def make_client(tmp_path, monkeypatch, authorized=True, hub_runtime=None):
     monkeypatch.setenv("LABPROBE_AI_MASTER_KEY", "test-master-key")
     app = Flask(__name__)
-    app.register_blueprint(create_ai_blueprint(check_app_token=lambda: authorized, db_path=tmp_path / "ai.db", logger=None))
+    app.register_blueprint(create_ai_blueprint(
+        check_app_token=lambda: authorized,
+        db_path=tmp_path / "ai.db",
+        logger=None,
+        hub_runtime=hub_runtime,
+    ))
     return app.test_client()
+
+
+def fake_hub(tmp_path):
+    devices_file = tmp_path / "devices.json"
+    portmap_status_file = tmp_path / "portmap-status.json"
+    devices_file.write_text(json.dumps({
+        "updatedAt": "2026-08-23 10:00:00",
+        "online": [{"name": "Mate60", "mac": "AA:BB:CC:DD:EE:01", "ipv6List": ["240e::60"]}],
+        "watched": [{"name": "ANS", "mac": "AA:BB:CC:DD:EE:02", "online": False}],
+    }), encoding="utf-8")
+    portmap_status_file.write_text("{}", encoding="utf-8")
+
+    def load_json(path, default):
+        try:
+            return json.loads(path.read_text(encoding="utf-8"))
+        except Exception:
+            return default
+
+    runtime = SimpleNamespace(
+        DEVICES_FILE=devices_file,
+        PORTMAP_ROUTER_STATUS_FILE=portmap_status_file,
+        load_json=load_json,
+        load_device_archive=lambda: {},
+        normalize_ipv6_list=lambda value: value if isinstance(value, list) else [value],
+        status_document=lambda: {"hub": {"name": "test"}},
+        aggregate_daily=lambda day: {"date": day, "summary": {}},
+        _load_portmap_rules_document=lambda: ({"rules": []}, True),
+        send_wol=lambda mac: {"ok": True, "mac": mac, "sent": 3},
+    )
+    return runtime
 
 
 def test_config_masks_key_and_never_echoes_it(tmp_path, monkeypatch):
@@ -122,3 +159,87 @@ def test_catalog_is_authenticated_and_versioned(tmp_path, monkeypatch):
     wol = next(tool for tool in response.json["tools"] if tool["id"] == "device.wol")
     assert wol["risk"] == "write"
     assert wol["confirmation"] == "always"
+
+
+def test_read_tool_resolves_device_ipv6_from_hub_cache(tmp_path, monkeypatch):
+    client = make_client(tmp_path, monkeypatch, hub_runtime=fake_hub(tmp_path))
+    response = client.post("/api/ai/tools/execute", json={
+        "toolId": "device.ipv6", "arguments": {"device": "mate60"},
+    })
+    assert response.status_code == 200
+    assert response.json["result"]["ipv6List"] == ["240e::60"]
+
+
+def test_write_tool_requires_one_time_confirmation(tmp_path, monkeypatch):
+    client = make_client(tmp_path, monkeypatch, hub_runtime=fake_hub(tmp_path))
+    denied = client.post("/api/ai/tools/execute", json={
+        "toolId": "device.wol", "arguments": {"device": "ANS"},
+    })
+    assert denied.status_code == 409
+    prepared = client.post("/api/ai/tools/prepare", json={
+        "toolId": "device.wol", "arguments": {"device": "ANS"},
+    })
+    assert prepared.status_code == 200
+    confirmation_id = prepared.json["confirmationId"]
+    confirmed = client.post("/api/ai/tools/confirm", json={"confirmationId": confirmation_id})
+    assert confirmed.status_code == 200
+    assert confirmed.json["result"]["mac"] == "AA:BB:CC:DD:EE:02"
+    assert client.post("/api/ai/tools/confirm", json={"confirmationId": confirmation_id}).status_code == 409
+
+
+def test_chat_executes_model_selected_read_tool_and_returns_final_answer(tmp_path, monkeypatch):
+    client = make_client(tmp_path, monkeypatch, hub_runtime=fake_hub(tmp_path))
+    assert client.put("/api/ai/config", json={"apiKey": "sk-test"}).status_code == 200
+
+    class FakeToolProvider:
+        calls = 0
+
+        def __init__(self, *args, **kwargs):
+            pass
+
+        def chat(self, messages, tools=None):
+            from assistant.provider import ChatResult
+            self.__class__.calls += 1
+            if self.__class__.calls == 1:
+                assert tools and any(row["function"]["name"] == "device_ipv6" for row in tools)
+                return ChatResult("", {"total_tokens": 4}, {
+                    "role": "assistant", "content": None,
+                    "tool_calls": [{
+                        "id": "call-1", "type": "function",
+                        "function": {"name": "device_ipv6", "arguments": '{"device":"Mate60"}'},
+                    }],
+                })
+            assert messages[-1]["role"] == "tool"
+            return ChatResult("Mate60 的 IPv6 地址是 240e::60。", {"total_tokens": 5}, {
+                "role": "assistant", "content": "Mate60 的 IPv6 地址是 240e::60。",
+            })
+
+    monkeypatch.setattr("assistant.api.OpenAICompatibleProvider", FakeToolProvider)
+    response = client.post("/api/ai/chat", json={"message": "告诉我 Mate60 的 IPv6 地址"})
+    assert response.status_code == 200
+    assert "240e::60" in response.json["message"]["content"]
+    assert response.json["usage"]["total_tokens"] == 9
+    assert response.json["toolExecutions"] == [{"status": "completed", "toolId": "device.ipv6"}]
+
+
+def test_app_context_is_sanitized_and_local_write_is_one_time_confirmed(tmp_path, monkeypatch):
+    client = make_client(tmp_path, monkeypatch, hub_runtime=fake_hub(tmp_path))
+    context = {
+        "settings": {"privacyMode": False, "favoriteNetworkMode": "lan", "token": "must-not-pass"},
+        "favorites": [{"id": "fav-1", "title": "Home Assistant", "localUrl": "http://192.168.1.2:8123"}],
+    }
+    settings = client.post("/api/ai/tools/execute", json={
+        "toolId": "app.settings.get", "arguments": {}, "clientContext": context,
+    })
+    assert settings.status_code == 200
+    assert settings.json["result"]["settings"] == {"privacyMode": False, "favoriteNetworkMode": "lan"}
+    prepared = client.post("/api/ai/tools/prepare", json={
+        "toolId": "app.favorite.remove", "arguments": {"favorite": "Home Assistant"}, "clientContext": context,
+    })
+    assert prepared.status_code == 200
+    assert prepared.json["preview"]["executor"] == "app"
+    confirmation_id = prepared.json["confirmationId"]
+    confirmed = client.post("/api/ai/tools/confirm", json={"confirmationId": confirmation_id})
+    assert confirmed.status_code == 200
+    assert confirmed.json["clientAction"]["arguments"]["favorite"] == "fav-1"
+    assert client.post("/api/ai/tools/confirm", json={"confirmationId": confirmation_id}).status_code == 409

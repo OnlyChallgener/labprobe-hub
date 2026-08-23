@@ -79,6 +79,7 @@ hub.app.register_blueprint(
         check_app_token=hub.check_app_token,
         db_path=hub.DB_PATH,
         logger=hub.LOGGER,
+        hub_runtime=hub,
     )
 )
 router_sync = install_router_rpc_compat(hub)

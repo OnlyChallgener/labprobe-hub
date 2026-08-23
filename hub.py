@@ -3985,16 +3985,12 @@ def build_magic_packet(mac: str) -> bytes:
     return b"\xff" * 6 + parts * 16
 
 
-@app.route("/api/wol", methods=["POST"])
-def api_wol():
-    if not check_app_token():
-        return jsonify({"ok": False, "error": "unauthorized"}), 401
-    payload = request.get_json(silent=True) or {}
-    mac = norm_mac(payload.get("mac"))
-    if not mac:
-        return jsonify({"ok": False, "error": "invalid mac"}), 400
-    port = to_int(payload.get("port"), 9) or 9
-    packet = build_magic_packet(mac)
+def send_wol(mac: str, port: int = 9) -> Dict[str, Any]:
+    """Send WOL for trusted callers after they have resolved and confirmed a device."""
+    normalized = norm_mac(mac)
+    if not normalized:
+        raise ValueError("invalid mac")
+    packet = build_magic_packet(normalized)
     targets = cfg_get("wol.broadcasts", []) or ["255.255.255.255"]
     if isinstance(targets, str):
         targets = [targets]
@@ -4005,18 +4001,32 @@ def api_wol():
         sock.setsockopt(socket.SOL_SOCKET, socket.SO_BROADCAST, 1)
         sock.settimeout(1.5)
         for host in targets:
-            for p in [port, 9, 7]:
+            for target_port in [int(port), 9, 7]:
                 try:
-                    sock.sendto(packet, (str(host), int(p)))
+                    sock.sendto(packet, (str(host), target_port))
                     sent += 1
-                except Exception as e:
-                    errors.append(f"{host}:{p} {e}")
+                except Exception as exc:
+                    errors.append(f"{host}:{target_port} {exc}")
     finally:
         sock.close()
     if sent <= 0:
-        return jsonify({"ok": False, "error": "; ".join(errors[-3:]) or "send failed"}), 500
-    add_event({"type": "wol_sent", "title": "WOL 唤醒", "name": mac, "newValue": f"sent {sent}", "mac": mac})
-    return jsonify({"ok": True, "message": f"Hub 已发送 WOL · {sent} 个广播包", "mac": mac, "sent": sent, "time": now_str()})
+        raise OSError("; ".join(errors[-3:]) or "send failed")
+    add_event({"type": "wol_sent", "title": "WOL 唤醒", "name": normalized, "newValue": f"sent {sent}", "mac": normalized})
+    return {"ok": True, "message": f"Hub 已发送 WOL · {sent} 个广播包", "mac": normalized, "sent": sent, "time": now_str()}
+
+
+@app.route("/api/wol", methods=["POST"])
+def api_wol():
+    if not check_app_token():
+        return jsonify({"ok": False, "error": "unauthorized"}), 401
+    payload = request.get_json(silent=True) or {}
+    mac = norm_mac(payload.get("mac"))
+    if not mac:
+        return jsonify({"ok": False, "error": "invalid mac"}), 400
+    try:
+        return jsonify(send_wol(mac, to_int(payload.get("port"), 9) or 9))
+    except (ValueError, OSError) as exc:
+        return jsonify({"ok": False, "error": str(exc)}), 500
 
 
 @app.route("/api/devices", methods=["GET"])

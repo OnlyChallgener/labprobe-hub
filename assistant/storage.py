@@ -51,6 +51,18 @@ class AIStore:
                 );
                 CREATE INDEX IF NOT EXISTS idx_ai_usage_created_at ON ai_usage(created_at);
                 CREATE INDEX IF NOT EXISTS idx_messages_conversation ON messages(conversation_id, id);
+                CREATE TABLE IF NOT EXISTS ai_tool_audit (
+                    id INTEGER PRIMARY KEY AUTOINCREMENT, request_id TEXT NOT NULL,
+                    tool_id TEXT NOT NULL, risk TEXT NOT NULL, status TEXT NOT NULL,
+                    arguments_json TEXT, result_json TEXT, created_at TEXT NOT NULL
+                );
+                CREATE INDEX IF NOT EXISTS idx_ai_tool_audit_created_at ON ai_tool_audit(created_at);
+                CREATE TABLE IF NOT EXISTS ai_tool_confirmations (
+                    id TEXT PRIMARY KEY, tool_id TEXT NOT NULL, arguments_json TEXT NOT NULL,
+                    preview_json TEXT NOT NULL, status TEXT NOT NULL,
+                    expires_at TEXT NOT NULL, created_at TEXT NOT NULL,
+                    confirmed_at TEXT, result_json TEXT
+                );
             """)
             # Existing phase-one databases may predate these audit fields.
             columns = {row["name"] for row in conn.execute("PRAGMA table_info(ai_usage)")}
@@ -148,3 +160,57 @@ class AIStore:
         return {key: int(row[key] or 0) for key in (
             "requests", "prompt_tokens", "completion_tokens", "total_tokens", "unknown_usage_requests"
         )}
+
+    def add_tool_audit(self, request_id: str, tool_id: str, risk: str, status: str,
+                       arguments: Dict[str, Any], result: Optional[Dict[str, Any]] = None) -> None:
+        arguments_json = json.dumps(arguments, ensure_ascii=False, separators=(",", ":"))[:16000]
+        result_json = json.dumps(result, ensure_ascii=False, separators=(",", ":"))[:32000] if result is not None else None
+        with self._connect() as conn:
+            conn.execute(
+                "INSERT INTO ai_tool_audit(request_id,tool_id,risk,status,arguments_json,result_json,created_at) "
+                "VALUES(?,?,?,?,?,?,?)",
+                (request_id, tool_id, risk, status, arguments_json, result_json, utc_now()),
+            )
+
+    def create_confirmation(self, confirmation_id: str, tool_id: str, arguments: Dict[str, Any],
+                            preview: Dict[str, Any], expires_at: str) -> None:
+        with self._connect() as conn:
+            conn.execute(
+                "INSERT INTO ai_tool_confirmations(id,tool_id,arguments_json,preview_json,status,expires_at,created_at) "
+                "VALUES(?,?,?,?,?,?,?)",
+                (confirmation_id, tool_id, json.dumps(arguments, ensure_ascii=False),
+                 json.dumps(preview, ensure_ascii=False), "pending", expires_at, utc_now()),
+            )
+
+    def claim_confirmation(self, confirmation_id: str) -> Optional[Dict[str, Any]]:
+        now = utc_now()
+        with self._connect() as conn:
+            conn.execute("BEGIN IMMEDIATE")
+            row = conn.execute(
+                "SELECT * FROM ai_tool_confirmations WHERE id=? AND status='pending' AND expires_at>=?",
+                (confirmation_id, now),
+            ).fetchone()
+            if row is None:
+                conn.execute("ROLLBACK")
+                return None
+            changed = conn.execute(
+                "UPDATE ai_tool_confirmations SET status='executing', confirmed_at=? "
+                "WHERE id=? AND status='pending'", (now, confirmation_id),
+            ).rowcount
+            if changed != 1:
+                conn.execute("ROLLBACK")
+                return None
+            conn.execute("COMMIT")
+        result = dict(row)
+        result["arguments"] = json.loads(result.pop("arguments_json"))
+        result["preview"] = json.loads(result.pop("preview_json"))
+        return result
+
+    def finish_confirmation(self, confirmation_id: str, status: str,
+                            result: Optional[Dict[str, Any]] = None) -> None:
+        result_json = json.dumps(result, ensure_ascii=False)[:32000] if result is not None else None
+        with self._connect() as conn:
+            conn.execute(
+                "UPDATE ai_tool_confirmations SET status=?, result_json=? WHERE id=?",
+                (status, result_json, confirmation_id),
+            )
