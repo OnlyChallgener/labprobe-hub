@@ -155,22 +155,24 @@ def test_tcp_native_map_updates_only_when_the_selected_target_changes(tmp_path):
     assert client.native_rules[0]["destPort"] == "8443"
 
 
-def test_udp_stun_keeps_relay_proxy_mode_and_does_not_create_a_router_map(tmp_path):
+def test_udp_stun_uses_the_same_router_native_map_model(tmp_path):
     client = _Client()
     service = StunService(_hub(tmp_path), client)
     rule = service.clean_rule({"serviceType": "WireGuard", "targetIpv4": "192.168.5.47", "targetPort": 51820})
 
-    assert rule["forwardMode"] == "relay_proxy"
-    assert service.ensure_native_mapping(rule)["state"] == "not_required"
-    assert client.native_rules == []
+    assert rule["forwardMode"] == "router_native"
+    assert service.ensure_native_mapping(rule)["state"] == "ready"
+    assert client.native_rules[0]["proto"] == "udp"
+    assert client.native_rules[0]["destIp"] == "192.168.5.47"
+    assert client.native_rules[0]["destPort"] == "51820"
 
 
-def test_udp_relay_firewall_is_created_through_router_controller_and_manual_change_pauses_it(tmp_path):
+def test_legacy_relay_firewall_binding_refuses_to_overwrite_manual_changes(tmp_path):
     client = _Client()
     service = StunService(_hub(tmp_path), client)
     rule = service.clean_rule({"serviceType": "WireGuard", "targetIpv4": "192.168.5.46", "targetPort": 51820})
 
-    assert rule["forwardMode"] == "relay_proxy"
+    rule["forwardMode"] = "relay_proxy"
     assert service.ensure_firewall(rule)["state"] == "ready"
     assert client.rules[0]["direction"] == "inbound"
     assert client.rules[0]["destPort"] == str(rule["listenPort"])
