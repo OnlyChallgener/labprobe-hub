@@ -1,15 +1,97 @@
-//! Phase 1: read-only WireGuard capability and status detection.
+//! WireGuard capability detection and the Agent-owned server control plane.
 //!
-//! Everything here is intentionally non-mutating: no interface creation, no
-//! UCI/firewall writes, no service restarts, and no private key handling.
-//! Detection failures degrade into [`WireGuardStatus::error`] and never
-//! propagate into the Agent/Relay lifecycle.
+//! Detection remains non-mutating. Provisioning is an explicit Agent command:
+//! it uses the kernel Generic Netlink backend, keeps the private key on the
+//! router, and never accepts arbitrary shell input.
 
 use anyhow::{bail, Context, Result};
 use serde::{Deserialize, Serialize};
-use std::fs;
-use std::path::Path;
+use std::fs::{self, OpenOptions};
+use std::io::Write;
+use std::net::IpAddr;
+use std::path::{Path, PathBuf};
 use std::process::Command;
+use wireguard_control::{Backend, Device, DeviceUpdate, InterfaceName, Key, KeyPair, PeerConfigBuilder};
+
+const DEFAULT_PRIVATE_KEY_PATH: &str = "/etc/labprobe/wireguard/private.key";
+
+/// A public endpoint profile belongs to exactly one updater.  DDNS and STUN
+/// are separate profiles so two background jobs can never race on one client
+/// endpoint.  The Agent does not resolve these values; it only preserves and
+/// reports the selected source as part of the desired configuration.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Default)]
+#[serde(rename_all = "camelCase")]
+pub struct WireGuardEndpointProfile {
+    pub id: String,
+    pub endpoint_source: String,
+    #[serde(default)]
+    pub hostname: String,
+    #[serde(default)]
+    pub public_endpoint: String,
+    #[serde(default)]
+    pub resolved_endpoint: String,
+    #[serde(default)]
+    pub stun_rule_id: String,
+    #[serde(default)]
+    pub binding_mode: String,
+    #[serde(default)]
+    pub transport_protocol: String,
+    #[serde(default)]
+    pub local_target_port: u16,
+    #[serde(default)]
+    pub port: u16,
+    #[serde(default)]
+    pub endpoint_revision: u64,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+#[serde(rename_all = "camelCase")]
+pub struct WireGuardPeerDesired {
+    pub id: String,
+    #[serde(default)]
+    pub name: String,
+    pub public_key: String,
+    pub allowed_ips: Vec<String>,
+    #[serde(default)]
+    pub persistent_keepalive_seconds: u16,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+#[serde(rename_all = "camelCase")]
+pub struct WireGuardServerDesired {
+    #[serde(default = "default_interface_name")]
+    pub interface_name: String,
+    #[serde(default = "default_server_address")]
+    pub address: String,
+    #[serde(default = "default_listen_port")]
+    pub listen_port: u16,
+    #[serde(default = "default_true")]
+    pub enabled: bool,
+    #[serde(default)]
+    pub revision: u64,
+    #[serde(default)]
+    pub peers: Vec<WireGuardPeerDesired>,
+    #[serde(default)]
+    pub endpoint_profiles: Vec<WireGuardEndpointProfile>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+#[serde(rename_all = "camelCase")]
+pub struct WireGuardApplyResult {
+    pub ok: bool,
+    pub interface_name: String,
+    pub public_key: String,
+    pub listen_port: u16,
+    pub peer_count: usize,
+    pub enabled: bool,
+    pub revision: u64,
+    pub control_backend: String,
+}
+
+fn default_interface_name() -> String { "labwg0".into() }
+fn default_server_address() -> String { "10.77.0.1/24".into() }
+fn default_listen_port() -> u16 { 51820 }
+fn default_true() -> bool { true }
 
 /// Per-interface WireGuard status. Public key is safe to report; the private
 /// key is never read, parsed, logged or serialized.
@@ -33,6 +115,12 @@ pub struct WireGuardInterfaceStatus {
 pub struct WireGuardStatus {
     pub supported: bool,
     pub wg_tool_available: bool,
+    pub kernel_supported: bool,
+    pub control_tool_available: bool,
+    /// True when Agent can provision through Generic Netlink even if `wg`
+    /// is not installed.
+    pub provisioning_ready: bool,
+    pub control_backend: String,
     pub kernel_support: bool,
     pub installed: bool,
     /// `true` when UCI contains a real `proto='wireguard'` interface OR a
@@ -52,10 +140,16 @@ impl WireGuardStatus {
     /// located; never treated as an error condition by callers.
     fn without_wg_tool(kernel_support: bool, uci_error: Option<String>) -> Self {
         Self {
-            supported: false,
+            // Runtime configuration uses the kernel Generic Netlink API and
+            // does not require the optional `wg` CLI.
+            supported: kernel_support,
             wg_tool_available: false,
+            kernel_supported: kernel_support,
+            control_tool_available: false,
+            provisioning_ready: kernel_support,
+            control_backend: if kernel_support { "kernel-netlink".into() } else { "unavailable".into() },
             kernel_support,
-            installed: false,
+            installed: kernel_support,
             configured: false,
             running: false,
             interfaces: Vec::new(),
@@ -71,6 +165,10 @@ impl WireGuardStatus {
         Self {
             supported: kernel_support,
             wg_tool_available: true,
+            kernel_supported: kernel_support,
+            control_tool_available: true,
+            provisioning_ready: kernel_support,
+            control_backend: if kernel_support { "kernel-netlink".into() } else { "unavailable".into() },
             kernel_support,
             installed: true,
             configured: false,
@@ -351,6 +449,209 @@ fn is_ascii_interface_name(name: &str) -> bool {
             .all(|ch| ch.is_ascii_alphanumeric() || matches!(ch, '.' | '-' | '_' | '@'))
 }
 
+fn parse_cidr(value: &str) -> Result<(IpAddr, u8)> {
+    let (address, prefix) = value
+        .split_once('/')
+        .ok_or_else(|| anyhow::anyhow!("CIDR prefix is required"))?;
+    let address: IpAddr = address.parse().context("invalid IP address")?;
+    let prefix: u8 = prefix.parse().context("invalid CIDR prefix")?;
+    let maximum = if address.is_ipv4() { 32 } else { 128 };
+    if prefix > maximum {
+        bail!("CIDR prefix out of range");
+    }
+    Ok((address, prefix))
+}
+
+/// Validate an untrusted Hub document before it reaches the kernel API.
+/// Private/preshared keys are deliberately not part of this schema.
+pub fn validate_server_desired(config: &WireGuardServerDesired) -> Result<()> {
+    if !is_ascii_interface_name(&config.interface_name)
+        || config.interface_name.len() > 15
+        || config.interface_name == "lo"
+    {
+        bail!("invalid WireGuard interface name");
+    }
+    if config.listen_port == 0 {
+        bail!("WireGuard server requires a fixed UDP listen port");
+    }
+    let (server_ip, _) = parse_cidr(&config.address)?;
+    if !server_ip.is_ipv4() {
+        bail!("MVP server address must be IPv4");
+    }
+    let mut profile_ids = std::collections::BTreeSet::new();
+    for profile in &config.endpoint_profiles {
+        if profile.id.is_empty() || !profile_ids.insert(profile.id.as_str()) {
+            bail!("endpoint profile ids must be unique");
+        }
+        if !matches!(profile.endpoint_source.as_str(), "ddns" | "stun") {
+            bail!("endpointSource must be ddns or stun");
+        }
+        if profile.endpoint_source == "ddns" && profile.hostname.trim().is_empty() {
+            bail!("DDNS endpoint profile requires hostname");
+        }
+        if profile.endpoint_source == "ddns" && profile.binding_mode != "fixed-port" {
+            bail!("DDNS endpoint profile requires fixed-port binding");
+        }
+        if profile.endpoint_source == "stun" && !profile.hostname.trim().is_empty() {
+            bail!("STUN endpoint profile cannot share a DDNS hostname");
+        }
+        if profile.endpoint_source == "stun"
+            && (profile.stun_rule_id.is_empty()
+                || profile.binding_mode != "udp-sidecar"
+                || profile.transport_protocol != "UDP"
+                || profile.local_target_port != config.listen_port)
+        {
+            bail!("STUN endpoint profile requires a dedicated UDP sidecar to the fixed WireGuard port");
+        }
+    }
+    let mut peer_ids = std::collections::BTreeSet::new();
+    let mut peer_keys = std::collections::BTreeSet::new();
+    for peer in &config.peers {
+        if peer.id.is_empty() || !peer_ids.insert(peer.id.as_str()) {
+            bail!("peer ids must be unique");
+        }
+        Key::from_base64(peer.public_key.trim()).map_err(|_| anyhow::anyhow!("invalid peer public key"))?;
+        if !peer_keys.insert(peer.public_key.trim()) {
+            bail!("peer public keys must be unique");
+        }
+        if peer.allowed_ips.is_empty() {
+            bail!("peer requires at least one allowed IP");
+        }
+        for allowed in &peer.allowed_ips {
+            parse_cidr(allowed)?;
+        }
+        if peer.persistent_keepalive_seconds > 600 {
+            bail!("persistent keepalive is out of range");
+        }
+    }
+    Ok(())
+}
+
+fn private_key_path() -> PathBuf {
+    std::env::var_os("LABPROBE_WIREGUARD_PRIVATE_KEY")
+        .map(PathBuf::from)
+        .unwrap_or_else(|| PathBuf::from(DEFAULT_PRIVATE_KEY_PATH))
+}
+
+fn load_or_create_keypair(path: &Path) -> Result<KeyPair> {
+    if path.exists() {
+        let raw = fs::read_to_string(path).context("read local WireGuard key")?;
+        let private = Key::from_base64(raw.trim())
+            .map_err(|_| anyhow::anyhow!("local WireGuard key is invalid"))?;
+        return Ok(KeyPair::from_private(private));
+    }
+    if let Some(parent) = path.parent() {
+        fs::create_dir_all(parent).context("create WireGuard key directory")?;
+    }
+    let pair = KeyPair::generate();
+    let mut options = OpenOptions::new();
+    options.write(true).create_new(true);
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::OpenOptionsExt;
+        options.mode(0o600);
+    }
+    let mut file = options.open(path).context("create local WireGuard key")?;
+    file.write_all(pair.private.to_base64().as_bytes())
+        .context("write local WireGuard key")?;
+    file.write_all(b"\n").context("finish local WireGuard key")?;
+    file.sync_all().context("sync local WireGuard key")?;
+    Ok(pair)
+}
+
+#[cfg(target_os = "linux")]
+fn configure_link(config: &WireGuardServerDesired) -> Result<()> {
+    let ip = find_tool("ip").ok_or_else(|| anyhow::anyhow!("ip tool is required to assign the tunnel address"))?;
+    // No shell is involved; every argument is validated and passed directly.
+    run_capture(&ip, &["address", "replace", &config.address, "dev", &config.interface_name])?;
+    run_capture(&ip, &["link", "set", "dev", &config.interface_name, if config.enabled { "up" } else { "down" }])?;
+    Ok(())
+}
+
+/// Apply the desired server through the kernel Generic Netlink backend.  This
+/// does not invoke `wg` and therefore works on the BE72 firmware where the
+/// kernel module exists but wireguard-tools is absent.
+#[cfg(target_os = "linux")]
+pub fn apply_server(config: &WireGuardServerDesired) -> Result<WireGuardApplyResult> {
+    validate_server_desired(config)?;
+    let keypair = load_or_create_keypair(&private_key_path())?;
+    let interface: InterfaceName = config.interface_name.parse()
+        .map_err(|_| anyhow::anyhow!("invalid WireGuard interface name"))?;
+    let mut update = DeviceUpdate::new()
+        .set_private_key(keypair.private.clone())
+        .set_listen_port(config.listen_port)
+        .replace_peers();
+    for peer in &config.peers {
+        let public = Key::from_base64(peer.public_key.trim())
+            .map_err(|_| anyhow::anyhow!("invalid peer public key"))?;
+        let mut builder = PeerConfigBuilder::new(&public).replace_allowed_ips();
+        for allowed in &peer.allowed_ips {
+            let (address, prefix) = parse_cidr(allowed)?;
+            builder = builder.add_allowed_ip(address, prefix);
+        }
+        if peer.persistent_keepalive_seconds > 0 {
+            builder = builder.set_persistent_keepalive_interval(peer.persistent_keepalive_seconds);
+        } else {
+            builder = builder.unset_persistent_keepalive();
+        }
+        update = update.add_peer(builder);
+    }
+    update.apply(&interface, Backend::Kernel).context("apply WireGuard kernel configuration")?;
+    configure_link(config)?;
+    Ok(WireGuardApplyResult {
+        ok: true,
+        interface_name: config.interface_name.clone(),
+        public_key: keypair.public.to_base64(),
+        listen_port: config.listen_port,
+        peer_count: config.peers.len(),
+        enabled: config.enabled,
+        revision: config.revision,
+        control_backend: "kernel-netlink".into(),
+    })
+}
+
+#[cfg(not(target_os = "linux"))]
+pub fn apply_server(config: &WireGuardServerDesired) -> Result<WireGuardApplyResult> {
+    validate_server_desired(config)?;
+    bail!("WireGuard kernel control is supported only on Linux")
+}
+
+pub fn stop_server(interface_name: &str) -> Result<()> {
+    if !is_ascii_interface_name(interface_name) || interface_name.len() > 15 {
+        bail!("invalid WireGuard interface name");
+    }
+    #[cfg(target_os = "linux")]
+    {
+        let ip = find_tool("ip").ok_or_else(|| anyhow::anyhow!("ip tool is unavailable"))?;
+        run_capture(&ip, &["link", "set", "dev", interface_name, "down"])?;
+        Ok(())
+    }
+    #[cfg(not(target_os = "linux"))]
+    bail!("WireGuard kernel control is supported only on Linux")
+}
+
+pub fn delete_server(interface_name: &str) -> Result<()> {
+    if !is_ascii_interface_name(interface_name) || interface_name.len() > 15 {
+        bail!("invalid WireGuard interface name");
+    }
+    #[cfg(target_os = "linux")]
+    {
+        let interface: InterfaceName = interface_name.parse()
+            .map_err(|_| anyhow::anyhow!("invalid WireGuard interface name"))?;
+        let exists = Device::list(Backend::Kernel)
+            .context("list WireGuard devices")?
+            .iter()
+            .any(|name| name == &interface);
+        if !exists {
+            return Ok(());
+        }
+        let device = Device::get(&interface, Backend::Kernel).context("read WireGuard device")?;
+        device.delete().context("delete WireGuard device")
+    }
+    #[cfg(not(target_os = "linux"))]
+    bail!("WireGuard kernel control is supported only on Linux")
+}
+
 /// Find a tool on PATH, preferring the plain name and falling back to a couple
 /// of conventional absolute locations used on OpenWrt.
 fn find_tool(name: &str) -> Option<String> {
@@ -507,6 +808,10 @@ pub fn detect_wireguard() -> WireGuardStatus {
     let mut status = WireGuardStatus {
         supported: wg_and_kernel,
         wg_tool_available: true,
+        kernel_supported: kernel_support,
+        control_tool_available: true,
+        provisioning_ready: kernel_support,
+        control_backend: if kernel_support { "kernel-netlink".into() } else { "unavailable".into() },
         kernel_support,
         installed: wg_and_kernel,
         configured: uci_configured || !interfaces.is_empty(),
@@ -580,6 +885,75 @@ mod tests {
         assert!(!status.running);
         assert!(status.interfaces.is_empty());
         assert_eq!(status.peer_count, 0);
+    }
+
+    #[test]
+    fn server_contract_keeps_endpoint_sources_separate() {
+        let peer = KeyPair::generate();
+        let desired = WireGuardServerDesired {
+            interface_name: "labwg0".into(),
+            address: "10.77.0.1/24".into(),
+            listen_port: 51820,
+            enabled: true,
+            revision: 7,
+            peers: vec![WireGuardPeerDesired {
+                id: "phone".into(),
+                name: "Phone".into(),
+                public_key: peer.public.to_base64(),
+                allowed_ips: vec!["10.77.0.2/32".into()],
+                persistent_keepalive_seconds: 25,
+            }],
+            endpoint_profiles: vec![
+                WireGuardEndpointProfile {
+                    id: "wg-ddns".into(),
+                    endpoint_source: "ddns".into(),
+                    hostname: "wg.example.test".into(),
+                    public_endpoint: String::new(),
+                    binding_mode: "fixed-port".into(),
+                    port: 51820,
+                    ..WireGuardEndpointProfile::default()
+                },
+                WireGuardEndpointProfile {
+                    id: "wg-stun".into(),
+                    endpoint_source: "stun".into(),
+                    hostname: String::new(),
+                    public_endpoint: "203.0.113.8:24567".into(),
+                    stun_rule_id: "stun-wireguard".into(),
+                    binding_mode: "udp-sidecar".into(),
+                    transport_protocol: "UDP".into(),
+                    local_target_port: 51820,
+                    port: 24567,
+                    ..WireGuardEndpointProfile::default()
+                },
+            ],
+        };
+        validate_server_desired(&desired).unwrap();
+        assert_eq!(desired.endpoint_profiles[0].endpoint_source, "ddns");
+        assert_eq!(desired.endpoint_profiles[1].endpoint_source, "stun");
+    }
+
+    #[test]
+    fn server_contract_rejects_mixed_stun_ddns_profile() {
+        let desired = WireGuardServerDesired {
+            interface_name: "labwg0".into(),
+            address: "10.77.0.1/24".into(),
+            listen_port: 51820,
+            enabled: true,
+            revision: 1,
+            peers: Vec::new(),
+            endpoint_profiles: vec![WireGuardEndpointProfile {
+                id: "bad".into(),
+                endpoint_source: "stun".into(),
+                hostname: "wg.example.test".into(),
+                public_endpoint: "203.0.113.8:24567".into(),
+                stun_rule_id: "stun-wireguard".into(),
+                binding_mode: "udp-sidecar".into(),
+                transport_protocol: "UDP".into(),
+                local_target_port: 51820,
+                ..WireGuardEndpointProfile::default()
+            }],
+        };
+        assert!(validate_server_desired(&desired).is_err());
     }
 
     #[test]
@@ -742,6 +1116,10 @@ mod tests {
         let status = WireGuardStatus {
             supported: true,
             wg_tool_available: true,
+            kernel_supported: true,
+            control_tool_available: true,
+            provisioning_ready: true,
+            control_backend: "kernel-netlink".into(),
             kernel_support: true,
             installed: true,
             configured: !interfaces.is_empty(),
@@ -779,6 +1157,10 @@ mod tests {
         let status = WireGuardStatus {
             supported: true,
             wg_tool_available: true,
+            kernel_supported: true,
+            control_tool_available: true,
+            provisioning_ready: true,
+            control_backend: "kernel-netlink".into(),
             kernel_support: true,
             installed: true,
             configured: true,
@@ -805,6 +1187,10 @@ mod tests {
         let status = WireGuardStatus {
             supported: true,
             wg_tool_available: true,
+            kernel_supported: true,
+            control_tool_available: true,
+            provisioning_ready: true,
+            control_backend: "kernel-netlink".into(),
             kernel_support: true,
             installed: true,
             configured: true,

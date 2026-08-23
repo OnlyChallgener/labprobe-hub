@@ -40,6 +40,7 @@ jobs:
             final_stability_patch.py followup_stability_patch.py \
             device_history_patch.py portmap_persistence_patch.py agent_presence_patch.py \
             router_task_manager_patch.py router_config_sync_patch.py stun_service.py \
+            wireguard_service.py \
             router_device_live_sync_patch.py router_lite_realtime_patch.py \
             labrelay_sync_patch.py router/firewall_automation.py
 

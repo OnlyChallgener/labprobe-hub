@@ -76,6 +76,9 @@ struct AgentState {
     last_credentials_refresh_nonce: u64,
     last_wireguard_at: u64,
     wireguard_status: Option<Value>,
+    wireguard_revision: u64,
+    wireguard_interface: String,
+    wireguard_apply_result: Option<Value>,
     last_ddns_address_at: u64,
     ddns_address: Option<Value>,
 }
@@ -1588,6 +1591,114 @@ async fn sync_stun(
     Ok(())
 }
 
+async fn sync_wireguard(
+    client: &Client,
+    config: &AgentConfig,
+    state: &mut AgentState,
+) -> Result<()> {
+    let router = url_encode(&config.router_name);
+    let root = get_json(
+        client,
+        config,
+        &format!("/api/router/wireguard/commands?router={}&limit=10", router),
+    )
+    .await?;
+    let commands = root
+        .get("commands")
+        .and_then(Value::as_array)
+        .cloned()
+        .unwrap_or_default();
+    if !commands.is_empty() {
+        let mut acks = Vec::new();
+        for command in commands {
+            let id = command.get("id").and_then(Value::as_str).unwrap_or("");
+            let action = command.get("action").and_then(Value::as_str).unwrap_or("");
+            let payload = command.get("payload").cloned().unwrap_or_else(|| json!({}));
+            let revision = command
+                .get("revision")
+                .or_else(|| payload.get("revision"))
+                .and_then(Value::as_u64)
+                .unwrap_or(0);
+            let result: Result<Value> = if revision < state.wireguard_revision {
+                Err(anyhow!("stale WireGuard revision"))
+            } else if revision == state.wireguard_revision && revision > 0 {
+                Ok(state.wireguard_apply_result.clone().unwrap_or_else(|| json!({
+                    "ok": true,
+                    "idempotent": true,
+                    "revision": revision,
+                    "interfaceName": state.wireguard_interface,
+                })))
+            } else {
+                (|| -> Result<Value> { match action {
+                    "apply" => {
+                        let desired_value = payload.get("server").cloned().unwrap_or(Value::Null);
+                        let mut desired: crate::wireguard::WireGuardServerDesired =
+                            serde_json::from_value(desired_value).context("invalid WireGuard server document")?;
+                        desired.revision = revision;
+                        let applied = crate::wireguard::apply_server(&desired)?;
+                        let value = serde_json::to_value(&applied)?;
+                        state.wireguard_interface = applied.interface_name.clone();
+                        Ok(value)
+                    }
+                    "stop" => {
+                        let interface = payload.get("interfaceName").and_then(Value::as_str)
+                            .filter(|value| !value.is_empty())
+                            .map(str::to_string)
+                            .unwrap_or_else(|| if state.wireguard_interface.is_empty() { "labwg0".into() } else { state.wireguard_interface.clone() });
+                        crate::wireguard::stop_server(&interface)?;
+                        state.wireguard_interface = interface.clone();
+                        Ok(json!({"ok":true,"interfaceName":interface,"enabled":false,"revision":revision,"controlBackend":"kernel-netlink"}))
+                    }
+                    "delete" => {
+                        let interface = payload.get("interfaceName").and_then(Value::as_str)
+                            .filter(|value| !value.is_empty())
+                            .map(str::to_string)
+                            .unwrap_or_else(|| if state.wireguard_interface.is_empty() { "labwg0".into() } else { state.wireguard_interface.clone() });
+                        crate::wireguard::delete_server(&interface)?;
+                        state.wireguard_interface = interface.clone();
+                        Ok(json!({"ok":true,"interfaceName":interface,"deleted":true,"revision":revision,"controlBackend":"kernel-netlink"}))
+                    }
+                    _ => Err(anyhow!("unsupported WireGuard action")),
+                }})()
+            };
+            match result {
+                Ok(value) => {
+                    if revision > state.wireguard_revision {
+                        state.wireguard_revision = revision;
+                        state.wireguard_apply_result = Some(value.clone());
+                    }
+                    acks.push(json!({"id":id,"ok":true,"revision":revision,"result":value}));
+                }
+                Err(error) => {
+                    acks.push(json!({"id":id,"ok":false,"revision":revision,"result":{"ok":false,"error":error.to_string()}}));
+                }
+            }
+        }
+        post_json(
+            client,
+            config,
+            &format!("/api/router/wireguard/ack?router={}", router),
+            &json!({"acks":acks}),
+        )
+        .await?;
+        state.last_command_at = now_epoch();
+    }
+    let capability = crate::wireguard::detect_wireguard();
+    post_json(
+        client,
+        config,
+        &format!("/api/router/wireguard/status?router={}", router),
+        &json!({
+            "revision": state.wireguard_revision,
+            "interfaceName": state.wireguard_interface,
+            "applyResult": state.wireguard_apply_result,
+            "capability": capability,
+        }),
+    )
+    .await?;
+    Ok(())
+}
+
 async fn agent_cycle(client: &Client, config: &AgentConfig, state: &mut AgentState) -> Result<()> {
     let user_list = collect_user_list()?;
     let mut current = BTreeMap::new();
@@ -1635,6 +1746,11 @@ pub async fn run(args: &[String], once: bool) -> Result<()> {
             if let Err(error) = sync_stun(&client, &config, &mut state).await {
                 let text = redact(&format!("stun status: {:#}", error), &config.hook_token);
                 log_limited(&config, &mut state, "WARN", "stun-status", &text);
+                errors.push(text);
+            }
+            if let Err(error) = sync_wireguard(&client, &config, &mut state).await {
+                let text = redact(&format!("wireguard status: {:#}", error), &config.hook_token);
+                log_limited(&config, &mut state, "WARN", "wireguard-status", &text);
                 errors.push(text);
             }
             last_status_at = now;

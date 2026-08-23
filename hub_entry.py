@@ -40,6 +40,7 @@ from router_task_manager_patch import install_router_task_manager_patch
 from router_ws_patch import install_router_ws_patch
 from router.ipv6 import create_ipv6_blueprint
 from stun_service import install_stun_service
+from wireguard_service import install_wireguard_service
 
 PREVIOUS_HUB_VERSION = "0.9.35"
 HUB_VERSION = "0.10.8"
@@ -80,6 +81,7 @@ install_hub_realtime_ws(hub, router_lite_realtime)
 install_router_config_sync_patch(hub, hub.ROUTER_TASK_MANAGER.client)
 install_firewall_automation(hub, hub.ROUTER_TASK_MANAGER.client)
 install_stun_service(hub, hub.ROUTER_TASK_MANAGER.client)
+install_wireguard_service(hub)
 install_lab_ddns(hub)
 install_agent_presence_patch(hub)
 install_device_history_patch(hub)

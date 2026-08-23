@@ -1,0 +1,131 @@
+import base64
+from pathlib import Path
+from types import SimpleNamespace
+
+import pytest
+from flask import Flask
+
+from wireguard_service import WireGuardService, install_wireguard_service
+
+
+PUBLIC_KEY = base64.b64encode(bytes(range(32))).decode()
+
+
+def _hub(tmp_path):
+    saved = {}
+
+    def load(path, default=None):
+        return saved.get(Path(path), default)
+
+    def save(path, value):
+        saved[Path(path)] = value
+
+    return SimpleNamespace(
+        DATA_DIR=tmp_path,
+        app=Flask(__name__),
+        load_json=load,
+        save_json=save,
+        check_app_token=lambda: True,
+        check_read_token=lambda: True,
+        check_hook_token=lambda: True,
+        _portmap_router_name=lambda: "Router",
+        _saved=saved,
+    )
+
+
+def _server():
+    return {
+        "expectedRevision": 0,
+        "interfaceName": "labwg0",
+        "address": "10.77.0.1/24",
+        "listenPort": 51820,
+        "enabled": True,
+        "peers": [{
+            "id": "phone",
+            "name": "Phone",
+            "publicKey": PUBLIC_KEY,
+            "allowedIps": ["10.77.0.2/32"],
+            "persistentKeepaliveSeconds": 25,
+        }],
+        "endpointProfiles": [
+            {
+                "id": "ddns-primary",
+                "endpointSource": "ddns",
+                "hostname": "wg.example.test",
+                "port": 51820,
+            },
+            {
+                "id": "stun-fallback",
+                "endpointSource": "stun",
+                "stunRuleId": "stun-wireguard",
+                "port": 24567,
+            },
+        ],
+    }
+
+
+def test_hub_rejects_private_and_preshared_keys(tmp_path):
+    service = WireGuardService(_hub(tmp_path))
+    payload = _server()
+    payload["privateKey"] = "must-never-reach-hub"
+    with pytest.raises(ValueError, match="私钥"):
+        service.put(payload, 0)
+
+    payload = _server()
+    payload["peers"][0]["presharedKey"] = "must-never-reach-hub"
+    with pytest.raises(ValueError, match="私钥"):
+        service.put(payload, 0)
+
+
+def test_ddns_and_stun_have_independent_endpoint_revisions(tmp_path):
+    service = WireGuardService(_hub(tmp_path))
+    saved = service.put(_server(), 0)
+    assert saved["revision"] == 1
+    assert saved["endpointRevision"] == 0
+    assert saved["server"]["endpointProfiles"][0]["bindingMode"] == "fixed-port"
+    assert saved["server"]["endpointProfiles"][1]["bindingMode"] == "udp-sidecar"
+    assert saved["server"]["endpointProfiles"][1]["localTargetPort"] == 51820
+
+    ddns = service.update_endpoint("ddns-primary", "ddns", "wg.example.test", 0)
+    stun = service.update_endpoint("stun-fallback", "stun", "203.0.113.8:24567", 0)
+    current = service.document()
+    assert current["revision"] == 1
+    assert current["endpointRevision"] == 2
+    assert ddns["endpointRevision"] == 1
+    assert stun["endpointRevision"] == 1
+    assert ddns["resolvedEndpoint"] == "wg.example.test:51820"
+    assert stun["resolvedEndpoint"] == "203.0.113.8:24567"
+
+
+def test_endpoint_updater_cannot_write_a_profile_owned_by_other_source(tmp_path):
+    service = WireGuardService(_hub(tmp_path))
+    service.put(_server(), 0)
+    with pytest.raises(ValueError, match="does not own"):
+        service.update_endpoint("ddns-primary", "stun", "203.0.113.8:24567", 0)
+
+
+def test_expected_revision_and_delete_tombstone_prevent_resurrection(tmp_path):
+    service = WireGuardService(_hub(tmp_path))
+    service.put(_server(), 0)
+    with pytest.raises(RuntimeError, match="revision conflict"):
+        service.put(_server(), 0)
+    deleted = service.delete(1)
+    assert deleted["revision"] == 2
+    assert deleted["server"] is None
+    assert deleted["tombstone"]["revision"] == 2
+    command = service.commands()[-1]
+    assert command["action"] == "delete"
+    assert command["revision"] == 2
+    assert command["payload"]["tombstone"] is True
+
+
+def test_agent_status_rejects_any_secret_material(tmp_path):
+    hub = _hub(tmp_path)
+    install_wireguard_service(hub)
+    client = hub.app.test_client()
+    response = client.post(
+        "/api/router/wireguard/status?router=Router",
+        json={"revision": 1, "privateKey": "never-store-this"},
+    )
+    assert response.status_code == 400
+    assert not (tmp_path / "wireguard_agent_status.json") in hub._saved
