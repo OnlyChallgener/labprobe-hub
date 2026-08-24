@@ -170,3 +170,36 @@ def test_error_translation_equivalence():
     assert isinstance(err2, RouterUnreachableError)
     assert err2.status_code == 502
     assert err2.code == "ROUTER_UNREACHABLE"
+
+
+def test_native_reyee_driver_mode():
+    from unittest.mock import MagicMock
+    from router_core.driver.reyee_rpc import ReyeeRpcClient
+    from router_core.driver.reyee_session import ReyeeSessionManager
+
+    mock_rpc = MagicMock(spec=ReyeeRpcClient)
+    mock_session_mgr = MagicMock(spec=ReyeeSessionManager)
+    mock_session_mgr.address = "https://192.168.110.1"
+    mock_session_mgr.is_valid.return_value = True
+    mock_rpc.session_manager = mock_session_mgr
+
+    mock_rpc.call.side_effect = lambda method, module, *args, **kwargs: {
+        ("devSta.get", "sysinfo"): {"data": {"hardware": {"cpu": 25.0}}},
+        ("devConfig.get", "port_mapping"): {"data": {"rules": [{"name": "web", "extPort": 80}]}},
+    }.get((method, module), {"data": {}})
+
+    driver = ReyeeEWebDriver(rpc_client=mock_rpc)
+    caps = driver.get_capabilities()
+    assert caps["configured"] is True
+    assert caps["features"]["dashboard"] is True
+
+    status = driver.get_status()
+    assert status["connected"] is True
+    assert status["state"] == "connected"
+
+    dash = driver.get_dashboard()
+    assert dash["hardware"]["cpu"] == 25.0
+
+    pm = driver.get_port_mappings()
+    assert len(pm["rules"]) == 1
+    assert pm["rules"][0]["extPort"] == 80
