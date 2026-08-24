@@ -3,6 +3,7 @@
 Formal architectural boundary for Router management in LabProbe Hub.
 """
 
+from .service import RouterService
 from .contracts import (
     RouterCapabilities,
     RouterStatus,
@@ -33,6 +34,7 @@ from .errors import (
 )
 
 __all__ = [
+    "RouterService",
     "RouterCapabilities",
     "RouterStatus",
     "NativePortMapRule",
