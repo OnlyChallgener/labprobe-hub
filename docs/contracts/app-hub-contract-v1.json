@@ -1,7 +1,7 @@
 {
   "version": "1.0.0",
   "extractedAt": "2026-08-24T16:33:00Z",
-  "totalRestEndpoints": 74,
+  "totalRestEndpoints": 76,
   "totalWebSocketTypes": 8,
   "rest": [
     {
@@ -39,6 +39,50 @@
         "message": "String",
         "errorCode": "String",
         "lastSuccessAt": "Long (epoch ms/s)"
+      }
+    },
+    {
+      "endpoint": "/api/router/config",
+      "method": "GET",
+      "caller": "MainActivity.kt",
+      "function": "getRouterConfig()",
+      "queryParams": [],
+      "requestBody": null,
+      "responseFields": {
+        "ok": "Boolean",
+        "name": "String",
+        "username": "String",
+        "address": "String",
+        "passwordConfigured": "Boolean",
+        "sessionSeconds": "Int",
+        "verifyTls": "Boolean",
+        "connected": "Boolean",
+        "state": "String",
+        "message": "String"
+      }
+    },
+    {
+      "endpoint": "/api/router/config",
+      "method": "PUT",
+      "caller": "MainActivity.kt",
+      "function": "putRouterConfig(config)",
+      "queryParams": [],
+      "requestBody": {
+        "name": "String",
+        "username": "String",
+        "address": "String",
+        "password": "String (optional; omitted preserves existing secret)",
+        "test": "Boolean"
+      },
+      "responseFields": {
+        "ok": "Boolean",
+        "name": "String",
+        "username": "String",
+        "address": "String",
+        "passwordConfigured": "Boolean",
+        "connected": "Boolean",
+        "state": "String",
+        "message": "String"
       }
     },
     {
@@ -1235,11 +1279,11 @@
     },
     {
       "endpoint": "/api/agent/update/check",
-      "method": "GET",
+      "method": "POST",
       "caller": "MainActivity.kt",
       "function": "checkAgentUpdate()",
       "queryParams": [],
-      "requestBody": null,
+      "requestBody": {},
       "responseFields": {
         "hasUpdate": "Boolean",
         "currentVersion": "String",

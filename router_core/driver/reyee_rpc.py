@@ -63,7 +63,7 @@ class ReyeeRpcClient:
         headers = {
             "Content-Type": "application/json;charset=UTF-8",
             "Cookie": cookie,
-            "User-Agent": "LabProbe-Hub/0.11.1",
+            "User-Agent": "LabProbe-Hub/0.11.2",
         }
         if endpoint_path.rstrip("/").endswith("/cmd"):
             secret = "Web@Rj$2020!"

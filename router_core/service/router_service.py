@@ -25,6 +25,8 @@ class RouterService:
         notify_config_change: Optional[Callable[[str, str, Dict[str, Any]], None]] = None,
         dashboard_loader: Optional[Callable[[bool], Dict[str, Any]]] = None,
         dashboard_refresher: Optional[Callable[[], Dict[str, Any]]] = None,
+        config_loader: Optional[Callable[[], Dict[str, Any]]] = None,
+        config_saver: Optional[Callable[[Dict[str, Any]], Dict[str, Any]]] = None,
     ):
         self._driver = driver
         self._cache = cache
@@ -32,6 +34,8 @@ class RouterService:
         self._notify_config_change = notify_config_change
         self._dashboard_loader = dashboard_loader
         self._dashboard_refresher = dashboard_refresher
+        self._config_loader = config_loader
+        self._config_saver = config_saver
 
     @property
     def driver(self) -> RouterDriver:
@@ -79,6 +83,16 @@ class RouterService:
             return self._driver.get_dashboard(force=force)
         except Exception as exc:
             raise from_legacy_error(exc) from exc
+
+    def get_connection_config(self) -> Dict[str, Any]:
+        if self._config_loader is None:
+            return {"ok": False, "error": "router_config_unavailable"}
+        return self._config_loader()
+
+    def save_connection_config(self, config: Dict[str, Any]) -> Dict[str, Any]:
+        if self._config_saver is None:
+            return {"ok": False, "error": "router_config_unavailable"}
+        return self._config_saver(config)
 
     def refresh_dashboard(self) -> Dict[str, Any]:
         try:

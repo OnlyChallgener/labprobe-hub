@@ -30,6 +30,7 @@ class ReyeeEWebDriver(RouterDriver):
         self._rpc_client = rpc_client
         self.cache = cache
         self.write_lock = threading.RLock()
+        self._rpc_lock = threading.RLock()
 
     @property
     def legacy_client(self) -> Optional[Any]:
@@ -228,7 +229,7 @@ class ReyeeEWebDriver(RouterDriver):
             ]), [])
             wan_values = wan if isinstance(wan, list) else []
             wireless_values = wireless if isinstance(wireless, list) else []
-            return {
+            result = {
                 "networkGroup": overview_values[0] if len(overview_values) > 0 else None,
                 "apList": overview_values[1] if len(overview_values) > 1 else None,
                 "eswNeighbor": overview_values[2] if len(overview_values) > 2 else None,
@@ -241,6 +242,22 @@ class ReyeeEWebDriver(RouterDriver):
                 "portStatus": optional(lambda: self.rpc("devSta.get", "port_status"), {}),
                 "updatedAt": int(time.time()),
             }
+
+            # The authenticated router WebSocket is the authoritative source
+            # for fast/slow telemetry. Keep it in the same raw dashboard shape
+            # consumed by RouterRpcCompatibilitySync instead of maintaining a
+            # second projection or polling the router for realtime values.
+            monitor = getattr(self, "router_ws_monitor", None)
+            if monitor is not None and hasattr(monitor, "snapshot"):
+                try:
+                    snapshot = monitor.snapshot()
+                    if isinstance(snapshot, dict):
+                        for key in ("static", "slow", "fast", "recent_wan", "daily_wan", "wsStatus"):
+                            if key in snapshot:
+                                result[key] = snapshot[key]
+                except Exception:
+                    pass
+            return result
 
         return self._cached("dashboard", 3.0, load, force)
 
@@ -504,10 +521,17 @@ class ReyeeEWebDriver(RouterDriver):
                 return self._legacy_client.ddns(force=force)
             if self._rpc_client:
                 def load() -> Dict[str, Any]:
-                    raw = self.rpc("devSta.get", "ddnsCfg")
+                    raw = self._unwrap_json(self.rpc("devSta.get", "ddnsCfg", no_parse=True))
                     if not isinstance(raw, dict):
                         return {"list": []}
-                    rows = raw.get("list") or raw.get("data") or []
+                    rows: Any = raw.get("list") or raw.get("services") or raw.get("records")
+                    if rows is None:
+                        nested = self._unwrap_json(raw.get("data"))
+                        if isinstance(nested, list):
+                            rows = nested
+                        elif isinstance(nested, dict):
+                            rows = nested.get("list") or nested.get("services") or nested.get("records") or []
+                    rows = rows or []
                     if isinstance(rows, list):
                         raw = {
                             **raw,
@@ -543,7 +567,7 @@ class ReyeeEWebDriver(RouterDriver):
             if self._legacy_client and hasattr(self._legacy_client, "update_ddns"):
                 return self._legacy_client.update_ddns(service_id, record, password)
             if self._rpc_client:
-                current = self.rpc("devSta.get", "ddnsCfg")
+                current = self.get_ddns(force=True)
                 rows = (current.get("list") or current.get("data") or []) if isinstance(current, dict) else []
                 old = next(
                     (row for row in rows if isinstance(row, dict) and str(row.get("service")) == service_id),
@@ -695,14 +719,15 @@ class ReyeeEWebDriver(RouterDriver):
         **kwargs: Any,
     ) -> Any:
         if self._rpc_client:
-            return self._rpc_client.rpc(
-                method=method,
-                module=module,
-                data=data,
-                no_parse=no_parse,
-                params=params,
-                **kwargs,
-            )
+            with self._rpc_lock:
+                return self._rpc_client.rpc(
+                    method=method,
+                    module=module,
+                    data=data,
+                    no_parse=no_parse,
+                    params=params,
+                    **kwargs,
+                )
         if self._legacy_client and hasattr(self._legacy_client, "rpc"):
             return self._legacy_client.rpc(
                 method,
@@ -715,7 +740,8 @@ class ReyeeEWebDriver(RouterDriver):
 
     def batch(self, calls: Any) -> Any:
         if self._rpc_client:
-            return self._rpc_client.batch(calls)
+            with self._rpc_lock:
+                return self._rpc_client.batch(calls)
         if self._legacy_client and hasattr(self._legacy_client, "batch"):
             return self._legacy_client.batch(calls)
         raise NotImplementedError("batch execution not available")

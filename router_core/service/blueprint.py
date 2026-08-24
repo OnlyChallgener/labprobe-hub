@@ -44,6 +44,15 @@ def create_router_blueprint_v1(
     def get_status():
         return jsonify(service.get_status())
 
+    @bp.get("/config")
+    def get_connection_config():
+        return jsonify(service.get_connection_config())
+
+    @bp.put("/config")
+    def save_connection_config():
+        body = request.get_json(silent=True) or {}
+        return jsonify(service.save_connection_config(body))
+
     @bp.get("/dashboard")
     def get_dashboard():
         force = request.args.get("force", "").lower() in ("1", "true")

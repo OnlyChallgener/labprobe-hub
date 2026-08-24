@@ -23,7 +23,7 @@ import paho.mqtt.client as mqtt
 from flask import Flask, request, jsonify, g
 from labprobe_storage import SQLiteStore
 
-APP_VERSION = "0.11.1"
+APP_VERSION = "0.11.2"
 PORT = int(os.environ.get("PORT", "58443"))
 BASE_DIR = Path(os.environ.get("LABPROBE_BASE_DIR", ".")).resolve()
 CONFIG_DIR = Path(os.environ.get("CONFIG_DIR", str(BASE_DIR / "config"))).resolve()
@@ -482,6 +482,9 @@ def hub_name() -> str:
 
 
 def primary_router_name() -> str:
+    runtime_name = str(globals().get("ROUTER_RUNTIME_NAME", "") or "").strip()
+    if runtime_name:
+        return runtime_name
     return env_compat(
         "PRIMARY_ROUTER_NAME", "PORTMAP_ROUTER_NAME",
         default=str(cfg_get("router.name", "")),

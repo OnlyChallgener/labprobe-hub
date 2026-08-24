@@ -5,8 +5,12 @@ Ensures zero contract drift across refactorings.
 """
 
 import json
+import re
 from pathlib import Path
 import pytest
+
+import hub
+import hub_entry  # noqa: F401 - installs the production Router Core routes
 
 
 def load_frozen_contract():
@@ -23,7 +27,7 @@ def test_frozen_contract_structure():
     assert "extractedAt" in data
     assert len(data["rest"]) == data["totalRestEndpoints"]
     assert len(data["websocket"][0]["frames"]) == data["totalWebSocketTypes"]
-    assert data["totalRestEndpoints"] == 74
+    assert data["totalRestEndpoints"] == 76
     assert data["totalWebSocketTypes"] == 8
 
 
@@ -32,6 +36,8 @@ def test_frozen_contract_endpoints_integrity():
     required_endpoints = {
         ("/api/router/capabilities", "GET"),
         ("/api/router/status", "GET"),
+        ("/api/router/config", "GET"),
+        ("/api/router/config", "PUT"),
         ("/api/router/port-mapping", "GET"),
         ("/api/router/port-mapping", "POST"),
         ("/api/router/port-mapping/{ruleName}", "PUT"),
@@ -84,7 +90,7 @@ def test_frozen_contract_endpoints_integrity():
         ("/api/router/beta-upgrade", "POST"),
         ("/api/router/realtime", "GET"),
         ("/api/devices/realtime", "GET"),
-        ("/api/agent/update/check", "GET"),
+        ("/api/agent/update/check", "POST"),
         ("/api/agent/update", "POST"),
         ("/api/agent/update/status", "GET"),
         ("/api/agent/cleanup", "POST"),
@@ -133,3 +139,24 @@ def test_frozen_contract_websocket_and_watchdog():
         "keepalive",
     }
     assert frame_types == expected_types
+
+
+def test_every_app_contract_endpoint_is_registered_in_production_hub():
+    data = load_frozen_contract()
+
+    def normalized(path: str) -> str:
+        path = re.sub(r"<(?:(?:path|string|int|float|uuid):)?[^>]+>", "{}", path)
+        return re.sub(r"\{[^}]+\}", "{}", path)
+
+    registered = {
+        (normalized(rule.rule), method)
+        for rule in hub.app.url_map.iter_rules()
+        for method in rule.methods
+        if method not in {"HEAD", "OPTIONS"}
+    }
+    expected = {
+        (normalized(item["endpoint"]), item["method"])
+        for item in data["rest"]
+    }
+
+    assert expected - registered == set()

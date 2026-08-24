@@ -51,6 +51,9 @@ _FAST_ROOT_NUMBER_FIELDS = {
     "cpuPercent": ("cpu_usage", "cpuUsage", "cpuutil", "cpuPercent"),
     "memoryPercent": ("memutil", "memoryPercent", "memory_usage"),
     "temperatureC": ("temp", "temperature", "temperatureC"),
+    "temperature2gC": ("temp_2g", "temperature2gC", "temperature_2g"),
+    "temperature5gC": ("temp_5g", "temperature5gC", "temperature_5g"),
+    "storagePercent": ("diskutil", "storagePercent", "disk_usage", "overlay_usage"),
 }
 
 
@@ -92,6 +95,13 @@ def _number(value: Any) -> Any:
         return float(str(value).strip().rstrip("%"))
     except (TypeError, ValueError):
         return _MISSING
+
+
+def _percent(value: Any) -> Any:
+    number = _number(value)
+    if number is _MISSING:
+        return _MISSING
+    return number * 100.0 if 0.0 < number <= 1.0 else number
 
 
 def _integer(value: Any) -> Any:
@@ -190,7 +200,8 @@ def normalize_fast_message(message: Dict[str, Any]) -> Dict[str, Any]:
         if number is not _MISSING:
             sample[target] = number
     for target, keys in _FAST_ROOT_NUMBER_FIELDS.items():
-        number = _number(_lookup_recursive(root, keys))
+        raw = _lookup_recursive(root, keys)
+        number = _percent(raw) if target in {"cpuPercent", "memoryPercent", "storagePercent"} else _number(raw)
         if number is not _MISSING:
             sample[target] = number
     return sample
@@ -214,6 +225,7 @@ class RouterWebSocketMonitor:
         self._low_thread: Optional[threading.Thread] = None
         self._low_frequency_messages: queue.Queue = queue.Queue(maxsize=32)
         self._fast_handler: Optional[Callable[[Dict[str, Any], int], None]] = None
+        self._slow_handler: Optional[Callable[[Dict[str, Any], int], None]] = None
         self._messages: Dict[str, Dict[str, Any]] = {}
         self._message_at: Dict[str, float] = {}
         self._fast_sample: Dict[str, Any] = {}
@@ -239,6 +251,24 @@ class RouterWebSocketMonitor:
     def stop(self) -> None:
         self._stop.set()
 
+    def restart(self) -> None:
+        """Reconnect after the Hub router configuration changes."""
+        self._stop.set()
+        for thread in (self._thread, self._low_thread):
+            if thread is not None and thread.is_alive():
+                thread.join(timeout=8.0)
+        with self._lock:
+            self._connected = False
+            self._authenticated_once = False
+            self._authenticated_at = 0.0
+            self._url = ""
+            self._last_error = ""
+        self._authenticated.clear()
+        self._stop = threading.Event()
+        self._thread = None
+        self._low_thread = None
+        self.start()
+
     def set_fast_handler(self, handler: Callable[[Dict[str, Any], int], None]) -> None:
         with self._fast_handler_lock:
             self._fast_handler = handler
@@ -250,6 +280,19 @@ class RouterWebSocketMonitor:
                 handler(dict(sample), epoch_ms)
             except Exception:
                 self.logger.debug("router fast handler rejected replayed frame", exc_info=True)
+
+    def set_slow_handler(self, handler: Callable[[Dict[str, Any], int], None]) -> None:
+        with self._fast_handler_lock:
+            self._slow_handler = handler
+        with self._lock:
+            message = dict(self._messages.get("slow") or {})
+            epoch_ms = int(self._message_at.get("slow", 0.0) * 1000)
+        sample = normalize_fast_message(message)
+        if sample and epoch_ms:
+            try:
+                handler(sample, epoch_ms)
+            except Exception:
+                self.logger.debug("router slow handler rejected replayed frame", exc_info=True)
 
     def wait_authenticated(self, timeout: float = 0.0) -> bool:
         return self._authenticated.wait(timeout=max(0.0, float(timeout or 0.0)))
@@ -361,6 +404,17 @@ class RouterWebSocketMonitor:
                     except Exception:
                         self.logger.debug("router fast handler failed; keeping websocket receiver alive", exc_info=True)
             return
+        if message_type == "slow":
+            epoch_ms = int(time.time() * 1000)
+            sample = normalize_fast_message(message)
+            if sample:
+                with self._fast_handler_lock:
+                    handler = self._slow_handler
+                if handler is not None:
+                    try:
+                        handler(dict(sample), epoch_ms)
+                    except Exception:
+                        self.logger.debug("router slow handler failed; keeping websocket receiver alive", exc_info=True)
         try:
             self._low_frequency_messages.put_nowait(message)
         except queue.Full:

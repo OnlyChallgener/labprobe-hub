@@ -39,7 +39,14 @@ _ROUTER_INTEGER_FIELDS = {
     "ipv6HalfConnections",
     "cps",
 }
-_ROUTER_NUMBER_FIELDS = {"cpuPercent", "memoryPercent", "temperatureC"}
+_ROUTER_NUMBER_FIELDS = {
+    "cpuPercent",
+    "memoryPercent",
+    "temperatureC",
+    "temperature2gC",
+    "temperature5gC",
+    "storagePercent",
+}
 
 
 def _integer(value: Any, default: int = 0) -> int:
@@ -239,6 +246,13 @@ class RouterRealtimeEngine:
 
     def accept_router_fast(self, sample: Any, sample_epoch_ms: int = 0) -> None:
         """Normalize one Reyee ``fast`` sample and publish the App router contract."""
+        self._accept_router_sample(sample, sample_epoch_ms, "router_eweb_ws_fast")
+
+    def accept_router_slow(self, sample: Any, sample_epoch_ms: int = 0) -> None:
+        """Merge slow eWeb fields such as storage without delaying APP refresh."""
+        self._accept_router_sample(sample, sample_epoch_ms, "router_eweb_ws_slow")
+
+    def _accept_router_sample(self, sample: Any, sample_epoch_ms: int, source: str) -> None:
         if not isinstance(sample, dict):
             return
         normalized: Dict[str, Any] = {}
@@ -270,7 +284,7 @@ class RouterRealtimeEngine:
             "sampleEpochMs": epoch_ms,
             "sampleAgeMs": max(0, int(time.time() * 1000) - epoch_ms),
             "sequence": sequence,
-            "source": "router_eweb_ws_fast",
+            "source": source,
             "stale": False,
             **merged,
             "error": "",

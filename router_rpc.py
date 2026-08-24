@@ -135,26 +135,59 @@ class EncryptedRouterConfigStore:
                     saved = json.loads(self.path.read_text(encoding="utf-8"))
                 except Exception:
                     saved = {}
-            address = _clean_url(os.environ.get("ROUTER_EWEB_URL") or saved.get("address") or DEFAULT_ROUTER_URL)
-            session_seconds = _safe_int(os.environ.get("ROUTER_SESSION_TIME") or saved.get("sessionSeconds"), 3600, 600, 7200)
-            password = os.environ.get("ROUTER_EWEB_PASSWORD", "")
+            managed = bool(saved.get("managed", False))
+            address = _clean_url(
+                (saved.get("address") if managed else os.environ.get("ROUTER_EWEB_URL"))
+                or saved.get("address")
+                or os.environ.get("ROUTER_EWEB_URL")
+                or DEFAULT_ROUTER_URL
+            )
+            session_seconds = _safe_int(
+                (saved.get("sessionSeconds") if managed else os.environ.get("ROUTER_SESSION_TIME"))
+                or saved.get("sessionSeconds")
+                or os.environ.get("ROUTER_SESSION_TIME"),
+                3600,
+                600,
+                7200,
+            )
+            password = "" if managed else os.environ.get("ROUTER_EWEB_PASSWORD", "")
             if not password and isinstance(saved.get("passwordEncrypted"), dict):
                 try:
                     password = self._decrypt(saved["passwordEncrypted"])
                 except Exception:
                     password = ""
+            verify_tls_value = (
+                saved.get("verifyTls", False)
+                if managed
+                else os.environ.get("ROUTER_VERIFY_TLS", saved.get("verifyTls", False))
+            )
             return {
+                "name": str(saved.get("name") or os.environ.get("PRIMARY_ROUTER_NAME") or "").strip(),
+                "username": str(saved.get("username") or os.environ.get("ROUTER_USERNAME") or "admin").strip(),
                 "address": address,
                 "password": password,
                 "sessionSeconds": session_seconds,
-                "verifyTls": str(os.environ.get("ROUTER_VERIFY_TLS") or saved.get("verifyTls") or "false").lower() == "true",
+                "verifyTls": str(verify_tls_value).lower() == "true",
+                "managed": managed,
             }
 
-    def save(self, address: str, password: Optional[str], session_seconds: int, verify_tls: bool = False) -> Dict[str, Any]:
+    def save(
+        self,
+        address: str,
+        password: Optional[str],
+        session_seconds: int,
+        verify_tls: bool = False,
+        *,
+        username: Optional[str] = None,
+        name: Optional[str] = None,
+    ) -> Dict[str, Any]:
         with self._lock:
             old = self.load()
             actual_password = old.get("password", "") if password is None else password
             payload = {
+                "managed": True,
+                "name": str(old.get("name", "") if name is None else name).strip(),
+                "username": str(old.get("username", "admin") if username is None else username).strip() or "admin",
                 "address": _clean_url(address),
                 "sessionSeconds": _safe_int(session_seconds, 3600, 600, 7200),
                 "verifyTls": bool(verify_tls),

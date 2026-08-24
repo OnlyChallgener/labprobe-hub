@@ -16,7 +16,6 @@ from hub_realtime_ws import install_hub_realtime_ws
 from labrelay_sync_patch import install_labrelay_sync_patch
 from lab_ddns import install_lab_ddns
 from portmap_persistence_patch import install_portmap_persistence_patch
-from router_build024_fix import install_router_build024_fix
 from router_compat import install_router_rpc_compat
 from router_config_sync_patch import install_router_config_sync_patch
 from router_control_actor_patch import install_router_control_actor_patch
@@ -45,46 +44,60 @@ from router_core.realtime.router_realtime import RouterRealtimeEngine, RealtimeF
 from router_core.service.router_service import RouterService
 from router_core.service.blueprint import create_router_blueprint_v1
 
-PREVIOUS_HUB_VERSION = "0.11.1-rc1"
-HUB_VERSION = "0.11.1"
+PREVIOUS_HUB_VERSION = "0.11.1"
+HUB_VERSION = "0.11.2"
 hub.APP_VERSION = HUB_VERSION
 
 # Initialize Router Core Single-Source-of-Truth
+router_config_store = EncryptedRouterConfigStore(Path(hub.CONFIG_DIR))
+
+
 def _resolve_router_settings():
-    legacy = EncryptedRouterConfigStore(Path(hub.CONFIG_DIR)).load()
+    legacy = router_config_store.load()
+    managed = bool(legacy.get("managed", False))
     host = (
-        hub.cfg_get("router.host")
+        (legacy.get("address") if managed else None)
+        or hub.cfg_get("router.host")
         or hub.cfg_get("router.address")
         or hub.cfg_get("router.ip")
+        or legacy.get("address")
         or os.environ.get("ROUTER_HOST")
         or os.environ.get("ROUTER_IP")
         or os.environ.get("ROUTER_ADDRESS")
-        or legacy.get("address")
         or "http://192.168.5.1"
     )
     password = (
-        hub.cfg_get("router.password")
-        or os.environ.get("ROUTER_PASSWORD")
+        (legacy.get("password") if managed else None)
+        or hub.cfg_get("router.password")
         or legacy.get("password")
+        or os.environ.get("ROUTER_PASSWORD")
         or ""
     )
     username = (
-        hub.cfg_get("router.username")
+        (legacy.get("username") if managed else None)
+        or hub.cfg_get("router.username")
+        or legacy.get("username")
         or os.environ.get("ROUTER_USERNAME")
         or "admin"
     )
     try:
         session_seconds = int(
-            hub.cfg_get("router.session_seconds")
+            (legacy.get("sessionSeconds") if managed else None)
+            or hub.cfg_get("router.session_seconds")
             or hub.cfg_get("router.sessionSeconds")
             or legacy.get("sessionSeconds")
+            or os.environ.get("ROUTER_SESSION_TIME")
             or 3600
         )
     except (TypeError, ValueError):
         session_seconds = 3600
-    verify_tls_value = hub.cfg_get(
-        "router.verify_tls",
-        hub.cfg_get("router.verifyTls", None),
+    verify_tls_value = (
+        legacy.get("verifyTls", False)
+        if managed
+        else hub.cfg_get(
+            "router.verify_tls",
+            hub.cfg_get("router.verifyTls", legacy.get("verifyTls", None)),
+        )
     )
     verify_tls = (
         bool(legacy.get("verifyTls", False))
@@ -101,6 +114,7 @@ def _resolve_router_settings():
 
 
 router_settings = _resolve_router_settings()
+hub.ROUTER_RUNTIME_NAME = str(router_config_store.load().get("name") or "").strip()
 
 router_session_mgr = ReyeeSessionManager(
     host=router_settings["host"],
@@ -121,8 +135,62 @@ hub.ROUTER_DRIVER = router_driver
 hub.ROUTER_CACHE = router_cache
 hub.ROUTER_REALTIME = router_realtime
 
+
+def _public_router_config() -> dict:
+    config = router_config_store.load()
+    status = router_driver.get_status()
+    return {
+        "ok": True,
+        "name": str(config.get("name") or hub.primary_router_name() or "").strip(),
+        "username": str(config.get("username") or "admin").strip(),
+        "address": str(config.get("address") or "").strip(),
+        "passwordConfigured": bool(config.get("password")),
+        "sessionSeconds": int(config.get("sessionSeconds") or 3600),
+        "verifyTls": bool(config.get("verifyTls", False)),
+        "connected": bool(status.get("connected", False)),
+        "state": str(status.get("state") or "unconfigured"),
+        "message": str(status.get("message") or ""),
+    }
+
+
+def _save_router_config(body: dict) -> dict:
+    current = router_config_store.load()
+    address = str(body.get("address") or current.get("address") or "").strip()
+    username = str(body.get("username") or current.get("username") or "admin").strip() or "admin"
+    name = str(body.get("name") if "name" in body else current.get("name") or "").strip()
+    password = body.get("password") if "password" in body and str(body.get("password") or "") else None
+    try:
+        session_seconds = int(body.get("sessionSeconds") or current.get("sessionSeconds") or 3600)
+    except (TypeError, ValueError):
+        session_seconds = 3600
+    saved = router_config_store.save(
+        address,
+        password,
+        session_seconds,
+        bool(body.get("verifyTls", current.get("verifyTls", False))),
+        username=username,
+        name=name,
+    )
+    router_session_mgr.reconfigure(
+        address=saved.get("address", ""),
+        password=saved.get("password", ""),
+        username=saved.get("username", "admin"),
+        verify_tls=bool(saved.get("verifyTls", False)),
+        session_seconds=int(saved.get("sessionSeconds") or 3600),
+    )
+    hub.ROUTER_RUNTIME_NAME = str(saved.get("name") or "").strip()
+    router_cache.clear()
+    monitor = getattr(router_driver, "router_ws_monitor", None)
+    if monitor is not None and hasattr(monitor, "restart"):
+        monitor.restart()
+    if bool(body.get("test", True)):
+        router_driver.login(force=True)
+        router_driver.rpc("acConfig.get", "network_group", no_parse=True)
+    return _public_router_config()
+
 # Existing App dashboard projection remains the public contract, but every
 # refresh now reads exclusively through the Router Core driver.
+install_router_relay_credentials_patch()
 router_sync = install_router_rpc_compat(hub)
 router_task_manager = RouterTaskManager(hub, router_driver, hub.LOGGER)
 hub.ROUTER_TASK_MANAGER = router_task_manager
@@ -134,6 +202,8 @@ router_service = RouterService(
     notify_config_change=lambda res, act, data: router_realtime.broadcast(RealtimeFrame.config(res, act, data)),
     dashboard_loader=router_sync.dashboard_snapshot,
     dashboard_refresher=router_sync.refresh_dashboard,
+    config_loader=_public_router_config,
+    config_saver=_save_router_config,
 )
 hub.ROUTER_SERVICE = router_service
 
@@ -156,6 +226,7 @@ install_hub_realtime_ws(hub, router_realtime, router_lite_realtime)
 router_ws_monitor = RouterWebSocketMonitor(router_driver, hub.LOGGER)
 router_driver.router_ws_monitor = router_ws_monitor
 router_ws_monitor.set_fast_handler(router_realtime.accept_router_fast)
+router_ws_monitor.set_slow_handler(router_realtime.accept_router_slow)
 router_ws_monitor.start()
 
 # Retained LabRelay & Product Extensions

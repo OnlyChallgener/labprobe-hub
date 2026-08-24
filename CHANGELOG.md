@@ -1,5 +1,15 @@
 # LabProbe 变更记录
 
+## 0.11.2
+
+- **Router Core 数据恢复**：原生 DDNS 正确解包 BE72 的 JSON/嵌套响应；eWeb WebSocket 的 2.4G、5G 温度和存储占用进入 Core realtime 与 Dashboard。
+- **宽带凭据恢复**：重新接入旧 main 已验证的 Hub 直读凭据入口，保留凭据仅驻内存；Relay 只在固件未暴露完整字段时执行原有路由器本地扩展读取。
+- **Agent 运维恢复**：更新命令使用实际解析成功的 GitHub/镜像源地址，过期命令不再阻塞“立即更新”和“一键清理”。
+- **Relay 扩展边界**：继续忽略 Relay 路由遥测，同时保留 LabProbe DDNS 地址与 WireGuard 扩展状态上报。
+- **路由连接设置**：新增受 APP Token 保护的 `GET/PUT /api/router/config`，配置加密落盘并在 Hub 内热切换 Router Core 会话与 WebSocket。
+- **接口验收**：CI 逐项核对 APP 的 76 个 HTTP 契约与 Hub 生产路由表。
+- **部署固定版本**：Docker Compose 默认镜像更新为 `onlychallgener/labprobe-hub:0.11.2`。
+
 ## 0.11.1
 
 - **BE72 生产认证**：恢复固件实际使用的 AES 登录载荷、序列号会话 Cookie、SID 校验与签名 CMD 请求。

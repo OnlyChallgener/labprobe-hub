@@ -178,6 +178,30 @@ class ReyeeSessionManager(RouterSessionProtocol):
         if session:
             session.touch()
 
+    def reconfigure(
+        self,
+        *,
+        address: str,
+        password: str,
+        username: str = "admin",
+        verify_tls: bool = False,
+        session_seconds: int = 3600,
+    ) -> None:
+        """Atomically apply a Hub-owned router connection configuration."""
+        raw_address = str(address or "").strip()
+        if raw_address and not re.match(r"^https?://", raw_address, re.I):
+            raw_address = f"http://{raw_address}"
+        with self._lock:
+            self.address = raw_address.rstrip("/")
+            self.password = str(password or "")
+            self.username = str(username or "admin").strip() or "admin"
+            self.verify_tls = bool(verify_tls)
+            self.session_seconds = max(600, min(7200, int(session_seconds or 3600)))
+            self._session = None
+            self._http.cookies.clear()
+            self._blocked_until = 0.0
+            self._consecutive_failures = 0
+
     def get_session(self, force: bool = False) -> ReyeeSession:
         """Thread-safe acquisition of a valid ReyeeSession using Single-Flight execution."""
         # Fast path: locally valid session

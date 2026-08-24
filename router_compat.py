@@ -32,6 +32,11 @@ def _number(value: Any, default: float = 0.0) -> float:
         return default
 
 
+def _percent(value: Any, default: float = 0.0) -> float:
+    number = _number(value, default)
+    return number * 100.0 if 0.0 < number <= 1.0 else number
+
+
 def _integer(value: Any, default: int = 0) -> int:
     try:
         return int(float(str(value).strip().rstrip("%")))
@@ -311,8 +316,8 @@ class RouterRpcCompatibilitySync:
         model = _clean(ap.get("devModel") or ap.get("deviceType") or ap.get("product") or _first(identity_source, "model", "devModel", "deviceType"))
         serial = _clean(ap.get("serialNumber") or _first(identity_source, "serialNumber", "sn"))
 
-        cpu = _number(_first(fast, "cpu_usage", "cpuUsage", "cpuutil"), _number(_first(slow, "cpu_usage", "cpuUsage", "cpuutil")))
-        memory = _number(_first(fast, "memutil", "memoryPercent", "memory_usage"), _number(_first(slow, "memutil", "memoryPercent", "memory_usage")))
+        cpu = _percent(_first(fast, "cpu_usage", "cpuUsage", "cpuutil"), _percent(_first(slow, "cpu_usage", "cpuUsage", "cpuutil")))
+        memory = _percent(_first(fast, "memutil", "memoryPercent", "memory_usage"), _percent(_first(slow, "memutil", "memoryPercent", "memory_usage")))
         storage_value = _first(slow, "diskutil", "storagePercent", "disk_usage", "overlay_usage", default=None)
         temperature = _number(_first(fast, "temp", "temperature", "temperatureC"), _number(_first(slow, "temp", "temperature", "temperatureC")))
         temperature2g = _number(_first(fast, "temp_2g", "temperature2gC"), _number(_first(slow, "temp_2g", "temperature2gC")))
@@ -403,7 +408,7 @@ class RouterRpcCompatibilitySync:
                 "temperature5gC": temperature5g,
                 "cpuPercent": cpu,
                 "memoryPercent": memory,
-                "storagePercent": None if storage_value in (None, "") else _number(storage_value),
+                "storagePercent": None if storage_value in (None, "") else _percent(storage_value),
                 "uptimeSeconds": uptime,
                 "onlineDeviceCount": self._device_total,
                 "wan": {
