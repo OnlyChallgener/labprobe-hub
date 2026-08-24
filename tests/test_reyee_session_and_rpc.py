@@ -229,3 +229,69 @@ def test_circuit_breaker_on_repeated_auth_failures():
     with pytest.raises(RouterAuthError) as exc_info:
         mgr.get_session()
     assert "retry paused" in str(exc_info.value)
+
+
+def test_reyee_rpc_client_rpc_with_no_parse_and_wire_payload():
+    """Validates rpc() constructs eWeb params payload with module, data, noParse."""
+    mock_mgr = MagicMock(spec=ReyeeSessionManager)
+    mock_mgr.address = "https://192.168.110.1"
+    mock_mgr.verify_tls = False
+    mock_mgr.http_timeout = (4, 12)
+    mock_mgr.get_session.return_value = ReyeeSession("sid_123", "tok_123", "sysauth=sid_123")
+
+    mock_http = MagicMock()
+    mock_mgr.http_session = mock_http
+
+    resp = MagicMock()
+    resp.status_code = 200
+    resp.json.return_value = {"code": 0, "data": [{"mac": "00:11:22:33:44:55"}]}
+    mock_http.post.return_value = resp
+
+    client = ReyeeRpcClient(mock_mgr)
+    res = client.rpc(
+        method="devSta.get",
+        module="user_list",
+        data={"devType": "all", "dataType": "timely"},
+        no_parse=True,
+    )
+
+    assert res["code"] == 0
+    assert len(res["data"]) == 1
+
+    # Verify wire payload passed into mock_http.post
+    call_args = mock_http.post.call_args
+    assert call_args is not None
+    posted_json = call_args.kwargs["json"]
+    assert posted_json["method"] == "devSta.get"
+    assert posted_json["params"]["module"] == "user_list"
+    assert posted_json["params"]["noParse"] is True
+    assert posted_json["params"]["data"] == {"devType": "all", "dataType": "timely"}
+    assert posted_json["params"]["device"] == "pc"
+
+
+def test_reyee_driver_rpc_and_batch_delegation():
+    """Validates ReyeeEWebDriver.rpc() and batch() delegate cleanly to ReyeeRpcClient."""
+    from router_core.driver.reyee import ReyeeEWebDriver
+
+    mock_rpc_client = MagicMock(spec=ReyeeRpcClient)
+    mock_rpc_client.rpc.return_value = {"ok": True, "source": "rpc_client"}
+    mock_rpc_client.batch.return_value = {"ok": True, "source": "batch"}
+
+    driver = ReyeeEWebDriver(rpc_client=mock_rpc_client)
+
+    # 1. Test rpc with no_parse
+    r1 = driver.rpc("devConfig.get", "network", no_parse=True)
+    assert r1["ok"] is True
+    mock_rpc_client.rpc.assert_called_once_with(
+        method="devConfig.get",
+        module="network",
+        data=None,
+        no_parse=True,
+        params=None,
+    )
+
+    # 2. Test batch
+    calls = [{"method": "devSta.get", "module": "sysinfo"}]
+    r2 = driver.batch(calls)
+    assert r2["ok"] is True
+    mock_rpc_client.batch.assert_called_once_with(calls)

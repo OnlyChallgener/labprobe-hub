@@ -9,7 +9,7 @@ Implements the official Wire Protocol:
 - Circuit breaker protects against infinite retry loops.
 """
 
-from typing import Any, Dict, Optional, Tuple
+from typing import Any, Dict, Optional, Tuple, Iterable
 import requests
 
 from router_core.driver.reyee_session import ReyeeSessionManager
@@ -59,6 +59,7 @@ class ReyeeRpcClient:
         headers = {
             "Content-Type": "application/json",
             "Cookie": session.cookie_header,
+            "User-Agent": "LabProbe-Hub/0.11.0",
         }
 
         req_timeout = timeout or self._session_manager.http_timeout
@@ -103,3 +104,52 @@ class ReyeeRpcClient:
         # Record activity on success (Idle Timeout refresh)
         self._session_manager.record_activity()
         return root
+
+    def rpc(
+        self,
+        method: str,
+        module: str = "",
+        data: Any = None,
+        no_parse: bool = False,
+        params: Any = None,
+        endpoint_path: str = "/cgi-bin/luci/api/cmd",
+        timeout: Optional[Tuple[int, int]] = None,
+        retry_auth: bool = True,
+        **kwargs: Any,
+    ) -> Any:
+        """Executes a legacy-compatible eWeb module RPC call with module/data/noParse wire payload."""
+        if params is None:
+            cmd_params: Dict[str, Any] = {
+                "module": module,
+                "noParse": bool(no_parse),
+                "async": None,
+                "remoteIp": False,
+                "device": "pc",
+            }
+            if data is not None:
+                cmd_params["data"] = data
+        else:
+            cmd_params = params
+
+        return self.call(
+            method=method,
+            params=cmd_params,
+            endpoint_path=endpoint_path,
+            timeout=timeout,
+            retry_auth=retry_auth,
+        )
+
+    def batch(self, calls: Iterable[Dict[str, Any]]) -> Any:
+        """Executes a batched eWeb array RPC call (cmdArr)."""
+        rows = []
+        for call in calls:
+            cmd_params: Dict[str, Any] = {
+                "module": call.get("module", ""),
+                "noParse": bool(call.get("noParse", False)),
+                "async": None,
+                "remoteIp": False,
+            }
+            if "data" in call:
+                cmd_params["data"] = call["data"]
+            rows.append({"method": call.get("method", ""), "params": cmd_params})
+        return self.call("cmdArr", {"device": "pc", "params": rows})

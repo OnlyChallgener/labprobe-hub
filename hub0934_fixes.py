@@ -299,6 +299,6 @@ def install_hub0934_fixes(hub: Any) -> None:
     pruned = _prune_redundant_portmap_commands(hub)
     hub.HUB0934_FIXES_INSTALLED = True
     hub.LOGGER.info(
-        "Hub 0.9.34 canonical devices, stable port-map time and credential scope enabled; pruned=%s",
+        "Hub canonical devices, stable port-map time and credential scope enabled; pruned=%s",
         pruned,
     )

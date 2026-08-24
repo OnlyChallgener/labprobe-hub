@@ -429,10 +429,38 @@ class ReyeeEWebDriver(RouterDriver):
     def upnp(self, force: bool = False) -> Dict[str, Any]:
         return self.get_upnp(force=force)
 
-    def rpc(self, method: str, module: str = "", params: Optional[Dict[str, Any]] = None) -> Dict[str, Any]:
+    def rpc(
+        self,
+        method: str,
+        module: str = "",
+        data: Any = None,
+        no_parse: bool = False,
+        params: Any = None,
+        **kwargs: Any,
+    ) -> Any:
         if self._rpc_client:
-            return self._rpc_client.call(method, module, params)
+            return self._rpc_client.rpc(
+                method=method,
+                module=module,
+                data=data,
+                no_parse=no_parse,
+                params=params,
+                **kwargs,
+            )
         if self._legacy_client and hasattr(self._legacy_client, "rpc"):
-            return self._legacy_client.rpc(method, module, params)
+            return self._legacy_client.rpc(
+                method,
+                module,
+                data=data,
+                no_parse=no_parse,
+                **kwargs,
+            )
         raise NotImplementedError("rpc execution not available")
+
+    def batch(self, calls: Any) -> Any:
+        if self._rpc_client:
+            return self._rpc_client.batch(calls)
+        if self._legacy_client and hasattr(self._legacy_client, "batch"):
+            return self._legacy_client.batch(calls)
+        raise NotImplementedError("batch execution not available")
 
