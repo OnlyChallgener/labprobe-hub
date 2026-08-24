@@ -51,7 +51,7 @@ def create_router_blueprint_v1(
 
     @bp.post("/dashboard/refresh")
     def refresh_dashboard():
-        return jsonify(service.get_dashboard(force=True))
+        return jsonify(service.refresh_dashboard())
 
     @bp.get("/devices")
     def get_devices():
@@ -205,11 +205,23 @@ def create_router_blueprint_v1(
             return jsonify({"ok": True, "data": data}), 202
         return jsonify({"ok": True, "data": {"kind": kind, "state": "started"}}), 202
 
+    @bp.get("/beta-upgrade")
+    def beta_upgrade_status():
+        if task_manager and hasattr(task_manager, "snapshot"):
+            return jsonify({"ok": True, "data": task_manager.snapshot("beta")})
+        return jsonify({"ok": True, "data": {"kind": "beta", "state": "idle"}})
+
     @bp.post("/beta-upgrade")
     def beta_upgrade():
         if task_manager and hasattr(task_manager, "start_beta"):
             return jsonify({"ok": True, "data": task_manager.start_beta()}), 202
         return jsonify({"ok": True, "data": {"state": "started"}}), 202
+
+    @bp.get("/nat-diagnostic")
+    def nat_diagnostic_status():
+        if task_manager and hasattr(task_manager, "snapshot"):
+            return jsonify({"ok": True, "data": task_manager.snapshot("nat")})
+        return jsonify({"ok": True, "data": {"kind": "nat", "state": "idle"}})
 
     @bp.post("/nat-diagnostic")
     def nat_diagnostic():

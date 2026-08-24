@@ -1,5 +1,13 @@
 # LabProbe 变更记录
 
+## 0.11.1
+
+- **BE72 生产认证**：恢复固件实际使用的 AES 登录载荷、序列号会话 Cookie、SID 校验与签名 CMD 请求。
+- **Router Core 唯一数据源**：Dashboard、路由状态、设备与配置 API 统一由 `ReyeeEWebDriver` 提供，RouterLite 只保留 Relay demand/ack 控制端点且不再接收实时数据。
+- **实时首帧恢复**：BE72 `fast` WebSocket 帧直接进入 `RouterRealtimeEngine`，生产 WSS 输出 APP 契约字段，并在数据流停滞时快速重连。
+- **原生能力接通**：设备、IPv6、端口映射、UPnP、防火墙、DDNS、NAT、自检和 Beta 查询均使用经旧版验证的 eWeb module envelope。
+- **部署固定版本**：Docker Compose 默认镜像固定为 `onlychallgener/labprobe-hub:0.11.1`，保留既有 APP/HOOK Token、MQTT 与 `config.yaml` 配置。
+
 ## 0.11.1-rc1
 
 - **Router Core 实时主链路**: Reyee eWeb `fast` 帧直接进入 `RouterRealtimeEngine`，生产 WSS 订阅 Core 引擎并向 APP 推送首帧与后续帧。

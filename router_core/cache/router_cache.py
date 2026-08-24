@@ -76,6 +76,10 @@ class RouterCache:
                 for k in to_delete:
                     del self._store[k]
 
+    def clear(self, key_or_prefix: str = "") -> None:
+        """Legacy controller-compatible alias for prefix invalidation."""
+        self.invalidate(key_or_prefix)
+
     def get_or_fetch(
         self,
         key: str,

@@ -5,7 +5,10 @@ Supports dual modes:
 2. Adapter Mode: Compatible wrapper over legacy RuijieRouterClient.
 """
 
-from typing import Any, Dict, List, Optional
+import json
+import threading
+import time
+from typing import Any, Callable, Dict, List, Optional
 from .base import RouterDriver
 from router_core.driver.reyee_rpc import ReyeeRpcClient
 from router_core.driver.reyee_session import ReyeeSessionManager
@@ -20,10 +23,13 @@ class ReyeeEWebDriver(RouterDriver):
         client: Optional[Any] = None,
         controller: Optional[Any] = None,
         rpc_client: Optional[ReyeeRpcClient] = None,
+        cache: Optional[Any] = None,
     ):
         self._legacy_client = client
         self._legacy_controller = controller
         self._rpc_client = rpc_client
+        self.cache = cache
+        self.write_lock = threading.RLock()
 
     @property
     def legacy_client(self) -> Optional[Any]:
@@ -77,6 +83,27 @@ class ReyeeEWebDriver(RouterDriver):
             return bool(self.login(force=force))
         except Exception:
             return False
+
+    def _cached(self, key: str, ttl: float, loader: Callable[[], Any], force: bool = False) -> Any:
+        if self.cache is None:
+            return loader()
+        return self.cache.get_or_fetch(key, loader, ttl=ttl, force=force)
+
+    def _invalidate(self, prefix: str) -> None:
+        if self.cache is not None:
+            self.cache.invalidate(prefix)
+
+    @staticmethod
+    def _unwrap_json(value: Any) -> Any:
+        current = value
+        for _ in range(6):
+            if isinstance(current, str):
+                text = current.strip()
+                if text.startswith(("{", "[")):
+                    current = json.loads(text)
+                    continue
+            break
+        return current
 
     def get_capabilities(self) -> Dict[str, Any]:
         try:
@@ -168,30 +195,54 @@ class ReyeeEWebDriver(RouterDriver):
                 return self._legacy_client.dashboard(force=force)
             except Exception:
                 pass
-        if self._rpc_client:
-            try:
-                mgr = self._rpc_client.session_manager
-                is_valid = getattr(mgr, "is_valid", lambda: False)()
-                has_pass = bool(getattr(mgr, "password", ""))
-                if is_valid or has_pass:
-                    res = self._rpc_client.call("devSta.get", "sysinfo")
-                    data = res.get("data", res)
-                    if isinstance(data, dict) and data and ("hardware" in data or "sysinfo" in data):
-                        return data
-            except Exception:
-                pass
-        try:
-            import hub
-            if hasattr(hub, "_router_dashboard_public"):
-                return hub._router_dashboard_public()
-        except Exception:
-            pass
-        return {
-            "router": "BE72",
-            "telemetry": {},
-            "details": {},
-            "wireguard": {},
-        }
+        if not self._rpc_client:
+            return {}
+
+        def load() -> Dict[str, Any]:
+            def optional(loader: Callable[[], Any], fallback: Any) -> Any:
+                try:
+                    return loader()
+                except Exception:
+                    return fallback
+
+            overview = self.batch([
+                {"method": "acConfig.get", "module": "network_group", "noParse": True},
+                {"method": "devSta.get", "module": "ap_list", "noParse": True},
+                {"method": "devSta.get", "module": "esw_neighbor", "noParse": True},
+                {
+                    "method": "devSta.get",
+                    "module": "neighbor",
+                    "noParse": True,
+                    "data": {"product": "GW_RGOS"},
+                },
+            ])
+            overview_values = overview if isinstance(overview, list) else []
+            network = optional(lambda: self.rpc("devConfig.get", "network"), {})
+            wan = optional(lambda: self.batch([
+                {"method": "devSta.get", "module": "ipinfo", "noParse": True},
+                {"method": "devSta.get", "module": "networkConnect", "data": {"ifname": "list"}},
+            ]), [])
+            wireless = optional(lambda: self.batch([
+                {"method": "acConfig.get", "module": "wireless"},
+                {"method": "devSta.get", "module": "rcgame"},
+            ]), [])
+            wan_values = wan if isinstance(wan, list) else []
+            wireless_values = wireless if isinstance(wireless, list) else []
+            return {
+                "networkGroup": overview_values[0] if len(overview_values) > 0 else None,
+                "apList": overview_values[1] if len(overview_values) > 1 else None,
+                "eswNeighbor": overview_values[2] if len(overview_values) > 2 else None,
+                "neighbor": overview_values[3] if len(overview_values) > 3 else None,
+                "network": network,
+                "ipinfo": wan_values[0] if len(wan_values) > 0 else None,
+                "networkConnect": wan_values[1] if len(wan_values) > 1 else None,
+                "wireless": wireless_values[0] if len(wireless_values) > 0 else None,
+                "rcgame": wireless_values[1] if len(wireless_values) > 1 else None,
+                "portStatus": optional(lambda: self.rpc("devSta.get", "port_status"), {}),
+                "updatedAt": int(time.time()),
+            }
+
+        return self._cached("dashboard", 3.0, load, force)
 
     def get_devices(self, force: bool = False) -> List[Dict[str, Any]]:
         try:
@@ -203,26 +254,52 @@ class ReyeeEWebDriver(RouterDriver):
                     return res["devices"]
                 return []
             if self._rpc_client:
-                res = self._rpc_client.call("devSta.get", "sta_info")
-                data = res.get("data", res)
-                if isinstance(data, list):
-                    return data
-                if isinstance(data, dict) and "devices" in data:
-                    return data["devices"]
-                return []
+                def load() -> List[Dict[str, Any]]:
+                    raw = self._unwrap_json(self.rpc(
+                        "devSta.get",
+                        "user_list",
+                        {"devType": "all", "dataType": "timely"},
+                        no_parse=True,
+                    ))
+                    rows = raw.get("list", []) if isinstance(raw, dict) else []
+                    result: List[Dict[str, Any]] = []
+                    for item in rows:
+                        if not isinstance(item, dict):
+                            continue
+                        result.append({
+                            **item,
+                            "mac": str(item.get("mac") or "").lower(),
+                            "ipv4": item.get("userIp") or "",
+                            "online": True,
+                            "realtimeUpBytes": int(item.get("flowUp") or 0),
+                            "realtimeDownBytes": int(item.get("flowDown") or 0),
+                            "connectionCount": int(item.get("flow_cnt") or 0),
+                        })
+                    return result
+                return self._cached("devices", 2.0, load, force)
             return []
         except Exception as exc:
             raise from_legacy_error(exc) from exc
 
     # --- Native Port Mapping ---
 
+    def _write_and_read(self, prefix: str, write: Callable[[], Any], read: Callable[[], Dict[str, Any]]) -> Dict[str, Any]:
+        with self.write_lock:
+            write()
+            self._invalidate(prefix)
+            return read()
+
     def get_port_mappings(self, force: bool = False) -> Dict[str, Any]:
         try:
             if self._legacy_client and hasattr(self._legacy_client, "native_port_mapping"):
                 return self._legacy_client.native_port_mapping(force=force)
             if self._rpc_client:
-                res = self._rpc_client.call("devConfig.get", "port_mapping")
-                return res.get("data", res)
+                return self._cached(
+                    "native-portmap",
+                    15.0,
+                    lambda: self.rpc("devConfig.get", "port_mapping"),
+                    force,
+                )
             raise NotImplementedError("native_port_mapping not available")
         except Exception as exc:
             raise from_legacy_error(exc) from exc
@@ -232,8 +309,11 @@ class ReyeeEWebDriver(RouterDriver):
             if self._legacy_client and hasattr(self._legacy_client, "add_native_port_mapping"):
                 return self._legacy_client.add_native_port_mapping(rule)
             if self._rpc_client:
-                res = self._rpc_client.call("devConfig.set", {"port_mapping": rule})
-                return res.get("data", res)
+                return self._write_and_read(
+                    "native-portmap",
+                    lambda: self.rpc("devConfig.add", "port_mapping", {"list": [rule]}),
+                    lambda: self.get_port_mappings(force=True),
+                )
             raise NotImplementedError("add_native_port_mapping not available")
         except Exception as exc:
             raise from_legacy_error(exc) from exc
@@ -243,8 +323,19 @@ class ReyeeEWebDriver(RouterDriver):
             if self._legacy_client and hasattr(self._legacy_client, "update_native_port_mapping"):
                 return self._legacy_client.update_native_port_mapping(old_name, rule)
             if self._rpc_client:
-                res = self._rpc_client.call("devConfig.set", {"port_mapping": rule, "old_name": old_name})
-                return res.get("data", res)
+                latest = self.get_port_mappings(force=True)
+                rows = latest.get("portMapping") or latest.get("list") or []
+                old = next(
+                    (row for row in rows if isinstance(row, dict) and str(row.get("ruleName")) == old_name),
+                    None,
+                )
+                if old is None:
+                    raise ValueError("Router native port mapping rule does not exist")
+                return self._write_and_read(
+                    "native-portmap",
+                    lambda: self.rpc("devConfig.update", "port_mapping", {"old": old, "new": rule}),
+                    lambda: self.get_port_mappings(force=True),
+                )
             raise NotImplementedError("update_native_port_mapping not available")
         except Exception as exc:
             raise from_legacy_error(exc) from exc
@@ -254,8 +345,11 @@ class ReyeeEWebDriver(RouterDriver):
             if self._legacy_client and hasattr(self._legacy_client, "delete_native_port_mapping"):
                 return self._legacy_client.delete_native_port_mapping(rule_name)
             if self._rpc_client:
-                res = self._rpc_client.call("devConfig.del", {"port_mapping": rule_name})
-                return res.get("data", res)
+                return self._write_and_read(
+                    "native-portmap",
+                    lambda: self.rpc("devConfig.del", "port_mapping", {"ruleName": [rule_name]}),
+                    lambda: self.get_port_mappings(force=True),
+                )
             raise NotImplementedError("delete_native_port_mapping not available")
         except Exception as exc:
             raise from_legacy_error(exc) from exc
@@ -267,8 +361,7 @@ class ReyeeEWebDriver(RouterDriver):
             if self._legacy_client and hasattr(self._legacy_client, "upnp"):
                 return self._legacy_client.upnp(force=force)
             if self._rpc_client:
-                res = self._rpc_client.call("devConfig.get", "upnp")
-                return res.get("data", res)
+                return self._cached("upnp", 10.0, lambda: self.rpc("devSta.get", "upnp"), force)
             raise NotImplementedError("upnp not available")
         except Exception as exc:
             raise from_legacy_error(exc) from exc
@@ -278,8 +371,18 @@ class ReyeeEWebDriver(RouterDriver):
             if self._legacy_client and hasattr(self._legacy_client, "set_upnp"):
                 return self._legacy_client.set_upnp(enabled, wan)
             if self._rpc_client:
-                res = self._rpc_client.call("devConfig.set", {"upnp": {"enabled": enabled, "wan": wan}})
-                return res.get("data", res)
+                latest = self.get_upnp(force=True)
+                payload = {
+                    "enable_upnp": "true" if enabled else "false",
+                    "upnpds": latest.get("upnpds") or [],
+                    "upnp_line": str(latest.get("upnp_line") or "1"),
+                    "wan": str(wan or latest.get("wan") or "AUTO").upper(),
+                }
+                return self._write_and_read(
+                    "upnp",
+                    lambda: self.rpc("devSta.set", "upnp", payload),
+                    lambda: self.get_upnp(force=True),
+                )
             raise NotImplementedError("set_upnp not available")
         except Exception as exc:
             raise from_legacy_error(exc) from exc
@@ -291,8 +394,25 @@ class ReyeeEWebDriver(RouterDriver):
             if self._legacy_client and hasattr(self._legacy_client, "firewall"):
                 return self._legacy_client.firewall(force=force)
             if self._rpc_client:
-                res = self._rpc_client.call("devConfig.get", "firewall")
-                return res.get("data", res)
+                def load() -> Dict[str, Any]:
+                    data = self.batch([
+                        {"method": "devConfig.get", "module": "ip_firewall"},
+                        {"method": "devSta.get", "module": "ip_firewall"},
+                    ])
+                    config = data[0] if isinstance(data, list) and len(data) > 0 and isinstance(data[0], dict) else {}
+                    stats = data[1] if isinstance(data, list) and len(data) > 1 and isinstance(data[1], dict) else {}
+                    stat_map = {
+                        str(row.get("uuid")): row
+                        for row in stats.get("list", [])
+                        if isinstance(row, dict)
+                    }
+                    rules = [
+                        {**rule, "stats": stat_map.get(str(rule.get("uuid")), {"packets": 0, "bytes": 0})}
+                        for rule in config.get("list", [])
+                        if isinstance(rule, dict)
+                    ]
+                    return {**config, "list": rules, "updatedAt": int(time.time())}
+                return self._cached("firewall", 5.0, load, force)
             raise NotImplementedError("firewall not available")
         except Exception as exc:
             raise from_legacy_error(exc) from exc
@@ -302,8 +422,11 @@ class ReyeeEWebDriver(RouterDriver):
             if self._legacy_client and hasattr(self._legacy_client, "add_firewall_rule"):
                 return self._legacy_client.add_firewall_rule(rule)
             if self._rpc_client:
-                res = self._rpc_client.call("devConfig.set", {"firewall_rule": rule})
-                return res.get("data", res)
+                return self._write_and_read(
+                    "firewall",
+                    lambda: self.rpc("devConfig.add", "ip_firewall", {"list": [rule]}),
+                    lambda: self.get_firewall(force=True),
+                )
             raise NotImplementedError("add_firewall_rule not available")
         except Exception as exc:
             raise from_legacy_error(exc) from exc
@@ -313,8 +436,12 @@ class ReyeeEWebDriver(RouterDriver):
             if self._legacy_client and hasattr(self._legacy_client, "update_firewall_rule"):
                 return self._legacy_client.update_firewall_rule(uuid, rule)
             if self._rpc_client:
-                res = self._rpc_client.call("devConfig.set", {"firewall_rule": rule, "uuid": uuid})
-                return res.get("data", res)
+                payload = {**rule, "uuid": uuid}
+                return self._write_and_read(
+                    "firewall",
+                    lambda: self.rpc("devConfig.update", "ip_firewall", {"list": [payload]}),
+                    lambda: self.get_firewall(force=True),
+                )
             raise NotImplementedError("update_firewall_rule not available")
         except Exception as exc:
             raise from_legacy_error(exc) from exc
@@ -324,8 +451,15 @@ class ReyeeEWebDriver(RouterDriver):
             if self._legacy_client and hasattr(self._legacy_client, "set_firewall_rule_enabled"):
                 return self._legacy_client.set_firewall_rule_enabled(uuid, enabled)
             if self._rpc_client:
-                res = self._rpc_client.call("devConfig.set", {"firewall_enabled": {"uuid": uuid, "enabled": enabled}})
-                return res.get("data", res)
+                return self._write_and_read(
+                    "firewall",
+                    lambda: self.rpc(
+                        "devConfig.update",
+                        "ip_firewall",
+                        {"list": [{"uuid": uuid, "enable": "1" if enabled else "0"}]},
+                    ),
+                    lambda: self.get_firewall(force=True),
+                )
             raise NotImplementedError("set_firewall_rule_enabled not available")
         except Exception as exc:
             raise from_legacy_error(exc) from exc
@@ -335,8 +469,11 @@ class ReyeeEWebDriver(RouterDriver):
             if self._legacy_client and hasattr(self._legacy_client, "delete_firewall_rule"):
                 return self._legacy_client.delete_firewall_rule(uuid)
             if self._rpc_client:
-                res = self._rpc_client.call("devConfig.del", {"firewall_rule": uuid})
-                return res.get("data", res)
+                return self._write_and_read(
+                    "firewall",
+                    lambda: self.rpc("devConfig.del", "ip_firewall", {"uuid": [uuid]}),
+                    lambda: self.get_firewall(force=True),
+                )
             raise NotImplementedError("delete_firewall_rule not available")
         except Exception as exc:
             raise from_legacy_error(exc) from exc
@@ -346,8 +483,15 @@ class ReyeeEWebDriver(RouterDriver):
             if self._legacy_client and hasattr(self._legacy_client, "reorder_firewall_rules"):
                 return self._legacy_client.reorder_firewall_rules(scope, uuids)
             if self._rpc_client:
-                res = self._rpc_client.call("devConfig.set", {"firewall_reorder": {"scope": scope, "uuids": uuids}})
-                return res.get("data", res)
+                return self._write_and_read(
+                    "firewall",
+                    lambda: self.rpc(
+                        "devConfig.update",
+                        "ip_firewall",
+                        {"op": "reorder", "scope": scope, "uuids": uuids},
+                    ),
+                    lambda: self.get_firewall(force=True),
+                )
             raise NotImplementedError("reorder_firewall_rules not available")
         except Exception as exc:
             raise from_legacy_error(exc) from exc
@@ -359,8 +503,22 @@ class ReyeeEWebDriver(RouterDriver):
             if self._legacy_client and hasattr(self._legacy_client, "ddns"):
                 return self._legacy_client.ddns(force=force)
             if self._rpc_client:
-                res = self._rpc_client.call("devConfig.get", "ddns")
-                return res.get("data", res)
+                def load() -> Dict[str, Any]:
+                    raw = self.rpc("devSta.get", "ddnsCfg")
+                    if not isinstance(raw, dict):
+                        return {"list": []}
+                    rows = raw.get("list") or raw.get("data") or []
+                    if isinstance(rows, list):
+                        raw = {
+                            **raw,
+                            "list": [
+                                {**row, "password": "", "passwordConfigured": bool(row.get("password"))}
+                                for row in rows
+                                if isinstance(row, dict)
+                            ],
+                        }
+                    return raw
+                return self._cached("ddns", 15.0, load, force)
             raise NotImplementedError("ddns not available")
         except Exception as exc:
             raise from_legacy_error(exc) from exc
@@ -370,8 +528,12 @@ class ReyeeEWebDriver(RouterDriver):
             if self._legacy_client and hasattr(self._legacy_client, "add_ddns"):
                 return self._legacy_client.add_ddns(record, password)
             if self._rpc_client:
-                res = self._rpc_client.call("devConfig.set", {"ddns": record, "password": password})
-                return res.get("data", res)
+                payload = {**record, "password": password}
+                return self._write_and_read(
+                    "ddns",
+                    lambda: self.rpc("devSta.add", "ddnsCfg", payload),
+                    lambda: self.get_ddns(force=True),
+                )
             raise NotImplementedError("add_ddns not available")
         except Exception as exc:
             raise from_legacy_error(exc) from exc
@@ -381,8 +543,24 @@ class ReyeeEWebDriver(RouterDriver):
             if self._legacy_client and hasattr(self._legacy_client, "update_ddns"):
                 return self._legacy_client.update_ddns(service_id, record, password)
             if self._rpc_client:
-                res = self._rpc_client.call("devConfig.set", {"ddns": record, "service_id": service_id, "password": password})
-                return res.get("data", res)
+                current = self.rpc("devSta.get", "ddnsCfg")
+                rows = (current.get("list") or current.get("data") or []) if isinstance(current, dict) else []
+                old = next(
+                    (row for row in rows if isinstance(row, dict) and str(row.get("service")) == service_id),
+                    {},
+                )
+                merged = {**old, **record, "service": service_id}
+                merged.pop("status", None)
+                merged.pop("ip", None)
+                if not password:
+                    merged["password"] = old.get("password", "")
+                else:
+                    merged["password"] = password
+                return self._write_and_read(
+                    "ddns",
+                    lambda: self.rpc("devSta.update", "ddnsCfg", {"data": [merged]}),
+                    lambda: self.get_ddns(force=True),
+                )
             raise NotImplementedError("update_ddns not available")
         except Exception as exc:
             raise from_legacy_error(exc) from exc
@@ -392,8 +570,11 @@ class ReyeeEWebDriver(RouterDriver):
             if self._legacy_client and hasattr(self._legacy_client, "delete_ddns"):
                 return self._legacy_client.delete_ddns(service_id)
             if self._rpc_client:
-                res = self._rpc_client.call("devConfig.del", {"ddns": service_id})
-                return res.get("data", res)
+                return self._write_and_read(
+                    "ddns",
+                    lambda: self.rpc("devSta.del", "ddnsCfg", {"data": [service_id]}),
+                    lambda: self.get_ddns(force=True),
+                )
             raise NotImplementedError("delete_ddns not available")
         except Exception as exc:
             raise from_legacy_error(exc) from exc
@@ -405,8 +586,8 @@ class ReyeeEWebDriver(RouterDriver):
             if self._legacy_client and hasattr(self._legacy_client, "ipv6_status"):
                 return self._legacy_client.ipv6_status()
             if self._rpc_client:
-                res = self._rpc_client.call("devSta.get", "ipinfo6")
-                return res.get("data", res)
+                from router.ipv6.mapper import map_status
+                return map_status(self.rpc("devSta.get", "ipinfo6")).to_dict()
             raise NotImplementedError("ipv6_status not available")
         except Exception as exc:
             raise from_legacy_error(exc) from exc
@@ -416,8 +597,8 @@ class ReyeeEWebDriver(RouterDriver):
             if self._legacy_client and hasattr(self._legacy_client, "ipv6_config"):
                 return self._legacy_client.ipv6_config()
             if self._rpc_client:
-                res = self._rpc_client.call("devConfig.get", "network6")
-                return res.get("data", res)
+                from router.ipv6.mapper import map_config
+                return map_config(self.rpc("devConfig.get", "network6")).to_dict()
             raise NotImplementedError("ipv6_config not available")
         except Exception as exc:
             raise from_legacy_error(exc) from exc
@@ -427,8 +608,14 @@ class ReyeeEWebDriver(RouterDriver):
             if self._legacy_client and hasattr(self._legacy_client, "dhcpv6_clients"):
                 return self._legacy_client.dhcpv6_clients()
             if self._rpc_client:
-                res = self._rpc_client.call("devSta.get", "dhcp_lease6")
-                return res.get("data", res)
+                from router.ipv6.mapper import map_clients
+                rows = map_clients(self.rpc(
+                    "devSta.get",
+                    "dhcp_lease6",
+                    {"index": 1, "size": 100, "macaddr": ""},
+                ))
+                clients = [row.to_dict() for row in rows]
+                return {"clients": clients, "total": len(clients)}
             raise NotImplementedError("dhcpv6_clients not available")
         except Exception as exc:
             raise from_legacy_error(exc) from exc
@@ -438,8 +625,13 @@ class ReyeeEWebDriver(RouterDriver):
             if self._legacy_client and hasattr(self._legacy_client, "save_ipv6_config"):
                 return self._legacy_client.save_ipv6_config(config)
             if self._rpc_client:
-                res = self._rpc_client.call("devConfig.set", {"network6": config})
-                return res.get("data", res)
+                from router.ipv6.mapper import map_config, merge_config
+                with self.write_lock:
+                    current = self.rpc("devConfig.get", "network6")
+                    payload = merge_config(current, config)
+                    self.rpc("devConfig.set", "network6", payload)
+                    verified = self.rpc("devConfig.get", "network6")
+                return map_config(verified).to_dict()
             raise NotImplementedError("save_ipv6_config not available")
         except Exception as exc:
             raise from_legacy_error(exc) from exc
@@ -451,8 +643,7 @@ class ReyeeEWebDriver(RouterDriver):
             if self._legacy_client and hasattr(self._legacy_client, "diagnostic"):
                 return self._legacy_client.diagnostic()
             if self._rpc_client:
-                res = self._rpc_client.call("devSta.get", "nat_detector")
-                return res.get("data", res)
+                return self.rpc("devSta.get", "dev_diag")
             raise NotImplementedError("diagnostic not available")
         except Exception as exc:
             raise from_legacy_error(exc) from exc
@@ -462,8 +653,8 @@ class ReyeeEWebDriver(RouterDriver):
             if self._legacy_client and hasattr(self._legacy_client, "start_diagnostic"):
                 return self._legacy_client.start_diagnostic()
             if self._rpc_client:
-                res = self._rpc_client.call("devSta.set", "nat_detector")
-                return res.get("data", res)
+                self.rpc("devSta.set", "dev_diag", {"user": "eweb", "action": "start"})
+                return self.rpc("devSta.get", "dev_diag")
             raise NotImplementedError("start_diagnostic not available")
         except Exception as exc:
             raise from_legacy_error(exc) from exc

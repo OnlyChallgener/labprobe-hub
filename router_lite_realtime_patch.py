@@ -135,12 +135,11 @@ class RouterLiteRealtimeService:
         self._client_demand_until = {
             key: until for key, until in self._client_demand_until.items() if until > now
         }
-        active = bool(self._client_demand_until)
         return {
             "ok": True,
             "sequence": self._demand_sequence,
             "routerActive": False,
-            "devicesActive": active,
+            "devicesActive": False,
             "demandClientCount": len(self._client_demand_until),
             "serverEpochMs": int(now * 1000),
         }
@@ -234,56 +233,11 @@ class RouterLiteRealtimeService:
     def accept_push(self, payload: Any) -> Dict[str, Any]:
         if not isinstance(payload, dict):
             raise ValueError("invalid realtime payload")
-
-        # Snapshot the APP-owned lease before touching sample memory. A Relay push
-        # never renews demand and cannot keep high-frequency collection alive.
         with self._demand:
             demand = self._demand_payload_locked()
-        devices_active = bool(demand["devicesActive"])
-
-        sample_epoch_ms = self._sample_epoch_ms(payload.get("sampleEpochMs"))
-        source = _clean_source(payload.get("source"))
-        agent_version = str(payload.get("agentVersion") or "").strip()[:32]
-        devices_supplied = devices_active and isinstance(payload.get("devices"), list)
-        devices = self._device_rows(payload.get("devices")) if devices_supplied else []
-
-        devices_event: Dict[str, Any] = {}
-        with self._lock:
-            if devices_supplied:
-                previous = {row["mac"]: row for row in self._devices}
-                changed_rows = [
-                    row for row in devices
-                    if previous.get(row["mac"]) != row
-                ]
-                changed = devices != self._devices or sample_epoch_ms != self._devices_epoch_ms
-                self._devices = devices
-                self._devices_epoch_ms = sample_epoch_ms
-                self._devices_source = source
-                self._devices_agent_version = agent_version
-                if changed:
-                    self._devices_sequence += 1
-                devices_event = {
-                    "ok": True,
-                    "sampleEpochMs": sample_epoch_ms,
-                    "sequence": self._devices_sequence,
-                    "source": source,
-                    "delta": True,
-                    "onlineDeviceCount": len(devices),
-                    "devices": changed_rows,
-                }
-
-        with self._lock:
-            publisher = self._app_realtime_publisher
-        if devices_event and self.router_realtime is not None:
-            self.router_realtime.accept_devices_realtime(
-                devices_event,
-                snapshot=self.devices_payload(),
-            )
-        elif devices_event and publisher is not None:
-            publisher.publish_devices_realtime(devices_event)
-
         demand["acceptedRouter"] = False
-        demand["acceptedDevices"] = devices_supplied
+        demand["acceptedDevices"] = False
+        demand["source"] = "router_core"
         return demand
 
     def router_payload(self) -> Dict[str, Any]:
@@ -321,6 +275,8 @@ class RouterLiteRealtimeService:
         }
 
     def devices_payload(self) -> Dict[str, Any]:
+        if self.router_realtime is not None:
+            return self.router_realtime.devices_payload()
         with self._lock:
             devices = [dict(row) for row in self._devices]
             epoch_ms = self._devices_epoch_ms

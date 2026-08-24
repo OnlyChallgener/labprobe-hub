@@ -23,7 +23,7 @@ import paho.mqtt.client as mqtt
 from flask import Flask, request, jsonify, g
 from labprobe_storage import SQLiteStore
 
-APP_VERSION = "0.11.1-rc1"
+APP_VERSION = "0.11.1"
 PORT = int(os.environ.get("PORT", "58443"))
 BASE_DIR = Path(os.environ.get("LABPROBE_BASE_DIR", ".")).resolve()
 CONFIG_DIR = Path(os.environ.get("CONFIG_DIR", str(BASE_DIR / "config"))).resolve()
@@ -2970,14 +2970,12 @@ def api_router_dashboard_push():
     })
 
 
-@app.route("/api/router/dashboard", methods=["GET"])
 def api_router_dashboard():
     if not check_read_token():
         return jsonify({"ok": False, "error": "unauthorized"}), 401
     return jsonify(_router_dashboard_public())
 
 
-@app.route("/api/router/dashboard/refresh", methods=["POST"])
 def api_router_dashboard_refresh():
     global ROUTER_DASHBOARD_REFRESH_NONCE
     if not check_app_token():

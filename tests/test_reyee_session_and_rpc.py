@@ -10,6 +10,7 @@ Validates:
 7. Circuit breaker cooldown on repeated authentication failures.
 """
 
+import json
 import threading
 import time
 from unittest.mock import MagicMock, patch
@@ -91,8 +92,19 @@ def test_dynamic_key_extraction_and_login():
     assert session.sid == "sid_abc_999"
     assert session.token == "tok_xyz_123"
     assert session.session_seconds == 1800
-    assert "sysauth=sid_abc_999" in session.cookie_header
+    assert session.cookie_header == "SN123456789=sid_abc_999"
     assert mgr.is_valid() is True
+
+    login_call = mock_http.post.call_args_list[0]
+    login_payload = json.loads(login_call.kwargs["data"].decode("utf-8"))
+    assert login_payload["method"] == "login"
+    assert set(login_payload["params"]) == {"password", "time", "encry", "limit", "setInit"}
+    assert "username" not in login_payload["params"]
+    assert "pwd" not in login_payload["params"]
+
+    probe_call = mock_http.post.call_args_list[1]
+    assert probe_call.args[0].endswith("/cgi-bin/luci/api/overview?auth=sid_abc_999")
+    assert probe_call.kwargs["headers"]["Cookie"] == "SN123456789=sid_abc_999"
 
 
 def test_single_flight_concurrent_login():
@@ -112,8 +124,10 @@ def test_single_flight_concurrent_login():
         "data": {
             "token": "token_single_flight",
             "sid": "sid_single_flight",
+            "sn": "SN_SINGLE_FLIGHT",
             "sessiontime": 3600,
-        }
+        },
+        "code": 0,
     }
     post_resp.headers = {"Set-Cookie": "sysauth=sid_single_flight; path=/"}
 
@@ -151,8 +165,8 @@ def test_single_flight_concurrent_login():
 
     assert len(sessions) == 30
     assert all(s.sid == "sid_single_flight" for s in sessions)
-    # Exactly ONE login executed!
-    assert mock_http.post.call_count == 1
+    # Exactly one login plus one SID validation probe executed.
+    assert mock_http.post.call_count == 2
     assert mock_http.get.call_count == 1
 
 
@@ -198,13 +212,15 @@ def test_reyee_rpc_wire_and_auto_recovery():
     resp_200.status_code = 200
     resp_200.json.return_value = {"code": 0, "data": {"hostname": "Reyee-BE72"}}
 
-    mock_http.post.side_effect = [resp_401, resp_200]
+    probe_401 = MagicMock()
+    probe_401.status_code = 401
+    mock_http.post.side_effect = [resp_401, probe_401, resp_200]
 
     rpc_client = ReyeeRpcClient(mock_mgr)
     result = rpc_client.call("getHostName")
 
     assert result["data"]["hostname"] == "Reyee-BE72"
-    assert mock_http.post.call_count == 2
+    assert mock_http.post.call_count == 3
     mock_mgr.invalidate_session.assert_called_once()
     mock_mgr.record_activity.assert_called_once()
 
@@ -255,18 +271,41 @@ def test_reyee_rpc_client_rpc_with_no_parse_and_wire_payload():
         no_parse=True,
     )
 
-    assert res["code"] == 0
-    assert len(res["data"]) == 1
+    assert len(res) == 1
 
     # Verify wire payload passed into mock_http.post
     call_args = mock_http.post.call_args
     assert call_args is not None
-    posted_json = call_args.kwargs["json"]
+    posted_json = json.loads(call_args.kwargs["data"].decode("utf-8"))
     assert posted_json["method"] == "devSta.get"
     assert posted_json["params"]["module"] == "user_list"
     assert posted_json["params"]["noParse"] is True
     assert posted_json["params"]["data"] == {"devType": "all", "dataType": "timely"}
     assert posted_json["params"]["device"] == "pc"
+    assert call_args.kwargs["headers"]["Cookie"] == "sysauth=sid_123"
+    assert len(call_args.kwargs["headers"]["Content-Accept"]) == 32
+    assert len(call_args.kwargs["headers"]["Contents-Accept"]) == 32
+
+
+def test_cmd_signature_rejection_does_not_invalidate_valid_session():
+    mock_mgr = MagicMock(spec=ReyeeSessionManager)
+    mock_mgr.address = "http://192.168.5.1"
+    mock_mgr.verify_tls = False
+    mock_mgr.http_timeout = (4, 12)
+    mock_mgr.get_session.return_value = ReyeeSession("sid", "token", "SN=sid", serial_number="SN")
+    mock_http = MagicMock()
+    mock_mgr.http_session = mock_http
+
+    rejected = MagicMock(status_code=403)
+    valid_probe = MagicMock(status_code=200)
+    valid_probe.json.return_value = {"code": 0, "data": {"sn": "SN"}}
+    mock_http.post.side_effect = [rejected, valid_probe]
+
+    with pytest.raises(Exception) as exc_info:
+        ReyeeRpcClient(mock_mgr).rpc("devSta.get", "user_list")
+
+    assert getattr(exc_info.value, "code", "") == "RPC_SIGNATURE_REJECTED"
+    mock_mgr.invalidate_session.assert_not_called()
 
 
 def test_reyee_driver_rpc_and_batch_delegation():

@@ -12,6 +12,7 @@ Implements the official Reference Oracle authentication specification:
 
 import base64
 import hashlib
+import json
 import os
 import re
 import threading
@@ -37,6 +38,7 @@ _KEY_PATTERNS = (
     re.compile(r"['\"]([A-Fa-f0-9]{16,64})['\"]\s*\)\s*;\s*//\s*aes", re.I),
 )
 AUTH_RETRY_BACKOFF_SECONDS = 15
+BE72_AES_PASSWORD = "RjYkhwzx$2018!"
 
 
 def _evp_bytes_to_key(password: bytes, salt: bytes, key_len: int = 32, iv_len: int = 16) -> Tuple[bytes, bytes]:
@@ -219,6 +221,7 @@ class ReyeeSessionManager(RouterSessionProtocol):
             f"{self.address}/",
         ]
         last_error = None
+        fetched_login_page = False
         for url in candidates:
             try:
                 resp = self._http.get(
@@ -228,18 +231,61 @@ class ReyeeSessionManager(RouterSessionProtocol):
                     allow_redirects=True,
                     headers={"Accept": "text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8"},
                 )
-                if resp.status_code < 400 and resp.text:
+                if resp.status_code < 400:
+                    fetched_login_page = True
                     for pat in _KEY_PATTERNS:
-                        match = pat.search(resp.text)
+                        match = pat.search(resp.text or "")
                         if match:
                             return match.group(1)
             except requests.RequestException as exc:
                 last_error = exc
                 continue
 
+        if fetched_login_page:
+            # BE72 firmware builds that keep the key outside the returned HTML use
+            # the same fixed key as the browser bundle on the exact auth endpoint.
+            return BE72_AES_PASSWORD
         if last_error:
             raise RouterUnreachableError(f"Unable to connect to router login page: {last_error}") from last_error
-        raise RouterAuthError("Could not extract dynamic GibberishAES key from router login HTML")
+        raise RouterAuthError("Router login page was unavailable")
+
+    @staticmethod
+    def _wire_json(value: Any) -> str:
+        return json.dumps(value, ensure_ascii=False, separators=(",", ":"))
+
+    def _validate_session(self, session: ReyeeSession) -> None:
+        payload = {"method": "getDeviceInfo", "params": None}
+        wire = self._wire_json(payload)
+        try:
+            response = self._http.post(
+                f"{self.address}/cgi-bin/luci/api/overview?auth={session.sid}",
+                data=wire.encode("utf-8"),
+                timeout=self.http_timeout,
+                verify=self.verify_tls,
+                allow_redirects=False,
+                headers={
+                    "Content-Type": "application/json;charset=UTF-8",
+                    "Cookie": session.cookie_header,
+                },
+            )
+        except requests.RequestException as exc:
+            raise RouterUnreachableError(f"Unable to validate router login session: {exc}") from exc
+        if response.status_code >= 400:
+            raise RouterAuthExpiredError(
+                f"BE72 login session validation returned HTTP {response.status_code}"
+            )
+        try:
+            root = response.json()
+        except Exception as exc:
+            raise RouterAuthError(f"Invalid JSON returned by router session validation: {exc}") from exc
+        if not isinstance(root, dict):
+            raise RouterAuthError("Router session validation response was not a JSON object")
+        try:
+            code = int(root.get("code") or 0)
+        except (TypeError, ValueError):
+            code = -1
+        if root.get("error") or code != 0:
+            raise RouterAuthExpiredError("BE72 login succeeded but SID session validation failed")
 
     def _perform_login(self) -> ReyeeSession:
         encryption_key = self._fetch_encryption_key()
@@ -249,23 +295,24 @@ class ReyeeSessionManager(RouterSessionProtocol):
         payload = {
             "method": "login",
             "params": {
-                "username": self.username,
+                "password": encrypted_pwd,
                 "time": timestamp,
                 "encry": True,
-                "pwd": encrypted_pwd,
-                "isCheckReadAgreement": "true",
+                "limit": False,
+                "setInit": False,
             },
         }
+        wire = self._wire_json(payload)
 
         url = f"{self.address}/cgi-bin/luci/api/auth"
         try:
             resp = self._http.post(
                 url,
-                json=payload,
+                data=wire.encode("utf-8"),
                 timeout=self.http_timeout,
                 verify=self.verify_tls,
                 allow_redirects=False,
-                headers={"Content-Type": "application/json"},
+                headers={"Content-Type": "application/json;charset=UTF-8"},
             )
         except requests.RequestException as exc:
             raise RouterUnreachableError(f"Unable to reach router authentication endpoint: {exc}") from exc
@@ -278,25 +325,33 @@ class ReyeeSessionManager(RouterSessionProtocol):
         except Exception as exc:
             raise RouterAuthError(f"Invalid JSON returned by router login endpoint: {exc}") from exc
 
+        if not isinstance(root, dict):
+            raise RouterAuthError("Router login response was not a JSON object")
         data = root.get("data") if isinstance(root.get("data"), dict) else {}
         token = str(data.get("token") or "").strip()
         sid = str(data.get("sid") or "").strip()
         serial = str(data.get("sn") or "").strip()
-        sessiontime = int(data.get("sessiontime") or data.get("sessionTime") or self.session_seconds)
+        try:
+            sessiontime = int(data.get("sessiontime") or data.get("sessionTime") or self.session_seconds)
+        except (TypeError, ValueError):
+            sessiontime = self.session_seconds
+        sessiontime = max(600, min(7200, sessiontime))
 
-        if not token or not sid:
+        try:
+            code = int(root.get("code") or 0)
+        except (TypeError, ValueError):
+            code = -1
+        if code != 0 or not token or not sid or not serial:
             code = root.get("code")
             msg = root.get("message") or root.get("msg") or "Login credentials rejected"
             raise RouterAuthError(f"Router login failed: {msg} (code={code})")
 
-        # Extract set-cookie header
-        set_cookie = resp.headers.get("Set-Cookie") or ""
-        cookie_header = set_cookie.split(";")[0].strip() if set_cookie else f"sysauth={sid}"
+        # Captured BE72 browser traffic uses the serial number as cookie name.
+        cookie_header = f"{serial}={sid}"
+        self._http.cookies.clear()
+        self._http.cookies.set(serial, sid, path="/")
 
-        # Update http session cookies
-        self._http.cookies.set("sysauth", sid, path="/cgi-bin/luci")
-
-        return ReyeeSession(
+        session = ReyeeSession(
             sid=sid,
             token=token,
             cookie_header=cookie_header,
@@ -304,3 +359,5 @@ class ReyeeSessionManager(RouterSessionProtocol):
             session_seconds=sessiontime,
             obtained_at=time.time(),
         )
+        self._validate_session(session)
+        return session

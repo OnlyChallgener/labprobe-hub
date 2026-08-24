@@ -183,10 +183,16 @@ def test_native_reyee_driver_mode():
     mock_session_mgr.is_valid.return_value = True
     mock_rpc.session_manager = mock_session_mgr
 
-    mock_rpc.call.side_effect = lambda method, module, *args, **kwargs: {
-        ("devSta.get", "sysinfo"): {"data": {"hardware": {"cpu": 25.0}}},
-        ("devConfig.get", "port_mapping"): {"data": {"rules": [{"name": "web", "extPort": 80}]}},
-    }.get((method, module), {"data": {}})
+    mock_rpc.rpc.side_effect = lambda method, module, *args, **kwargs: {
+        ("devConfig.get", "network"): {"wan": []},
+        ("devSta.get", "port_status"): {"ports": []},
+        ("devConfig.get", "port_mapping"): {"rules": [{"name": "web", "extPort": 80}]},
+    }.get((method, module), {})
+    mock_rpc.batch.side_effect = [
+        [{"hardware": {"cpu": 25.0}}, {}, {}, {}],
+        [{}, {}],
+        [{}, {}],
+    ]
 
     driver = ReyeeEWebDriver(rpc_client=mock_rpc)
     caps = driver.get_capabilities()
@@ -198,7 +204,7 @@ def test_native_reyee_driver_mode():
     assert status["state"] == "connected"
 
     dash = driver.get_dashboard()
-    assert dash["hardware"]["cpu"] == 25.0
+    assert dash["networkGroup"]["hardware"]["cpu"] == 25.0
 
     pm = driver.get_port_mappings()
     assert len(pm["rules"]) == 1

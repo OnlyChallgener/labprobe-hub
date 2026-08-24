@@ -166,7 +166,7 @@ class RouterRpcCompatibilitySync:
         self.logger = hub.LOGGER
         self.dashboard_interval = max(2.0, float(os.environ.get("ROUTER_DASHBOARD_POLL_SEC", "3")))
         self.device_interval = max(3.0, float(os.environ.get("ROUTER_DEVICE_POLL_SEC", "5")))
-        self.primary = str(os.environ.get("ROUTER_RPC_PRIMARY", "false")).lower() in {"1", "true", "yes"}
+        self.primary = str(os.environ.get("ROUTER_RPC_PRIMARY", "true")).lower() in {"1", "true", "yes"}
         self._stop = threading.Event()
         self._refresh_lock = threading.RLock()
         self._thread: Optional[threading.Thread] = None
@@ -456,23 +456,32 @@ class RouterRpcCompatibilitySync:
         self.hub.MQTT_PUBLISHER.publish_dashboard(public)
         return public
 
-    def refresh_view(self):
-        if not self.hub.check_app_token():
-            return jsonify({"ok": False, "error": "unauthorized"}), 401
-        global_nonce = 0
+    def dashboard_snapshot(self, force: bool = False) -> Dict[str, Any]:
+        """Return the Core-owned cache immediately; force performs a wire refresh."""
+        if force:
+            return self.sync_dashboard(force=True)
+        with self.hub.ROUTER_DASHBOARD_LOCK:
+            return self.hub._router_dashboard_public()
+
+    def refresh_dashboard(self) -> Dict[str, Any]:
         with self.hub.ROUTER_DASHBOARD_LOCK:
             self.hub.ROUTER_DASHBOARD_REFRESH_NONCE += 1
             global_nonce = self.hub.ROUTER_DASHBOARD_REFRESH_NONCE
+        result = self.sync_once(force=True)
+        return {
+            "ok": True,
+            "refreshNonce": global_nonce,
+            "refreshCompletedNonce": global_nonce,
+            "message": "router RPC refresh completed",
+            "dashboard": result["dashboard"],
+            "time": self.hub.now_str(),
+        }
+
+    def refresh_view(self):
+        if not self.hub.check_app_token():
+            return jsonify({"ok": False, "error": "unauthorized"}), 401
         try:
-            result = self.sync_once(force=True)
-            return jsonify({
-                "ok": True,
-                "refreshNonce": global_nonce,
-                "refreshCompletedNonce": global_nonce,
-                "message": "router RPC refresh completed",
-                "dashboard": result["dashboard"],
-                "time": self.hub.now_str(),
-            })
+            return jsonify(self.refresh_dashboard())
         except RouterRpcError as exc:
             return jsonify({"ok": False, "error": exc.code, "message": str(exc)}), exc.http_status
         except Exception as exc:
@@ -482,16 +491,21 @@ class RouterRpcCompatibilitySync:
     def ignored_relay_dashboard_push(self):
         if not self.hub.check_hook_token():
             return jsonify({"ok": False, "error": "bad agent token"}), 401
-        ddns_store = getattr(self.hub, "LAB_DDNS", None)
-        if ddns_store is not None:
-            payload = request.get_json(silent=True) or {}
-            if isinstance(payload, dict):
+        payload = request.get_json(silent=True) or {}
+        if isinstance(payload, dict):
+            ddns_store = getattr(self.hub, "LAB_DDNS", None)
+            if ddns_store is not None:
                 ddns_store.accept_address(payload.get("ddnsAddress"))
+            wireguard = payload.get("wireguard")
+            if isinstance(wireguard, dict):
+                with self.hub.ROUTER_DASHBOARD_LOCK:
+                    self.hub.ROUTER_DASHBOARD_CACHE["wireguard"] = dict(wireguard)
+                self.hub._persist_router_dashboard_if_due(force=False)
         return jsonify({
             "ok": True,
             "ignored": True,
             "source": "router_rpc",
-            "message": "dashboard telemetry is supplied directly by Hub; Relay push is no longer authoritative",
+            "message": "router telemetry is supplied by Router Core; Relay extensions were accepted",
             "time": self.hub.now_str(),
         })
 

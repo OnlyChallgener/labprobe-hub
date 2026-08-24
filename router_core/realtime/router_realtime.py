@@ -290,6 +290,13 @@ class RouterRealtimeEngine:
                 self._latest_devices_frame = {"type": "devices", "data": dict(snapshot)}
         self.broadcast({"type": "devices", "data": dict(payload)})
 
+    def accept_devices_snapshot(self, payload: Any) -> None:
+        """Publish the authoritative Router Driver ``user_list`` snapshot."""
+        if not isinstance(payload, dict) or _integer(payload.get("sampleEpochMs")) <= 0:
+            return
+        frame = {"type": "devices_snapshot", "data": dict(payload)}
+        self.broadcast(frame)
+
     def emit_keepalive(self) -> None:
         """Emits a lightweight heartbeat keepalive frame."""
         self._last_heartbeat_at = time.time()

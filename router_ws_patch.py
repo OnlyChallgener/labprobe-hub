@@ -23,6 +23,10 @@ import router_rpc_v010
 
 
 WS_MESSAGE_TYPES = {"static", "slow", "fast", "recent_wan", "daily_wan", "ping"}
+FAST_START_GRACE_SECONDS = 8.0
+FAST_STALL_SECONDS = 8.0
+FAST_SOCKET_POLL_SECONDS = 1.0
+MAX_ROUTER_RETRY_SECONDS = 2.0
 _MISSING = object()
 
 _FAST_WAN_INT_FIELDS = {
@@ -434,23 +438,27 @@ class RouterWebSocketMonitor:
             http_no_proxy=[hostname] if hostname else None,
             enable_multithread=True,
         )
-        ws.settimeout(1.0)
+        ws.settimeout(FAST_SOCKET_POLL_SECONDS)
+        connected_at = time.time()
         self._set_connected(True, ws_url)
-        keepalive_stop = threading.Event()
-        keepalive_thread = threading.Thread(
-            target=self._keepalive_loop,
-            args=(ws, keepalive_stop),
-            name="router-eweb-ws-keepalive",
-            daemon=True,
-        )
-        keepalive_thread.start()
         try:
             while not self._stop.is_set():
                 try:
                     raw = ws.recv()
                 except websocket.WebSocketTimeoutException:
+                    now = time.time()
+                    with self._lock:
+                        last_fast_at = self._last_fast_at
+                    stalled = (
+                        now - last_fast_at >= FAST_STALL_SECONDS
+                        if last_fast_at >= connected_at
+                        else now - connected_at >= FAST_START_GRACE_SECONDS
+                    )
+                    if stalled:
+                        self._set_connected(False, ws_url, "router fast stream stalled; reconnecting")
+                        return
                     continue
-                if raw is None:
+                if raw is None or raw == "":
                     raise RuntimeError("router websocket closed")
                 if isinstance(raw, bytes):
                     raw = raw.decode("utf-8", errors="replace")
@@ -461,7 +469,6 @@ class RouterWebSocketMonitor:
                 if isinstance(message, dict):
                     self._dispatch_message(message)
         finally:
-            keepalive_stop.set()
             try:
                 ws.close()
             except Exception:
@@ -474,7 +481,7 @@ class RouterWebSocketMonitor:
         while not self._stop.is_set():
             try:
                 if not self._ensure_authenticated(force=force_login):
-                    self._stop.wait(2.0)
+                    self._stop.wait(1.0)
                     continue
                 force_login = False
             except Exception as exc:
@@ -482,11 +489,11 @@ class RouterWebSocketMonitor:
                 self._set_connected(False, "", message if message != last_logged_error else "")
                 last_logged_error = message
                 self._stop.wait(retry)
-                retry = min(30.0, retry * 2.0)
+                retry = min(MAX_ROUTER_RETRY_SECONDS, retry + 1.0)
                 continue
             ws_url, origin, cookie, verify_tls, hostname = self._connection_info()
             if not ws_url:
-                self._stop.wait(2.0)
+                self._stop.wait(1.0)
                 continue
             try:
                 self._run_connection(ws_url, origin, cookie, verify_tls, hostname)
@@ -506,13 +513,13 @@ class RouterWebSocketMonitor:
                 self._set_connected(False, ws_url, message if message != last_logged_error else "")
                 last_logged_error = message
                 self._stop.wait(1.0 if force_login else retry)
-                retry = 1.0 if force_login else min(30.0, retry * 2.0)
+                retry = 1.0 if force_login else min(MAX_ROUTER_RETRY_SECONDS, retry + 1.0)
             except Exception as exc:
                 message = f"{type(exc).__name__}: {exc}"
                 self._set_connected(False, ws_url, message if message != last_logged_error else "")
                 last_logged_error = message
                 self._stop.wait(retry)
-                retry = min(30.0, retry * 2.0)
+                retry = min(MAX_ROUTER_RETRY_SECONDS, retry + 1.0)
 
     def snapshot(self) -> Dict[str, Any]:
         with self._lock:

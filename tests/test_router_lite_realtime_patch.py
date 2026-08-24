@@ -53,7 +53,7 @@ def test_router_http_reads_memory_without_starting_realtime_demand():
     assert demand["devicesActive"] is False
 
 
-def test_device_request_wakes_idle_agent_long_poll():
+def test_app_socket_wakes_relay_long_poll_but_does_not_request_router_samples():
     _hub, service = _fixture()
     entered = threading.Event()
     result = {}
@@ -70,7 +70,7 @@ def test_device_request_wakes_idle_agent_long_poll():
     thread.join(timeout=0.8)
 
     assert not thread.is_alive()
-    assert result["devicesActive"] is True
+    assert result["devicesActive"] is False
     assert result["sequence"] >= 1
 
 
@@ -84,7 +84,7 @@ def test_app_demand_lease_expires_and_relay_push_is_not_cached():
         "devices": [{"mac": "aa", "uploadBps": 2, "downloadBps": 3, "connectionCount": 4}],
     })
     assert accepted["acceptedRouter"] is False
-    assert accepted["acceptedDevices"] is True
+    assert accepted["acceptedDevices"] is False
 
     service.set_wss_demand("app-test", False)
 
@@ -102,11 +102,11 @@ def test_app_demand_lease_expires_and_relay_push_is_not_cached():
     with service._lock:
         assert service._router_sample == {}
         assert service._router_epoch_ms == 0
-        assert service._devices[0]["uploadBps"] == 2
-        assert service._devices_epoch_ms == first_ms
+        assert service._devices == []
+        assert service._devices_epoch_ms == 0
 
 
-def test_relay_device_sample_enters_router_core_realtime_engine():
+def test_relay_device_sample_does_not_enter_router_core_realtime_engine():
     hub, _legacy_service = _fixture()
     engine = RouterRealtimeEngine()
     frames = []
@@ -121,12 +121,10 @@ def test_relay_device_sample_enters_router_core_realtime_engine():
         "devices": [{"mac": "AA-BB", "uploadBps": 12, "downloadBps": 34, "connectionCount": 5}],
     })
 
-    assert frames[-1]["type"] == "devices"
-    assert frames[-1]["data"]["sampleEpochMs"] == epoch_ms
-    assert frames[-1]["data"]["devices"][0]["mac"] == "aa:bb"
+    assert frames == []
     snapshot = engine.devices_payload()
-    assert snapshot["delta"] is False
-    assert snapshot["devices"][0]["downloadBps"] == 34
+    assert snapshot["devices"] == []
+    assert snapshot["sampleEpochMs"] == 0
 
 
 def test_ws_fast_updates_router_memory_sample_and_pushes_native_wss():
@@ -150,7 +148,7 @@ def test_ws_fast_updates_router_memory_sample_and_pushes_native_wss():
     assert hub.realtime_publisher.router[-1]["uploadBps"] == 1234
 
 
-def test_relay_push_updates_only_device_memory_samples():
+def test_relay_push_is_acknowledged_without_becoming_a_data_source():
     hub, service = _fixture()
     _activate_both(service)
     now_ms = int(time.time() * 1000)
@@ -176,45 +174,40 @@ def test_relay_push_updates_only_device_memory_samples():
 
     assert response["ok"] is True
     assert response["acceptedRouter"] is False
-    assert response["acceptedDevices"] is True
+    assert response["acceptedDevices"] is False
     router = service.router_payload()
     devices = service.devices_payload()
     assert "uploadBps" not in router
     assert router["source"] == "waiting_router_eweb_ws_fast"
-    assert devices["devices"] == [{
-        "mac": "aa:bb:cc:dd:ee:ff",
-        "uploadBps": 101,
-        "downloadBps": 202,
-        "connectionCount": 3,
-    }]
-    assert devices["stale"] is False
+    assert devices["devices"] == []
+    assert devices["stale"] is True
     assert hub.realtime_publisher.router == []
-    assert hub.realtime_publisher.devices[-1]["devices"][0]["mac"] == "aa:bb:cc:dd:ee:ff"
-    assert hub.realtime_publisher.devices[-1]["delta"] is True
+    assert hub.realtime_publisher.devices == []
 
 
-def test_router_and_device_samples_can_update_independently():
-    _hub, service = _fixture()
-    _activate_both(service)
+def test_router_core_owns_router_and_device_samples_independently():
+    _hub, _service = _fixture()
+    engine = RouterRealtimeEngine()
     first_ms = int(time.time() * 1000)
-    service.accept_router_fast({
+    engine.accept_router_fast({
         "uploadBps": 1,
         "downloadBps": 2,
     }, first_ms)
-    service.accept_push({
+    engine.accept_devices_snapshot({
         "sampleEpochMs": first_ms,
+        "delta": False,
         "devices": [{"mac": "aa", "uploadBps": 3, "downloadBps": 4, "connectionCount": 5}],
     })
-    service.accept_router_fast({
+    engine.accept_router_fast({
         "uploadBps": 9,
         "downloadBps": 8,
     }, first_ms + 10)
 
-    assert service.router_payload()["uploadBps"] == 9
-    assert service.devices_payload()["devices"][0]["uploadBps"] == 3
+    assert engine.router_payload()["uploadBps"] == 9
+    assert engine.devices_payload()["devices"][0]["uploadBps"] == 3
 
 
-def test_device_wss_payload_contains_only_changed_rows():
+def test_relay_device_push_never_publishes_wss_rows():
     hub, service = _fixture()
     _activate_both(service)
     first_ms = int(time.time() * 1000)
@@ -233,14 +226,7 @@ def test_device_wss_payload_contains_only_changed_rows():
         ],
     })
 
-    event = hub.realtime_publisher.devices[-1]
-    assert event["sampleEpochMs"] == first_ms + 2000
-    assert event["devices"] == [{
-        "mac": "bb",
-        "uploadBps": 40,
-        "downloadBps": 5,
-        "connectionCount": 6,
-    }]
+    assert hub.realtime_publisher.devices == []
 
 
 def test_expired_samples_are_reported_stale_without_blocking():

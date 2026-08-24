@@ -23,11 +23,15 @@ class RouterService:
         cache: Optional[Any] = None,
         realtime: Optional[Any] = None,
         notify_config_change: Optional[Callable[[str, str, Dict[str, Any]], None]] = None,
+        dashboard_loader: Optional[Callable[[bool], Dict[str, Any]]] = None,
+        dashboard_refresher: Optional[Callable[[], Dict[str, Any]]] = None,
     ):
         self._driver = driver
         self._cache = cache
         self._realtime = realtime
         self._notify_config_change = notify_config_change
+        self._dashboard_loader = dashboard_loader
+        self._dashboard_refresher = dashboard_refresher
 
     @property
     def driver(self) -> RouterDriver:
@@ -70,7 +74,17 @@ class RouterService:
 
     def get_dashboard(self, force: bool = False) -> Dict[str, Any]:
         try:
+            if self._dashboard_loader is not None:
+                return self._dashboard_loader(force)
             return self._driver.get_dashboard(force=force)
+        except Exception as exc:
+            raise from_legacy_error(exc) from exc
+
+    def refresh_dashboard(self) -> Dict[str, Any]:
+        try:
+            if self._dashboard_refresher is not None:
+                return self._dashboard_refresher()
+            return self.get_dashboard(force=True)
         except Exception as exc:
             raise from_legacy_error(exc) from exc
 

@@ -9,6 +9,8 @@ Implements the official Wire Protocol:
 - Circuit breaker protects against infinite retry loops.
 """
 
+import hashlib
+import json
 from typing import Any, Dict, Optional, Tuple, Iterable
 import requests
 
@@ -39,6 +41,74 @@ class ReyeeRpcClient:
     def session_manager(self) -> ReyeeSessionManager:
         return self._session_manager
 
+    @staticmethod
+    def _wire_json(value: Any) -> str:
+        return json.dumps(value, ensure_ascii=False, separators=(",", ":"))
+
+    @staticmethod
+    def _eweb_byte_length(value: str) -> int:
+        total = 0
+        for char in value:
+            codepoint = ord(char)
+            if codepoint <= 0xFF:
+                total += 1
+            elif codepoint <= 0xFFFF:
+                total += 3
+            else:
+                total += 4
+        return total
+
+    @classmethod
+    def _headers(cls, endpoint_path: str, wire: str, cookie: str) -> Dict[str, str]:
+        headers = {
+            "Content-Type": "application/json;charset=UTF-8",
+            "Cookie": cookie,
+            "User-Agent": "LabProbe-Hub/0.11.1",
+        }
+        if endpoint_path.rstrip("/").endswith("/cmd"):
+            secret = "Web@Rj$2020!"
+            headers["Content-Accept"] = hashlib.md5(
+                (secret + str(cls._eweb_byte_length(wire))).encode("utf-8")
+            ).hexdigest()
+            headers["Contents-Accept"] = hashlib.md5(
+                (secret + wire).encode("utf-8")
+            ).hexdigest()
+        return headers
+
+    def _post(
+        self,
+        endpoint_path: str,
+        session: Any,
+        payload: Dict[str, Any],
+        timeout: Optional[Tuple[int, int]] = None,
+    ) -> requests.Response:
+        wire = self._wire_json(payload)
+        return self._session_manager.http_session.post(
+            f"{self._session_manager.address}{endpoint_path}?auth={session.sid}",
+            data=wire.encode("utf-8"),
+            headers=self._headers(endpoint_path, wire, session.cookie_header),
+            timeout=timeout or self._session_manager.http_timeout,
+            verify=self._session_manager.verify_tls,
+            allow_redirects=False,
+        )
+
+    def _session_probe_ok(self, session: Any, timeout: Optional[Tuple[int, int]]) -> bool:
+        try:
+            response = self._post(
+                "/cgi-bin/luci/api/overview",
+                session,
+                {"method": "getDeviceInfo", "params": None},
+                timeout,
+            )
+            if response.status_code >= 400:
+                return False
+            root = response.json()
+            if not isinstance(root, dict) or root.get("error"):
+                return False
+            return int(root.get("code") or 0) == 0
+        except Exception:
+            return False
+
     def call(
         self,
         method: str,
@@ -49,36 +119,24 @@ class ReyeeRpcClient:
     ) -> Dict[str, Any]:
         """Executes a JSON-RPC method call with automatic single-flight auth recovery."""
         session = self._session_manager.get_session()
-        base_url = self._session_manager.address
-
-        url = f"{base_url}{endpoint_path}?auth={session.sid}"
         payload = {
             "method": method,
             "params": params if params is not None else {},
         }
-        headers = {
-            "Content-Type": "application/json",
-            "Cookie": session.cookie_header,
-            "User-Agent": "LabProbe-Hub/0.11.1-rc1",
-        }
-
-        req_timeout = timeout or self._session_manager.http_timeout
-        http = self._session_manager.http_session
 
         try:
-            resp = http.post(
-                url,
-                json=payload,
-                headers=headers,
-                timeout=req_timeout,
-                verify=self._session_manager.verify_tls,
-                allow_redirects=False,
-            )
+            resp = self._post(endpoint_path, session, payload, timeout)
         except requests.RequestException as exc:
             raise RouterUnreachableError(f"Network error executing RPC '{method}': {exc}") from exc
 
         # Check for auth expiration at HTTP status level
         if resp.status_code in (401, 403):
+            if endpoint_path.rstrip("/").endswith("/cmd") and self._session_probe_ok(session, timeout):
+                raise RouterRpcExecutionError(
+                    "Router session is valid, but the signed cmd RPC was rejected",
+                    code="RPC_SIGNATURE_REJECTED",
+                    status_code=502,
+                )
             if retry_auth:
                 self._session_manager.invalidate_session()
                 # Re-login under single-flight and retry exactly once
@@ -94,12 +152,26 @@ class ReyeeRpcClient:
             raise RouterRpcExecutionError(f"Invalid JSON response for method '{method}': {exc}") from exc
 
         # Check for application-level session invalidation in JSON body
+        if not isinstance(root, dict):
+            raise RouterRpcExecutionError(f"Router returned a non-object response for '{method}'")
         code = root.get("code")
-        if code in (401, 403, 1001) or root.get("error") == "session_expired":
+        if str(code) in {"401", "403", "1001"} or root.get("error") == "session_expired":
             if retry_auth:
                 self._session_manager.invalidate_session()
                 return self.call(method, params, endpoint_path, timeout, retry_auth=False)
             raise RouterAuthExpiredError(f"Router application session invalid on '{method}' (code={code})")
+
+        if root.get("error"):
+            error = root.get("error")
+            message = error.get("message") if isinstance(error, dict) else str(error)
+            raise RouterRpcExecutionError(message or f"Router rejected method '{method}'")
+        try:
+            numeric_code = int(code or 0)
+        except (TypeError, ValueError):
+            numeric_code = -1
+        if numeric_code != 0:
+            message = root.get("message") or root.get("msg") or f"Router API code {numeric_code}"
+            raise RouterRpcExecutionError(str(message), code="RPC_REJECTED", status_code=409)
 
         # Record activity on success (Idle Timeout refresh)
         self._session_manager.record_activity()
@@ -131,13 +203,14 @@ class ReyeeRpcClient:
         else:
             cmd_params = params
 
-        return self.call(
+        root = self.call(
             method=method,
             params=cmd_params,
             endpoint_path=endpoint_path,
             timeout=timeout,
             retry_auth=retry_auth,
         )
+        return root.get("data") if isinstance(root, dict) and "data" in root else root
 
     def batch(self, calls: Iterable[Dict[str, Any]]) -> Any:
         """Executes a batched eWeb array RPC call (cmdArr)."""
@@ -152,4 +225,5 @@ class ReyeeRpcClient:
             if "data" in call:
                 cmd_params["data"] = call["data"]
             rows.append({"method": call.get("method", ""), "params": cmd_params})
-        return self.call("cmdArr", {"device": "pc", "params": rows})
+        root = self.call("cmdArr", {"device": "pc", "params": rows})
+        return root.get("data") if isinstance(root, dict) and "data" in root else root
