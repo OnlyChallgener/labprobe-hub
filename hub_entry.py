@@ -48,10 +48,30 @@ HUB_VERSION = "0.11.0"
 hub.APP_VERSION = HUB_VERSION
 
 # Initialize Router Core Single-Source-of-Truth
+router_host = (
+    hub.cfg_get("router.host")
+    or hub.cfg_get("router.address")
+    or hub.cfg_get("router.ip")
+    or os.environ.get("ROUTER_HOST")
+    or os.environ.get("ROUTER_IP")
+    or os.environ.get("ROUTER_ADDRESS")
+    or "192.168.110.1"
+)
+router_password = (
+    hub.cfg_get("router.password")
+    or os.environ.get("ROUTER_PASSWORD")
+    or ""
+)
+router_username = (
+    hub.cfg_get("router.username")
+    or os.environ.get("ROUTER_USERNAME")
+    or "admin"
+)
+
 router_session_mgr = ReyeeSessionManager(
-    host=hub.cfg_get("router.host", "192.168.110.1"),
-    password=hub.cfg_get("router.password", ""),
-    username=hub.cfg_get("router.username", "admin"),
+    host=str(router_host).strip(),
+    password=str(router_password).strip(),
+    username=str(router_username).strip(),
     timeout=8.0,
 )
 router_rpc_client = ReyeeRpcClient(session_mgr=router_session_mgr)
