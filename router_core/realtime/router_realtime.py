@@ -24,6 +24,46 @@ import time
 from typing import Any, Callable, Dict, List, Optional, Set
 
 
+ROUTER_STALE_MS = 3_000
+DEVICES_STALE_MS = 4_000
+_ROUTER_INTEGER_FIELDS = {
+    "uploadBps",
+    "downloadBps",
+    "totalUploadBytes",
+    "totalDownloadBytes",
+    "uptimeSeconds",
+    "onlineDeviceCount",
+    "ipv4Connections",
+    "ipv6Connections",
+    "ipv4HalfConnections",
+    "ipv6HalfConnections",
+    "cps",
+}
+_ROUTER_NUMBER_FIELDS = {"cpuPercent", "memoryPercent", "temperatureC"}
+
+
+def _integer(value: Any, default: int = 0) -> int:
+    try:
+        return max(0, int(float(str(value).strip())))
+    except (TypeError, ValueError):
+        return default
+
+
+def _number(value: Any, default: float = 0.0) -> float:
+    try:
+        return float(str(value).strip().rstrip("%"))
+    except (TypeError, ValueError):
+        return default
+
+
+def _sample_epoch_ms(value: Any = 0) -> int:
+    now_ms = int(time.time() * 1000)
+    sample_ms = _integer(value, now_ms)
+    if sample_ms <= 0 or sample_ms > now_ms + 10_000:
+        return now_ms
+    return sample_ms
+
+
 class RealtimeFrame:
     """Helper to build specification-compliant WSS frames."""
 
@@ -48,41 +88,55 @@ class RealtimeFrame:
         download_speed: int = 0,
         wan_ip: str = "",
         message: str = "",
+        sample_epoch_ms: int = 0,
     ) -> Dict[str, Any]:
+        epoch_ms = _sample_epoch_ms(sample_epoch_ms)
         return {
             "type": "router",
             "data": {
                 "state": state,
                 "connected": connected,
-                "cpu": round(cpu, 1),
-                "memory": round(memory, 1),
-                "uploadSpeed": int(upload_speed),
-                "downloadSpeed": int(download_speed),
+                "cpuPercent": round(cpu, 1),
+                "memoryPercent": round(memory, 1),
+                "uploadBps": _integer(upload_speed),
+                "downloadBps": _integer(download_speed),
                 "wanIp": wan_ip,
                 "message": message,
-                "timestamp": int(time.time() * 1000),
+                "sampleEpochMs": epoch_ms,
+                "sampleAgeMs": max(0, int(time.time() * 1000) - epoch_ms),
+                "stale": False,
             },
         }
 
     @staticmethod
-    def devices(devices_list: List[Dict[str, Any]]) -> Dict[str, Any]:
+    def devices(
+        devices_list: List[Dict[str, Any]],
+        sample_epoch_ms: int = 0,
+        delta: bool = False,
+    ) -> Dict[str, Any]:
+        epoch_ms = _sample_epoch_ms(sample_epoch_ms)
         return {
             "type": "devices",
             "data": {
                 "devices": devices_list,
-                "count": len(devices_list),
-                "timestamp": int(time.time() * 1000),
+                "onlineDeviceCount": len(devices_list),
+                "delta": bool(delta),
+                "sampleEpochMs": epoch_ms,
+                "sampleAgeMs": max(0, int(time.time() * 1000) - epoch_ms),
             },
         }
 
     @staticmethod
-    def devices_snapshot(devices_list: List[Dict[str, Any]]) -> Dict[str, Any]:
+    def devices_snapshot(devices_list: List[Dict[str, Any]], sample_epoch_ms: int = 0) -> Dict[str, Any]:
+        epoch_ms = _sample_epoch_ms(sample_epoch_ms)
         return {
             "type": "devices_snapshot",
             "data": {
                 "devices": devices_list,
-                "count": len(devices_list),
-                "timestamp": int(time.time() * 1000),
+                "onlineDeviceCount": len(devices_list),
+                "fullSnapshot": True,
+                "sampleEpochMs": epoch_ms,
+                "sampleAgeMs": max(0, int(time.time() * 1000) - epoch_ms),
             },
         }
 
@@ -147,9 +201,10 @@ class RouterRealtimeEngine:
 
     def __init__(self):
         self._subscribers: Set[Callable[[str], None]] = set()
-        self._lock = threading.Lock()
+        self._lock = threading.RLock()
         self._latest_router_frame: Optional[Dict[str, Any]] = None
         self._latest_devices_frame: Optional[Dict[str, Any]] = None
+        self._router_sequence = 0
         self._last_heartbeat_at = time.time()
 
     def subscribe(self, callback: Callable[[str], None]) -> None:
@@ -165,13 +220,15 @@ class RouterRealtimeEngine:
     def broadcast(self, frame_dict: Dict[str, Any]) -> None:
         """Broadcasts a normalized frame to all active App subscribers."""
         frame_type = frame_dict.get("type")
-        if frame_type == "router":
-            self._latest_router_frame = frame_dict
-        elif frame_type in ("devices", "devices_snapshot"):
-            self._latest_devices_frame = frame_dict
-
         raw_json = json.dumps(frame_dict, ensure_ascii=False, separators=(",", ":"))
         with self._lock:
+            if frame_type == "router":
+                self._latest_router_frame = frame_dict
+            elif frame_type == "devices_snapshot" or (
+                frame_type == "devices"
+                and not bool((frame_dict.get("data") or {}).get("delta", False))
+            ):
+                self._latest_devices_frame = frame_dict
             subscribers = list(self._subscribers)
 
         for sub in subscribers:
@@ -180,6 +237,59 @@ class RouterRealtimeEngine:
             except Exception:
                 pass
 
+    def accept_router_fast(self, sample: Any, sample_epoch_ms: int = 0) -> None:
+        """Normalize one Reyee ``fast`` sample and publish the App router contract."""
+        if not isinstance(sample, dict):
+            return
+        normalized: Dict[str, Any] = {}
+        for key in _ROUTER_INTEGER_FIELDS:
+            if key in sample:
+                normalized[key] = _integer(sample.get(key))
+        for key in _ROUTER_NUMBER_FIELDS:
+            if key in sample:
+                normalized[key] = _number(sample.get(key))
+        if not normalized:
+            return
+
+        epoch_ms = _sample_epoch_ms(sample_epoch_ms)
+        with self._lock:
+            previous = dict((self._latest_router_frame or {}).get("data") or {})
+            merged = {
+                key: value
+                for key, value in previous.items()
+                if key in _ROUTER_INTEGER_FIELDS or key in _ROUTER_NUMBER_FIELDS
+            }
+            merged.update(normalized)
+            self._router_sequence += 1
+            sequence = self._router_sequence
+
+        payload = {
+            "ok": True,
+            "state": "connected",
+            "connected": True,
+            "sampleEpochMs": epoch_ms,
+            "sampleAgeMs": max(0, int(time.time() * 1000) - epoch_ms),
+            "sequence": sequence,
+            "source": "router_eweb_ws_fast",
+            "stale": False,
+            **merged,
+            "error": "",
+        }
+        self.broadcast({"type": "router", "data": payload})
+
+    def accept_devices_realtime(
+        self,
+        payload: Any,
+        snapshot: Optional[Dict[str, Any]] = None,
+    ) -> None:
+        """Publish a Relay terminal delta while retaining its full memory snapshot."""
+        if not isinstance(payload, dict) or _integer(payload.get("sampleEpochMs")) <= 0:
+            return
+        if isinstance(snapshot, dict) and _integer(snapshot.get("sampleEpochMs")) > 0:
+            with self._lock:
+                self._latest_devices_frame = {"type": "devices", "data": dict(snapshot)}
+        self.broadcast({"type": "devices", "data": dict(payload)})
+
     def emit_keepalive(self) -> None:
         """Emits a lightweight heartbeat keepalive frame."""
         self._last_heartbeat_at = time.time()
@@ -187,22 +297,64 @@ class RouterRealtimeEngine:
 
     def get_router_calibration_snapshot(self) -> Dict[str, Any]:
         """Calibration snapshot for HTTP /api/router/realtime cold start."""
-        if self._latest_router_frame:
-            return self._latest_router_frame.get("data", {})
+        with self._lock:
+            latest = dict((self._latest_router_frame or {}).get("data") or {})
+        if latest:
+            now_ms = int(time.time() * 1000)
+            epoch_ms = _integer(latest.get("sampleEpochMs"))
+            age_ms = max(0, now_ms - epoch_ms) if epoch_ms else 0
+            latest["serverEpochMs"] = now_ms
+            latest["sampleAgeMs"] = age_ms
+            latest["stale"] = not epoch_ms or age_ms > ROUTER_STALE_MS
+            return latest
         return {
+            "ok": True,
             "state": "checking",
             "connected": False,
-            "cpu": 0.0,
-            "memory": 0.0,
-            "uploadSpeed": 0,
-            "downloadSpeed": 0,
+            "cpuPercent": 0.0,
+            "memoryPercent": 0.0,
+            "uploadBps": 0,
+            "downloadBps": 0,
             "wanIp": "",
             "message": "正在准备数据",
-            "timestamp": int(time.time() * 1000),
+            "sampleEpochMs": 0,
+            "serverEpochMs": int(time.time() * 1000),
+            "sampleAgeMs": 0,
+            "stale": True,
+            "error": "等待路由器本地实时采样",
         }
+
+    def router_payload(self) -> Dict[str, Any]:
+        return self.get_router_calibration_snapshot()
 
     def get_devices_calibration_snapshot(self) -> List[Dict[str, Any]]:
         """Calibration snapshot for HTTP /api/devices/realtime cold start."""
-        if self._latest_devices_frame:
-            return self._latest_devices_frame.get("data", {}).get("devices", [])
+        with self._lock:
+            latest = dict((self._latest_devices_frame or {}).get("data") or {})
+        if latest:
+            return list(latest.get("devices") or [])
         return []
+
+    def devices_payload(self) -> Dict[str, Any]:
+        with self._lock:
+            latest = dict((self._latest_devices_frame or {}).get("data") or {})
+        now_ms = int(time.time() * 1000)
+        if not latest:
+            return {
+                "ok": True,
+                "devices": [],
+                "onlineDeviceCount": 0,
+                "delta": False,
+                "sampleEpochMs": 0,
+                "serverEpochMs": now_ms,
+                "sampleAgeMs": 0,
+                "stale": True,
+                "error": "等待路由器本地终端采样",
+            }
+        epoch_ms = _integer(latest.get("sampleEpochMs"))
+        age_ms = max(0, now_ms - epoch_ms) if epoch_ms else 0
+        latest["serverEpochMs"] = now_ms
+        latest["sampleAgeMs"] = age_ms
+        latest["stale"] = not epoch_ms or age_ms > DEVICES_STALE_MS
+        latest["delta"] = False
+        return latest

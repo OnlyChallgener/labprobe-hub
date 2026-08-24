@@ -59,9 +59,10 @@ def _clean_source(value: Any) -> str:
 
 
 class RouterLiteRealtimeService:
-    def __init__(self, hub: Any, router_sync: Any = None):
+    def __init__(self, hub: Any, router_sync: Any = None, router_realtime: Any = None):
         self.hub = hub
         self.sync = router_sync
+        self.router_realtime = router_realtime
         self.logger = hub.LOGGER
         self._lock = threading.RLock()
         self._demand = threading.Condition(threading.RLock())
@@ -85,8 +86,12 @@ class RouterLiteRealtimeService:
     def start(self) -> None:
         monitor = getattr(getattr(self.sync, "client", None), "router_ws_monitor", None)
         if monitor is not None and hasattr(monitor, "set_fast_handler"):
-            monitor.set_fast_handler(self.accept_router_fast)
-            self.logger.info("router eweb /ws fast realtime bridge enabled; relay handles devices only")
+            handler = (
+                getattr(self.router_realtime, "accept_router_fast", None)
+                or self.accept_router_fast
+            )
+            monitor.set_fast_handler(handler)
+            self.logger.info("router eweb /ws fast connected to Router Core realtime; relay handles devices only")
         else:
             self.logger.info("router realtime cache enabled; waiting for eweb /ws monitor")
 
@@ -269,7 +274,12 @@ class RouterLiteRealtimeService:
 
         with self._lock:
             publisher = self._app_realtime_publisher
-        if devices_event and publisher is not None:
+        if devices_event and self.router_realtime is not None:
+            self.router_realtime.accept_devices_realtime(
+                devices_event,
+                snapshot=self.devices_payload(),
+            )
+        elif devices_event and publisher is not None:
             publisher.publish_devices_realtime(devices_event)
 
         demand["acceptedRouter"] = False
@@ -277,6 +287,8 @@ class RouterLiteRealtimeService:
         return demand
 
     def router_payload(self) -> Dict[str, Any]:
+        if self.router_realtime is not None:
+            return self.router_realtime.router_payload()
         with self._lock:
             sample = dict(self._router_sample)
             epoch_ms = self._router_epoch_ms
@@ -333,12 +345,16 @@ class RouterLiteRealtimeService:
         }
 
 
-def install_router_lite_realtime_patch(hub: Any, router_sync: Any) -> RouterLiteRealtimeService:
+def install_router_lite_realtime_patch(
+    hub: Any,
+    router_sync: Any,
+    router_realtime: Any = None,
+) -> RouterLiteRealtimeService:
     existing = getattr(hub, "ROUTER_LITE_REALTIME", None)
     if existing is not None:
         return existing
 
-    service = RouterLiteRealtimeService(hub, router_sync)
+    service = RouterLiteRealtimeService(hub, router_sync, router_realtime)
 
     @hub.app.get("/api/router/realtime")
     def api_router_realtime():

@@ -8,6 +8,7 @@ from types import SimpleNamespace
 from flask import Flask
 
 import router_lite_realtime_patch as realtime_patch
+from router_core.realtime.router_realtime import RouterRealtimeEngine
 from router_lite_realtime_patch import RouterLiteRealtimeService, install_router_lite_realtime_patch
 from router_ws_patch import RouterWebSocketMonitor, normalize_fast_message
 
@@ -103,6 +104,29 @@ def test_app_demand_lease_expires_and_relay_push_is_not_cached():
         assert service._router_epoch_ms == 0
         assert service._devices[0]["uploadBps"] == 2
         assert service._devices_epoch_ms == first_ms
+
+
+def test_relay_device_sample_enters_router_core_realtime_engine():
+    hub, _legacy_service = _fixture()
+    engine = RouterRealtimeEngine()
+    frames = []
+    engine.subscribe(lambda raw: frames.append(json.loads(raw)))
+    service = RouterLiteRealtimeService(hub, router_realtime=engine)
+    service.set_wss_demand("app-core", True)
+    epoch_ms = int(time.time() * 1000)
+
+    service.accept_push({
+        "sampleEpochMs": epoch_ms,
+        "source": "relay_local_dev_sta",
+        "devices": [{"mac": "AA-BB", "uploadBps": 12, "downloadBps": 34, "connectionCount": 5}],
+    })
+
+    assert frames[-1]["type"] == "devices"
+    assert frames[-1]["data"]["sampleEpochMs"] == epoch_ms
+    assert frames[-1]["data"]["devices"][0]["mac"] == "aa:bb"
+    snapshot = engine.devices_payload()
+    assert snapshot["delta"] is False
+    assert snapshot["devices"][0]["downloadBps"] == 34
 
 
 def test_ws_fast_updates_router_memory_sample_and_pushes_native_wss():

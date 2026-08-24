@@ -59,7 +59,7 @@ class ReyeeRpcClient:
         headers = {
             "Content-Type": "application/json",
             "Cookie": session.cookie_header,
-            "User-Agent": "LabProbe-Hub/0.11.0",
+            "User-Agent": "LabProbe-Hub/0.11.1-rc1",
         }
 
         req_timeout = timeout or self._session_manager.http_timeout

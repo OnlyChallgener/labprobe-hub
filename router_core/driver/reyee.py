@@ -41,6 +41,7 @@ class ReyeeEWebDriver(RouterDriver):
             mgr = self._rpc_client.session_manager
             return {
                 "address": getattr(mgr, "address", ""),
+                "password": getattr(mgr, "password", ""),
                 "verifyTls": getattr(mgr, "verify_tls", False),
                 "sessionSeconds": getattr(mgr, "session_seconds", 3600),
             }
@@ -468,6 +469,13 @@ class ReyeeEWebDriver(RouterDriver):
             raise from_legacy_error(exc) from exc
 
     # --- Compatibility Aliases for Extension Services ---
+    def dashboard(self, force: bool = False) -> Dict[str, Any]:
+        return self.get_dashboard(force=force)
+
+    def devices(self, force: bool = False) -> Dict[str, Any]:
+        rows = self.get_devices(force=force)
+        return {"items": rows, "total": len(rows)}
+
     def status(self, probe: bool = False) -> Dict[str, Any]:
         return self.get_status()
 

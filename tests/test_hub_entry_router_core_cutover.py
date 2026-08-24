@@ -27,6 +27,29 @@ def test_production_router_core_blueprint_registered(test_client):
     assert hasattr(hub, "ROUTER_DRIVER")
     assert hasattr(hub, "ROUTER_CACHE")
     assert hasattr(hub, "ROUTER_REALTIME")
+    assert hub.HUB_REALTIME_WEBSOCKET.realtime_service is hub.ROUTER_REALTIME
+    assert hub.HUB_REALTIME_WEBSOCKET.demand_service is hub.ROUTER_LITE_REALTIME
+
+
+def test_router_settings_accept_existing_compose_environment(monkeypatch, tmp_path):
+    monkeypatch.setattr(hub, "CONFIG_DIR", tmp_path)
+    monkeypatch.setattr(hub, "cfg_get", lambda _key, default=None: default)
+    monkeypatch.delenv("ROUTER_HOST", raising=False)
+    monkeypatch.delenv("ROUTER_PASSWORD", raising=False)
+    monkeypatch.setenv("ROUTER_EWEB_URL", "http://192.168.8.1")
+    monkeypatch.setenv("ROUTER_EWEB_PASSWORD", "existing-secret")
+    monkeypatch.setenv("ROUTER_SESSION_TIME", "4200")
+    monkeypatch.setenv("ROUTER_VERIFY_TLS", "true")
+
+    settings = hub_entry._resolve_router_settings()
+
+    assert settings == {
+        "host": "http://192.168.8.1",
+        "password": "existing-secret",
+        "username": "admin",
+        "session_seconds": 4200,
+        "verify_tls": True,
+    }
 
 
 def test_production_router_capabilities_and_status(test_client):

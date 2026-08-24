@@ -1,5 +1,11 @@
 # LabProbe 变更记录
 
+## 0.11.1-rc1
+
+- **Router Core 实时主链路**: Reyee eWeb `fast` 帧直接进入 `RouterRealtimeEngine`，生产 WSS 订阅 Core 引擎并向 APP 推送首帧与后续帧。
+- **APP contract 修复**: 路由实时字段统一为 `uploadBps`、`downloadBps`、`cpuPercent`、`memoryPercent` 与 `sampleEpochMs`。
+- **升级兼容**: Router Core 继续读取既有 `ROUTER_EWEB_*` Compose 变量与加密 `config/router_eweb.json`，保留 APP、HOOK 与 MQTT 配置行为。
+
 ## 0.11.0 / LabRelay 0.2.28
 
 - **Router Core v1 架构生产切流**: 生产主干正式由 `RouterService` 与 `create_router_blueprint_v1` 接管，统一承载 30 个原生路由 API 端点；

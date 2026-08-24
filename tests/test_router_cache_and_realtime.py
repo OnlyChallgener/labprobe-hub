@@ -1,5 +1,6 @@
 """Tests for RouterCache SWR engine and RouterRealtime aggregation engine."""
 
+import json
 import time
 import pytest
 from router_core.cache.router_cache import RouterCache, CacheEntry
@@ -89,7 +90,14 @@ def test_router_realtime_engine_frames_and_snapshots():
     # Verify snapshot
     snapshot = engine.get_router_calibration_snapshot()
     assert snapshot["connected"] is True
-    assert snapshot["cpu"] == 15.4
+    assert snapshot["cpuPercent"] == 15.4
+    assert snapshot["memoryPercent"] == 42.1
+    assert snapshot["uploadBps"] == 1024
+    assert snapshot["downloadBps"] == 2048
+    assert snapshot["sampleEpochMs"] > 0
+    assert "uploadSpeed" not in snapshot
+    assert "downloadSpeed" not in snapshot
+    assert "timestamp" not in snapshot
     assert snapshot["wanIp"] == "1.2.3.4"
 
     # 2. Devices frame
@@ -126,3 +134,35 @@ def test_router_realtime_engine_frames_and_snapshots():
     assert engine.CLIENT_WATCHDOG_PING_INTERVAL_SECONDS == 10
     assert engine.CLIENT_WATCHDOG_CHECK_INTERVAL_SECONDS == 1
     assert engine.CLIENT_SERVER_FRAME_TIMEOUT_SECONDS == 45
+
+
+def test_reyee_fast_sample_is_broadcast_with_android_contract():
+    engine = RouterRealtimeEngine()
+    frames = []
+    engine.subscribe(lambda raw: frames.append(json.loads(raw)))
+    epoch_ms = int(time.time() * 1000)
+
+    engine.accept_router_fast(
+        {
+            "uploadBps": "1234",
+            "downloadBps": 5678,
+            "cpuPercent": "12.5%",
+            "memoryPercent": 34.5,
+            "temperatureC": 51,
+            "onlineDeviceCount": 7,
+        },
+        epoch_ms,
+    )
+
+    assert len(frames) == 1
+    assert frames[0]["type"] == "router"
+    payload = frames[0]["data"]
+    assert payload["uploadBps"] == 1234
+    assert payload["downloadBps"] == 5678
+    assert payload["cpuPercent"] == 12.5
+    assert payload["memoryPercent"] == 34.5
+    assert payload["temperatureC"] == 51.0
+    assert payload["onlineDeviceCount"] == 7
+    assert payload["sampleEpochMs"] == epoch_ms
+    assert payload["source"] == "router_eweb_ws_fast"
+    assert payload["stale"] is False
