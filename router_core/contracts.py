@@ -1,3 +1,4 @@
+from __future__ import annotations
 """Router Core Data Contracts and Models.
 
 Defines the exact typed structures consumed and produced by Router Core.
@@ -302,7 +303,7 @@ class RouterDiagnosticItem:
 class RouterDiagnostic:
     process: str = "0%"
     error_count: Any = 0
-    List: List[RouterDiagnosticItem] = field(default_factory=list)
+    List: list[RouterDiagnosticItem] = field(default_factory=list)
 
     def to_dict(self) -> Dict[str, Any]:
         return {
