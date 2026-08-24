@@ -619,7 +619,7 @@ class WireGuardService:
 def create_wireguard_blueprint(hub: Any, service: WireGuardService) -> Blueprint:
     bp = Blueprint("wireguard_service", __name__, url_prefix="/api")
 
-    @bp.route("/wireguard/server", methods=["GET", "PUT", "DELETE"])
+    @bp.route("/wireguard/server", methods=["GET", "PUT", "POST", "DELETE"])
     def server():
         if request.method == "GET":
             if not hub.check_read_token():

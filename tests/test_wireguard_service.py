@@ -430,5 +430,42 @@ def test_invalid_listen_port_rejected(tmp_path):
         service.put(server_data, 0)
 
 
+def test_blueprint_post_method_supported_as_alias(tmp_path):
+    hub = _hub(tmp_path)
+    service = install_wireguard_service(hub)
+    client = hub.app.test_client()
+
+    response = client.post(
+        "/api/wireguard/server",
+        json={"listenPort": 51826, "mtu": 1400, "enabled": True},
+    )
+    assert response.status_code == 200
+    data = response.get_json()
+    assert data["ok"] is True
+    assert data["server"]["listenPort"] == 51826
+    assert data["server"]["mtu"] == 1400
+    assert data["server"]["enabled"] is True
+
+
+def test_server_toggle_enabled_state(tmp_path):
+    hub = _hub(tmp_path)
+    service = WireGuardService(hub)
+    saved = service.put(_server(), 0)
+    assert saved["server"]["enabled"] is True
+
+    # Disable the server
+    disabled = service.put({"enabled": False}, 1)
+    assert disabled["server"]["enabled"] is False
+    assert disabled["server"]["listenPort"] == 51820
+
+    # Verify apply command was queued with enabled: False
+    commands = service.commands()
+    assert len(commands) == 1
+    latest_cmd = commands[0]
+    assert latest_cmd["action"] == "apply"
+    assert latest_cmd["payload"]["server"]["enabled"] is False
+
+
+
 
 
