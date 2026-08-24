@@ -1,10 +1,10 @@
 # LabProbe 变更记录
 
-## 0.10.12
+## 0.10.12 / LabRelay 0.2.28
 
 - WireGuard 服务端支持 `POST` 别名方法与 `enabled: false/true` 开关控制；
 - 下发服务端停用命令时自动将 `labwg0` 接口置为 down 并释放相关防火墙规则，避免与官方固件或第三方服务端冲突；
-- 配套 APP v0.10.52 build 207。
+- LabRelay 升级至 0.2.28，配套 APP v0.10.52 build 207。
 
 ## 0.9.19 / LabRelay 0.2.11
 
