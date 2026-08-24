@@ -1,5 +1,15 @@
 # LabProbe 变更记录
 
+## 0.11.0-rc1 / LabRelay 0.2.28
+
+- **Router Core v1 架构生产切流**: 生产主干正式由 `RouterService` 与 `create_router_blueprint_v1` 接管，统一承载 30 个原生路由 API 端点；
+- **单一职责实现收口**: 核心鉴权由 `ReyeeSessionManager`（动态 Key 提取 + EVP MD5 AES-256-CBC + 3600s Idle Timeout + Single-Flight 并发防重登录锁）统一收拢；
+- **RPC 与缓存优化**: `ReyeeRpcClient` 原生对接 `/api/cmd?auth=<sid>` Wire 协议并内置断路器；引入 `RouterCache` SWR 引擎降低路由器 CPU 负载；
+- **实时事件规范化**: `RouterRealtimeEngine` 提供 3.0s 空闲心跳广播，严密适配 Android Client 45s 断线看门狗容差；
+- **BE72 Shadow 验证工具链就绪**: 提供 `api/be72_shadow_validation.py`，支持 12 大能力 Dual-Read 字段对比与安全可逆写操作门禁；
+- **LabRelay 自研核心能力 100% 保留**: LabProbe DDNS、6→4/6→6 映射转发、STUN NAT 穿透、WireGuard VPN、Agent 双进程拓扑完整兼容，LabRelay 保持 0.2.28 不变。
+
+
 ## 0.10.12 / LabRelay 0.2.28
 
 - WireGuard 服务端支持 `POST` 别名方法与 `enabled: false/true` 开关控制；
