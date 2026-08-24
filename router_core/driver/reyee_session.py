@@ -30,7 +30,12 @@ from router_core.errors import (
 )
 from router_core.session.interface import RouterSessionProtocol
 
-_KEY_RE = re.compile(r'GibberishAES\.enc\(passwordEl\.value,\s*"([a-f0-9]+)"\)')
+_KEY_PATTERNS = (
+    re.compile(r'GibberishAES\.enc\(passwordEl\.value,\s*["\']([A-Fa-f0-9]+)["\']\)', re.I),
+    re.compile(r"GibberishAES\s*\.\s*enc\s*\(\s*[^,]+,\s*['\"]([A-Fa-f0-9]{16,128})['\"]\s*\)", re.I),
+    re.compile(r"(?:encrypt(?:ion)?Key|aesKey|loginKey)\s*[:=]\s*['\"]([A-Fa-f0-9]{16,128})['\"]", re.I),
+    re.compile(r"['\"]([A-Fa-f0-9]{16,64})['\"]\s*\)\s*;\s*//\s*aes", re.I),
+)
 AUTH_RETRY_BACKOFF_SECONDS = 15
 
 
@@ -133,7 +138,9 @@ class ReyeeSessionManager(RouterSessionProtocol):
         http_timeout: Tuple[int, int] = (4, 12),
         session_factory: Optional[Callable[[], requests.Session]] = None,
     ):
-        raw_addr = address or host
+        raw_addr = str(address or host).strip()
+        if raw_addr and not re.match(r"^https?://", raw_addr, re.I):
+            raw_addr = f"http://{raw_addr}"
         self.address = raw_addr.rstrip("/")
         self.password = password
         self.username = username
@@ -207,25 +214,32 @@ class ReyeeSessionManager(RouterSessionProtocol):
                 raise
 
     def _fetch_encryption_key(self) -> str:
-        url = f"{self.address}/cgi-bin/luci/"
-        try:
-            resp = self._http.get(
-                url,
-                timeout=self.http_timeout,
-                verify=self.verify_tls,
-                allow_redirects=False,
-                headers={"Accept": "text/html,application/xhtml+xml"},
-            )
-        except requests.RequestException as exc:
-            raise RouterUnreachableError(f"Unable to connect to router login page: {exc}") from exc
+        candidates = [
+            f"{self.address}/cgi-bin/luci/",
+            f"{self.address}/",
+        ]
+        last_error = None
+        for url in candidates:
+            try:
+                resp = self._http.get(
+                    url,
+                    timeout=self.http_timeout,
+                    verify=self.verify_tls,
+                    allow_redirects=True,
+                    headers={"Accept": "text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8"},
+                )
+                if resp.status_code < 400 and resp.text:
+                    for pat in _KEY_PATTERNS:
+                        match = pat.search(resp.text)
+                        if match:
+                            return match.group(1)
+            except requests.RequestException as exc:
+                last_error = exc
+                continue
 
-        if resp.status_code >= 400:
-            raise RouterUnreachableError(f"Router login page returned HTTP {resp.status_code}")
-
-        match = _KEY_RE.search(resp.text or "")
-        if not match:
-            raise RouterAuthError("Could not extract dynamic GibberishAES key from router login HTML")
-        return match.group(1)
+        if last_error:
+            raise RouterUnreachableError(f"Unable to connect to router login page: {last_error}") from last_error
+        raise RouterAuthError("Could not extract dynamic GibberishAES key from router login HTML")
 
     def _perform_login(self) -> ReyeeSession:
         encryption_key = self._fetch_encryption_key()
