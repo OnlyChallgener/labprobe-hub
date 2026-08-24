@@ -1,6 +1,6 @@
 # LabProbe 变更记录
 
-## 0.11.0-rc1 / LabRelay 0.2.28
+## 0.11.0 / LabRelay 0.2.28
 
 - **Router Core v1 架构生产切流**: 生产主干正式由 `RouterService` 与 `create_router_blueprint_v1` 接管，统一承载 30 个原生路由 API 端点；
 - **单一职责实现收口**: 核心鉴权由 `ReyeeSessionManager`（动态 Key 提取 + EVP MD5 AES-256-CBC + 3600s Idle Timeout + Single-Flight 并发防重登录锁）统一收拢；
