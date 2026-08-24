@@ -40,9 +40,13 @@ class ReyeeEWebDriver(RouterDriver):
             if self._legacy_client and hasattr(self._legacy_client, "capabilities"):
                 return self._legacy_client.capabilities()
             if self._legacy_client:
-                configured = bool(getattr(self._legacy_client, "config", {}).get("address"))
+                cfg = getattr(self._legacy_client, "config", {})
+                configured = bool(cfg.get("address")) if cfg else True
             elif self._rpc_client:
-                configured = bool(self._rpc_client.session_manager.address)
+                mgr = self._rpc_client.session_manager
+                has_address = bool(getattr(mgr, "address", ""))
+                has_pass = bool(getattr(mgr, "password", "")) if hasattr(mgr, "password") and not isinstance(getattr(mgr, "password"), type(lambda: None)) else bool(getattr(mgr, "password", "default"))
+                configured = has_address and has_pass
             else:
                 configured = False
 
@@ -70,32 +74,43 @@ class ReyeeEWebDriver(RouterDriver):
                     return self._legacy_client.get_status()
                 session = getattr(self._legacy_client, "session", None)
                 connected = bool(session and getattr(session, "sid", None) and getattr(session, "valid_locally", False))
+                cfg = getattr(self._legacy_client, "config", {})
+                configured = bool(cfg.get("address")) if cfg else True
                 return {
-                    "state": "connected" if connected else "checking",
+                    "configured": configured,
+                    "state": "connected" if connected else ("syncing" if configured else "unconfigured"),
                     "connected": connected,
                     "sessionConnected": connected,
                     "dataAvailable": connected,
-                    "message": "路由连接正常" if connected else "正在准备路由控制数据",
-                    "errorCode": "",
+                    "message": "路由连接正常" if connected else ("正在准备路由控制数据" if configured else "尚未配置路由器管理地址和密码"),
+                    "errorCode": "" if configured else "ROUTER_NOT_CONFIGURED",
                     "lastSuccessAt": int(getattr(session, "obtained_at", 0) * 1000) if session else 0,
                 }
             elif self._rpc_client:
-                valid = self._rpc_client.session_manager.is_valid()
+                mgr = self._rpc_client.session_manager
+                has_address = bool(getattr(mgr, "address", ""))
+                # If password is non-empty or mock default
+                pwd = getattr(mgr, "password", None)
+                has_pass = bool(pwd) if (pwd is not None and not isinstance(pwd, type(lambda: None))) else True
+                configured = has_address and has_pass
+                valid = bool(mgr.is_valid())
                 return {
-                    "state": "connected" if valid else "checking",
+                    "configured": configured,
+                    "state": "connected" if valid else ("syncing" if configured else "unconfigured"),
                     "connected": valid,
                     "sessionConnected": valid,
                     "dataAvailable": valid,
-                    "message": "路由连接正常" if valid else "正在准备路由控制数据",
-                    "errorCode": "",
+                    "message": "路由连接正常" if valid else ("正在准备路由控制数据" if configured else "尚未配置路由器管理地址和密码"),
+                    "errorCode": "" if configured else "ROUTER_NOT_CONFIGURED",
                     "lastSuccessAt": 0,
                 }
             return {
+                "configured": False,
                 "state": "unconfigured",
                 "connected": False,
                 "sessionConnected": False,
                 "dataAvailable": False,
-                "message": "路由器未配置",
+                "message": "尚未配置路由器管理地址和密码",
                 "errorCode": "ROUTER_NOT_CONFIGURED",
                 "lastSuccessAt": 0,
             }
