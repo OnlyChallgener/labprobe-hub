@@ -1,3 +1,4 @@
+from router_ws_patch import RouterWebSocketMonitor
 """LabProbe Hub entrypoint with direct Router Core v1 architecture enabled."""
 import os
 from pathlib import Path
@@ -93,6 +94,15 @@ hub.ROUTER_DRIVER = router_driver
 hub.ROUTER_CACHE = router_cache
 hub.ROUTER_REALTIME = router_realtime
 hub.ROUTER_SERVICE = router_service
+# Attach and start eWeb WS monitor for router_driver
+if getattr(router_driver, "router_ws_monitor", None) is None:
+    try:
+        router_ws_monitor = RouterWebSocketMonitor(router_driver, hub.LOGGER)
+        router_driver.router_ws_monitor = router_ws_monitor
+        router_ws_monitor.start()
+    except Exception as exc:
+        hub.LOGGER.debug("router ws monitor init deferred: %s", exc)
+
 
 # Initialize task manager for async router tasks
 install_router_task_manager_patch(hub)

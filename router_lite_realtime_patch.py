@@ -283,6 +283,16 @@ class RouterLiteRealtimeService:
             sequence = self._router_sequence
             source = self._router_source
             agent_version = self._router_agent_version
+
+        if not epoch_ms and self.hub:
+            with getattr(self.hub, "ROUTER_DASHBOARD_LOCK", threading.Lock()):
+                cache = getattr(self.hub, "ROUTER_DASHBOARD_CACHE", {})
+                telemetry = cache.get("telemetry") if isinstance(cache.get("telemetry"), dict) else {}
+                if telemetry:
+                    sample = self._router_fields(telemetry)
+                    epoch_ms = int(cache.get("telemetryEpoch") or time.time()) * 1000
+                    source = "hub_dashboard_telemetry_cache"
+
         now_ms = int(time.time() * 1000)
         age_ms = max(0, now_ms - epoch_ms) if epoch_ms else 0
         return {

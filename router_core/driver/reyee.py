@@ -35,6 +35,48 @@ class ReyeeEWebDriver(RouterDriver):
 
     # --- Capabilities & Status ---
 
+    @property
+    def config(self) -> Dict[str, Any]:
+        if self._rpc_client:
+            mgr = self._rpc_client.session_manager
+            return {
+                "address": getattr(mgr, "address", ""),
+                "verifyTls": getattr(mgr, "verify_tls", False),
+                "sessionSeconds": getattr(mgr, "session_seconds", 3600),
+            }
+        if self._legacy_client:
+            return getattr(self._legacy_client, "config", {})
+        return {}
+
+    @property
+    def session(self) -> Any:
+        if self._rpc_client:
+            return getattr(self._rpc_client.session_manager, "_session", None)
+        if self._legacy_client:
+            return getattr(self._legacy_client, "session", None)
+        return None
+
+    @property
+    def http(self) -> Any:
+        if self._rpc_client:
+            return self._rpc_client.session_manager.http_session
+        if self._legacy_client:
+            return getattr(self._legacy_client, "http", getattr(self._legacy_client, "_http", None))
+        return None
+
+    def login(self, force: bool = False) -> Any:
+        if self._rpc_client:
+            return self._rpc_client.session_manager.get_session(force=force)
+        if self._legacy_client and hasattr(self._legacy_client, "login"):
+            return self._legacy_client.login(force=force)
+        return None
+
+    def ensure_authenticated(self, force: bool = False) -> bool:
+        try:
+            return bool(self.login(force=force))
+        except Exception:
+            return False
+
     def get_capabilities(self) -> Dict[str, Any]:
         try:
             if self._legacy_client and hasattr(self._legacy_client, "capabilities"):
