@@ -1,4 +1,5 @@
 """LabProbe Hub entrypoint with direct Router Core v1 architecture enabled."""
+import os
 from pathlib import Path
 import hub
 
