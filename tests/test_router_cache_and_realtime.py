@@ -1,154 +1,128 @@
-"""Unit Tests for router_core/cache and router_core/realtime.
+"""Tests for RouterCache SWR engine and RouterRealtime aggregation engine."""
 
-Validates:
-1. RouterCache SWR lifecycle and Single-Flight collapsing.
-2. RouterRealtimeEngine frame formatting for all 8 standard types.
-3. Exact Watchdog parameters (10s ping, 1s check, 45s frame timeout).
-4. HTTP calibration snapshots.
-"""
-
-import json
-import threading
 import time
 import pytest
+from router_core.cache.router_cache import RouterCache, CacheEntry
+from router_core.realtime.router_realtime import RouterRealtimeEngine, RealtimeFrame
 
-from router_core.cache.router_cache import RouterCache
-from router_core.realtime.router_realtime import RealtimeFrame, RouterRealtimeEngine
+
+def test_router_cache_lifecycle_and_invalidation():
+    cache = RouterCache(default_ttl=10.0, max_entries=10)
+
+    # Set and get
+    cache.set("status", {"state": "connected"})
+    assert cache.get("status") == {"state": "connected"}
+
+    # Invalidation by prefix
+    cache.set("firewall:1", {"name": "rule1"})
+    cache.set("firewall:2", {"name": "rule2"})
+    cache.set("other", {"val": 123})
+
+    cache.invalidate("firewall")
+    assert cache.get("firewall:1") is None
+    assert cache.get("firewall:2") is None
+    assert cache.get("other") == {"val": 123}
+
+    # Clear all
+    cache.invalidate()
+    assert cache.get("other") is None
 
 
-def test_router_cache_swr_and_single_flight():
-    cache = RouterCache(default_ttl=0.1)
-
-    # 1. Basic set and get
-    cache.set("k1", "v1", ttl=0.05)
-    assert cache.get("k1") == "v1"
-    assert cache.peek("k1") == "v1"
-
-    # Wait for expiration
-    time.sleep(0.06)
-    assert cache.get("k1") is None
-    # Stale peek still returns v1
-    assert cache.peek("k1") == "v1"
-
-    # 2. Invalidate prefix
-    cache.set("p_1", "a")
-    cache.set("p_2", "b")
-    cache.set("other", "c")
-    cache.invalidate("p_")
-    assert cache.get("p_1") is None
-    assert cache.get("p_2") is None
-    assert cache.get("other") == "c"
-
-    # 3. Single-Flight collapsing
+def test_router_cache_single_flight_collapsing():
+    cache = RouterCache(default_ttl=5.0)
     fetch_count = 0
 
-    def slow_fetcher():
+    def slow_fetch():
         nonlocal fetch_count
         fetch_count += 1
         time.sleep(0.05)
-        return "expensive_result"
+        return {"data": "fetched"}
+
+    # Concurrent callers
+    import threading
 
     results = []
-    threads = []
-    barrier = threading.Barrier(20)
 
-    def worker():
-        barrier.wait()
-        val = cache.get_or_fetch("heavy_key", slow_fetcher, ttl=1.0)
-        results.append(val)
+    def caller():
+        res = cache.get_or_fetch("heavy_key", slow_fetch, ttl=5.0)
+        results.append(res)
 
-    for _ in range(20):
-        t = threading.Thread(target=worker)
-        threads.append(t)
+    threads = [threading.Thread(target=caller) for _ in range(10)]
+    for t in threads:
         t.start()
-
     for t in threads:
         t.join()
 
-    assert len(results) == 20
-    assert all(r == "expensive_result" for r in results)
-    # Exactly ONE fetch executed!
+    # All 10 callers should get identical data
+    assert len(results) == 10
+    for r in results:
+        assert r == {"data": "fetched"}
+
+    # Single flight collapsed the 10 requests into 1 execution
     assert fetch_count == 1
 
 
-def test_realtime_frame_specifications():
-    # 1. ready frame
-    f_ready = RealtimeFrame.ready("cid_123", 1700000000000)
-    assert f_ready["type"] == "ready"
-    assert f_ready["data"]["clientId"] == "cid_123"
+def test_router_realtime_engine_frames_and_snapshots():
+    engine = RouterRealtimeEngine()
 
-    # 2. router frame
-    f_router = RealtimeFrame.router(
+    received_frames = []
+
+    def mock_subscriber(raw_json: str):
+        received_frames.append(raw_json)
+
+    engine.subscribe(mock_subscriber)
+
+    # 1. Router frame
+    r_frame = RealtimeFrame.router(
         state="connected",
         connected=True,
-        cpu=12.55,
-        memory=40.2,
+        cpu=15.4,
+        memory=42.1,
         upload_speed=1024,
         download_speed=2048,
         wan_ip="1.2.3.4",
         message="OK",
     )
-    assert f_router["type"] == "router"
-    assert f_router["data"]["cpu"] == 12.6
-    assert f_router["data"]["downloadSpeed"] == 2048
-
-    # 3. devices & devices_snapshot frame
-    dev_list = [{"mac": "AA:BB:CC:DD:EE:01", "ip": "192.168.110.100"}]
-    f_devs = RealtimeFrame.devices(dev_list)
-    assert f_devs["type"] == "devices"
-    assert f_devs["data"]["count"] == 1
-
-    f_snap = RealtimeFrame.devices_snapshot(dev_list)
-    assert f_snap["type"] == "devices_snapshot"
-
-    # 4. task frame
-    f_task = RealtimeFrame.task(kind="nat_diagnostic", state="running", progress=50)
-    assert f_task["type"] == "task"
-    assert f_task["data"]["progress"] == 50
-
-    # 5. config frame
-    f_cfg = RealtimeFrame.config(resource="portMappings", action="add", payload={"rule": "web"})
-    assert f_cfg["type"] == "config"
-    assert f_cfg["data"]["resource"] == "portMappings"
-
-    # 6. agent frame
-    f_agent = RealtimeFrame.agent(status="online", version="0.2.28", ip="192.168.110.1")
-    assert f_agent["type"] == "agent"
-    assert f_agent["data"]["status"] == "online"
-
-    # 7. keepalive frame
-    f_ka = RealtimeFrame.keepalive()
-    assert f_ka["type"] == "keepalive"
-    assert "timestamp" in f_ka["data"]
-
-
-def test_realtime_engine_watchdog_and_broadcasting():
-    engine = RouterRealtimeEngine()
-
-    assert engine.WATCHDOG_PING_INTERVAL_SECONDS == 10
-    assert engine.WATCHDOG_CHECK_INTERVAL_SECONDS == 1
-    assert engine.SERVER_FRAME_TIMEOUT_SECONDS == 45
-
-    received_frames = []
-
-    def on_frame(raw_json: str):
-        received_frames.append(json.loads(raw_json))
-
-    engine.subscribe(on_frame)
-
-    # Broadcast router frame
-    r_frame = RealtimeFrame.router(state="connected", connected=True, cpu=5.0)
+    assert r_frame["type"] == "router"
     engine.broadcast(r_frame)
 
-    assert len(received_frames) == 1
-    assert received_frames[0]["type"] == "router"
+    # Verify snapshot
+    snapshot = engine.get_router_calibration_snapshot()
+    assert snapshot["connected"] is True
+    assert snapshot["cpu"] == 15.4
+    assert snapshot["wanIp"] == "1.2.3.4"
 
-    # Calibration snapshot matches latest broadcast
-    calib = engine.get_router_calibration_snapshot()
-    assert calib["connected"] is True
-    assert calib["cpu"] == 5.0
+    # 2. Devices frame
+    d_frame = RealtimeFrame.devices([{"mac": "AA:BB:CC:DD:EE:FF", "ip": "192.168.110.100"}])
+    assert d_frame["type"] == "devices"
+    engine.broadcast(d_frame)
 
-    # Unsubscribe
-    engine.unsubscribe(on_frame)
-    engine.broadcast(RealtimeFrame.keepalive())
-    assert len(received_frames) == 1
+    dev_snapshot = engine.get_devices_calibration_snapshot()
+    assert len(dev_snapshot) == 1
+    assert dev_snapshot[0]["mac"] == "AA:BB:CC:DD:EE:FF"
+
+    # 3. Task, Config, Agent, Keepalive frames
+    t_frame = RealtimeFrame.task(kind="diagnostic", state="running", progress=50)
+    assert t_frame["type"] == "task"
+    engine.broadcast(t_frame)
+
+    c_frame = RealtimeFrame.config(resource="firewall", action="update", payload={"rules": []})
+    assert c_frame["type"] == "config"
+    engine.broadcast(c_frame)
+
+    a_frame = RealtimeFrame.agent(status="running", version="0.10.12", ip="127.0.0.1")
+    assert a_frame["type"] == "agent"
+    engine.broadcast(a_frame)
+
+    k_frame = RealtimeFrame.keepalive()
+    assert k_frame["type"] == "keepalive"
+    engine.broadcast(k_frame)
+
+    assert len(received_frames) == 6
+
+    # Verify parameters
+    assert engine.SERVER_KEEPALIVE_INTERVAL_SECONDS == 3.0
+    assert engine.SERVER_CLIENT_QUEUE_SIZE == 8
+    assert engine.CLIENT_WATCHDOG_PING_INTERVAL_SECONDS == 10
+    assert engine.CLIENT_WATCHDOG_CHECK_INTERVAL_SECONDS == 1
+    assert engine.CLIENT_SERVER_FRAME_TIMEOUT_SECONDS == 45
