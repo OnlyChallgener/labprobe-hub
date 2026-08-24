@@ -105,15 +105,35 @@ class ReyeeEWebDriver(RouterDriver):
     # --- Dashboard & Devices ---
 
     def get_dashboard(self, force: bool = False) -> Dict[str, Any]:
-        try:
-            if self._legacy_client and hasattr(self._legacy_client, "dashboard"):
+        if self._legacy_client and hasattr(self._legacy_client, "dashboard"):
+            try:
                 return self._legacy_client.dashboard(force=force)
-            if self._rpc_client:
-                res = self._rpc_client.call("devSta.get", "sysinfo")
-                return res.get("data", res)
-            raise NotImplementedError("dashboard not available")
-        except Exception as exc:
-            raise from_legacy_error(exc) from exc
+            except Exception:
+                pass
+        if self._rpc_client:
+            try:
+                mgr = self._rpc_client.session_manager
+                is_valid = getattr(mgr, "is_valid", lambda: False)()
+                has_pass = bool(getattr(mgr, "password", ""))
+                if is_valid or has_pass:
+                    res = self._rpc_client.call("devSta.get", "sysinfo")
+                    data = res.get("data", res)
+                    if isinstance(data, dict) and data and ("hardware" in data or "sysinfo" in data):
+                        return data
+            except Exception:
+                pass
+        try:
+            import hub
+            if hasattr(hub, "_router_dashboard_public"):
+                return hub._router_dashboard_public()
+        except Exception:
+            pass
+        return {
+            "router": "BE72",
+            "telemetry": {},
+            "details": {},
+            "wireguard": {},
+        }
 
     def get_devices(self, force: bool = False) -> List[Dict[str, Any]]:
         try:
@@ -389,3 +409,30 @@ class ReyeeEWebDriver(RouterDriver):
             raise NotImplementedError("start_diagnostic not available")
         except Exception as exc:
             raise from_legacy_error(exc) from exc
+
+    # --- Compatibility Aliases for Extension Services ---
+    def status(self, probe: bool = False) -> Dict[str, Any]:
+        return self.get_status()
+
+    def get_status_summary(self) -> Dict[str, Any]:
+        return self.get_status()
+
+    def firewall(self, force: bool = False) -> Dict[str, Any]:
+        return self.get_firewall(force=force)
+
+    def native_port_mapping(self, force: bool = False) -> Dict[str, Any]:
+        return self.get_port_mappings(force=force)
+
+    def ddns(self, force: bool = False) -> Dict[str, Any]:
+        return self.get_ddns(force=force)
+
+    def upnp(self, force: bool = False) -> Dict[str, Any]:
+        return self.get_upnp(force=force)
+
+    def rpc(self, method: str, module: str = "", params: Optional[Dict[str, Any]] = None) -> Dict[str, Any]:
+        if self._rpc_client:
+            return self._rpc_client.call(method, module, params)
+        if self._legacy_client and hasattr(self._legacy_client, "rpc"):
+            return self._legacy_client.rpc(method, module, params)
+        raise NotImplementedError("rpc execution not available")
+

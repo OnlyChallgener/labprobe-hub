@@ -18,6 +18,7 @@ class RouterCoreError(Exception):
 
     def to_response_dict(self) -> Dict[str, Any]:
         resp: Dict[str, Any] = {
+            "ok": False,
             "error": self.message,
             "code": self.code,
             "status": "error",

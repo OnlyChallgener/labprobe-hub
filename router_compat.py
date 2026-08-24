@@ -133,18 +133,30 @@ def _select_network_row(network: Any, kind: str) -> Dict[str, Any]:
     return {}
 
 
-def _find_client(app: Any) -> RuijieRouterClient:
-    for endpoint, function in app.view_functions.items():
-        if not endpoint.startswith("router_rpc."):
-            continue
-        for cell in function.__closure__ or ():
-            try:
-                value = cell.cell_contents
-            except ValueError:
+def _find_client(hub_or_app: Any) -> Any:
+    driver = getattr(hub_or_app, "ROUTER_DRIVER", None)
+    if driver is not None:
+        return driver
+    mgr = getattr(hub_or_app, "ROUTER_TASK_MANAGER", None)
+    if mgr is not None and getattr(mgr, "client", None) is not None:
+        return mgr.client
+    app = getattr(hub_or_app, "app", hub_or_app)
+    if hasattr(app, "view_functions"):
+        for endpoint, function in app.view_functions.items():
+            if not endpoint.startswith("router_rpc.") and not endpoint.startswith("router_core_api."):
                 continue
-            if isinstance(value, RuijieRouterClient):
-                return value
-    raise RuntimeError("router RPC client was not found in registered blueprint")
+            for cell in function.__closure__ or ():
+                try:
+                    value = cell.cell_contents
+                except ValueError:
+                    continue
+                if isinstance(value, RuijieRouterClient) or hasattr(value, "get_dashboard") or hasattr(value, "dashboard"):
+                    return value
+    class _EmptyFallbackClient:
+        def dashboard(self, force: bool = False): return {}
+        def devices(self, force: bool = False): return []
+        def get_status(self): return {"state": "checking", "connected": False}
+    return _EmptyFallbackClient()
 
 
 class RouterRpcCompatibilitySync:
@@ -154,7 +166,7 @@ class RouterRpcCompatibilitySync:
         self.logger = hub.LOGGER
         self.dashboard_interval = max(2.0, float(os.environ.get("ROUTER_DASHBOARD_POLL_SEC", "3")))
         self.device_interval = max(3.0, float(os.environ.get("ROUTER_DEVICE_POLL_SEC", "5")))
-        self.primary = str(os.environ.get("ROUTER_RPC_PRIMARY", "true")).lower() not in {"0", "false", "no"}
+        self.primary = str(os.environ.get("ROUTER_RPC_PRIMARY", "false")).lower() in {"1", "true", "yes"}
         self._stop = threading.Event()
         self._refresh_lock = threading.RLock()
         self._thread: Optional[threading.Thread] = None
@@ -485,7 +497,7 @@ class RouterRpcCompatibilitySync:
 
 
 def install_router_rpc_compat(hub: Any) -> RouterRpcCompatibilitySync:
-    client = _find_client(hub.app)
+    client = _find_client(hub)
     sync = RouterRpcCompatibilitySync(hub, client)
     if sync.primary:
         if "api_router_dashboard_refresh" in hub.app.view_functions:

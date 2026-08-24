@@ -20,14 +20,26 @@ class RouterService:
     def __init__(
         self,
         driver: RouterDriver,
+        cache: Optional[Any] = None,
+        realtime: Optional[Any] = None,
         notify_config_change: Optional[Callable[[str, str, Dict[str, Any]], None]] = None,
     ):
         self._driver = driver
+        self._cache = cache
+        self._realtime = realtime
         self._notify_config_change = notify_config_change
 
     @property
     def driver(self) -> RouterDriver:
         return self._driver
+
+    @property
+    def cache(self) -> Optional[Any]:
+        return self._cache
+
+    @property
+    def realtime(self) -> Optional[Any]:
+        return self._realtime
 
     def _notify(self, resource: str, action: str, data: Dict[str, Any]) -> None:
         if self._notify_config_change:

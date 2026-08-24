@@ -123,20 +123,28 @@ class ReyeeSessionManager(RouterSessionProtocol):
 
     def __init__(
         self,
-        address: str,
-        password: str,
+        address: str = "",
+        password: str = "",
         username: str = "admin",
+        host: str = "",
+        timeout: Optional[Any] = None,
         verify_tls: bool = False,
         session_seconds: int = 3600,
         http_timeout: Tuple[int, int] = (4, 12),
         session_factory: Optional[Callable[[], requests.Session]] = None,
     ):
-        self.address = address.rstrip("/")
+        raw_addr = address or host
+        self.address = raw_addr.rstrip("/")
         self.password = password
         self.username = username
         self.verify_tls = verify_tls
         self.session_seconds = session_seconds
-        self.http_timeout = http_timeout
+        if isinstance(timeout, (int, float)):
+            self.http_timeout = (int(timeout), int(timeout))
+        elif isinstance(timeout, (tuple, list)) and len(timeout) >= 2:
+            self.http_timeout = (int(timeout[0]), int(timeout[1]))
+        else:
+            self.http_timeout = http_timeout
         self._http = session_factory() if session_factory else requests.Session()
         
         self._session: Optional[ReyeeSession] = None

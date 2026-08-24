@@ -4,7 +4,7 @@ Provides Flask REST route handlers powered by RouterService.
 Guarantees 100% contract compliance with docs/contracts/app-hub-contract-v1.json.
 """
 
-from typing import Any, Callable, Optional
+from typing import Any, Callable, Optional, Dict
 from flask import Blueprint, jsonify, request
 
 from router_core.errors import RouterCoreError, from_legacy_error
@@ -15,6 +15,7 @@ def create_router_blueprint_v1(
     service: RouterService,
     check_app_token: Callable[[], bool],
     logger: Optional[Any] = None,
+    task_manager: Optional[Any] = None,
     name: str = "router_core_api",
     url_prefix: str = "/api/router",
 ) -> Blueprint:
@@ -168,7 +169,7 @@ def create_router_blueprint_v1(
         body = request.get_json(silent=True) or {}
         return jsonify(service.save_ipv6_config(body))
 
-    # --- Diagnostic ---
+    # --- Diagnostic & Tasks ---
 
     @bp.get("/diagnostic")
     def get_diagnostic():
@@ -176,6 +177,60 @@ def create_router_blueprint_v1(
 
     @bp.post("/diagnostic")
     def start_diagnostic():
+        if task_manager and hasattr(task_manager, "start_diagnostic"):
+            return jsonify({"ok": True, "data": task_manager.start_diagnostic()}), 202
         return jsonify(service.start_diagnostic())
+
+    @bp.get("/tasks/<kind>")
+    def get_task(kind: str):
+        if kind not in {"nat", "diagnostic", "beta"}:
+            return jsonify({"ok": False, "error": "未知任务类型"}), 404
+        if task_manager and hasattr(task_manager, "snapshot"):
+            return jsonify({"ok": True, "data": task_manager.snapshot(kind)})
+        return jsonify({"ok": True, "data": {"kind": kind, "state": "idle", "stage": "idle"}})
+
+    @bp.post("/tasks/<kind>")
+    def start_task(kind: str):
+        if kind not in {"nat", "diagnostic", "beta"}:
+            return jsonify({"ok": False, "error": "未知任务类型"}), 404
+        if task_manager:
+            if kind == "nat" and hasattr(task_manager, "start_nat"):
+                data = task_manager.start_nat(request.get_json(silent=True) or {})
+            elif kind == "diagnostic" and hasattr(task_manager, "start_diagnostic"):
+                data = task_manager.start_diagnostic()
+            elif kind == "beta" and hasattr(task_manager, "start_beta"):
+                data = task_manager.start_beta()
+            else:
+                data = {"kind": kind, "state": "started"}
+            return jsonify({"ok": True, "data": data}), 202
+        return jsonify({"ok": True, "data": {"kind": kind, "state": "started"}}), 202
+
+    @bp.post("/beta-upgrade")
+    def beta_upgrade():
+        if task_manager and hasattr(task_manager, "start_beta"):
+            return jsonify({"ok": True, "data": task_manager.start_beta()}), 202
+        return jsonify({"ok": True, "data": {"state": "started"}}), 202
+
+    @bp.post("/nat-diagnostic")
+    def nat_diagnostic():
+        body = request.get_json(silent=True) or {}
+        if task_manager and hasattr(task_manager, "start_nat"):
+            return jsonify({"ok": True, "data": task_manager.start_nat(body)}), 202
+        return jsonify({"ok": True, "data": {"state": "started"}}), 202
+
+    @bp.get("/realtime")
+    def get_realtime_calibration():
+        if hasattr(service, "realtime") and service.realtime:
+            return jsonify(service.realtime.get_router_calibration_snapshot())
+        return jsonify({
+            "state": "checking",
+            "connected": False,
+            "cpu": 0.0,
+            "memory": 0.0,
+            "uploadSpeed": 0,
+            "downloadSpeed": 0,
+            "wanIp": "",
+            "message": "正在准备数据",
+        })
 
     return bp

@@ -25,8 +25,15 @@ from router_core.errors import (
 class ReyeeRpcClient:
     """Client for executing wire JSON-RPC commands against Reyee eWeb OS."""
 
-    def __init__(self, session_manager: ReyeeSessionManager):
-        self._session_manager = session_manager
+    def __init__(
+        self,
+        session_manager: Optional[ReyeeSessionManager] = None,
+        session_mgr: Optional[ReyeeSessionManager] = None,
+    ):
+        mgr = session_manager or session_mgr
+        if mgr is None:
+            raise ValueError("session_manager is required")
+        self._session_manager = mgr
 
     @property
     def session_manager(self) -> ReyeeSessionManager:
