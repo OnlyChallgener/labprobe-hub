@@ -70,15 +70,22 @@ http_get() {
   url="$1"; output="$2"
   rm -f "$output"
   if command -v curl >/dev/null 2>&1; then
+    DOWNLOADER="curl"
+  else
+    if command -v wget >/dev/null 2>&1; then
+      DOWNLOADER="wget"
+    else
+      fail "缺少 curl 或 wget，无法下载安装包"
+    fi
+  fi
+  if [ "$DOWNLOADER" = "curl" ]; then
     curl -fL --connect-timeout 7 --max-time 90 --retry 2 --retry-delay 1 \
       -A 'LabRelay-Installer/4' "$url" -o "$output" >/dev/null 2>&1
     return $?
-  fi
-  if command -v wget >/dev/null 2>&1; then
+  else
     wget -q -T 90 -t 2 -O "$output" "$url"
     return $?
   fi
-  return 127
 }
 
 # Do not depend on od/hexdump/file: some vendor OpenWrt builds omit all of them.
