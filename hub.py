@@ -562,18 +562,18 @@ def _token_matches(candidate: Any, expected: Any) -> bool:
 
 
 def check_app_token() -> bool:
-    app_token = get_app_token()
-    return any(_token_matches(t, app_token) for t in _auth_tokens_from_request())
+    allowed = {get_app_token(), get_hook_token()}
+    return any(any(_token_matches(t, token) for token in allowed if token) for t in _auth_tokens_from_request())
 
 
 def check_hook_token() -> bool:
-    hook_token = get_hook_token()
-    return any(_token_matches(t, hook_token) for t in _auth_tokens_from_request())
+    allowed = {get_hook_token(), get_app_token()}
+    return any(any(_token_matches(t, token) for token in allowed if token) for t in _auth_tokens_from_request())
 
 
 def check_read_token() -> bool:
     allowed = {get_app_token(), get_hook_token()}
-    return any(any(_token_matches(t, token) for token in allowed) for t in _auth_tokens_from_request())
+    return any(any(_token_matches(t, token) for token in allowed if token) for t in _auth_tokens_from_request())
 
 
 def add_event(event: Dict[str, Any]) -> Dict[str, Any]:
