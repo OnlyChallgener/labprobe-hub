@@ -44,8 +44,8 @@ from router_core.realtime.router_realtime import RouterRealtimeEngine, RealtimeF
 from router_core.service.router_service import RouterService
 from router_core.service.blueprint import create_router_blueprint_v1
 
-PREVIOUS_HUB_VERSION = "0.11.2"
-HUB_VERSION = "0.11.3"
+PREVIOUS_HUB_VERSION = "0.11.3"
+HUB_VERSION = "0.11.4"
 hub.APP_VERSION = HUB_VERSION
 
 # Initialize Router Core Single-Source-of-Truth

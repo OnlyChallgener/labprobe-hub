@@ -1,5 +1,11 @@
 # LabProbe 变更记录
 
+## 0.11.4
+
+- **Router Native DDNS 身份修复**：读取时分别保留路由器原生记录 ID（`service`）与服务商名称（`service_name`），返回字段继续兼容现有 App 契约。
+- **Router Native DDNS 开关修复**：写入时将 App 的 `enable` 映射为路由器原生 `enabled` 字段，并保持 `ddnsCfg` RPC envelope 与路由器 Web 管理端一致。
+- **部署固定版本**：Docker Compose 默认镜像更新为 `onlychallgener/labprobe-hub:0.11.4`，发布仅更新 `latest`、`0.11.4` 与 `v0.11.4` 标签。
+
 ## 0.11.3
 
 - **Router Native DDNS 解析修复**：修复 Reyee BE72 固件 `devSta.get ddnsCfg` 返回 JSON 数组字符串或列表对象时被误判为非 dict 导致返回空列表的问题；同时输出 `list` 与 `services` 保证对 App 的完全兼容。
