@@ -582,6 +582,10 @@ class ReyeeEWebDriver(RouterDriver):
                 return self._legacy_client.add_ddns(record, password)
             if self._rpc_client:
                 payload = {**record, "password": password}
+                enabled_raw = payload.get("enable") if "enable" in payload else payload.get("enabled")
+                if enabled_raw is not None:
+                    payload["enabled"] = "1" if str(enabled_raw).lower() in ("1", "true", "yes") else "0"
+                    payload.pop("enable", None)
                 return self._write_and_read(
                     "ddns",
                     lambda: self.rpc("devSta.add", "ddnsCfg", data=payload),
@@ -619,7 +623,8 @@ class ReyeeEWebDriver(RouterDriver):
                 if enable_raw is not None:
                     enable_val = "1" if str(enable_raw).lower() in ("1", "true", "yes") else "0"
                 else:
-                    enable_val = "1" if str(old.get("enable", "1")).lower() in ("1", "true", "yes") else "0"
+                    old_enabled = old.get("enabled") if "enabled" in old else old.get("enable", "1")
+                    enable_val = "1" if str(old_enabled).lower() in ("1", "true", "yes") else "0"
 
                 service_val = str(
                     old.get("service")
@@ -648,13 +653,15 @@ class ReyeeEWebDriver(RouterDriver):
                     "service": service_val,
                     "service_name": service_name_val,
                     "domain": domain_val,
-                    "user": user_val,
                     "username": user_val,
                     "password": pass_val,
-                    "enable": enable_val,
+                    "enabled": enable_val,
                     "use_ipv6": use_ipv6_val,
                     "interface": iface_val,
                 }
+                # BE72 ddnsCfg wire schema uses `enabled`; App's `enable` is
+                # an HTTP-contract field and must not leak into the router RPC.
+                merged.pop("enable", None)
                 merged.pop("status", None)
                 merged.pop("ip", None)
                 merged.pop("passwordConfigured", None)

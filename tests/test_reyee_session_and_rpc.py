@@ -289,12 +289,12 @@ def test_reyee_rpc_client_rpc_with_no_parse_and_wire_payload():
     client.rpc(
         method="devSta.update",
         module="ddnsCfg",
-        data={"data": [{"service": "0", "enable": "0"}]},
+        data={"data": [{"service": "0", "enabled": "0"}]},
     )
     nested_call_args = mock_http.post.call_args
     nested_json = json.loads(nested_call_args.kwargs["data"].decode("utf-8"))
     assert nested_json["params"]["data"] == {
-        "data": [{"service": "0", "enable": "0"}],
+        "data": [{"service": "0", "enabled": "0"}],
     }
 
 
@@ -354,8 +354,8 @@ def test_reyee_driver_ddns_get_update_delete():
     # Simulate router returning 2 DDNS records for aliyun.com
     mock_rpc.rpc.return_value = {
         "list": [
-            {"service": "0", "service_name": "aliyun.com", "domain": "rj.lab86@shinya.icu", "user": "user1", "enable": "1", "password": "pwd"},
-            {"service": "1", "service_name": "aliyun.com", "domain": "op.lab86@shinya.icu", "user": "user2", "enable": "1", "password": "pwd"},
+            {"service": "random-service-a", "service_name": "aliyun.com", "domain": "rj.lab86@shinya.icu", "username": "user1", "enabled": "1", "password": "pwd"},
+            {"service": "random-service-b", "service_name": "aliyun.com", "domain": "op.lab86@shinya.icu", "username": "user2", "enabled": "1", "password": "pwd"},
         ]
     }
 
@@ -363,33 +363,53 @@ def test_reyee_driver_ddns_get_update_delete():
     ddns_res = driver.get_ddns(force=True)
 
     assert len(ddns_res["list"]) == 2
-    assert ddns_res["list"][0]["serviceId"] == "0"
-    assert ddns_res["list"][0]["service"] == "0"
+    assert ddns_res["list"][0]["serviceId"] == "random-service-a"
+    assert ddns_res["list"][0]["service"] == "random-service-a"
     assert ddns_res["list"][0]["service_name"] == "aliyun.com"
     assert ddns_res["list"][0]["domain"] == "rj.lab86@shinya.icu"
     assert ddns_res["list"][0]["password"] == ""
     assert ddns_res["list"][0]["passwordConfigured"] is True
     assert ddns_res["list"][1]["domain"] == "op.lab86@shinya.icu"
 
+    # App's `enable` contract field must be translated to BE72's `enabled`.
+    mock_rpc.rpc.reset_mock()
+    mock_rpc.rpc.side_effect = [{"code": 0}, {"list": []}]
+    driver.add_ddns(
+        {
+            "service_name": "aliyun.com",
+            "domain": "new.lab86@shinya.icu",
+            "username": "user3",
+            "enable": "0",
+        },
+        "pwd3",
+    )
+    add_call = next(
+        call
+        for call in mock_rpc.rpc.call_args_list
+        if call.kwargs.get("method") == "devSta.add"
+    )
+    assert add_call.kwargs["data"]["enabled"] == "0"
+    assert "enable" not in add_call.kwargs["data"]
+
     # Test update_ddns
     mock_rpc.rpc.reset_mock()
     mock_rpc.rpc.side_effect = [
         # 1. raw rows inside update_ddns
         {"list": [
-            {"service": "0", "service_name": "aliyun.com", "domain": "rj.lab86@shinya.icu", "user": "user1", "enable": "1"},
-            {"service": "1", "service_name": "aliyun.com", "domain": "op.lab86@shinya.icu", "user": "user2", "enable": "1"},
+            {"service": "random-service-a", "service_name": "aliyun.com", "domain": "rj.lab86@shinya.icu", "username": "user1", "enabled": "1"},
+            {"service": "random-service-b", "service_name": "aliyun.com", "domain": "op.lab86@shinya.icu", "username": "user2", "enabled": "1"},
         ]},
         # 2. devSta.update
         {"code": 0},
         # 3. read back get_ddns
         {"list": [
-            {"service": "0", "service_name": "aliyun.com", "domain": "rj.lab86@shinya.icu", "user": "user1", "enable": "0"},
-            {"service": "1", "service_name": "aliyun.com", "domain": "op.lab86@shinya.icu", "user": "user2", "enable": "1"},
+            {"service": "random-service-a", "service_name": "aliyun.com", "domain": "rj.lab86@shinya.icu", "username": "user1", "enabled": "0"},
+            {"service": "random-service-b", "service_name": "aliyun.com", "domain": "op.lab86@shinya.icu", "username": "user2", "enabled": "1"},
         ]},
     ]
 
     update_res = driver.update_ddns(
-        "0",
+        "random-service-a",
         {
             "service_name": "aliyun.com",
             "enable": "0",
@@ -399,7 +419,7 @@ def test_reyee_driver_ddns_get_update_delete():
         password=None,
     )
     assert len(update_res["list"]) == 2
-    assert update_res["list"][0]["enable"] == "0"
+    assert update_res["list"][0]["enabled"] == "0"
     update_call = next(
         call
         for call in mock_rpc.rpc.call_args_list
@@ -407,7 +427,8 @@ def test_reyee_driver_ddns_get_update_delete():
     )
     update_payload = update_call.kwargs["data"]
     assert list(update_payload) == ["data"]
-    assert update_payload["data"][0]["service"] == "0"
+    assert update_payload["data"][0]["service"] == "random-service-a"
     assert update_payload["data"][0]["service_name"] == "aliyun.com"
-    assert update_payload["data"][0]["enable"] == "0"
-    assert "enabled" not in update_payload["data"][0]
+    assert update_payload["data"][0]["enabled"] == "0"
+    assert "enable" not in update_payload["data"][0]
+    assert "user" not in update_payload["data"][0]
