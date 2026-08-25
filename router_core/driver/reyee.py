@@ -634,21 +634,7 @@ class ReyeeEWebDriver(RouterDriver):
                 merged.pop("serviceId", None)
 
                 def do_update():
-                    self.rpc("devSta.update", "ddnsCfg", data=[merged])
-                    full_list = []
-                    found = False
-                    for r in raw_rows:
-                        if (target_domain and str(r.get("domain") or r.get("host") or "").strip() == target_domain) or (not found and str(r.get("service")) == service_id):
-                            full_list.append(merged)
-                            found = True
-                        else:
-                            full_list.append(r)
-                    if not found:
-                        full_list.append(merged)
-                    try:
-                        self.rpc("devSta.set", "ddnsCfg", data=full_list)
-                    except Exception:
-                        pass
+                    self.rpc("devSta.update", "ddnsCfg", {"data": [merged]})
 
                 return self._write_and_read(
                     "ddns",
@@ -678,13 +664,7 @@ class ReyeeEWebDriver(RouterDriver):
                 del_id = target.get("service") or target.get("id") or target.get("domain") or service_id
 
                 def do_delete():
-                    self.rpc("devSta.del", "ddnsCfg", data=[del_id])
-                    remaining = [r for r in raw_rows if r is not target]
-                    if remaining != raw_rows:
-                        try:
-                            self.rpc("devSta.set", "ddnsCfg", data=remaining)
-                        except Exception:
-                            pass
+                    self.rpc("devSta.del", "ddnsCfg", {"data": [del_id]})
 
                 return self._write_and_read(
                     "ddns",

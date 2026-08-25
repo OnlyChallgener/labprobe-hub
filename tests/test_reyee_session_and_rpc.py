@@ -367,9 +367,7 @@ def test_reyee_driver_ddns_get_update_delete():
         ]},
         # 2. devSta.update
         {"code": 0},
-        # 3. devSta.set fallback
-        {"code": 0},
-        # 4. read back get_ddns
+        # 3. read back get_ddns
         {"list": [
             {"service": "aliyun.com", "domain": "rj.lab86@shinya.icu", "user": "user1", "enable": "0"},
             {"service": "aliyun.com", "domain": "op.lab86@shinya.icu", "user": "user2", "enable": "1"},
