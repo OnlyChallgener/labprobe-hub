@@ -46,27 +46,27 @@ def audit_auth_and_session(host: str, password: str, username: str = "admin") ->
     
     # 1. Key extraction & Login
     t0 = time.perf_counter()
-    session = session_mgr.get_session(force_refresh=True)
+    session = session_mgr.get_session(force=True)
     t_login = (time.perf_counter() - t0) * 1000
     
-    if not session.is_valid:
-        print(f"  [FAIL] Failed to acquire valid session: error={session.last_error}")
+    if not session.is_valid_locally:
+        print(f"  [FAIL] Failed to acquire valid session")
         return False
     print(f"  [PASS] Session acquired in {t_login:.1f}ms (SID length={len(session.sid)}, dynamic key extracted)")
     
     # 2. Wire RPC Execution
     rpc_client = ReyeeRpcClient(session_mgr=session_mgr)
     t0 = time.perf_counter()
-    res = rpc_client.execute("sys.status")
+    res = rpc_client.rpc("devSta.get", "sysinfo", no_parse=True)
     t_rpc = (time.perf_counter() - t0) * 1000
-    if not res.get("data") and not res.get("sys"):
-        print(f"  [FAIL] sys.status RPC returned empty data: {res}")
+    if not res:
+        print(f"  [FAIL] sysinfo RPC returned empty data: {res}")
         return False
-    print(f"  [PASS] sys.status wire RPC executed in {t_rpc:.1f}ms")
+    print(f"  [PASS] sysinfo wire RPC executed in {t_rpc:.1f}ms")
     
     # 3. Idle Session Reuse
     t0 = time.perf_counter()
-    res2 = rpc_client.execute("sys.status")
+    res2 = rpc_client.rpc("devSta.get", "sysinfo", no_parse=True)
     t_rpc2 = (time.perf_counter() - t0) * 1000
     print(f"  [PASS] Reused active session for 2nd RPC in {t_rpc2:.1f}ms (Single-Flight reuse OK)")
     return True
@@ -93,14 +93,14 @@ def audit_dual_read_shadow_diff(host: str, password: str, username: str = "admin
         ("status", lambda: legacy_client.get_status(), lambda: native_driver.get_status()),
         ("dashboard", lambda: legacy_client.get_dashboard(), lambda: native_driver.get_dashboard()),
         ("devices", lambda: legacy_client.get_devices(), lambda: native_driver.get_devices()),
-        ("native_port_mapping", lambda: legacy_client.get_port_mapping(), lambda: native_driver.get_port_mapping()),
+        ("native_port_mapping", lambda: legacy_client.get_port_mapping(), lambda: native_driver.get_port_mappings()),
         ("upnp", lambda: legacy_client.get_upnp(), lambda: native_driver.get_upnp()),
-        ("firewall", lambda: legacy_client.get_firewall_rules(), lambda: native_driver.get_firewall_rules()),
+        ("firewall", lambda: legacy_client.get_firewall_rules(), lambda: native_driver.get_firewall()),
         ("ddns", lambda: legacy_client.get_ddns(), lambda: native_driver.get_ddns()),
         ("ipv6_status", lambda: legacy_client.get_ipv6_status(), lambda: native_driver.get_ipv6_status()),
         ("ipv6_config", lambda: legacy_client.get_ipv6_config(), lambda: native_driver.get_ipv6_config()),
-        ("dhcpv6_clients", lambda: legacy_client.get_ipv6_clients(), lambda: native_driver.get_ipv6_clients()),
-        ("diagnostic", lambda: legacy_client.get_diagnostic_result(), lambda: native_driver.get_diagnostic_result()),
+        ("dhcpv6_clients", lambda: legacy_client.get_ipv6_clients(), lambda: native_driver.get_dhcpv6_clients()),
+        ("diagnostic", lambda: legacy_client.get_diagnostic_result(), lambda: native_driver.get_diagnostic()),
     ]
     
     all_passed = True
@@ -149,16 +149,17 @@ def audit_safe_reversible_mutations(host: str, password: str, username: str = "a
     # 1. UPnP reversible test (read -> toggle -> read-back -> restore -> read after)
     print("  Testing UPnP toggle (Read -> Toggle -> Verify -> Restore)...")
     orig_upnp = driver.get_upnp()
-    orig_enabled = orig_upnp.get("enabled", False)
+    orig_enabled = bool(orig_upnp.get("enabled", False))
+    orig_wan = str(orig_upnp.get("wan", "AUTO"))
     test_enabled = not orig_enabled
     
     # Write
-    driver.set_upnp(test_enabled)
+    driver.set_upnp(test_enabled, orig_wan)
     # Read-back
     mid_upnp = driver.get_upnp()
     assert mid_upnp.get("enabled") == test_enabled, "UPnP write read-back failed"
     # Restore
-    driver.set_upnp(orig_enabled)
+    driver.set_upnp(orig_enabled, orig_wan)
     # Read after
     final_upnp = driver.get_upnp()
     assert final_upnp.get("enabled") == orig_enabled, "UPnP restore failed"

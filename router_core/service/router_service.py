@@ -56,6 +56,15 @@ class RouterService:
             except Exception:
                 pass
 
+    def _invalidate_cache(self, prefix: str = "") -> None:
+        if self._cache is not None:
+            try:
+                if prefix:
+                    self._cache.invalidate(prefix)
+                self._cache.invalidate("dashboard")
+            except Exception:
+                pass
+
     def _ensure_data_wrapper(self, res: Any) -> Dict[str, Any]:
         """Ensures the response has the standard {"data": ...} wrapper expected by App."""
         if isinstance(res, dict) and "data" in res:
@@ -120,6 +129,7 @@ class RouterService:
     def add_port_mapping(self, rule: Dict[str, Any]) -> Dict[str, Any]:
         try:
             res = self._driver.add_port_mapping(rule)
+            self._invalidate_cache("native-portmap")
             wrapped = self._ensure_data_wrapper(res)
             self._notify("portMappings", "add", wrapped.get("data", {}))
             return wrapped
@@ -129,6 +139,7 @@ class RouterService:
     def update_port_mapping(self, old_name: str, rule: Dict[str, Any]) -> Dict[str, Any]:
         try:
             res = self._driver.update_port_mapping(old_name, rule)
+            self._invalidate_cache("native-portmap")
             wrapped = self._ensure_data_wrapper(res)
             self._notify("portMappings", "update", wrapped.get("data", {}))
             return wrapped
@@ -138,6 +149,7 @@ class RouterService:
     def delete_port_mapping(self, rule_name: str) -> Dict[str, Any]:
         try:
             res = self._driver.delete_port_mapping(rule_name)
+            self._invalidate_cache("native-portmap")
             wrapped = self._ensure_data_wrapper(res)
             self._notify("portMappings", "delete", wrapped.get("data", {}))
             return wrapped
@@ -156,6 +168,7 @@ class RouterService:
     def set_upnp(self, enabled: bool, wan: str) -> Dict[str, Any]:
         try:
             res = self._driver.set_upnp(enabled, wan)
+            self._invalidate_cache("upnp")
             wrapped = self._ensure_data_wrapper(res)
             self._notify("upnp", "update", wrapped.get("data", {}))
             return wrapped
@@ -174,6 +187,7 @@ class RouterService:
     def add_firewall_rule(self, rule: Dict[str, Any]) -> Dict[str, Any]:
         try:
             res = self._driver.add_firewall_rule(rule)
+            self._invalidate_cache("firewall")
             wrapped = self._ensure_data_wrapper(res)
             self._notify("firewall", "add", wrapped.get("data", {}))
             return wrapped
@@ -183,6 +197,7 @@ class RouterService:
     def update_firewall_rule(self, uuid: str, rule: Dict[str, Any]) -> Dict[str, Any]:
         try:
             res = self._driver.update_firewall_rule(uuid, rule)
+            self._invalidate_cache("firewall")
             wrapped = self._ensure_data_wrapper(res)
             self._notify("firewall", "update", wrapped.get("data", {}))
             return wrapped
@@ -192,6 +207,7 @@ class RouterService:
     def set_firewall_rule_enabled(self, uuid: str, enabled: bool) -> Dict[str, Any]:
         try:
             res = self._driver.set_firewall_rule_enabled(uuid, enabled)
+            self._invalidate_cache("firewall")
             wrapped = self._ensure_data_wrapper(res)
             self._notify("firewall", "update", wrapped.get("data", {}))
             return wrapped
@@ -201,6 +217,7 @@ class RouterService:
     def delete_firewall_rule(self, uuid: str) -> Dict[str, Any]:
         try:
             res = self._driver.delete_firewall_rule(uuid)
+            self._invalidate_cache("firewall")
             wrapped = self._ensure_data_wrapper(res)
             self._notify("firewall", "delete", wrapped.get("data", {}))
             return wrapped
@@ -210,6 +227,7 @@ class RouterService:
     def reorder_firewall_rules(self, scope: str, uuids: List[str]) -> Dict[str, Any]:
         try:
             res = self._driver.reorder_firewall_rules(scope, uuids)
+            self._invalidate_cache("firewall")
             wrapped = self._ensure_data_wrapper(res)
             self._notify("firewall", "reorder", wrapped.get("data", {}))
             return wrapped
@@ -228,6 +246,7 @@ class RouterService:
     def add_ddns(self, record: Dict[str, Any], password: str) -> Dict[str, Any]:
         try:
             res = self._driver.add_ddns(record, password)
+            self._invalidate_cache("ddns")
             wrapped = self._ensure_data_wrapper(res)
             self._notify("ddns", "add", wrapped.get("data", {}))
             return wrapped
@@ -237,6 +256,7 @@ class RouterService:
     def update_ddns(self, service_id: str, record: Dict[str, Any], password: Optional[str]) -> Dict[str, Any]:
         try:
             res = self._driver.update_ddns(service_id, record, password)
+            self._invalidate_cache("ddns")
             wrapped = self._ensure_data_wrapper(res)
             self._notify("ddns", "update", wrapped.get("data", {}))
             return wrapped
@@ -246,6 +266,7 @@ class RouterService:
     def delete_ddns(self, service_id: str) -> Dict[str, Any]:
         try:
             res = self._driver.delete_ddns(service_id)
+            self._invalidate_cache("ddns")
             wrapped = self._ensure_data_wrapper(res)
             self._notify("ddns", "delete", wrapped.get("data", {}))
             return wrapped
@@ -278,6 +299,7 @@ class RouterService:
     def save_ipv6_config(self, config: Dict[str, Any]) -> Dict[str, Any]:
         try:
             res = self._driver.save_ipv6_config(config)
+            self._invalidate_cache("ipv6")
             wrapped = self._ensure_data_wrapper(res)
             self._notify("ipv6", "update", wrapped.get("data", {}))
             return wrapped
