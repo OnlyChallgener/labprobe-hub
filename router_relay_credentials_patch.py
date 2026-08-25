@@ -330,13 +330,30 @@ def _relay_credentials_push_view(self: Any):
     return jsonify({"ok": True, "time": self.hub.now_str(), "refreshNonce": requested})
 
 
+def _matches_router(hub: Any, cmd_router: str, target_router: str) -> bool:
+    clean = getattr(hub, "clean_saved_value", lambda v: str(v or "").strip())
+    cmd_r = clean(cmd_router)
+    target_r = clean(target_router)
+    if not cmd_r or cmd_r in ("router", "default"):
+        return True
+    if not target_r or target_r in ("router", "default"):
+        return True
+    primary_fn = getattr(hub, "primary_router_name", None)
+    primary = primary_fn() if callable(primary_fn) else ""
+    return (
+        cmd_r.lower() == target_r.lower()
+        or (primary and cmd_r.lower() == primary.lower())
+        or (primary and target_r.lower() == primary.lower())
+    )
+
+
 def _agent_command_snapshot(self: Any, router: str) -> tuple[list[Dict[str, Any]], int, int]:
     data = self.hub.load_json(self.hub.AGENT_UPDATE_COMMANDS_FILE, {"commands": []})
     commands = data.get("commands", []) if isinstance(data, dict) else []
     changed = False
     now_epoch = time.time()
     for row in commands:
-        if not isinstance(row, dict) or row.get("router") != router or row.get("state") != "pending":
+        if not isinstance(row, dict) or not _matches_router(self.hub, row.get("router", ""), router) or row.get("state") != "pending":
             continue
         updated_epoch = self.hub.time_to_epoch(row.get("updatedAt") or row.get("createdAt") or 0)
         if updated_epoch > 0 and now_epoch - updated_epoch > 900:
@@ -350,7 +367,7 @@ def _agent_command_snapshot(self: Any, router: str) -> tuple[list[Dict[str, Any]
         self.hub.save_json(self.hub.AGENT_UPDATE_COMMANDS_FILE, {"commands": commands[-100:]})
     pending = [
         row for row in commands
-        if isinstance(row, dict) and row.get("router") == router and row.get("state") == "pending"
+        if isinstance(row, dict) and _matches_router(self.hub, row.get("router", ""), router) and row.get("state") == "pending"
     ][-20:]
     with self.hub.ROUTER_CREDENTIALS_LOCK:
         requested = self.hub.ROUTER_CREDENTIALS_REFRESH_NONCE
@@ -390,6 +407,7 @@ def install_router_relay_credentials_patch() -> None:
 
     def start_with_scoped_routes(self: Any) -> Any:
         result = original_start(self)
+        self.hub._AGENT_COMMAND_CONDITION = _AGENT_COMMAND_CONDITION
         if "api_router_credentials_refresh" in self.hub.app.view_functions:
             self.hub.app.view_functions["api_router_credentials_refresh"] = self.direct_credentials_refresh_view
         if "api_router_credentials_push" in self.hub.app.view_functions:

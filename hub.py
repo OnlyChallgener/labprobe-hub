@@ -2521,6 +2521,16 @@ def latest_agent_command(router: str, action: str = "update") -> Dict[str, Any]:
     )
 
 
+def notify_agent_commands_changed() -> None:
+    cond = globals().get("_AGENT_COMMAND_CONDITION")
+    if cond is not None:
+        try:
+            with cond:
+                cond.notify_all()
+        except Exception:
+            pass
+
+
 def agent_command_by_id(command_id: str, router: str = "", action: str = "") -> Dict[str, Any]:
     data = load_json(AGENT_UPDATE_COMMANDS_FILE, {"commands": []})
     rows = data.get("commands", []) if isinstance(data, dict) else []
@@ -2589,6 +2599,7 @@ def api_agent_update_request():
     commands = data.get("commands", []) if isinstance(data, dict) else []
     commands.append(command)
     save_json(AGENT_UPDATE_COMMANDS_FILE, {"commands": commands[-100:]})
+    notify_agent_commands_changed()
     return jsonify({"ok": True, "commandId": command["id"], "targetVersion": target, "message": "Rust Agent 更新指令已发送"})
 
 
@@ -2625,6 +2636,7 @@ def api_agent_cleanup_request():
     commands = data.get("commands", []) if isinstance(data, dict) else []
     commands.append(command)
     save_json(AGENT_UPDATE_COMMANDS_FILE, {"commands": commands[-100:]})
+    notify_agent_commands_changed()
     return jsonify({
         "ok": True,
         "commandId": command["id"],
@@ -2719,6 +2731,7 @@ def api_router_agent_ack():
             break
     if changed:
         save_json(AGENT_UPDATE_COMMANDS_FILE, {"commands": commands})
+        notify_agent_commands_changed()
     return jsonify({"ok": True, "acknowledged": changed})
 
 
