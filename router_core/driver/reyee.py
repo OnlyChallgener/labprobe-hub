@@ -544,10 +544,24 @@ class ReyeeEWebDriver(RouterDriver):
                     for index, row in enumerate(rows):
                         item = dict(row)
                         domain = str(item.get("domain") or item.get("host") or "").strip()
-                        service_name = str(item.get("service") or item.get("service_name") or "aliyun.com").strip()
-                        service_id = str(item.get("serviceId") or item.get("service_id") or item.get("id") or domain or service_name or f"ddns_{index}")
+                        raw_service = str(item.get("service") or "").strip()
+                        service_name = str(
+                            item.get("service_name")
+                            or item.get("provider")
+                            or item.get("providerName")
+                            or raw_service
+                            or "aliyun.com"
+                        ).strip()
+                        service_id = str(
+                            item.get("serviceId")
+                            or item.get("service_id")
+                            or item.get("id")
+                            or raw_service
+                            or domain
+                            or service_name
+                            or f"ddns_{index}"
+                        )
                         item["serviceId"] = service_id
-                        item["service"] = service_name
                         item["service_name"] = service_name
                         item["domain"] = domain
                         item["passwordConfigured"] = bool(item.get("password") or item.get("passwordConfigured"))
@@ -607,7 +621,20 @@ class ReyeeEWebDriver(RouterDriver):
                 else:
                     enable_val = "1" if str(old.get("enable", "1")).lower() in ("1", "true", "yes") else "0"
 
-                service_val = str(record.get("service") or record.get("service_name") or old.get("service") or old.get("service_name") or service_id).strip()
+                service_val = str(
+                    old.get("service")
+                    or old.get("serviceId")
+                    or old.get("id")
+                    or service_id
+                ).strip()
+                service_name_val = str(
+                    record.get("service_name")
+                    or record.get("provider")
+                    or old.get("service_name")
+                    or old.get("provider")
+                    or old.get("service")
+                    or "aliyun.com"
+                ).strip()
                 domain_val = str(record.get("domain") or record.get("host") or old.get("domain") or old.get("host") or "").strip()
                 user_val = str(record.get("username") or record.get("user") or old.get("username") or old.get("user") or "").strip()
                 pass_val = password if password else old.get("password", "")
@@ -617,14 +644,14 @@ class ReyeeEWebDriver(RouterDriver):
 
                 merged = {
                     **old,
+                    **record,
                     "service": service_val,
-                    "service_name": service_val,
+                    "service_name": service_name_val,
                     "domain": domain_val,
                     "user": user_val,
                     "username": user_val,
                     "password": pass_val,
                     "enable": enable_val,
-                    "enabled": enable_val == "1",
                     "use_ipv6": use_ipv6_val,
                     "interface": iface_val,
                 }
