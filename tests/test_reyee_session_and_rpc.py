@@ -334,3 +334,46 @@ def test_reyee_driver_rpc_and_batch_delegation():
     r2 = driver.batch(calls)
     assert r2["ok"] is True
     mock_rpc_client.batch.assert_called_once_with(calls)
+
+
+def test_reyee_driver_ddns_get_update_delete():
+    from router_core.driver.reyee import ReyeeEWebDriver
+
+    mock_rpc = MagicMock(spec=ReyeeRpcClient)
+    # Simulate router returning 2 DDNS records for aliyun.com
+    mock_rpc.rpc.return_value = {
+        "list": [
+            {"service": "aliyun.com", "domain": "rj.lab86@shinya.icu", "user": "user1", "enable": "1", "password": "pwd"},
+            {"service": "aliyun.com", "domain": "op.lab86@shinya.icu", "user": "user2", "enable": "1", "password": "pwd"},
+        ]
+    }
+
+    driver = ReyeeEWebDriver(rpc_client=mock_rpc)
+    ddns_res = driver.get_ddns(force=True)
+
+    assert len(ddns_res["list"]) == 2
+    assert ddns_res["list"][0]["domain"] == "rj.lab86@shinya.icu"
+    assert ddns_res["list"][0]["password"] == ""
+    assert ddns_res["list"][0]["passwordConfigured"] is True
+    assert ddns_res["list"][1]["domain"] == "op.lab86@shinya.icu"
+
+    # Test update_ddns
+    mock_rpc.rpc.reset_mock()
+    mock_rpc.rpc.side_effect = [
+        # 1. get_ddns inside update_ddns
+        {"list": [
+            {"service": "aliyun.com", "domain": "rj.lab86@shinya.icu", "user": "user1", "enable": "1"},
+            {"service": "aliyun.com", "domain": "op.lab86@shinya.icu", "user": "user2", "enable": "1"},
+        ]},
+        # 2. devSta.update
+        {"code": 0},
+        # 3. read back get_ddns
+        {"list": [
+            {"service": "aliyun.com", "domain": "rj.lab86@shinya.icu", "user": "user1", "enable": "0"},
+            {"service": "aliyun.com", "domain": "op.lab86@shinya.icu", "user": "user2", "enable": "1"},
+        ]},
+    ]
+
+    update_res = driver.update_ddns("rj.lab86@shinya.icu", {"enable": "0", "domain": "rj.lab86@shinya.icu"}, password=None)
+    assert len(update_res["list"]) == 2
+    assert update_res["list"][0]["enable"] == "0"

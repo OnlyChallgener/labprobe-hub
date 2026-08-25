@@ -199,7 +199,10 @@ class ReyeeRpcClient:
                 "device": "pc",
             }
             if data is not None:
-                cmd_params["data"] = data
+                if isinstance(data, dict) and "data" in data and len(data) == 1:
+                    cmd_params["data"] = data["data"]
+                else:
+                    cmd_params["data"] = data
         else:
             cmd_params = params
 

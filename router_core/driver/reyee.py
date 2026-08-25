@@ -521,7 +521,8 @@ class ReyeeEWebDriver(RouterDriver):
                 return self._legacy_client.ddns(force=force)
             if self._rpc_client:
                 def load() -> Dict[str, Any]:
-                    raw = self._unwrap_json(self.rpc("devSta.get", "ddnsCfg", no_parse=True))
+                    raw_res = self.rpc("devSta.get", "ddnsCfg")
+                    raw = self._unwrap_json(raw_res)
                     rows: Any = None
                     if isinstance(raw, list):
                         rows = raw
@@ -533,18 +534,27 @@ class ReyeeEWebDriver(RouterDriver):
                             if isinstance(nested, list):
                                 rows = nested
                             elif isinstance(nested, dict):
-                                rows = nested.get("list") or nested.get("services") or nested.get("records") or []
+                                rows = nested.get("list") or nested.get("services") or nested.get("records")
+                        if rows is None and ("service" in raw or "domain" in raw or "service_name" in raw):
+                            rows = [raw]
                     else:
                         return {"list": [], "services": []}
                     rows = rows or []
                     if isinstance(rows, list):
-                        clean_rows = [
-                            {**row, "password": "", "passwordConfigured": bool(row.get("password"))}
-                            for row in rows
-                            if isinstance(row, dict)
-                        ]
+                        clean_rows = []
+                        for index, row in enumerate(rows):
+                            if not isinstance(row, dict):
+                                continue
+                            item = dict(row)
+                            service_id = str(item.get("service") or item.get("serviceId") or item.get("service_id") or item.get("domain") or item.get("id") or f"ddns_{index}")
+                            item["serviceId"] = service_id
+                            item["service"] = item.get("service") or item.get("service_name") or "aliyun.com"
+                            item["service_name"] = item.get("service_name") or item.get("service") or "aliyun.com"
+                            item["passwordConfigured"] = bool(item.get("password") or item.get("passwordConfigured"))
+                            item["password"] = ""
+                            clean_rows.append(item)
                         return {
-                            **raw,
+                            **(raw if isinstance(raw, dict) else {}),
                             "list": clean_rows,
                             "services": clean_rows,
                         }
@@ -562,7 +572,7 @@ class ReyeeEWebDriver(RouterDriver):
                 payload = {**record, "password": password}
                 return self._write_and_read(
                     "ddns",
-                    lambda: self.rpc("devSta.add", "ddnsCfg", payload),
+                    lambda: self.rpc("devSta.add", "ddnsCfg", data=payload),
                     lambda: self.get_ddns(force=True),
                 )
             raise NotImplementedError("add_ddns not available")
@@ -575,21 +585,35 @@ class ReyeeEWebDriver(RouterDriver):
                 return self._legacy_client.update_ddns(service_id, record, password)
             if self._rpc_client:
                 current = self.get_ddns(force=True)
-                rows = (current.get("list") or current.get("data") or []) if isinstance(current, dict) else []
+                rows = (current.get("list") or current.get("services") or current.get("data") or []) if isinstance(current, dict) else []
                 old = next(
-                    (row for row in rows if isinstance(row, dict) and str(row.get("service")) == service_id),
+                    (
+                        row
+                        for row in rows
+                        if isinstance(row, dict)
+                        and (
+                            str(row.get("service")) == service_id
+                            or str(row.get("serviceId")) == service_id
+                            or str(row.get("domain")) == service_id
+                            or str(row.get("id")) == service_id
+                            or str(row.get("service_name")) == service_id
+                        )
+                    ),
                     {},
                 )
-                merged = {**old, **record, "service": service_id}
+                merged = {**old, **record}
+                if "service" not in merged:
+                    merged["service"] = service_id
                 merged.pop("status", None)
                 merged.pop("ip", None)
+                merged.pop("passwordConfigured", None)
                 if not password:
                     merged["password"] = old.get("password", "")
                 else:
                     merged["password"] = password
                 return self._write_and_read(
                     "ddns",
-                    lambda: self.rpc("devSta.update", "ddnsCfg", {"data": [merged]}),
+                    lambda: self.rpc("devSta.update", "ddnsCfg", data=[merged]),
                     lambda: self.get_ddns(force=True),
                 )
             raise NotImplementedError("update_ddns not available")
@@ -603,7 +627,7 @@ class ReyeeEWebDriver(RouterDriver):
             if self._rpc_client:
                 return self._write_and_read(
                     "ddns",
-                    lambda: self.rpc("devSta.del", "ddnsCfg", {"data": [service_id]}),
+                    lambda: self.rpc("devSta.del", "ddnsCfg", data=[service_id]),
                     lambda: self.get_ddns(force=True),
                 )
             raise NotImplementedError("delete_ddns not available")

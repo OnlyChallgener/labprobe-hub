@@ -122,13 +122,19 @@ class RouterDeviceLiveSync:
             observed_delta = max(0, min(30, now_epoch - previous_epoch)) if previous_epoch else 0
             observed_seconds = old_seconds + observed_delta if old else 0
             seconds = max(router_seconds, observed_seconds)
+            target_up = _as_int(raw.get("flowUp"))
+            target_down = _as_int(raw.get("flowDown"))
+            old_up = _as_int(old.get("uploadBps"))
+            old_down = _as_int(old.get("downloadBps"))
+            smooth_up = int(old_up * 0.25 + target_up * 0.75) if old else target_up
+            smooth_down = int(old_down * 0.25 + target_down * 0.75) if old else target_down
             row.update(
                 {
                     "online": True,
                     "lastSeenAt": stamp,
                     "offlineAt": None,
-                    "uploadBps": _as_int(raw.get("flowUp")),
-                    "downloadBps": _as_int(raw.get("flowDown")),
+                    "uploadBps": smooth_up,
+                    "downloadBps": smooth_down,
                     "connectionCount": _as_int(raw.get("flow_cnt")),
                     "todayOnlineDurationSec": seconds,
                     "todayOnlineDurationText": self.hub.human_duration(seconds),
