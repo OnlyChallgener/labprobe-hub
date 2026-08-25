@@ -601,21 +601,58 @@ class ReyeeEWebDriver(RouterDriver):
                         {},
                     )
                 
-                merged = {**old, **record}
-                if "service" not in merged:
-                    merged["service"] = old.get("service") or old.get("service_name") or service_id
+                enable_raw = record.get("enable") if "enable" in record else record.get("enabled")
+                if enable_raw is not None:
+                    enable_val = "1" if str(enable_raw).lower() in ("1", "true", "yes") else "0"
+                else:
+                    enable_val = "1" if str(old.get("enable", "1")).lower() in ("1", "true", "yes") else "0"
+
+                service_val = str(record.get("service") or record.get("service_name") or old.get("service") or old.get("service_name") or service_id).strip()
+                domain_val = str(record.get("domain") or record.get("host") or old.get("domain") or old.get("host") or "").strip()
+                user_val = str(record.get("username") or record.get("user") or old.get("username") or old.get("user") or "").strip()
+                pass_val = password if password else old.get("password", "")
+                use_ipv6_raw = record.get("use_ipv6") if "use_ipv6" in record else record.get("useIpv6", old.get("use_ipv6", "1"))
+                use_ipv6_val = "1" if str(use_ipv6_raw).lower() in ("1", "true", "yes") else "0"
+                iface_val = str(record.get("interface") or record.get("iface") or old.get("interface") or "wan").strip()
+
+                merged = {
+                    **old,
+                    "service": service_val,
+                    "service_name": service_val,
+                    "domain": domain_val,
+                    "user": user_val,
+                    "username": user_val,
+                    "password": pass_val,
+                    "enable": enable_val,
+                    "enabled": enable_val == "1",
+                    "use_ipv6": use_ipv6_val,
+                    "interface": iface_val,
+                }
                 merged.pop("status", None)
                 merged.pop("ip", None)
                 merged.pop("passwordConfigured", None)
-                
-                if not password:
-                    merged["password"] = old.get("password", "")
-                else:
-                    merged["password"] = password
+                merged.pop("serviceId", None)
+
+                def do_update():
+                    self.rpc("devSta.update", "ddnsCfg", data=[merged])
+                    full_list = []
+                    found = False
+                    for r in raw_rows:
+                        if (target_domain and str(r.get("domain") or r.get("host") or "").strip() == target_domain) or (not found and str(r.get("service")) == service_id):
+                            full_list.append(merged)
+                            found = True
+                        else:
+                            full_list.append(r)
+                    if not found:
+                        full_list.append(merged)
+                    try:
+                        self.rpc("devSta.set", "ddnsCfg", data=full_list)
+                    except Exception:
+                        pass
 
                 return self._write_and_read(
                     "ddns",
-                    lambda: self.rpc("devSta.update", "ddnsCfg", data=[merged]),
+                    do_update,
                     lambda: self.get_ddns(force=True),
                 )
             raise NotImplementedError("update_ddns not available")
@@ -639,9 +676,19 @@ class ReyeeEWebDriver(RouterDriver):
                     {},
                 )
                 del_id = target.get("service") or target.get("id") or target.get("domain") or service_id
+
+                def do_delete():
+                    self.rpc("devSta.del", "ddnsCfg", data=[del_id])
+                    remaining = [r for r in raw_rows if r is not target]
+                    if remaining != raw_rows:
+                        try:
+                            self.rpc("devSta.set", "ddnsCfg", data=remaining)
+                        except Exception:
+                            pass
+
                 return self._write_and_read(
                     "ddns",
-                    lambda: self.rpc("devSta.del", "ddnsCfg", data=[del_id]),
+                    do_delete,
                     lambda: self.get_ddns(force=True),
                 )
             raise NotImplementedError("delete_ddns not available")

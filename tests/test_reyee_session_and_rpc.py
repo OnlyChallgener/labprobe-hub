@@ -360,14 +360,16 @@ def test_reyee_driver_ddns_get_update_delete():
     # Test update_ddns
     mock_rpc.rpc.reset_mock()
     mock_rpc.rpc.side_effect = [
-        # 1. get_ddns inside update_ddns
+        # 1. raw rows inside update_ddns
         {"list": [
             {"service": "aliyun.com", "domain": "rj.lab86@shinya.icu", "user": "user1", "enable": "1"},
             {"service": "aliyun.com", "domain": "op.lab86@shinya.icu", "user": "user2", "enable": "1"},
         ]},
         # 2. devSta.update
         {"code": 0},
-        # 3. read back get_ddns
+        # 3. devSta.set fallback
+        {"code": 0},
+        # 4. read back get_ddns
         {"list": [
             {"service": "aliyun.com", "domain": "rj.lab86@shinya.icu", "user": "user1", "enable": "0"},
             {"service": "aliyun.com", "domain": "op.lab86@shinya.icu", "user": "user2", "enable": "1"},
