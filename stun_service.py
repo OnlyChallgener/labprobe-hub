@@ -55,6 +55,21 @@ def _int(value: Any, default: int = 0) -> int:
         return default
 
 
+def _bool(value: Any, default: bool = False) -> bool:
+    if value is None:
+        return default
+    if isinstance(value, bool):
+        return value
+    if isinstance(value, (int, float)):
+        return value != 0
+    normalized = _text(value).lower()
+    if normalized in {"true", "1", "yes", "on"}:
+        return True
+    if normalized in {"false", "0", "no", "off", ""}:
+        return False
+    return default
+
+
 def _now() -> int:
     return int(time.time())
 
@@ -133,7 +148,7 @@ class StunService:
             return
         self._save_rules(migrated)
         for rule in migrated:
-            if rule.get("enabled") and _text(rule.get("kind")).lower() == "stun":
+            if _bool(rule.get("enabled")) and _text(rule.get("kind")).lower() == "stun":
                 self.queue("upsert", {"rule": rule})
 
     def _router_name(self) -> str:
@@ -142,17 +157,21 @@ class StunService:
             return _text(value()) or "router"
         return _text(os.environ.get("PORTMAP_ROUTER_NAME")) or "router"
 
-    def _allocated_port(self, protocol: str, excluding: str = "") -> int:
+    def _used_ports(self, protocol: str, excluding: str = "") -> set[int]:
         used = {
             _int(row.get("listenPort"))
             for row in self._document()["rules"]
-            if _text(row.get("id")) != excluding and _text(row.get("transportProtocol")).upper() == protocol
+            if _text(row.get("id")) != excluding and _text(row.get("transportProtocol")).upper() == protocol.upper()
         }
         loader = getattr(self.hub, "_load_portmap_rules", None)
         if callable(loader):
             for row in loader():
-                if _text(row.get("transportProtocol")).upper() == protocol:
+                if _text(row.get("transportProtocol")).upper() == protocol.upper():
                     used.add(_int(row.get("listenPort")))
+        return {port for port in used if port > 0}
+
+    def _allocated_port(self, protocol: str, excluding: str = "") -> int:
+        used = self._used_ports(protocol, excluding)
         for port in range(20000, 20021):
             if port not in used:
                 return port
@@ -180,16 +199,17 @@ class StunService:
         if not all(char.isalnum() or char in "-_" for char in rule_id):
             raise ValueError("规则 ID 无效")
         listen = _int(old.get("listenPort")) if old else 0
-        if not listen:
+        if not listen or listen in self._used_ports(protocol, rule_id):
             listen = self._allocated_port(protocol, rule_id)
-        name = _text(payload.get("name") or old.get("name")) or f"{service} · {target_ip}:{target_port}"
+        generated_name = f"{service} · {target_ip}:{target_port}"
+        name = (_text(payload.get("name")) or generated_name) if "name" in payload else (_text(old.get("name")) or generated_name)
         if len(name) > 64:
             raise ValueError("名称不能超过 64 个字符")
         return {
             "id": rule_id,
             "kind": "stun",
             "name": name,
-            "enabled": bool(payload.get("enabled", old.get("enabled", True))),
+            "enabled": _bool(payload.get("enabled"), _bool(old.get("enabled"), True)),
             "mode": "stun",
             "listenPort": listen,
             "targetMode": "ipv4",
@@ -215,6 +235,41 @@ class StunService:
     def _save_commands(self, commands: Iterable[Dict[str, Any]]) -> None:
         self.hub.save_json(self.commands_path, {"commands": [dict(row) for row in commands]})
 
+    @staticmethod
+    def _compact_commands(commands: Iterable[Dict[str, Any]], terminal_limit: int = 100) -> List[Dict[str, Any]]:
+        rows = [dict(row) for row in commands]
+        terminal_ids = [
+            _text(row.get("id"))
+            for row in rows
+            if row.get("status") in {"done", "failed"}
+        ][-terminal_limit:]
+        keep_terminal = set(terminal_ids)
+        return [
+            row for row in rows
+            if row.get("status") not in {"done", "failed"} or _text(row.get("id")) in keep_terminal
+        ]
+
+    def _command_sync_errors(self) -> Dict[str, str]:
+        errors: Dict[str, str] = {}
+        for command in self._commands():
+            if command.get("status") not in {"done", "failed"}:
+                continue
+            payload = command.get("payload") if isinstance(command.get("payload"), dict) else {}
+            rule = payload.get("rule") if isinstance(payload.get("rule"), dict) else {}
+            rule_id = _text(payload.get("id") or rule.get("id"))
+            if not rule_id:
+                continue
+            if command.get("status") == "done":
+                errors.pop(rule_id, None)
+                continue
+            result = command.get("result")
+            if isinstance(result, dict):
+                message = _text(result.get("error") or result.get("message"))
+            else:
+                message = _text(result)
+            errors[rule_id] = message or f"Agent 执行 {_text(command.get('action')) or '命令'} 失败"
+        return errors
+
     def queue(self, action: str, payload: Dict[str, Any], router: str = "") -> None:
         router = router or self._router_name()
         rule_id = _text(payload.get("id") or (payload.get("rule") or {}).get("id"))
@@ -222,7 +277,7 @@ class StunService:
             commands = self._commands()
             commands = [row for row in commands if not (row.get("router") == router and row.get("action") == action and _text((row.get("payload") or {}).get("id") or ((row.get("payload") or {}).get("rule") or {}).get("id")) == rule_id and row.get("status") in {"pending", "delivered"})]
             commands.append({"id": f"stun-cmd-{uuid.uuid4().hex[:12]}", "router": router, "action": action, "payload": payload, "status": "pending", "createdAt": _now_text(), "attempts": 0})
-            self._save_commands(commands)
+            self._save_commands(self._compact_commands(commands))
 
     def _status_record(self) -> Dict[str, Any]:
         raw = self.hub.load_json(self.status_path, {})
@@ -469,18 +524,29 @@ class StunService:
         runtime = self._runtime()
         firewall_bindings = self._firewall_bindings()
         native_bindings = self._native_mapping_bindings()
+        sync_errors = self._command_sync_errors()
         result = []
         for rule in self._document()["rules"]:
             item = dict(rule)
             current = runtime.get(rule["id"], {})
-            native_state = _text(native_bindings.get(rule["id"], {}).get("state")) or ("ready" if native_bindings.get(rule["id"], {}).get("fingerprint") else "pending")
+            native_binding = native_bindings.get(rule["id"], {})
+            native_state = _text(native_binding.get("state")) or ("ready" if native_binding.get("fingerprint") else "pending")
             firewall_state = "not_required" if self._is_native_forward(rule) else (_text(firewall_bindings.get(rule["id"], {}).get("state")) or ("ready" if firewall_bindings.get(rule["id"], {}).get("uuid") else "pending"))
             actual = _text(current.get("state"))
-            if self._is_native_forward(rule) and actual == "mapped" and native_state != "ready":
+            if not _bool(rule.get("enabled")):
+                actual = "stopped"
+            elif self._is_native_forward(rule) and actual == "mapped" and native_state != "ready":
                 actual = "router_mapping_error" if native_state not in {"pending", ""} else "router_mapping"
             elif not self._is_native_forward(rule) and actual == "mapped" and firewall_state != "ready":
                 actual = "firewall_error" if firewall_state not in {"pending", ""} else "mapping"
-            item.update({"runtime": current, "actualState": actual, "firewallState": firewall_state, "nativeMappingState": native_state})
+            item.update({
+                "runtime": current,
+                "actualState": actual,
+                "firewallState": firewall_state,
+                "nativeMappingState": native_state,
+                "nativeMappingMessage": _text(native_binding.get("message")),
+                "syncError": _text(sync_errors.get(rule["id"])),
+            })
             result.append(item)
         return result
 
@@ -531,6 +597,10 @@ def create_stun_blueprint(hub: Any, service: StunService) -> Blueprint:
                 return jsonify({"ok": False, "error": str(error)}), 409
             service._save_rules([row for row in doc["rules"] if _text(row.get("id")) != rule_id])
             service.queue("delete", {"id": rule_id})
+            history = service._history()
+            if rule_id in history:
+                history.pop(rule_id, None)
+                service.hub.save_json(service.history_path, history)
             return jsonify({"ok": True, "id": rule_id, "deleted": True, "cleanupError": cleanup_error})
         try:
             payload = request.get_json(silent=True) or {}
@@ -592,6 +662,8 @@ def create_stun_blueprint(hub: Any, service: StunService) -> Blueprint:
     def addresses(rule_id: str):
         if not hub.check_read_token():
             return jsonify({"ok": False, "error": "unauthorized"}), 401
+        if not any(_text(row.get("id")) == rule_id for row in service._document()["rules"]):
+            return jsonify({"ok": False, "error": "rule not found"}), 404
         return jsonify({"ok": True, "id": rule_id, "addresses": service._history().get(rule_id, [])[:3]})
 
     @bp.get("/router/stun/commands")
@@ -615,7 +687,7 @@ def create_stun_blueprint(hub: Any, service: StunService) -> Blueprint:
                 if len(selected) >= limit:
                     break
         if changed:
-            service._save_commands(commands)
+            service._save_commands(service._compact_commands(commands))
         return jsonify({"ok": True, "commands": selected})
 
     @bp.post("/router/stun/ack")
@@ -629,10 +701,10 @@ def create_stun_blueprint(hub: Any, service: StunService) -> Blueprint:
         for command in commands:
             ack = values.get(_text(command.get("id")))
             if ack:
-                command.update({"status": "done" if bool(ack.get("ok")) else "failed", "result": ack.get("result"), "finishedAt": _now_text()})
+                command.update({"status": "done" if _bool(ack.get("ok")) else "failed", "result": ack.get("result"), "finishedAt": _now_text()})
                 changed += 1
         if changed:
-            service._save_commands(commands)
+            service._save_commands(service._compact_commands(commands))
         return jsonify({"ok": True, "acknowledged": changed})
 
     @bp.post("/router/stun/status")
@@ -662,7 +734,7 @@ def create_stun_blueprint(hub: Any, service: StunService) -> Blueprint:
         for rule in rules:
             current = runtime.get(rule["id"], {})
             service._remember_endpoint(rule["id"], current)
-            if rule.get("enabled") and service._is_native_forward(rule):
+            if _bool(rule.get("enabled")) and service._is_native_forward(rule):
                 try:
                     service.ensure_native_mapping(rule)
                 except Exception as error:
@@ -675,7 +747,7 @@ def create_stun_blueprint(hub: Any, service: StunService) -> Blueprint:
                     service.remove_firewall(rule["id"])
                 except Exception:
                     pass
-            elif rule.get("enabled") and _text(current.get("state")) == "mapped":
+            elif _bool(rule.get("enabled")) and _text(current.get("state")) == "mapped":
                 try:
                     result = service.ensure_firewall(rule)
                 except Exception as error:

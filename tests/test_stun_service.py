@@ -4,7 +4,7 @@ import threading
 
 from flask import Flask
 
-from stun_service import DEFAULT_STUN_TCP_SERVER, StunService
+from stun_service import DEFAULT_STUN_TCP_SERVER, StunService, create_stun_blueprint
 
 
 class _Cache:
@@ -60,6 +60,9 @@ def _hub(tmp_path):
         load_json=load,
         save_json=save,
         _load_portmap_rules=lambda: [{"listenPort": 20000, "transportProtocol": "TCP"}],
+        check_app_token=lambda: True,
+        check_read_token=lambda: True,
+        check_hook_token=lambda: True,
     )
 
 
@@ -153,6 +156,102 @@ def test_tcp_native_map_updates_only_when_the_selected_target_changes(tmp_path):
     assert client.native_rules[0]["srcPort"] == str(old["listenPort"])
     assert client.native_rules[0]["destIp"] == "192.168.5.47"
     assert client.native_rules[0]["destPort"] == "8443"
+
+
+def test_custom_target_port_is_preserved_until_service_is_explicitly_changed(tmp_path):
+    service = StunService(_hub(tmp_path), _Client())
+
+    http = service.clean_rule({"serviceType": "HTTP", "targetIpv4": "192.168.5.46", "targetPort": 9999})
+    https = service.clean_rule({"serviceType": "HTTPS", "targetIpv4": "192.168.5.46", "targetPort": 9443})
+
+    assert http["targetPort"] == 9999
+    assert https["targetPort"] == 9443
+
+
+def test_edit_preserves_enabled_false_and_can_clear_a_custom_name(tmp_path):
+    service = StunService(_hub(tmp_path), _Client())
+    old = service.clean_rule({
+        "serviceType": "HTTP",
+        "targetIpv4": "192.168.5.46",
+        "targetPort": 9999,
+        "name": "家庭 NAS",
+        "enabled": True,
+    })
+
+    updated = service.clean_rule({"enabled": "false", "name": ""}, old)
+
+    assert updated["enabled"] is False
+    assert updated["name"] == "HTTP · 192.168.5.46:9999"
+
+
+def test_protocol_change_reallocates_a_listen_port_that_conflicts_in_new_protocol(tmp_path):
+    service = StunService(_hub(tmp_path), _Client())
+    old = service.clean_rule({"serviceType": "HTTPS", "targetIpv4": "192.168.5.46", "targetPort": 9443})
+    udp = {
+        **service.clean_rule({"serviceType": "WireGuard", "targetIpv4": "192.168.5.47", "targetPort": 51820}),
+        "listenPort": old["listenPort"],
+    }
+    service._save_rules([old, udp])
+
+    updated = service.clean_rule({"serviceType": "OpenVPN", "transportProtocol": "UDP"}, old)
+
+    assert updated["transportProtocol"] == "UDP"
+    assert updated["listenPort"] != old["listenPort"]
+
+
+def test_rows_expose_agent_and_native_mapping_errors_and_stop_disabled_runtime(tmp_path):
+    service = StunService(_hub(tmp_path), _Client())
+    rule = service.clean_rule({"serviceType": "HTTPS", "targetIpv4": "192.168.5.46", "targetPort": 9443})
+    service._save_rules([rule])
+    service.hub.save_json(service.status_path, {
+        "status": {"rules": [{"rule": rule, "runtime": {"id": rule["id"], "state": "mapped", "publicEndpoint": "203.0.113.9:20001"}}]},
+    })
+    service._save_native_mapping_bindings({rule["id"]: {"state": "error", "message": "路由器拒绝写入"}})
+    service._save_commands([{
+        "id": "stun-cmd-failed",
+        "action": "upsert",
+        "payload": {"rule": {"id": rule["id"]}},
+        "status": "failed",
+        "result": {"error": "Agent 端口冲突"},
+    }])
+
+    current = service.rows()[0]
+    assert current["actualState"] == "router_mapping_error"
+    assert current["nativeMappingMessage"] == "路由器拒绝写入"
+    assert current["syncError"] == "Agent 端口冲突"
+
+    stopped = {**rule, "enabled": False}
+    service._save_rules([stopped])
+    assert service.rows()[0]["actualState"] == "stopped"
+
+
+def test_command_log_keeps_active_commands_and_only_latest_terminal_records(tmp_path):
+    service = StunService(_hub(tmp_path), _Client())
+    terminal = [
+        {"id": f"done-{index}", "status": "done", "payload": {"id": f"rule-{index}"}}
+        for index in range(130)
+    ]
+    pending = {"id": "pending", "status": "pending", "payload": {"id": "rule-pending"}}
+
+    compacted = service._compact_commands([*terminal, pending])
+
+    assert len(compacted) == 101
+    assert compacted[0]["id"] == "done-30"
+    assert compacted[-1]["id"] == "pending"
+
+
+def test_delete_removes_address_history_and_deleted_rule_history_is_not_readable(tmp_path):
+    hub = _hub(tmp_path)
+    service = StunService(hub, _Client())
+    rule = service.clean_rule({"serviceType": "HTTPS", "targetIpv4": "192.168.5.46", "targetPort": 9443})
+    service._save_rules([rule])
+    service._remember_endpoint(rule["id"], {"publicEndpoint": "203.0.113.9:20001"})
+    hub.app.register_blueprint(create_stun_blueprint(hub, service))
+    client = hub.app.test_client()
+
+    assert client.delete(f"/api/stun/{rule['id']}").status_code == 200
+    assert rule["id"] not in service._history()
+    assert client.get(f"/api/stun/{rule['id']}/addresses").status_code == 404
 
 
 def test_udp_stun_uses_the_same_router_native_map_model(tmp_path):
