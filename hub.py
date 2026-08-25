@@ -2530,7 +2530,6 @@ def agent_command_by_id(command_id: str, router: str = "", action: str = "") -> 
             for row in reversed(rows)
             if isinstance(row, dict)
             and row.get("id") == command_id
-            and (not router or row.get("router") == router)
             and (not action or row.get("action") == action)
         ),
         {},
@@ -2671,7 +2670,26 @@ def api_router_agent_commands():
     router = clean_saved_value(request.args.get("router")) or primary_router_name()
     data = load_json(AGENT_UPDATE_COMMANDS_FILE, {"commands": []})
     commands = data.get("commands", []) if isinstance(data, dict) else []
-    pending = [row for row in commands if isinstance(row, dict) and row.get("router") == router and row.get("state") == "pending"][:5]
+
+    def matches_router(cmd_router: str) -> bool:
+        cmd_r = clean_saved_value(cmd_router)
+        if not cmd_r or cmd_r in ("router", "default"):
+            return True
+        if not router or router in ("router", "default"):
+            return True
+        primary = primary_router_name()
+        return (
+            cmd_r.lower() == router.lower()
+            or (primary and cmd_r.lower() == primary.lower())
+            or (primary and router.lower() == primary.lower())
+        )
+
+    pending = [
+        row for row in commands
+        if isinstance(row, dict)
+        and matches_router(row.get("router", ""))
+        and row.get("state") == "pending"
+    ][:5]
     return jsonify({"ok": True, "commands": pending, "time": now_str()})
 
 
