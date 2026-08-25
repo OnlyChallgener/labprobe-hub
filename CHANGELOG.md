@@ -1,5 +1,10 @@
 # LabProbe 变更记录
 
+## 0.11.3
+
+- **Router Native DDNS 解析修复**：修复 Reyee BE72 固件 `devSta.get ddnsCfg` 返回 JSON 数组字符串或列表对象时被误判为非 dict 导致返回空列表的问题；同时输出 `list` 与 `services` 保证对 App 的完全兼容。
+- **部署固定版本**：Docker Compose 默认镜像更新为 `onlychallgener/labprobe-hub:0.11.3`。
+
 ## 0.11.2
 
 - **Router Core 数据恢复**：原生 DDNS 正确解包 BE72 的 JSON/嵌套响应；eWeb WebSocket 的 2.4G、5G 温度和存储占用进入 Core realtime 与 Dashboard。

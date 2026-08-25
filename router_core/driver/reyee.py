@@ -522,26 +522,33 @@ class ReyeeEWebDriver(RouterDriver):
             if self._rpc_client:
                 def load() -> Dict[str, Any]:
                     raw = self._unwrap_json(self.rpc("devSta.get", "ddnsCfg", no_parse=True))
-                    if not isinstance(raw, dict):
-                        return {"list": []}
-                    rows: Any = raw.get("list") or raw.get("services") or raw.get("records")
-                    if rows is None:
-                        nested = self._unwrap_json(raw.get("data"))
-                        if isinstance(nested, list):
-                            rows = nested
-                        elif isinstance(nested, dict):
-                            rows = nested.get("list") or nested.get("services") or nested.get("records") or []
+                    rows: Any = None
+                    if isinstance(raw, list):
+                        rows = raw
+                        raw = {}
+                    elif isinstance(raw, dict):
+                        rows = raw.get("list") or raw.get("services") or raw.get("records")
+                        if rows is None:
+                            nested = self._unwrap_json(raw.get("data"))
+                            if isinstance(nested, list):
+                                rows = nested
+                            elif isinstance(nested, dict):
+                                rows = nested.get("list") or nested.get("services") or nested.get("records") or []
+                    else:
+                        return {"list": [], "services": []}
                     rows = rows or []
                     if isinstance(rows, list):
-                        raw = {
+                        clean_rows = [
+                            {**row, "password": "", "passwordConfigured": bool(row.get("password"))}
+                            for row in rows
+                            if isinstance(row, dict)
+                        ]
+                        return {
                             **raw,
-                            "list": [
-                                {**row, "password": "", "passwordConfigured": bool(row.get("password"))}
-                                for row in rows
-                                if isinstance(row, dict)
-                            ],
+                            "list": clean_rows,
+                            "services": clean_rows,
                         }
-                    return raw
+                    return {"list": [], "services": []}
                 return self._cached("ddns", 15.0, load, force)
             raise NotImplementedError("ddns not available")
         except Exception as exc:

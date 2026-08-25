@@ -25,21 +25,29 @@ def _rpc_mock() -> MagicMock:
 
 def test_native_ddns_accepts_be72_json_string_and_redacts_password():
     rpc = _rpc_mock()
-    rpc.rpc.return_value = json.dumps({
-        "data": {
-            "list": [
-                {"service": "first", "domain": "one.example", "password": "one-secret"},
-                {"service": "second", "domain": "two.example", "password": "two-secret"},
-            ]
-        }
-    })
+    # Case 1: Router returns json array string in data field directly
+    rpc.rpc.return_value = json.dumps([
+        {"service": "first", "domain": "one.example", "password": "one-secret"},
+        {"service": "second", "domain": "two.example", "password": "two-secret"},
+    ])
     driver = ReyeeEWebDriver(rpc_client=rpc)
 
     result = driver.get_ddns(force=True)
 
     assert [row["service"] for row in result["list"]] == ["first", "second"]
+    assert [row["service"] for row in result["services"]] == ["first", "second"]
     assert all(row["password"] == "" for row in result["list"])
     assert all(row["passwordConfigured"] is True for row in result["list"])
+
+    # Case 2: Router returns nested list dict
+    rpc.rpc.return_value = {
+        "list": [
+            {"service": "third", "domain": "three.example", "password": "three-secret"},
+        ]
+    }
+    result2 = driver.get_ddns(force=True)
+    assert [row["service"] for row in result2["list"]] == ["third"]
+    assert [row["service"] for row in result2["services"]] == ["third"]
 
 
 def test_be72_fast_frame_keeps_both_radio_temperatures_in_core_wss():
