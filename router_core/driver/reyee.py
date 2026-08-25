@@ -515,50 +515,48 @@ class ReyeeEWebDriver(RouterDriver):
 
     # --- DDNS ---
 
+    def _get_raw_ddns_rows(self) -> List[Dict[str, Any]]:
+        raw_res = self.rpc("devSta.get", "ddnsCfg")
+        raw = self._unwrap_json(raw_res)
+        rows: Any = None
+        if isinstance(raw, list):
+            rows = raw
+        elif isinstance(raw, dict):
+            rows = raw.get("list") or raw.get("services") or raw.get("records")
+            if rows is None:
+                nested = self._unwrap_json(raw.get("data"))
+                if isinstance(nested, list):
+                    rows = nested
+                elif isinstance(nested, dict):
+                    rows = nested.get("list") or nested.get("services") or nested.get("records")
+            if rows is None and ("service" in raw or "domain" in raw or "service_name" in raw):
+                rows = [raw]
+        return [row for row in (rows or []) if isinstance(row, dict)]
+
     def get_ddns(self, force: bool = False) -> Dict[str, Any]:
         try:
             if self._legacy_client and hasattr(self._legacy_client, "ddns"):
                 return self._legacy_client.ddns(force=force)
             if self._rpc_client:
                 def load() -> Dict[str, Any]:
-                    raw_res = self.rpc("devSta.get", "ddnsCfg")
-                    raw = self._unwrap_json(raw_res)
-                    rows: Any = None
-                    if isinstance(raw, list):
-                        rows = raw
-                        raw = {}
-                    elif isinstance(raw, dict):
-                        rows = raw.get("list") or raw.get("services") or raw.get("records")
-                        if rows is None:
-                            nested = self._unwrap_json(raw.get("data"))
-                            if isinstance(nested, list):
-                                rows = nested
-                            elif isinstance(nested, dict):
-                                rows = nested.get("list") or nested.get("services") or nested.get("records")
-                        if rows is None and ("service" in raw or "domain" in raw or "service_name" in raw):
-                            rows = [raw]
-                    else:
-                        return {"list": [], "services": []}
-                    rows = rows or []
-                    if isinstance(rows, list):
-                        clean_rows = []
-                        for index, row in enumerate(rows):
-                            if not isinstance(row, dict):
-                                continue
-                            item = dict(row)
-                            service_id = str(item.get("service") or item.get("serviceId") or item.get("service_id") or item.get("domain") or item.get("id") or f"ddns_{index}")
-                            item["serviceId"] = service_id
-                            item["service"] = item.get("service") or item.get("service_name") or "aliyun.com"
-                            item["service_name"] = item.get("service_name") or item.get("service") or "aliyun.com"
-                            item["passwordConfigured"] = bool(item.get("password") or item.get("passwordConfigured"))
-                            item["password"] = ""
-                            clean_rows.append(item)
-                        return {
-                            **(raw if isinstance(raw, dict) else {}),
-                            "list": clean_rows,
-                            "services": clean_rows,
-                        }
-                    return {"list": [], "services": []}
+                    rows = self._get_raw_ddns_rows()
+                    clean_rows = []
+                    for index, row in enumerate(rows):
+                        item = dict(row)
+                        domain = str(item.get("domain") or item.get("host") or "").strip()
+                        service_name = str(item.get("service") or item.get("service_name") or "aliyun.com").strip()
+                        service_id = str(item.get("serviceId") or item.get("service_id") or item.get("id") or domain or service_name or f"ddns_{index}")
+                        item["serviceId"] = service_id
+                        item["service"] = service_name
+                        item["service_name"] = service_name
+                        item["domain"] = domain
+                        item["passwordConfigured"] = bool(item.get("password") or item.get("passwordConfigured"))
+                        item["password"] = ""
+                        clean_rows.append(item)
+                    return {
+                        "list": clean_rows,
+                        "services": clean_rows,
+                    }
                 return self._cached("ddns", 15.0, load, force)
             raise NotImplementedError("ddns not available")
         except Exception as exc:
@@ -584,33 +582,37 @@ class ReyeeEWebDriver(RouterDriver):
             if self._legacy_client and hasattr(self._legacy_client, "update_ddns"):
                 return self._legacy_client.update_ddns(service_id, record, password)
             if self._rpc_client:
-                current = self.get_ddns(force=True)
-                rows = (current.get("list") or current.get("services") or current.get("data") or []) if isinstance(current, dict) else []
-                old = next(
-                    (
-                        row
-                        for row in rows
-                        if isinstance(row, dict)
-                        and (
-                            str(row.get("service")) == service_id
-                            or str(row.get("serviceId")) == service_id
-                            or str(row.get("domain")) == service_id
-                            or str(row.get("id")) == service_id
-                            or str(row.get("service_name")) == service_id
-                        )
-                    ),
-                    {},
-                )
+                raw_rows = self._get_raw_ddns_rows()
+                target_domain = str(record.get("domain") or record.get("host") or "").strip()
+                
+                old = {}
+                if target_domain:
+                    old = next((r for r in raw_rows if str(r.get("domain") or r.get("host") or "").strip() == target_domain), {})
+                if not old:
+                    old = next(
+                        (
+                            r for r in raw_rows
+                            if str(r.get("service")) == service_id
+                            or str(r.get("serviceId")) == service_id
+                            or str(r.get("id")) == service_id
+                            or str(r.get("domain")) == service_id
+                            or str(r.get("service_name")) == service_id
+                        ),
+                        {},
+                    )
+                
                 merged = {**old, **record}
                 if "service" not in merged:
-                    merged["service"] = service_id
+                    merged["service"] = old.get("service") or old.get("service_name") or service_id
                 merged.pop("status", None)
                 merged.pop("ip", None)
                 merged.pop("passwordConfigured", None)
+                
                 if not password:
                     merged["password"] = old.get("password", "")
                 else:
                     merged["password"] = password
+
                 return self._write_and_read(
                     "ddns",
                     lambda: self.rpc("devSta.update", "ddnsCfg", data=[merged]),
@@ -625,9 +627,21 @@ class ReyeeEWebDriver(RouterDriver):
             if self._legacy_client and hasattr(self._legacy_client, "delete_ddns"):
                 return self._legacy_client.delete_ddns(service_id)
             if self._rpc_client:
+                raw_rows = self._get_raw_ddns_rows()
+                target = next(
+                    (
+                        r for r in raw_rows
+                        if str(r.get("domain") or "").strip() == service_id
+                        or str(r.get("service")) == service_id
+                        or str(r.get("serviceId")) == service_id
+                        or str(r.get("id")) == service_id
+                    ),
+                    {},
+                )
+                del_id = target.get("service") or target.get("id") or target.get("domain") or service_id
                 return self._write_and_read(
                     "ddns",
-                    lambda: self.rpc("devSta.del", "ddnsCfg", data=[service_id]),
+                    lambda: self.rpc("devSta.del", "ddnsCfg", data=[del_id]),
                     lambda: self.get_ddns(force=True),
                 )
             raise NotImplementedError("delete_ddns not available")
