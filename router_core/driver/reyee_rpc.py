@@ -4,8 +4,8 @@ Implements the official Wire Protocol:
 - Path: /cgi-bin/luci/api/cmd?auth=<sid> (or module path)
 - Headers: Cookie: <cookie_header>, Content-Type: application/json
 - Body: {"method": "<method>", "params": <params>}
-- Auto-recovery: On HTTP 401/403 or application session invalid, performs single-flight
-  re-login and retries original request at most ONCE.
+- Auto-recovery: On HTTP 401/403, LuCI login redirect/page, or application session
+  invalid, performs single-flight re-login and retries the request at most ONCE.
 - Circuit breaker protects against infinite retry loops.
 """
 
@@ -109,6 +109,20 @@ class ReyeeRpcClient:
         except Exception:
             return False
 
+    @staticmethod
+    def _is_login_redirect(response: requests.Response) -> bool:
+        """Recognize the LuCI login redirect observed on expired BE72 sessions."""
+        if response.status_code not in {301, 302, 303, 307, 308}:
+            return False
+        location = str(response.headers.get("Location") or "").lower()
+        return "luci" in location
+
+    @staticmethod
+    def _looks_like_login_page(text: str) -> bool:
+        """Use the same narrow login-page markers as the BE72-proven client."""
+        low = str(text or "").lower()
+        return 'id="password"' in low and 'id="login"' in low and "api/auth" in low
+
     def call(
         self,
         method: str,
@@ -129,19 +143,31 @@ class ReyeeRpcClient:
         except requests.RequestException as exc:
             raise RouterUnreachableError(f"Network error executing RPC '{method}': {exc}") from exc
 
-        # Check for auth expiration at HTTP status level
-        if resp.status_code in (401, 403):
-            if endpoint_path.rstrip("/").endswith("/cmd") and self._session_probe_ok(session, timeout):
+        # An expired BE72 SID can be reported as 401/403, a redirect to LuCI,
+        # or an HTTP-200 login page. These are the same narrow conditions used
+        # by the previous client after real-device verification.
+        login_redirect = self._is_login_redirect(resp)
+        login_page = self._looks_like_login_page(getattr(resp, "text", ""))
+        if resp.status_code in (401, 403) or login_redirect or login_page:
+            if (
+                resp.status_code in (401, 403)
+                and not login_redirect
+                and not login_page
+                and endpoint_path.rstrip("/").endswith("/cmd")
+                and self._session_probe_ok(session, timeout)
+            ):
                 raise RouterRpcExecutionError(
                     "Router session is valid, but the signed cmd RPC was rejected",
                     code="RPC_SIGNATURE_REJECTED",
                     status_code=502,
                 )
+            self._session_manager.invalidate_session()
             if retry_auth:
-                self._session_manager.invalidate_session()
                 # Re-login under single-flight and retry exactly once
                 return self.call(method, params, endpoint_path, timeout, retry_auth=False)
-            raise RouterAuthExpiredError(f"Router returned HTTP {resp.status_code} for method '{method}'")
+            raise RouterAuthExpiredError(
+                f"Router authentication expired for method '{method}' (HTTP {resp.status_code})"
+            )
 
         if resp.status_code >= 400:
             raise RouterRpcExecutionError(f"Router HTTP error {resp.status_code} on method '{method}'")
@@ -156,8 +182,8 @@ class ReyeeRpcClient:
             raise RouterRpcExecutionError(f"Router returned a non-object response for '{method}'")
         code = root.get("code")
         if str(code) in {"401", "403", "1001"} or root.get("error") == "session_expired":
+            self._session_manager.invalidate_session()
             if retry_auth:
-                self._session_manager.invalidate_session()
                 return self.call(method, params, endpoint_path, timeout, retry_auth=False)
             raise RouterAuthExpiredError(f"Router application session invalid on '{method}' (code={code})")
 

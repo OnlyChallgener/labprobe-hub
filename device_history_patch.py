@@ -1,9 +1,9 @@
-"""Durable device snapshots, daily rollups and summary enrichment.
+"""Durable Router Core device snapshots, daily rollups and summary enrichment.
 
-The two-second APP realtime lane is intentionally memory-only.  This patch adds a
-separate full user_list ingestion path that is always sampled by LabRelay at a
-low cadence.  Only this authoritative path updates device history, daily online
-time, traffic counters and daily summaries.
+RouterDeviceLiveSync supplies the authoritative ``user_list`` snapshot. The same
+normalized rows drive realtime, durable device state, daily online time, traffic
+counters and summaries. Relay snapshots are retained only for terminal-side
+IPv6/NDP enrichment and never replace the Core online list.
 """
 from __future__ import annotations
 
@@ -189,6 +189,26 @@ class DurableDeviceHistory:
             duration = self.hub.duration_between(online_since, offline_at)
             if not duration:
                 duration = _clean(self.hub, previous.get("todayOnlineDurationText") or previous.get("onlineDurationText"))
+        # Relay may report the same transition a few seconds before or after
+        # the Core snapshot. Preserve its richer event and avoid a duplicate.
+        try:
+            events_path = getattr(self.hub, "EVENTS_FILE", None)
+            parse_time = getattr(self.hub, "parse_time_safe", None)
+            events = self.hub.load_json(events_path, []) if events_path is not None else []
+            target_mac = self.hub.norm_mac(device.get("mac") or previous.get("mac"))
+            target_time = parse_time(stamp) if callable(parse_time) else None
+            for row in reversed(events[-20:] if isinstance(events, list) else []):
+                if not isinstance(row, dict):
+                    continue
+                if self.hub.norm_mac(row.get("mac")) != target_mac:
+                    continue
+                if row.get("type") == typ:
+                    previous_time = parse_time(row.get("createdAt") or row.get("time")) if callable(parse_time) else None
+                    if previous_time and target_time and abs((target_time - previous_time).total_seconds()) <= 10:
+                        return
+                break
+        except Exception:
+            self.logger.debug("device transition dedup deferred", exc_info=True)
         self.hub.add_event({
             "type": typ,
             "source": "durable_device_snapshot",
@@ -218,6 +238,7 @@ class DurableDeviceHistory:
         *,
         prepared_online: Optional[List[Dict[str, Any]]] = None,
         prepared_total: Optional[int] = None,
+        source: str = "router_snapshot",
     ) -> Dict[str, Any]:
         with self.lock:
             now = datetime.now()
@@ -301,9 +322,12 @@ class DurableDeviceHistory:
             for dev in hydrated:
                 self.hub.archive_device_snapshot(dev)
 
-            watched = self.hub.build_watched_devices(hydrated)
+            # Core membership transitions were emitted above. Build the watched
+            # projection without letting the legacy helper emit them again.
+            watched = self.hub.build_watched_devices(hydrated, emit_events=False)
+            source_name = _clean(self.hub, source) or "router_snapshot"
             devices_state = {
-                "source": "labrelay_durable_snapshot",
+                "source": source_name,
                 "updatedAt": stamp,
                 "onlineDeviceCount": len(hydrated),
                 "total": total,
@@ -318,7 +342,7 @@ class DurableDeviceHistory:
             state.setdefault("router", {})
             state["router"].update({
                 "name": self.hub.primary_router_name(),
-                "mode": "labrelay_durable_snapshot",
+                "mode": source_name,
                 "onlineDeviceCount": len(hydrated),
                 "total": total,
                 "devicesUpdatedAt": stamp,
@@ -334,6 +358,100 @@ class DurableDeviceHistory:
                 "watchedCount": len(watched),
                 "updatedAt": stamp,
             }
+
+    def ingest_enrichment(
+        self,
+        payload: Any,
+        *,
+        source: str = "relay_device_enrichment",
+    ) -> Dict[str, Any]:
+        """Accept Relay terminal enrichment without replacing Core device state."""
+        with self.lock:
+            neighbors = self.hub.parse_ipv6_neighbors(payload)
+            prefixes: List[str] = []
+            if isinstance(payload, dict):
+                normalize_prefixes = getattr(self.hub, "normalize_ipv6_prefixes", None)
+                raw_prefixes = payload.get("lanIpv6Prefixes") or payload.get("lan_ipv6_prefixes")
+                if callable(normalize_prefixes):
+                    prefixes = normalize_prefixes(raw_prefixes)
+                elif isinstance(raw_prefixes, list):
+                    prefixes = [str(value) for value in raw_prefixes if value]
+            merged = self.hub.merge_ipv6_neighbors_to_archive(neighbors, prefixes)
+            current = self.hub.load_json(
+                self.hub.DEVICES_FILE,
+                {"online": [], "watched": [], "onlineDeviceCount": 0},
+            )
+            online = current.get("online") if isinstance(current, dict) else []
+            watched = current.get("watched") if isinstance(current, dict) else []
+            count = current.get("onlineDeviceCount", len(online or [])) if isinstance(current, dict) else 0
+            return {
+                "accepted": True,
+                "enrichmentOnly": True,
+                "persisted": False,
+                "source": _clean(self.hub, source) or "relay_device_enrichment",
+                "ipv6NeighborCount": len(neighbors),
+                "ipv6Changed": bool(merged),
+                "ipv6ArchiveUpdates": int(merged or 0),
+                "onlineDeviceCount": _integer(count),
+                "watchedCount": len(watched or []),
+                "updatedAt": self.hub.now_str(),
+            }
+
+    def ingest_event_enrichment(
+        self,
+        snapshot: Dict[str, Any],
+        *,
+        online: bool,
+        event_time: str,
+    ) -> None:
+        """Preserve richer Relay event fields without writing Core device state."""
+        if not isinstance(snapshot, dict):
+            return
+        with self.lock:
+            row = dict(snapshot)
+            row["online"] = bool(online)
+            row["lastChangedAt"] = event_time
+            if online:
+                row["lastSeenAt"] = event_time
+                row["offlineAt"] = None
+            else:
+                row["lastIp"] = row.get("lastIp") or row.get("ip")
+                row["ip"] = None
+                row["offlineAt"] = row.get("offlineAt") or event_time
+            self.hub.archive_device_snapshot(row)
+
+    def record_event_enrichment(
+        self,
+        event: Dict[str, Any],
+        snapshot: Dict[str, Any],
+        *,
+        online: bool,
+        event_time: str,
+        dedup_seconds: int,
+        dedup_offline_only: bool = False,
+    ) -> Dict[str, Any]:
+        """Serialize Relay event dedup/archive with Core transition writes."""
+        with self.lock:
+            duplicate = False
+            if not dedup_offline_only or not online:
+                events = self.hub.load_json(self.hub.EVENTS_FILE, [])
+                target_mac = self.hub.norm_mac(event.get("mac"))
+                last = next((
+                    row for row in reversed(events if isinstance(events, list) else [])
+                    if isinstance(row, dict)
+                    and self.hub.norm_mac(row.get("mac")) == target_mac
+                ), None)
+                if last and last.get("type") == event.get("type"):
+                    previous_time = self.hub.parse_time_safe(last.get("createdAt") or last.get("time"))
+                    current_time = self.hub.parse_time_safe(event_time)
+                    duplicate = bool(
+                        previous_time
+                        and current_time
+                        and abs((current_time - previous_time).total_seconds()) <= max(0, dedup_seconds)
+                    )
+            saved = None if duplicate else self.hub.add_event(event)
+            self.ingest_event_enrichment(snapshot, online=online, event_time=event_time)
+            return {"dedup": duplicate, "event": saved}
 
     def day_devices(self, day: str) -> Dict[str, Dict[str, Any]]:
         root = self._load_rollups()

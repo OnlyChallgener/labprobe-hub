@@ -25,6 +25,7 @@ class RouterService:
         notify_config_change: Optional[Callable[[str, str, Dict[str, Any]], None]] = None,
         dashboard_loader: Optional[Callable[[bool], Dict[str, Any]]] = None,
         dashboard_refresher: Optional[Callable[[], Dict[str, Any]]] = None,
+        devices_loader: Optional[Callable[[bool], List[Dict[str, Any]]]] = None,
         config_loader: Optional[Callable[[], Dict[str, Any]]] = None,
         config_saver: Optional[Callable[[Dict[str, Any]], Dict[str, Any]]] = None,
     ):
@@ -34,6 +35,7 @@ class RouterService:
         self._notify_config_change = notify_config_change
         self._dashboard_loader = dashboard_loader
         self._dashboard_refresher = dashboard_refresher
+        self._devices_loader = devices_loader
         self._config_loader = config_loader
         self._config_saver = config_saver
 
@@ -113,6 +115,8 @@ class RouterService:
 
     def get_devices(self, force: bool = False) -> List[Dict[str, Any]]:
         try:
+            if self._devices_loader is not None:
+                return self._devices_loader(force)
             return self._driver.get_devices(force=force)
         except Exception as exc:
             raise from_legacy_error(exc) from exc

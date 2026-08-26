@@ -1,4 +1,6 @@
 import json
+import inspect
+import threading
 import time
 from types import SimpleNamespace
 from unittest.mock import MagicMock
@@ -24,6 +26,13 @@ def test_production_url_map_is_owned_by_router_core():
     }
     for (method, path), endpoint in expected.items():
         assert adapter.match(path, method=method)[0] == endpoint
+
+    realtime_rules = [
+        rule
+        for rule in hub.app.url_map.iter_rules()
+        if rule.rule == "/api/router/realtime" and "GET" in rule.methods
+    ]
+    assert len(realtime_rules) == 1
 
     assert hub.ROUTER_RPC_COMPAT_SYNC.client is hub.ROUTER_DRIVER
     assert hub.ROUTER_RPC_COMPAT_SYNC.primary is True
@@ -130,6 +139,38 @@ def test_native_driver_uses_production_module_envelopes():
     )
 
 
+def test_relay_device_hook_is_enrichment_only(monkeypatch):
+    calls = []
+    monkeypatch.setattr(hub, "check_hook_token", lambda: True)
+    monkeypatch.setattr(
+        hub.DURABLE_DEVICE_HISTORY,
+        "ingest_enrichment",
+        lambda payload: calls.append(payload) or {
+            "accepted": True,
+            "enrichmentOnly": True,
+            "persisted": False,
+            "onlineDeviceCount": 2,
+            "watchedCount": 1,
+        },
+    )
+
+    with hub.app.test_request_context(
+        "/hook/ruijie/devices",
+        method="POST",
+        json={"list": [{"mac": "relay-only"}], "ipv6Neighbors": []},
+    ):
+        response = hub.app.view_functions["hook_ruijie_devices"]()
+
+    body = response.get_json()
+    assert body["ok"] is True
+    assert body["enrichmentOnly"] is True
+    assert body["persisted"] is False
+    assert body["watchedCount"] == 1
+    assert body["authority"] == "router_core_user_list"
+    assert body["relayRole"] == "enrichment"
+    assert calls == [{"list": [{"mac": "relay-only"}], "ipv6Neighbors": []}]
+
+
 def test_relay_realtime_endpoint_is_control_only():
     service = hub.ROUTER_LITE_REALTIME
     demand = service.demand_payload()
@@ -144,3 +185,52 @@ def test_relay_realtime_endpoint_is_control_only():
     assert result["acceptedRouter"] is False
     assert result["acceptedDevices"] is False
     assert result["source"] == "router_core"
+
+
+def test_legacy_router_push_cannot_write_core_device_state():
+    source = inspect.getsource(hub.api_router_push)
+    assert "save_json(DEVICES_FILE" not in source
+    assert "upsert_watched_device_from_event(" not in source
+    assert "ingest_enrichment" in source
+    assert "record_event_enrichment" in source
+
+
+def test_router_push_merges_latest_state_and_preserves_ipv6_change_count(monkeypatch):
+    stale = {
+        "router": {},
+        "nas": {"exitIpv4": "1.1.1.1", "exitIpv6": "2409::1"},
+        "devices": [{"mac": "stale"}],
+    }
+    latest = {
+        "router": {},
+        "nas": {"exitIpv4": "1.1.1.1", "exitIpv6": "2409::1"},
+        "devices": [{"mac": "core-new"}],
+    }
+    reads = [stale, latest]
+    writes = []
+    enrichment_payloads = []
+    history = SimpleNamespace(
+        lock=threading.RLock(),
+        ingest_enrichment=lambda payload, **_kwargs: enrichment_payloads.append(payload) or {
+            "accepted": True,
+            "ipv6ArchiveUpdates": 2,
+        },
+    )
+    monkeypatch.setattr(hub, "DURABLE_DEVICE_HISTORY", history)
+    monkeypatch.setattr(hub, "check_push_token", lambda: True)
+    monkeypatch.setattr(hub, "load_json", lambda _path, _default: dict(reads.pop(0)))
+    monkeypatch.setattr(hub, "save_json", lambda path, value: writes.append((path, dict(value))))
+    monkeypatch.setattr(hub, "parse_ipv6_neighbors", lambda _payload: [{"mac": "aa", "ip": "2409::2"}])
+
+    with hub.app.test_request_context(
+        "/api/router/push",
+        method="POST",
+        json={"type": "snapshot", "router": "BE72", "lan_ip": "192.168.5.1"},
+    ):
+        response = hub.api_router_push()
+
+    body = response.get_json()
+    assert body["ipv6Changed"] == 2
+    assert writes[-1][1]["devices"] == [{"mac": "core-new"}]
+    assert writes[-1][1]["router"]["name"] == "BE72"
+    assert enrichment_payloads[0]["ipv6Neighbors"][0]["mac"] == "aa"

@@ -1883,7 +1883,11 @@ def parse_ruijie_devices(payload: Any) -> Tuple[List[Dict[str, Any]], int]:
     return devices, total
 
 
-def build_watched_devices(online_devices: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
+def build_watched_devices(
+    online_devices: List[Dict[str, Any]],
+    *,
+    emit_events: bool = True,
+) -> List[Dict[str, Any]]:
     watched = cfg_get("watched_devices", []) or []
     by_mac = {norm_mac(d.get("mac")): d for d in online_devices}
     result: List[Dict[str, Any]] = []
@@ -1912,7 +1916,7 @@ def build_watched_devices(online_devices: List[Dict[str, Any]]) -> List[Dict[str
                 "lastChangedAt": old.get("lastChangedAt") or now,
             })
             archive_device_snapshot(dev)
-            if old_online is not None and old_online is False:
+            if emit_events and old_online is not None and old_online is False:
                 dev["lastChangedAt"] = now
                 add_event({
                     "type": "device_online",
@@ -1952,7 +1956,7 @@ def build_watched_devices(online_devices: List[Dict[str, Any]]) -> List[Dict[str
             }
             dev = hydrate_device_with_archive(dev, archive)
             archive_device_snapshot(dev)
-            if was_online:
+            if emit_events and was_online:
                 duration_text = duration_between(old.get("onlineSince"), offline_at) or old.get("onlineDurationText") or ""
                 add_event({
                     "type": "device_offline",
@@ -2256,23 +2260,38 @@ def api_router_push():
                 router_update["wan6List"] = cleaned
         state["router"].update(router_update)
 
-        # v0.7.7：路由脚本可附带 IPv6 邻居表；Hub 只按 MAC 合并到设备归档。
+        # v0.7.7：路由脚本可附带 IPv6 邻居表；Router Core 设备快照仍是唯一状态源，
+        # 这里只把邻居信息作为归档增强，不能回写 devices.json。
         neighbors = parse_ipv6_neighbors(payload)
-        ipv6_changed = merge_ipv6_neighbors_to_archive(neighbors, lan_prefixes or state.get("router", {}).get("lanIpv6Prefixes") or [])
-        if neighbors:
-            devices_state = load_json(DEVICES_FILE, {"online": [], "watched": [], "updatedAt": None})
-            archive = load_device_archive()
-            devices_state["online"] = [hydrate_device_with_archive(d, archive) for d in (devices_state.get("online") or [])]
-            devices_state["watched"] = [hydrate_device_with_archive(d, archive) for d in (devices_state.get("watched") or [])]
-            devices_state["updatedAt"] = event_time
-            save_json(DEVICES_FILE, devices_state)
+        history = globals().get("DURABLE_DEVICE_HISTORY")
+        enrich = getattr(history, "ingest_enrichment", None)
+        if callable(enrich):
+            enrichment = enrich(
+                {"ipv6Neighbors": neighbors, "lanIpv6Prefixes": lan_prefixes or state.get("router", {}).get("lanIpv6Prefixes") or []},
+                source="router_push_snapshot",
+            )
+            ipv6_changed = int(enrichment.get("ipv6ArchiveUpdates") or 0) if isinstance(enrichment, dict) else 0
+        else:
+            ipv6_changed = merge_ipv6_neighbors_to_archive(
+                neighbors,
+                lan_prefixes or state.get("router", {}).get("lanIpv6Prefixes") or [],
+            )
 
         # v0.7.5：/api/router/push 只允许更新 router.*。
         # NAS IPv4 / NAS IPv6 是 Hub/NAS 本机出口，不能由路由脚本清空，也不能因为和路由 WAN6 相同就隐藏。
         # 某些桥接场景下 NAS 出口 IPv6 与路由 WAN6 可能相同，这仍然是有效的 NAS IPv6。
 
-        state["updatedAt"] = event_time
-        save_json(STATE_FILE, state)
+        # Re-read under the same lock used by DurableDeviceHistory so this old
+        # push path cannot save a stale copy over a newer Core device state.
+        state_lock = getattr(history, "lock", DATA_LOCK)
+        with state_lock:
+            latest_state = load_json(STATE_FILE, {})
+            latest_state.setdefault("router", {})
+            latest_state.setdefault("nas", {})
+            latest_state["router"].update(router_update)
+            latest_state["updatedAt"] = event_time
+            save_json(STATE_FILE, latest_state)
+            state = latest_state
 
         nas_state = state.get("nas") if isinstance(state.get("nas"), dict) else {}
         if not clean_saved_value(nas_state.get("exitIpv4")) or not clean_saved_value(nas_state.get("exitIpv6")):
@@ -2308,15 +2327,21 @@ def api_router_push():
         }
         if not online and not event.get("onlineDurationText"):
             event["onlineDurationText"] = duration_between(event.get("onlineSince"), event.get("offlineAt"))
-        events = load_json(EVENTS_FILE, [])
-        last = next((e for e in reversed(events) if norm_mac(e.get("mac")) == norm_mac(event.get("mac")) and e.get("type") == event.get("type")), None)
-        if last:
-            lt = parse_time_safe(last.get("createdAt") or last.get("time")); nt = parse_time_safe(event_time)
-            if lt and nt and abs((nt - lt).total_seconds()) <= 300 and mapped == "device_offline":
-                upsert_watched_device_from_event(snap, online, event_time)
-                return jsonify({"ok": True, "dedup": True, "message": "duplicate offline ignored", "time": now_str()})
-        saved = add_event(event)
-        upsert_watched_device_from_event(snap, online, event_time)
+        history = globals().get("DURABLE_DEVICE_HISTORY")
+        record_event = getattr(history, "record_event_enrichment", None)
+        if callable(record_event):
+            recorded = record_event(
+                event,
+                snap,
+                online=online,
+                event_time=event_time,
+                dedup_seconds=300,
+            )
+            if recorded.get("dedup"):
+                return jsonify({"ok": True, "dedup": True, "message": "duplicate device event ignored", "time": now_str()})
+            saved = recorded.get("event")
+        else:
+            saved = add_event(event)
         return jsonify({"ok": True, "message": "device event saved", "event": saved, "time": now_str()})
 
     return jsonify({"ok": False, "error": "unknown type"}), 400
@@ -3350,19 +3375,21 @@ def hook_ruijie_device_event():
     if not online and not event.get("onlineDurationText"):
         event["onlineDurationText"] = duration_between(event.get("onlineSince"), event.get("offlineAt"))
 
-    # 简单去重：同一 MAC 同类型 10 秒内不重复保存。
-    events = load_json(EVENTS_FILE, [])
-    if events:
-        last = events[-1]
-        if norm_mac(last.get("mac")) == norm_mac(event.get("mac")) and last.get("type") == event.get("type"):
-            lt = parse_time_safe(last.get("createdAt") or last.get("time"))
-            nt = parse_time_safe(event_time)
-            if lt and nt and abs((nt - lt).total_seconds()) <= 10:
-                upsert_watched_device_from_event(snap, online, event_time)
-                return jsonify({"ok": True, "dedup": True, "message": "duplicate device event ignored", "time": now_str()})
-
-    saved = add_event(event)
-    upsert_watched_device_from_event(snap, online, event_time)
+    history = globals().get("DURABLE_DEVICE_HISTORY")
+    record_event = getattr(history, "record_event_enrichment", None)
+    if callable(record_event):
+        recorded = record_event(
+            event,
+            snap,
+            online=online,
+            event_time=event_time,
+            dedup_seconds=10,
+        )
+        if recorded.get("dedup"):
+            return jsonify({"ok": True, "dedup": True, "message": "duplicate device event ignored", "time": now_str()})
+        saved = recorded.get("event")
+    else:
+        saved = add_event(event)
     return jsonify({"ok": True, "message": "device event saved", "event": saved, "time": now_str()})
 
 

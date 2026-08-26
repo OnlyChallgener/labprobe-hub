@@ -5,11 +5,9 @@ frames continuously and closes the connection when Hub sends the unsupported
 application message ``{"action":"keepalive"}``.  The replacement receiver is
 therefore passive and relies on the existing fast-frame stall watchdog.
 
-Device persistence also has one writer.  LabRelay's ``/hook/ruijie/devices`` is
-the normal durable authority.  Hub's five-second router poll remains a live WSS
-view only and cannot overwrite the durable archive.  The one-minute snapshot
-endpoint is retained as a fallback only when the Relay hook has genuinely gone
-stale.
+Router Core ``user_list`` is the durable authority for basic device state.
+LabRelay device endpoints remain available for deployed agents, but only enrich
+the archive with terminal-side IPv6/NDP data and never replace the Core list.
 """
 from __future__ import annotations
 
@@ -17,8 +15,7 @@ import json
 import ssl
 import threading
 import time
-from types import MethodType
-from typing import Any, Dict, List, Optional
+from typing import Any, Dict
 
 import websocket
 from flask import jsonify, request
@@ -97,47 +94,14 @@ def install_router_ws_passive_fix() -> None:
     monitor_class._labprobe_passive_fast_stream_fix = True
 
 
-def _patch_live_history_to_memory_only(hub: Any) -> None:
-    history = getattr(hub, "DURABLE_DEVICE_HISTORY", None)
-    if history is None or getattr(history, "_live_poll_memory_only", False):
-        return
-    original_ingest = history.ingest
-
-    def ingest(
-        self: Any,
-        payload: Any,
-        *,
-        prepared_online: Optional[List[Dict[str, Any]]] = None,
-        prepared_total: Optional[int] = None,
-    ) -> Dict[str, Any]:
-        # ``prepared_online`` is supplied only by RouterDeviceLiveSync.  That
-        # five-second lane may publish a live WSS frame but must never rewrite
-        # DEVICES_FILE, the archive, transition events, rollups or revisions.
-        if prepared_online is not None:
-            rows = [row for row in prepared_online if isinstance(row, dict)]
-            return {
-                "accepted": True,
-                "liveOnly": True,
-                "persisted": False,
-                "onlineDeviceCount": len(rows),
-                "total": max(len(rows), int(prepared_total or 0)),
-                "updatedAt": hub.now_str(),
-            }
-        return original_ingest(payload)
-
-    history.ingest = MethodType(ingest, history)
-    history._live_poll_memory_only = True
-
-
 def install_hub0935_device_sync_fix(hub: Any) -> None:
-    """Make the Relay hook authoritative and expose independent channel health."""
+    """Keep Relay enrichment endpoints without giving them Core data ownership."""
     if getattr(hub, "HUB0935_DEVICE_SYNC_FIXED", False):
         return
     history = getattr(hub, "DURABLE_DEVICE_HISTORY", None)
     if history is None:
         raise RuntimeError("DurableDeviceHistory must be installed first")
 
-    _patch_live_history_to_memory_only(hub)
     state_lock = threading.RLock()
     source_state: Dict[str, Any] = {
         "lastHookEpoch": 0,
@@ -167,13 +131,14 @@ def install_hub0935_device_sync_fix(hub: Any) -> None:
             except (TypeError, ValueError):
                 return jsonify({"ok": False, "error": "invalid device payload"}), 400
         try:
-            result = history.ingest(payload)
+            result = history.ingest_enrichment(payload)
             if result.get("accepted"):
                 mark_source("hook")
             return jsonify({
                 "ok": True,
                 **result,
-                "authority": "labrelay_hook",
+                "authority": "router_core_user_list",
+                "relayRole": "enrichment",
                 "time": hub.now_str(),
             })
         except Exception as exc:
@@ -195,18 +160,20 @@ def install_hub0935_device_sync_fix(hub: Any) -> None:
                 "ok": True,
                 "accepted": False,
                 "duplicateSource": True,
-                "authority": "labrelay_hook",
+                "authority": "router_core_user_list",
+                "relayRole": "enrichment",
                 "hookAgeSeconds": max(0, hook_age),
                 "time": hub.now_str(),
             })
         try:
-            result = history.ingest(payload)
+            result = history.ingest_enrichment(payload)
             if result.get("accepted"):
                 mark_source("fallback")
             return jsonify({
                 "ok": True,
                 **result,
-                "authority": "labrelay_snapshot_fallback",
+                "authority": "router_core_user_list",
+                "relayRole": "enrichment",
                 "time": hub.now_str(),
             })
         except Exception as exc:
@@ -226,11 +193,12 @@ def install_hub0935_device_sync_fix(hub: Any) -> None:
             "ok": True,
             **(health if isinstance(health, dict) else {}),
             **source,
-            "authority": "labrelay_hook",
+            "authority": "router_core_user_list",
+            "relayRole": "enrichment",
             "hookHealthy": bool(hook_epoch and hook_age <= HOOK_FALLBACK_GRACE_SECONDS),
             "hookAgeSeconds": hook_age,
             "fallbackAfterSeconds": HOOK_FALLBACK_GRACE_SECONDS,
-            "liveRouterPollPersistence": False,
+            "liveRouterPollPersistence": True,
             "routerWebSocketIndependent": True,
         })
 
@@ -240,5 +208,5 @@ def install_hub0935_device_sync_fix(hub: Any) -> None:
     hub.DEVICE_SYNC_SOURCE_STATE = source_state
     hub.HUB0935_DEVICE_SYNC_FIXED = True
     hub.LOGGER.info(
-        "Hub device authority enabled: Relay hook durable, router live poll memory-only"
+        "Hub device authority enabled: Router Core durable, Relay hook enrichment-only"
     )
