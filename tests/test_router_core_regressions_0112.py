@@ -219,3 +219,65 @@ def test_router_config_routes_are_owned_by_core():
     adapter = hub.app.url_map.bind("localhost")
     assert adapter.match("/api/router/config", method="GET")[0] == "router_core_api.get_connection_config"
     assert adapter.match("/api/router/config", method="PUT")[0] == "router_core_api.save_connection_config"
+
+
+def test_public_router_config_uses_effective_runtime_values_when_store_is_empty(monkeypatch):
+    monkeypatch.setattr(hub_entry.router_config_store, "load", lambda: {})
+    monkeypatch.setattr(hub_entry.router_driver, "get_status", lambda: {
+        "connected": True,
+        "state": "ready",
+        "message": "ok",
+    })
+    monkeypatch.setattr(hub_entry.router_session_mgr, "address", "http://192.168.5.1")
+    monkeypatch.setattr(hub_entry.router_session_mgr, "username", "admin")
+    monkeypatch.setattr(hub_entry.router_session_mgr, "password", "runtime-secret")
+    monkeypatch.setattr(hub_entry.router_session_mgr, "session_seconds", 3600)
+    monkeypatch.setattr(hub_entry.router_session_mgr, "verify_tls", False)
+
+    config = hub_entry._public_router_config()
+
+    assert config["address"] == "http://192.168.5.1"
+    assert config["username"] == "admin"
+    assert config["passwordConfigured"] is True
+    assert config["connected"] is True
+
+
+def test_router_config_save_with_blank_password_preserves_effective_secret(monkeypatch):
+    saved_passwords = []
+    reconfigured = []
+
+    monkeypatch.setattr(hub_entry.router_config_store, "load", lambda: {})
+
+    def save(address, password, session_seconds, verify_tls, *, username, name):
+        saved_passwords.append(password)
+        return {
+            "address": address,
+            "password": password,
+            "sessionSeconds": session_seconds,
+            "verifyTls": verify_tls,
+            "username": username,
+            "name": name,
+            "managed": True,
+        }
+
+    monkeypatch.setattr(hub_entry.router_config_store, "save", save)
+    monkeypatch.setattr(hub_entry.router_session_mgr, "address", "http://192.168.5.1")
+    monkeypatch.setattr(hub_entry.router_session_mgr, "username", "admin")
+    monkeypatch.setattr(hub_entry.router_session_mgr, "password", "runtime-secret")
+    monkeypatch.setattr(hub_entry.router_session_mgr, "session_seconds", 3600)
+    monkeypatch.setattr(hub_entry.router_session_mgr, "reconfigure", lambda **kwargs: reconfigured.append(kwargs))
+    monkeypatch.setattr(hub_entry.router_cache, "clear", lambda: None)
+    monkeypatch.setattr(hub_entry.router_driver, "get_status", lambda: {"connected": True, "state": "ready"})
+
+    result = hub_entry._save_router_config({
+        "name": "BE72",
+        "address": "http://192.168.5.1",
+        "username": "admin",
+        "password": "",
+        "test": False,
+    })
+
+    assert saved_passwords == ["runtime-secret"]
+    assert reconfigured[0]["password"] == "runtime-secret"
+    assert result["address"] == "http://192.168.5.1"
+    assert result["passwordConfigured"] is True

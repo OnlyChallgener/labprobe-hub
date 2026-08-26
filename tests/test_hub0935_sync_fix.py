@@ -46,9 +46,15 @@ class FakeMonitor:
 
 def test_router_native_ws_is_passive_and_sends_no_application_keepalive(monkeypatch):
     socket = FakeSocket()
+    connection_options = {}
+
+    def connect(*args, **kwargs):
+        connection_options.update(kwargs)
+        return socket
+
     monkeypatch.setattr(
         "hub0935_sync_fix.websocket.create_connection",
-        lambda *args, **kwargs: socket,
+        connect,
     )
     monitor = FakeMonitor()
 
@@ -64,6 +70,7 @@ def test_router_native_ws_is_passive_and_sends_no_application_keepalive(monkeypa
     assert monitor.connected[0][0] is True
     assert monitor.messages == [{"type": "fast", "data": {"up": 1}}]
     assert socket.closed is True
+    assert connection_options["subprotocols"] == ["sysinfo-stream"]
     # FakeSocket deliberately has no send()/ping() method.  Reaching this line
     # proves the receiver did not emit the old {"action":"keepalive"} frame.
 

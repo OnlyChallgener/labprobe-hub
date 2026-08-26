@@ -17,6 +17,12 @@ use crate::ddns_address;
 const DEFAULT_AGENT_CONFIG: &str = "/etc/labprobe/agent.json";
 const DEFAULT_AGENT_STATE: &str = "/tmp/labprobe/agent-state.json";
 const DEFAULT_AGENT_LOG: &str = "/tmp/labprobe/labrelay-agent.log";
+// A single empty user_list can be caused by a transient router RPC failure.
+// Require two consecutive empty snapshots before treating existing devices as offline.
+const EMPTY_DEVICE_SNAPSHOT_CONFIRMATIONS: u32 = 2;
+// Bound memory while the Hub is unavailable. Repeated events for the same device and
+// transition are coalesced before this cap is applied.
+const MAX_PENDING_DEVICE_EVENTS: usize = 256;
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(default, rename_all = "camelCase")]
@@ -61,6 +67,7 @@ impl Default for AgentConfig {
 struct AgentState {
     devices: BTreeMap<String, Value>,
     pending_events: Vec<Value>,
+    empty_device_snapshot_streak: u32,
     last_success_at: u64,
     last_error: String,
     last_logged_errors: BTreeMap<String, u64>,
@@ -1417,6 +1424,35 @@ fn event_payload(event: &str, mac: &str, device: &Value) -> Value {
     Value::Object(body)
 }
 
+fn accept_device_snapshot(state: &mut AgentState, new: &BTreeMap<String, Value>) -> bool {
+    if new.is_empty() && !state.devices.is_empty() {
+        state.empty_device_snapshot_streak = state.empty_device_snapshot_streak.saturating_add(1);
+        return state.empty_device_snapshot_streak >= EMPTY_DEVICE_SNAPSHOT_CONFIRMATIONS;
+    }
+    state.empty_device_snapshot_streak = 0;
+    true
+}
+
+fn enqueue_device_event(state: &mut AgentState, body: Value) {
+    let event = body.get("event").and_then(Value::as_str);
+    let mac = body.get("mac").and_then(Value::as_str);
+    if let (Some(event), Some(mac)) = (event, mac) {
+        if let Some(existing) = state.pending_events.iter().position(|item| {
+            item.get("event").and_then(Value::as_str) == Some(event)
+                && item.get("mac").and_then(Value::as_str) == Some(mac)
+        }) {
+            // Keep queue order while refreshing the payload/timestamp.
+            state.pending_events[existing] = body;
+            return;
+        }
+    }
+    state.pending_events.push(body);
+    if state.pending_events.len() > MAX_PENDING_DEVICE_EVENTS {
+        let excess = state.pending_events.len() - MAX_PENDING_DEVICE_EVENTS;
+        state.pending_events.drain(..excess);
+    }
+}
+
 fn queue_device_events(state: &mut AgentState, new: &BTreeMap<String, Value>) {
     let online_events = new
         .iter()
@@ -1429,8 +1465,9 @@ fn queue_device_events(state: &mut AgentState, new: &BTreeMap<String, Value>) {
         .filter(|(mac, _)| !new.contains_key(*mac))
         .map(|(mac, device)| event_payload("offline", mac, device))
         .collect::<Vec<_>>();
-    state.pending_events.extend(online_events);
-    state.pending_events.extend(offline_events);
+    for event in online_events.into_iter().chain(offline_events) {
+        enqueue_device_event(state, event);
+    }
     state.devices = new.clone();
 }
 
@@ -1723,8 +1760,21 @@ async fn agent_cycle(client: &Client, config: &AgentConfig, state: &mut AgentSta
     let user_list = collect_user_list()?;
     let mut current = BTreeMap::new();
     find_devices(&user_list, &mut current);
-    queue_device_events(state, &current);
-    post_json(client, config, "/hook/ruijie/devices", &user_list).await?;
+    if accept_device_snapshot(state, &current) {
+        queue_device_events(state, &current);
+        post_json(client, config, "/hook/ruijie/devices", &user_list).await?;
+    } else {
+        log_limited(
+            config,
+            state,
+            "WARN",
+            "empty-user-list",
+            &format!(
+                "transient empty user_list ignored (confirmation {}/{})",
+                state.empty_device_snapshot_streak, EMPTY_DEVICE_SNAPSHOT_CONFIRMATIONS
+            ),
+        );
+    }
     flush_device_events(client, config, state).await;
     post_json(client, config, "/api/router/push", &router_snapshot(config)).await?;
     state.last_success_at = now_epoch();
@@ -1873,4 +1923,71 @@ pub fn print_status(args: &[String]) -> Result<()> {
         )?
     );
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn device(mac: &str) -> (String, Value) {
+        (mac.into(), json!({"mac": mac, "hostname": "test"}))
+    }
+
+    #[test]
+    fn transient_empty_snapshot_does_not_mark_devices_offline() {
+        let (mac, value) = device("aa:bb:cc:dd:ee:ff");
+        let mut state = AgentState::default();
+        state.devices.insert(mac.clone(), value);
+        let empty = BTreeMap::new();
+
+        assert!(!accept_device_snapshot(&mut state, &empty));
+        assert!(state.devices.contains_key(&mac));
+        assert!(state.pending_events.is_empty());
+
+        assert!(accept_device_snapshot(&mut state, &empty));
+        queue_device_events(&mut state, &empty);
+        assert!(state.devices.is_empty());
+        assert_eq!(state.pending_events.len(), 1);
+        assert_eq!(state.pending_events[0]["event"], "offline");
+    }
+
+    #[test]
+    fn non_empty_snapshot_resets_empty_confirmation() {
+        let (mac, value) = device("aa:bb:cc:dd:ee:ff");
+        let mut state = AgentState::default();
+        state.devices.insert(mac.clone(), value.clone());
+        let empty = BTreeMap::new();
+        let mut current = BTreeMap::new();
+        current.insert(mac, value);
+
+        assert!(!accept_device_snapshot(&mut state, &empty));
+        assert!(accept_device_snapshot(&mut state, &current));
+        assert_eq!(state.empty_device_snapshot_streak, 0);
+    }
+
+    #[test]
+    fn pending_events_coalesce_by_device_and_transition() {
+        let mut state = AgentState::default();
+        enqueue_device_event(&mut state, json!({"event":"online","mac":"aa","seq":1}));
+        enqueue_device_event(&mut state, json!({"event":"online","mac":"aa","seq":2}));
+        enqueue_device_event(&mut state, json!({"event":"offline","mac":"aa","seq":3}));
+
+        assert_eq!(state.pending_events.len(), 2);
+        assert_eq!(state.pending_events[0]["seq"], 2);
+        assert_eq!(state.pending_events[1]["event"], "offline");
+    }
+
+    #[test]
+    fn pending_events_are_bounded() {
+        let mut state = AgentState::default();
+        for index in 0..(MAX_PENDING_DEVICE_EVENTS + 10) {
+            enqueue_device_event(
+                &mut state,
+                json!({"event":"online","mac":format!("aa:{index:010x}")}),
+            );
+        }
+        assert_eq!(state.pending_events.len(), MAX_PENDING_DEVICE_EVENTS);
+        assert_eq!(state.pending_events[0]["mac"], "aa:000000000a");
+    }
+
 }

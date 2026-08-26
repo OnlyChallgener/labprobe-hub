@@ -1,9 +1,11 @@
+import inspect
 from types import SimpleNamespace
 
 from hub0934_fixes import (
     _normalize_portmap_payload,
     _prune_redundant_portmap_commands,
     canonical_watched_devices,
+    install_hub0934_fixes,
 )
 
 
@@ -93,6 +95,12 @@ def test_current_online_snapshot_has_highest_device_authority():
     assert row["online"] is True
     assert row["rssi"] == "-45"
     assert row["offlineAt"] is None
+
+
+def test_installed_watched_projection_keeps_router_core_keyword_contract():
+    source = inspect.getsource(install_hub0934_fixes)
+    assert "emit_events: bool = True" in source
+    assert "del emit_events" in source
 
 
 def test_permanent_rule_missing_lease_does_not_trigger_false_mismatch():

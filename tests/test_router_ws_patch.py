@@ -1,4 +1,6 @@
+import json
 from pathlib import Path
+from types import SimpleNamespace
 
 import websocket
 import router_ws_patch
@@ -84,3 +86,40 @@ def test_production_ws_receiver_remains_passive():
     # inspect the production module source rather than the mutated test process.
     source = Path(router_ws_patch.__file__).read_text(encoding="utf-8")
     assert "target=self._keepalive_loop" not in source
+    assert 'WS_SUBPROTOCOL = "sysinfo-stream"' in source
+    assert "subprotocols=[WS_SUBPROTOCOL]" in source
+
+
+def test_production_ws_requests_firmware_sysinfo_subprotocol(monkeypatch):
+    connection_options = {}
+
+    class FakeSocket:
+        def settimeout(self, _value):
+            return None
+
+        def recv(self):
+            return json.dumps({"type": "fast", "data": {"up": 1, "down": 2}})
+
+        def close(self):
+            return None
+
+    def connect(*_args, **kwargs):
+        connection_options.update(kwargs)
+        return FakeSocket()
+
+    monkeypatch.setattr(router_ws_patch.websocket, "create_connection", connect)
+    monitor = RouterWebSocketMonitor(
+        SimpleNamespace(),
+        SimpleNamespace(info=lambda *_args, **_kwargs: None, debug=lambda *_args, **_kwargs: None),
+    )
+    monitor.set_fast_handler(lambda *_args: monitor._stop.set())
+
+    monitor._run_connection(
+        "ws://192.168.5.1/ws?auth=test",
+        "http://192.168.5.1",
+        "sid=test",
+        False,
+        "192.168.5.1",
+    )
+
+    assert connection_options["subprotocols"] == ["sysinfo-stream"]

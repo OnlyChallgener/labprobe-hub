@@ -53,6 +53,7 @@ def _run_connection_with_fast_watchdog(
         timeout=6,
         origin=origin,
         cookie=cookie or None,
+        subprotocols=[router_ws_patch.WS_SUBPROTOCOL],
         sslopt=sslopt or {},
         http_no_proxy=[hostname] if hostname else None,
         enable_multithread=True,
