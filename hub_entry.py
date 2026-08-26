@@ -18,16 +18,10 @@ from lab_ddns import install_lab_ddns
 from portmap_persistence_patch import install_portmap_persistence_patch
 from router_compat import install_router_rpc_compat
 from router_config_sync_patch import install_router_config_sync_patch
-from router_control_actor_patch import install_router_control_actor_patch
-from router_control_scheduler_patch import install_router_control_scheduler_patch
 from router_device_live_sync_patch import install_router_device_live_sync_patch
 from router.firewall_automation import install_firewall_automation
 from router_lite_realtime_patch import install_router_lite_realtime_patch
-from router_native_features_patch import install_router_native_features_patch
-from router_realtime_stability_patch import (
-    install_router_realtime_stability_patch,
-    install_router_status_localization,
-)
+from router_realtime_stability_patch import install_router_status_localization
 from router_relay_credentials_patch import install_router_relay_credentials_patch
 from router_rpc import EncryptedRouterConfigStore
 from router_task_manager_patch import RouterTaskManager
@@ -202,6 +196,7 @@ router_service = RouterService(
     notify_config_change=lambda res, act, data: router_realtime.broadcast(RealtimeFrame.config(res, act, data)),
     dashboard_loader=router_sync.dashboard_snapshot,
     dashboard_refresher=router_sync.refresh_dashboard,
+    devices_loader=router_sync.devices_snapshot,
     config_loader=_public_router_config,
     config_saver=_save_router_config,
 )

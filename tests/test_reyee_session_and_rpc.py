@@ -225,6 +225,93 @@ def test_reyee_rpc_wire_and_auto_recovery():
     mock_mgr.record_activity.assert_called_once()
 
 
+@pytest.mark.parametrize(
+    "expired_response",
+    [
+        {
+            "status_code": 302,
+            "headers": {"Location": "/cgi-bin/luci/"},
+            "text": "",
+        },
+        {
+            "status_code": 200,
+            "headers": {},
+            "text": '<form id="login"><input id="password"><script src="api/auth"></script></form>',
+        },
+    ],
+)
+def test_reyee_rpc_recovers_from_be72_login_redirect_or_page(expired_response):
+    mock_mgr = MagicMock(spec=ReyeeSessionManager)
+    mock_mgr.address = "https://192.168.110.1"
+    mock_mgr.verify_tls = False
+    mock_mgr.http_timeout = (4, 12)
+    mock_mgr.get_session.side_effect = [
+        ReyeeSession("sid_old", "tok_old", "SN=sid_old"),
+        ReyeeSession("sid_new", "tok_new", "SN=sid_new"),
+    ]
+
+    expired = MagicMock()
+    expired.status_code = expired_response["status_code"]
+    expired.headers = expired_response["headers"]
+    expired.text = expired_response["text"]
+    success = MagicMock()
+    success.status_code = 200
+    success.headers = {}
+    success.text = ""
+    success.json.return_value = {"code": 0, "data": {"hostname": "Reyee-BE72"}}
+    mock_mgr.http_session.post.side_effect = [expired, success]
+
+    result = ReyeeRpcClient(mock_mgr).call("getHostName")
+
+    assert result["data"]["hostname"] == "Reyee-BE72"
+    mock_mgr.invalidate_session.assert_called_once_with()
+    assert mock_mgr.http_session.post.call_count == 2
+    assert "auth=sid_old" in mock_mgr.http_session.post.call_args_list[0].args[0]
+    assert "auth=sid_new" in mock_mgr.http_session.post.call_args_list[1].args[0]
+
+
+def test_reyee_rpc_login_redirect_retries_at_most_once():
+    mock_mgr = MagicMock(spec=ReyeeSessionManager)
+    mock_mgr.address = "https://192.168.110.1"
+    mock_mgr.verify_tls = False
+    mock_mgr.http_timeout = (4, 12)
+    mock_mgr.get_session.side_effect = [
+        ReyeeSession("sid_old", "tok_old", "SN=sid_old"),
+        ReyeeSession("sid_new", "tok_new", "SN=sid_new"),
+    ]
+    expired = MagicMock()
+    expired.status_code = 302
+    expired.headers = {"Location": "/cgi-bin/luci/"}
+    expired.text = ""
+    mock_mgr.http_session.post.side_effect = [expired, expired]
+
+    with pytest.raises(RouterAuthExpiredError):
+        ReyeeRpcClient(mock_mgr).call("getHostName")
+
+    assert mock_mgr.http_session.post.call_count == 2
+    assert mock_mgr.invalidate_session.call_count == 2
+
+
+def test_reyee_rpc_does_not_treat_unrelated_redirect_as_auth_expiry():
+    mock_mgr = MagicMock(spec=ReyeeSessionManager)
+    mock_mgr.address = "https://192.168.110.1"
+    mock_mgr.verify_tls = False
+    mock_mgr.http_timeout = (4, 12)
+    mock_mgr.get_session.return_value = ReyeeSession("sid", "tok", "SN=sid")
+    redirect = MagicMock()
+    redirect.status_code = 302
+    redirect.headers = {"Location": "https://router.example/maintenance"}
+    redirect.text = ""
+    redirect.json.side_effect = ValueError("not json")
+    mock_mgr.http_session.post.return_value = redirect
+
+    with pytest.raises(Exception) as raised:
+        ReyeeRpcClient(mock_mgr).call("getHostName")
+
+    assert "Invalid JSON" in str(raised.value)
+    mock_mgr.invalidate_session.assert_not_called()
+
+
 def test_circuit_breaker_on_repeated_auth_failures():
     """Validates that 3 consecutive login failures trigger retry backoff."""
     mock_http = MagicMock()

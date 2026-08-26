@@ -312,11 +312,19 @@ def install_router_lite_realtime_patch(
 
     service = RouterLiteRealtimeService(hub, router_sync, router_realtime)
 
-    @hub.app.get("/api/router/realtime")
-    def api_router_realtime():
-        if not hub.check_app_token():
-            return jsonify({"ok": False, "error": "unauthorized"}), 401
-        return jsonify(service.router_payload())
+    # Router Core owns this calibration endpoint in production. Keep the
+    # standalone registration only for legacy/unit fixtures where Core has not
+    # already registered the route.
+    has_router_realtime = any(
+        rule.rule == "/api/router/realtime"
+        for rule in hub.app.url_map.iter_rules()
+    )
+    if not has_router_realtime:
+        @hub.app.get("/api/router/realtime")
+        def api_router_realtime():
+            if not hub.check_app_token():
+                return jsonify({"ok": False, "error": "unauthorized"}), 401
+            return jsonify(service.router_payload())
 
     @hub.app.get("/api/devices/realtime")
     def api_devices_realtime():

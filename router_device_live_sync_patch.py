@@ -1,12 +1,12 @@
-"""Authoritative five-second terminal snapshot synchronization.
+"""Authoritative Router Core terminal snapshot synchronization.
 
 The router web UI reads ``devSta.get/user_list`` with ``dataType=timely`` every
-five seconds. This service uses the same read through Hub's low-priority router
-control actor, publishes the complete normalized snapshot over the existing WSS,
-and lets the durable history service write to disk at a lower cadence.
+few seconds. This service is the Hub's only reader for that native module,
+publishes the complete normalized snapshot over the existing WSS, and lets the
+durable history service write the same source snapshot at a lower cadence.
 
 A failed or transiently empty poll never clears the last good APP snapshot.
-User commands always win because background RPCs are deferred by the actor.
+The Router Driver serializes this background RPC with user commands.
 """
 from __future__ import annotations
 
@@ -23,7 +23,7 @@ from flask import jsonify
 POLL_INTERVAL_SECONDS = max(2.0, float(os.environ.get("ROUTER_DEVICE_LIVE_POLL_SEC", "2")))
 PERSIST_INTERVAL_SECONDS = max(
     POLL_INTERVAL_SECONDS,
-    float(os.environ.get("ROUTER_DEVICE_PERSIST_SEC", "30")),
+    float(os.environ.get("ROUTER_DEVICE_PERSIST_SEC", "5")),
 )
 EMPTY_CONFIRMATIONS = 2
 
@@ -83,6 +83,7 @@ class RouterDeviceLiveSync:
         self.client = client
         self.logger = hub.LOGGER
         self.lock = threading.RLock()
+        self.poll_lock = threading.Lock()
         self.latest: Dict[str, Any] = {}
         self.last_persist_at = 0.0
         self.last_success_at = 0.0
@@ -191,6 +192,10 @@ class RouterDeviceLiveSync:
             }
 
     def poll_once(self) -> Dict[str, Any]:
+        with self.poll_lock:
+            return self._poll_once_locked()
+
+    def _poll_once_locked(self) -> Dict[str, Any]:
         raw = self.client.rpc(
             "devSta.get",
             "user_list",
@@ -202,6 +207,14 @@ class RouterDeviceLiveSync:
 
         with self.lock:
             previous_non_empty = bool(self.latest.get("devices"))
+            if not rows and not self.latest.get("sampleEpochMs") and not previous_non_empty:
+                persisted = self.hub.load_json(
+                    self.hub.DEVICES_FILE,
+                    {"online": []},
+                )
+                previous_non_empty = bool(
+                    persisted.get("online") if isinstance(persisted, dict) else []
+                )
             confirmed_empty = False
             if not rows and previous_non_empty:
                 self.empty_streak += 1
@@ -234,12 +247,18 @@ class RouterDeviceLiveSync:
             history = getattr(self.hub, "DURABLE_DEVICE_HISTORY", None)
             ingest = getattr(history, "ingest", None)
             if callable(ingest):
-                # Persist the already-normalized five-second sample. Passing
+                # Persist the already-normalized Router Core sample. Passing
                 # the raw payload here loses online seconds for routers whose
                 # user_list has no usable activeTime/onlinetime fields.
-                ingest(payload, prepared_online=rows, prepared_total=total)
-                with self.lock:
-                    self.last_persist_at = time.time()
+                persisted = ingest(
+                    payload,
+                    prepared_online=rows,
+                    prepared_total=total,
+                    source="router_core_user_list",
+                )
+                if isinstance(persisted, dict) and persisted.get("accepted"):
+                    with self.lock:
+                        self.last_persist_at = time.time()
         return frame
 
     def _worker(self) -> None:

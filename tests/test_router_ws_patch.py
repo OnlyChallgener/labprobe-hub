@@ -1,4 +1,15 @@
-from router_ws_patch import _config_poll_seconds, _first_ssid, _merge_wireless, _normalized_ports
+from pathlib import Path
+
+import websocket
+import router_ws_patch
+
+from router_ws_patch import (
+    RouterWebSocketMonitor,
+    _config_poll_seconds,
+    _first_ssid,
+    _merge_wireless,
+    _normalized_ports,
+)
 
 
 def test_empty_realtime_ssid_list_does_not_erase_configured_ssids():
@@ -43,3 +54,33 @@ def test_config_poll_interval_has_safe_floor(monkeypatch):
     assert _config_poll_seconds() == 10.0
     monkeypatch.setenv("ROUTER_CONFIG_POLL_SEC", "45")
     assert _config_poll_seconds() == 45.0
+
+
+def test_ws_bad_status_relogin_is_limited_to_proven_auth_failures():
+    assert RouterWebSocketMonitor._bad_status_requires_login(
+        websocket.WebSocketBadStatusException("unauthorized", 401)
+    ) is True
+    assert RouterWebSocketMonitor._bad_status_requires_login(
+        websocket.WebSocketBadStatusException(
+            "redirect",
+            302,
+            resp_headers={"Location": "/cgi-bin/luci/"},
+        )
+    ) is True
+    assert RouterWebSocketMonitor._bad_status_requires_login(
+        websocket.WebSocketBadStatusException(
+            "maintenance",
+            302,
+            resp_headers={"Location": "/maintenance"},
+        )
+    ) is False
+    assert RouterWebSocketMonitor._bad_status_requires_login(
+        websocket.WebSocketBadStatusException("gateway", 502)
+    ) is False
+
+
+def test_production_ws_receiver_remains_passive():
+    # Other patch unit tests intentionally monkey-patch the class globally, so
+    # inspect the production module source rather than the mutated test process.
+    source = Path(router_ws_patch.__file__).read_text(encoding="utf-8")
+    assert "target=self._keepalive_loop" not in source

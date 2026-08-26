@@ -169,7 +169,7 @@ class RouterRpcCompatibilitySync:
         self.hub = hub
         self.client = client
         self.logger = hub.LOGGER
-        self.dashboard_interval = max(2.0, float(os.environ.get("ROUTER_DASHBOARD_POLL_SEC", "3")))
+        self.dashboard_interval = max(10.0, float(os.environ.get("ROUTER_DASHBOARD_POLL_SEC", "30")))
         self.device_interval = max(3.0, float(os.environ.get("ROUTER_DEVICE_POLL_SEC", "5")))
         self.primary = str(os.environ.get("ROUTER_RPC_PRIMARY", "true")).lower() in {"1", "true", "yes"}
         self._stop = threading.Event()
@@ -205,7 +205,9 @@ class RouterRpcCompatibilitySync:
             now = time.monotonic()
             try:
                 if now - self._last_devices >= self.device_interval:
-                    self.sync_devices(force=True)
+                    # Project the authoritative RouterDeviceLiveSync snapshot;
+                    # never issue a second user_list RPC from this compatibility lane.
+                    self.sync_devices(force=False)
                     self._last_devices = now
                 if now - self._last_dashboard >= self.dashboard_interval:
                     self.sync_dashboard(force=True)
@@ -225,52 +227,40 @@ class RouterRpcCompatibilitySync:
             return {"dashboard": dashboard, "devices": devices}
 
     def sync_devices(self, force: bool = True) -> Dict[str, Any]:
-        raw = self.client.devices(force=force)
-        raw_rows = raw.get("items", []) if isinstance(raw, dict) else []
-        payload = {"list": raw_rows, "total": raw.get("total", len(raw_rows)) if isinstance(raw, dict) else len(raw_rows)}
-        online, total = self.hub.parse_ruijie_devices(payload)
-        realtime_by_mac: Dict[str, Dict[str, int]] = {}
-        for item in raw_rows:
-            if not isinstance(item, dict):
-                continue
-            mac = self.hub.norm_mac(item.get("mac"))
-            if not mac:
-                continue
-            realtime_by_mac[mac] = {
-                "realtimeUpload": _integer(item.get("realtimeUpBytes", item.get("flowUp"))),
-                "realtimeDownload": _integer(item.get("realtimeDownBytes", item.get("flowDown"))),
-                "connectionCount": _integer(item.get("connectionCount", item.get("flow_cnt"))),
-            }
-
-        archive = self.hub.load_device_archive()
-        normalized: List[Dict[str, Any]] = []
-        for device in online:
-            mac = self.hub.norm_mac(device.get("mac"))
-            device.update(realtime_by_mac.get(mac, {}))
-            device = self.hub.hydrate_device_with_archive(device, archive)
-            device["online"] = True
-            device["lastSeenAt"] = self.hub.now_str()
-            self.hub.archive_device_snapshot(device)
-            normalized.append(device)
-        normalized = self.hub.attach_hub_local_ipv6_to_nas_devices(normalized)
-        watched = self.hub.build_watched_devices(normalized)
-        updated_at = self.hub.now_str()
-        document = {
-            "online": normalized,
-            "watched": watched,
-            "onlineDeviceCount": total,
-            "updatedAt": updated_at,
-            "source": "router_rpc",
-        }
-        with self.hub.DATA_LOCK:
-            self.hub.save_json(self.hub.DEVICES_FILE, document)
-            state = self.hub.load_json(self.hub.STATE_FILE, {})
-            state["devices"] = watched
-            state["devicesUpdatedAt"] = updated_at
-            state["updatedAt"] = updated_at
-            self.hub.save_json(self.hub.STATE_FILE, state)
-        self._device_total = total
+        live = getattr(self.hub, "ROUTER_DEVICE_LIVE_SYNC", None)
+        snapshot = getattr(live, "snapshot", None)
+        if live is None or not callable(snapshot):
+            return self.hub.load_json(
+                self.hub.DEVICES_FILE,
+                {"online": [], "watched": [], "onlineDeviceCount": 0, "updatedAt": None},
+            )
+        if force:
+            poll_once = getattr(live, "poll_once", None)
+            if callable(poll_once):
+                poll_once()
+        document = self.hub.load_json(
+            self.hub.DEVICES_FILE,
+            {"online": [], "watched": [], "onlineDeviceCount": 0, "updatedAt": None},
+        )
+        if not isinstance(document, dict):
+            document = {"online": [], "watched": [], "onlineDeviceCount": 0, "updatedAt": None}
+        self._device_total = _integer(document.get("onlineDeviceCount"))
         return document
+
+    def devices_snapshot(self, force: bool = False) -> List[Dict[str, Any]]:
+        """Return the accepted Core list without issuing a second native RPC."""
+        if force:
+            self.sync_devices(force=True)
+        live = getattr(self.hub, "ROUTER_DEVICE_LIVE_SYNC", None)
+        snapshot = getattr(live, "snapshot", None)
+        frame = snapshot() if callable(snapshot) else {}
+        if isinstance(frame, dict) and int(frame.get("sampleEpochMs") or 0) > 0:
+            rows = frame.get("devices")
+            if isinstance(rows, list):
+                return [dict(row) for row in rows if isinstance(row, dict)]
+        document = self.sync_devices(force=False)
+        rows = document.get("online") if isinstance(document, dict) else []
+        return [dict(row) for row in rows if isinstance(row, dict)]
 
     def _normalize_dashboard(self, raw: Dict[str, Any]) -> Dict[str, Any]:
         static = _unwrap(raw.get("static")) or {}
