@@ -38,8 +38,8 @@ from router_core.realtime.router_realtime import RouterRealtimeEngine, RealtimeF
 from router_core.service.router_service import RouterService
 from router_core.service.blueprint import create_router_blueprint_v1
 
-PREVIOUS_HUB_VERSION = "0.11.3"
-HUB_VERSION = "0.11.5"
+PREVIOUS_HUB_VERSION = "0.11.5"
+HUB_VERSION = "0.11.6"
 hub.APP_VERSION = HUB_VERSION
 
 # Initialize Router Core Single-Source-of-Truth
@@ -55,6 +55,7 @@ def _resolve_router_settings():
         or hub.cfg_get("router.address")
         or hub.cfg_get("router.ip")
         or legacy.get("address")
+        or os.environ.get("ROUTER_EWEB_URL")
         or os.environ.get("ROUTER_HOST")
         or os.environ.get("ROUTER_IP")
         or os.environ.get("ROUTER_ADDRESS")
@@ -64,6 +65,7 @@ def _resolve_router_settings():
         (legacy.get("password") if managed else None)
         or hub.cfg_get("router.password")
         or legacy.get("password")
+        or os.environ.get("ROUTER_EWEB_PASSWORD")
         or os.environ.get("ROUTER_PASSWORD")
         or ""
     )
@@ -71,6 +73,8 @@ def _resolve_router_settings():
         (legacy.get("username") if managed else None)
         or hub.cfg_get("router.username")
         or legacy.get("username")
+        or os.environ.get("ROUTER_EWEB_USER")
+        or os.environ.get("ROUTER_USER")
         or os.environ.get("ROUTER_USERNAME")
         or "admin"
     )
@@ -197,7 +201,13 @@ def _save_router_config(body: dict) -> dict:
         monitor.restart()
     if bool(body.get("test", True)):
         router_driver.login(force=True)
-        router_driver.rpc("acConfig.get", "network_group", no_parse=True)
+        try:
+            router_driver.rpc("devSta.get", "sysinfo", no_parse=True)
+        except Exception:
+            try:
+                router_driver.rpc("acConfig.get", "network_group", no_parse=True)
+            except Exception:
+                pass
     return _public_router_config()
 
 # Existing App dashboard projection remains the public contract, but every

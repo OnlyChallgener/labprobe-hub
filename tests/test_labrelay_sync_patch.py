@@ -98,3 +98,44 @@ def test_production_reconcile_treats_missing_legacy_transport_as_tcp():
 
     assert response.status_code == 200
     assert queued == []
+
+
+def test_api_portmap_commands_matches_canonical_router_name():
+    app = Flask(__name__)
+    app.add_url_rule("/api/portmaps", endpoint="api_portmaps", view_func=lambda: ("original", 200))
+    commands_store = {
+        "commands": [
+            {
+                "id": "cmd-1",
+                "router": "BE72",
+                "action": "upsert",
+                "payload": {"rule": {"id": "rule-1"}},
+                "status": "pending",
+                "attempts": 0,
+                "createdAt": "2026-08-11 12:00:00",
+                "createdEpoch": 1700000000,
+            }
+        ]
+    }
+    hub = _Hub(
+        app=app,
+        LOGGER=_Logger(),
+        AGENT_STATUS_FILE="agent_status.json",
+        PORTMAP_ROUTER_STATUS_FILE="portmap_status.json",
+        PORTMAP_COMMANDS_FILE="portmap_commands.json",
+        _load_portmap_rules=lambda: [],
+        load_json=lambda path, default=None: commands_store if "commands" in path else default,
+        save_json=lambda path, value: commands_store.update(value) if "commands" in path else None,
+        _append_portmap_history=lambda record: None,
+        _queue_portmap_command=lambda action, payload, router: None,
+    )
+    hub.primary_router_name = lambda: "BE72"
+    install_labrelay_sync_patch(hub)
+
+    with hub.app.test_request_context("/api/router/portmaps/commands?router=router", method="GET"):
+        response = hub.app.view_functions["api_router_portmap_commands"]()
+
+    assert response.status_code == 200
+    data = response.get_json()
+    assert len(data["commands"]) == 1
+    assert data["commands"][0]["id"] == "cmd-1"

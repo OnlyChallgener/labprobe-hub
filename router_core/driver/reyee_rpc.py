@@ -81,10 +81,12 @@ class ReyeeRpcClient:
         session: Any,
         payload: Dict[str, Any],
         timeout: Optional[Tuple[int, int]] = None,
+        auth_param: Optional[str] = None,
     ) -> requests.Response:
         wire = self._wire_json(payload)
+        auth = auth_param or getattr(session, "sid", "") or getattr(session, "token", "")
         return self._session_manager.http_session.post(
-            f"{self._session_manager.address}{endpoint_path}?auth={session.sid}",
+            f"{self._session_manager.address}{endpoint_path}?auth={auth}",
             data=wire.encode("utf-8"),
             headers=self._headers(endpoint_path, wire, session.cookie_header),
             timeout=timeout or self._session_manager.http_timeout,
@@ -148,6 +150,7 @@ class ReyeeRpcClient:
         # by the previous client after real-device verification.
         login_redirect = self._is_login_redirect(resp)
         login_page = self._looks_like_login_page(getattr(resp, "text", ""))
+
         if resp.status_code in (401, 403) or login_redirect or login_page:
             if (
                 resp.status_code in (401, 403)

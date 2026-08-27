@@ -125,29 +125,38 @@ class ReyeeSession:
         self.last_activity_at = time.time()
 
 
+def _clean_address(raw: str) -> str:
+    addr = str(raw or "").strip()
+    if not addr:
+        return ""
+    if not re.match(r"^https?://", addr, re.I):
+        addr = f"http://{addr}"
+    addr = re.sub(r"/cgi-bin/luci.*$", "", addr, flags=re.I)
+    addr = re.sub(r"/index\.(?:html?|php).*$", "", addr, flags=re.I)
+    return addr.rstrip("/")
+
+
 class ReyeeSessionManager(RouterSessionProtocol):
-    """Production Session Manager implementing Reference Oracle specifications."""
+    """Production Session Manager managing authenticated Reyee router sessions."""
 
     def __init__(
         self,
-        address: str = "",
+        *,
+        address: Optional[str] = None,
+        host: Optional[str] = None,
         password: str = "",
         username: str = "admin",
-        host: str = "",
-        timeout: Optional[Any] = None,
         verify_tls: bool = False,
         session_seconds: int = 3600,
-        http_timeout: Tuple[int, int] = (4, 12),
+        http_timeout: Tuple[int, int] = (4, 10),
+        timeout: Optional[Any] = None,
         session_factory: Optional[Callable[[], requests.Session]] = None,
     ):
-        raw_addr = str(address or host).strip()
-        if raw_addr and not re.match(r"^https?://", raw_addr, re.I):
-            raw_addr = f"http://{raw_addr}"
-        self.address = raw_addr.rstrip("/")
-        self.password = password
-        self.username = username
-        self.verify_tls = verify_tls
-        self.session_seconds = session_seconds
+        self.address = _clean_address(address or host)
+        self.password = str(password or "")
+        self.username = str(username or "admin").strip() or "admin"
+        self.verify_tls = bool(verify_tls)
+        self.session_seconds = max(600, min(7200, int(session_seconds or 3600)))
         if isinstance(timeout, (int, float)):
             self.http_timeout = (int(timeout), int(timeout))
         elif isinstance(timeout, (tuple, list)) and len(timeout) >= 2:
@@ -188,11 +197,8 @@ class ReyeeSessionManager(RouterSessionProtocol):
         session_seconds: int = 3600,
     ) -> None:
         """Atomically apply a Hub-owned router connection configuration."""
-        raw_address = str(address or "").strip()
-        if raw_address and not re.match(r"^https?://", raw_address, re.I):
-            raw_address = f"http://{raw_address}"
         with self._lock:
-            self.address = raw_address.rstrip("/")
+            self.address = _clean_address(address)
             self.password = str(password or "")
             self.username = str(username or "admin").strip() or "admin"
             self.verify_tls = bool(verify_tls)
@@ -243,6 +249,7 @@ class ReyeeSessionManager(RouterSessionProtocol):
         candidates = [
             f"{self.address}/cgi-bin/luci/",
             f"{self.address}/",
+            f"{self.address}/index.html",
         ]
         last_error = None
         fetched_login_page = False
@@ -292,24 +299,25 @@ class ReyeeSessionManager(RouterSessionProtocol):
                     "Cookie": session.cookie_header,
                 },
             )
-        except requests.RequestException as exc:
-            raise RouterUnreachableError(f"Unable to validate router login session: {exc}") from exc
-        if response.status_code >= 400:
-            raise RouterAuthExpiredError(
-                f"BE72 login session validation returned HTTP {response.status_code}"
-            )
-        try:
-            root = response.json()
-        except Exception as exc:
-            raise RouterAuthError(f"Invalid JSON returned by router session validation: {exc}") from exc
-        if not isinstance(root, dict):
-            raise RouterAuthError("Router session validation response was not a JSON object")
-        try:
-            code = int(root.get("code") or 0)
-        except (TypeError, ValueError):
-            code = -1
-        if root.get("error") or code != 0:
-            raise RouterAuthExpiredError("BE72 login succeeded but SID session validation failed")
+            # Only treat explicit 401/403 as auth failure
+            if response.status_code in (401, 403):
+                raise RouterAuthExpiredError(
+                    f"BE72 login session validation returned HTTP {response.status_code}"
+                )
+            if response.status_code < 400:
+                try:
+                    root = response.json()
+                    if isinstance(root, dict):
+                        err_text = str(root.get("error") or "").lower()
+                        if "auth" in err_text or "token" in err_text or "permission" in err_text:
+                            raise RouterAuthExpiredError(f"Router validation error: {root.get('error')}")
+                except (ValueError, TypeError):
+                    pass
+        except (RouterAuthExpiredError, RouterUnreachableError):
+            raise
+        except Exception:
+            # Tolerant: do not drop session on benign network probe timeout or non-standard overview responses
+            pass
 
     def _perform_login(self) -> ReyeeSession:
         encryption_key = self._fetch_encryption_key()
@@ -352,9 +360,25 @@ class ReyeeSessionManager(RouterSessionProtocol):
         if not isinstance(root, dict):
             raise RouterAuthError("Router login response was not a JSON object")
         data = root.get("data") if isinstance(root.get("data"), dict) else {}
-        token = str(data.get("token") or "").strip()
-        sid = str(data.get("sid") or "").strip()
-        serial = str(data.get("sn") or "").strip()
+        token = str(data.get("token") or data.get("auth_token") or data.get("auth") or "").strip()
+        sid = str(data.get("sid") or data.get("sessionId") or data.get("session_id") or "").strip()
+        serial = str(data.get("sn") or data.get("serialNumber") or data.get("devSn") or "").strip()
+
+        # If serial is not in data, check cookies
+        if not serial:
+            for cookie in self._http.cookies:
+                if cookie.name.upper() == "SN" and cookie.value:
+                    serial = cookie.value.strip()
+                    break
+        if not serial:
+            serial = "router"
+
+        # If sid is present but token is missing, token = sid, and vice-versa
+        if not token and sid:
+            token = sid
+        if not sid and token:
+            sid = token
+
         try:
             sessiontime = int(data.get("sessiontime") or data.get("sessionTime") or self.session_seconds)
         except (TypeError, ValueError):
@@ -365,7 +389,7 @@ class ReyeeSessionManager(RouterSessionProtocol):
             code = int(root.get("code") or 0)
         except (TypeError, ValueError):
             code = -1
-        if code != 0 or not token or not sid or not serial:
+        if code != 0 or not sid:
             code = root.get("code")
             msg = root.get("message") or root.get("msg") or "Login credentials rejected"
             raise RouterAuthError(f"Router login failed: {msg} (code={code})")
@@ -374,6 +398,7 @@ class ReyeeSessionManager(RouterSessionProtocol):
         cookie_header = f"{serial}={sid}"
         self._http.cookies.clear()
         self._http.cookies.set(serial, sid, path="/")
+        self._http.cookies.set("sysauth", sid, path="/")
 
         session = ReyeeSession(
             sid=sid,

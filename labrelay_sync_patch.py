@@ -229,9 +229,67 @@ def install_labrelay_sync_patch(hub: Any) -> None:
                 hub.LOGGER.debug("Agent realtime publish deferred", exc_info=True)
         return jsonify({"ok": True, "router": router, "runtimeRevision": revision, "serverTime": now})
 
+    def api_portmap_commands() -> Any:
+        if not hub.check_hook_token():
+            return jsonify({"ok": False, "error": "bad hook token"}), 401
+        router = router_name(request.args.get("router"))
+        limit = max(1, min(50, hub.to_int(request.args.get("limit"), 20) or 20))
+        data = hub.load_json(hub.PORTMAP_COMMANDS_FILE, {"commands": []})
+        commands = data.get("commands", []) if isinstance(data, dict) else []
+        now_epoch = int(time.time())
+        selected = []
+        changed = False
+        for command in commands:
+            if not isinstance(command, dict):
+                continue
+            cmd_router = router_name(command.get("router"))
+            if cmd_router != router and command.get("router") != router and command.get("router") != "router":
+                continue
+            retry_due = (
+                command.get("status") == "delivered"
+                and now_epoch - hub.to_int(command.get("deliveredEpoch"), 0) >= 15
+                and hub.to_int(command.get("attempts"), 0) < 5
+            )
+            if command.get("status") == "pending" or retry_due:
+                command["status"] = "delivered"
+                command["deliveredAt"] = hub.now_str()
+                command["deliveredEpoch"] = now_epoch
+                command["attempts"] = hub.to_int(command.get("attempts"), 0) + 1
+                selected.append({k: command.get(k) for k in ["id", "action", "payload", "createdAt"]})
+                changed = True
+                if len(selected) >= limit:
+                    break
+        if changed:
+            hub.save_json(hub.PORTMAP_COMMANDS_FILE, {"commands": commands})
+        return jsonify({"ok": True, "commands": selected, "time": hub.now_str()})
+
+    def api_portmap_ack() -> Any:
+        if not hub.check_hook_token():
+            return jsonify({"ok": False, "error": "bad hook token"}), 401
+        payload = request.get_json(silent=True) or {}
+        acks = payload.get("acks", []) if isinstance(payload.get("acks"), list) else []
+        data = hub.load_json(hub.PORTMAP_COMMANDS_FILE, {"commands": []})
+        commands = data.get("commands", []) if isinstance(data, dict) else []
+        ack_map = {clean(x.get("id")): x for x in acks if isinstance(x, dict)}
+        changed = 0
+        for command in commands:
+            ack = ack_map.get(clean(command.get("id")))
+            if not ack:
+                continue
+            command["status"] = "done" if bool(ack.get("ok")) else "failed"
+            command["result"] = ack.get("result")
+            command["finishedAt"] = hub.now_str()
+            command["finishedEpoch"] = int(time.time())
+            changed += 1
+        if changed:
+            hub.save_json(hub.PORTMAP_COMMANDS_FILE, {"commands": commands})
+        return jsonify({"ok": True, "acknowledged": changed})
+
     hub.app.view_functions["api_portmaps"] = api_portmaps
     hub.app.view_functions["api_router_agent_status"] = api_agent_status
     hub.app.view_functions["api_router_portmap_status"] = api_portmap_status
+    hub.app.view_functions["api_router_portmap_commands"] = api_portmap_commands
+    hub.app.view_functions["api_router_portmap_ack"] = api_portmap_ack
     hub.agent_presence_snapshot = presence
     hub.LABRELAY_SYNC_PATCHED = True
     hub.LOGGER.info("LabRelay authoritative presence/runtime revisions enabled")
