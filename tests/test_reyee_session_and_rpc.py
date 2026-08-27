@@ -5,7 +5,7 @@ Validates:
 2. Dynamic key extraction from mock HTML.
 3. Single-Flight concurrency locking (only 1 real login across parallel callers).
 4. Idle timeout maintenance (touch/record_activity).
-5. RPC wire format (?auth=<token>, Cookie header, {method, params}).
+5. RPC wire format (?auth=<sid>, Cookie header, {method, params}).
 6. Auto-recovery on HTTP 401 / code 401 (max 1 retry).
 7. Circuit breaker cooldown on repeated authentication failures.
 8. BE72 signed-CMD headers match the last known-good production client.
@@ -217,8 +217,8 @@ def test_reyee_rpc_recovers_from_be72_login_redirect_or_page(expired_response):
     assert result["data"]["hostname"] == "Reyee-BE72"
     mock_mgr.invalidate_session.assert_called_once_with()
     assert mock_mgr.http_session.post.call_count == 2
-    assert "auth=tok_old" in mock_mgr.http_session.post.call_args_list[0].args[0]
-    assert "auth=tok_new" in mock_mgr.http_session.post.call_args_list[1].args[0]
+    assert "auth=sid_old" in mock_mgr.http_session.post.call_args_list[0].args[0]
+    assert "auth=sid_new" in mock_mgr.http_session.post.call_args_list[1].args[0]
 
 
 def test_reyee_rpc_login_redirect_retries_at_most_once():
@@ -297,7 +297,7 @@ def test_reyee_rpc_client_rpc_with_no_parse_and_wire_payload():
     assert len(res) == 1
     call_args = mock_http.post.call_args
     assert call_args is not None
-    assert "auth=tok_123" in call_args.args[0]
+    assert "auth=sid_123" in call_args.args[0]
     posted_json = json.loads(call_args.kwargs["data"].decode("utf-8"))
     assert posted_json["method"] == "devSta.get"
     assert posted_json["params"]["module"] == "user_list"
@@ -331,10 +331,11 @@ def test_be72_cmd_signature_matches_known_good_production_contract():
         },
     }
     wire = json.dumps(payload, ensure_ascii=False, separators=(",", ":"))
-    stable = json.dumps(payload, ensure_ascii=False, separators=(",", ":"), sort_keys=True)
     headers = ReyeeRpcClient._headers("/cgi-bin/luci/api/cmd", payload, wire, "SN=sid")
     secret = "Web@Rj$2020!"
-    assert headers["Content-Accept"] == hashlib.md5((secret + stable).encode("utf-8")).hexdigest()
+    assert headers["Content-Accept"] == hashlib.md5(
+        (secret + str(ReyeeRpcClient._eweb_byte_length(wire))).encode("utf-8")
+    ).hexdigest()
     assert headers["Contents-Accept"] == hashlib.md5((secret + wire).encode("utf-8")).hexdigest()
 
 
