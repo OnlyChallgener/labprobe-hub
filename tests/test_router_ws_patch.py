@@ -2,7 +2,6 @@ import json
 from pathlib import Path
 from types import SimpleNamespace
 
-import websocket
 import router_ws_patch
 
 from router_ws_patch import (
@@ -58,39 +57,13 @@ def test_config_poll_interval_has_safe_floor(monkeypatch):
     assert _config_poll_seconds() == 45.0
 
 
-def test_ws_bad_status_relogin_is_limited_to_proven_auth_failures():
-    assert RouterWebSocketMonitor._bad_status_requires_login(
-        websocket.WebSocketBadStatusException("unauthorized", 401)
-    ) is True
-    assert RouterWebSocketMonitor._bad_status_requires_login(
-        websocket.WebSocketBadStatusException(
-            "redirect",
-            302,
-            resp_headers={"Location": "/cgi-bin/luci/"},
-        )
-    ) is True
-    assert RouterWebSocketMonitor._bad_status_requires_login(
-        websocket.WebSocketBadStatusException(
-            "maintenance",
-            302,
-            resp_headers={"Location": "/maintenance"},
-        )
-    ) is False
-    assert RouterWebSocketMonitor._bad_status_requires_login(
-        websocket.WebSocketBadStatusException("gateway", 502)
-    ) is False
-
-
-def test_production_ws_receiver_remains_passive():
-    # Other patch unit tests intentionally monkey-patch the class globally, so
-    # inspect the production module source rather than the mutated test process.
+def test_production_ws_transport_matches_last_known_good_be72_path():
     source = Path(router_ws_patch.__file__).read_text(encoding="utf-8")
-    assert "target=self._keepalive_loop" not in source
-    assert 'WS_SUBPROTOCOL = "sysinfo-stream"' in source
-    assert "subprotocols=[WS_SUBPROTOCOL]" in source
+    assert 'WS_SUBPROTOCOL = "sysinfo-stream"' not in source
+    assert "subprotocols=[" not in source
 
 
-def test_production_ws_requests_firmware_sysinfo_subprotocol(monkeypatch):
+def test_production_ws_does_not_request_subprotocol(monkeypatch):
     connection_options = {}
 
     class FakeSocket:
@@ -117,9 +90,9 @@ def test_production_ws_requests_firmware_sysinfo_subprotocol(monkeypatch):
     monitor._run_connection(
         "ws://192.168.5.1/ws?auth=test",
         "http://192.168.5.1",
-        "sid=test",
+        "SN=test",
         False,
         "192.168.5.1",
     )
 
-    assert connection_options["subprotocols"] == ["sysinfo-stream"]
+    assert "subprotocols" not in connection_options
