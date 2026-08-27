@@ -135,11 +135,12 @@ class RouterLiteRealtimeService:
         self._client_demand_until = {
             key: until for key, until in self._client_demand_until.items() if until > now
         }
+        devices_active = bool(self._client_demand_until)
         return {
             "ok": True,
             "sequence": self._demand_sequence,
             "routerActive": False,
-            "devicesActive": False,
+            "devicesActive": devices_active,
             "demandClientCount": len(self._client_demand_until),
             "serverEpochMs": int(now * 1000),
         }
@@ -230,13 +231,84 @@ class RouterLiteRealtimeService:
         rows.sort(key=lambda row: row["mac"])
         return rows
 
+    def _merge_device_rates(self, rates: List[Dict[str, Any]], epoch_ms: int, agent_version: str = "") -> None:
+        rates_by_mac = {row["mac"]: row for row in rates}
+        core_devices = []
+        if self.router_realtime:
+            core_devices = self.router_realtime.get_devices_calibration_snapshot()
+        if not core_devices and self.sync:
+            loader = getattr(self.sync, "devices_snapshot", None)
+            if callable(loader):
+                core_devices = loader()
+
+        if not core_devices:
+            return
+
+        updated_devices = []
+        delta_rows = []
+        for dev in core_devices:
+            mac = self.hub.norm_mac(dev.get("mac")) if hasattr(self.hub, "norm_mac") else str(dev.get("mac") or "").lower()
+            row = dict(dev)
+            if mac in rates_by_mac:
+                r = rates_by_mac[mac]
+                row["uploadBps"] = r["uploadBps"]
+                row["downloadBps"] = r["downloadBps"]
+                row["connectionCount"] = r["connectionCount"]
+                delta_rows.append({
+                    "mac": mac,
+                    "uploadBps": r["uploadBps"],
+                    "downloadBps": r["downloadBps"],
+                    "connectionCount": r["connectionCount"],
+                })
+            updated_devices.append(row)
+
+        full_snapshot = {
+            "ok": True,
+            "sampleEpochMs": epoch_ms,
+            "serverEpochMs": int(time.time() * 1000),
+            "sampleAgeMs": max(0, int(time.time() * 1000) - epoch_ms),
+            "source": "router_core_devices+relay_rates",
+            "agentVersion": agent_version,
+            "stale": False,
+            "delta": False,
+            "onlineDeviceCount": len(updated_devices),
+            "devices": updated_devices,
+            "error": "",
+        }
+        delta_payload = {
+            "ok": True,
+            "sampleEpochMs": epoch_ms,
+            "serverEpochMs": int(time.time() * 1000),
+            "sampleAgeMs": max(0, int(time.time() * 1000) - epoch_ms),
+            "source": "relay_local_rates",
+            "agentVersion": agent_version,
+            "stale": False,
+            "delta": True,
+            "onlineDeviceCount": len(updated_devices),
+            "devices": delta_rows,
+            "error": "",
+        }
+        if self.router_realtime:
+            self.router_realtime.accept_devices_realtime(delta_payload, snapshot=full_snapshot)
+
     def accept_push(self, payload: Any) -> Dict[str, Any]:
         if not isinstance(payload, dict):
             raise ValueError("invalid realtime payload")
         with self._demand:
             demand = self._demand_payload_locked()
+        devices_active = bool(demand.get("devicesActive"))
+        accepted_devices = False
+        if devices_active and "devices" in payload:
+            raw_devices = payload.get("devices")
+            if isinstance(raw_devices, list):
+                sample_epoch_ms = self._sample_epoch_ms(payload.get("sampleEpochMs") or payload.get("sampleTime"))
+                rates = self._device_rows(raw_devices)
+                if rates:
+                    self._merge_device_rates(rates, sample_epoch_ms, str(payload.get("agentVersion") or ""))
+                    accepted_devices = True
+
         demand["acceptedRouter"] = False
-        demand["acceptedDevices"] = False
+        demand["acceptedDevices"] = accepted_devices
         demand["source"] = "router_core"
         return demand
 

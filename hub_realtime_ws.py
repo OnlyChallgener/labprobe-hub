@@ -142,55 +142,10 @@ class HubRealtimeWebSocketService:
 
     def _send_initial_snapshots(self, ws: Any, client: _RealtimeClient) -> None:
         router = self.realtime_service.router_payload()
-        if int(router.get("sampleEpochMs") or 0) <= 0:
-            sync = getattr(self.hub, "ROUTER_RPC_SYNC", None)
-            loader = getattr(sync, "dashboard_snapshot", None)
-            if callable(loader):
-                try:
-                    db = loader()
-                    if isinstance(db, dict) and db:
-                        self.realtime_service.seed_from_dashboard(db)
-                        router = self.realtime_service.router_payload()
-                except Exception:
-                    pass
-        if int(router.get("sampleEpochMs") or 0) <= 0:
-            status = getattr(self.hub, "ROUTER_DRIVER", None)
-            st = status.get_status() if status and hasattr(status, "get_status") else {}
-            now_ms = int(time.time() * 1000)
-            router = {
-                "ok": True,
-                "state": str(st.get("state") or "connected"),
-                "connected": bool(st.get("connected", True)),
-                "cpuPercent": 0.0,
-                "memoryPercent": 0.0,
-                "uploadBps": 0,
-                "downloadBps": 0,
-                "wanIp": "",
-                "message": str(st.get("message") or "实时链路已连接"),
-                "sampleEpochMs": now_ms,
-                "sampleAgeMs": 0,
-                "stale": False,
-            }
-        if router:
+        if int(router.get("sampleEpochMs") or 0) > 0 and not router.get("stale"):
             self._send(ws, client, self._frame("router", router))
-
         devices = self.realtime_service.devices_payload()
-        if int(devices.get("sampleEpochMs") or 0) <= 0:
-            dev_list = self.hub.load_json(getattr(self.hub, "DEVICES_FILE", "devices.json"), [])
-            if isinstance(dev_list, dict):
-                dev_list = dev_list.get("online", [])
-            if isinstance(dev_list, list):
-                now_ms = int(time.time() * 1000)
-                devices = {
-                    "ok": True,
-                    "devices": dev_list,
-                    "onlineDeviceCount": len(dev_list),
-                    "delta": False,
-                    "sampleEpochMs": now_ms,
-                    "sampleAgeMs": 0,
-                    "stale": False,
-                }
-        if devices:
+        if int(devices.get("sampleEpochMs") or 0) > 0:
             self._send(ws, client, self._frame("devices", devices))
 
         # Persistent configuration snapshots are Hub-owned state. Replaying them

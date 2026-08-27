@@ -316,29 +316,6 @@ class RouterRealtimeEngine:
         self._last_heartbeat_at = time.time()
         self.broadcast(RealtimeFrame.keepalive())
 
-    def seed_from_dashboard(self, dashboard: Dict[str, Any]) -> None:
-        """Seed realtime frame from cached dashboard or RPC snapshot so cold clients receive data immediately."""
-        if not isinstance(dashboard, dict):
-            return
-        hardware = dashboard.get("hardware") if isinstance(dashboard.get("hardware"), dict) else {}
-        traffic = dashboard.get("traffic") if isinstance(dashboard.get("traffic"), dict) else {}
-        network = dashboard.get("network") if isinstance(dashboard.get("network"), dict) else {}
-        
-        cpu = _number(hardware.get("cpuUsage") or dashboard.get("cpuPercent") or dashboard.get("cpu"))
-        mem = _number(hardware.get("memoryUsage") or dashboard.get("memoryPercent") or dashboard.get("memory"))
-        up = _integer(traffic.get("uploadBps") or dashboard.get("uploadBps") or dashboard.get("uploadSpeed"))
-        down = _integer(traffic.get("downloadBps") or dashboard.get("downloadBps") or dashboard.get("downloadSpeed"))
-        wan = str(network.get("wanIp") or dashboard.get("wanIp") or "")
-
-        sample = {
-            "cpuPercent": cpu,
-            "memoryPercent": mem,
-            "uploadBps": up,
-            "downloadBps": down,
-            "wanIp": wan,
-        }
-        self._accept_router_sample(sample, int(time.time() * 1000), "router_dashboard_seed")
-
     def get_router_calibration_snapshot(self) -> Dict[str, Any]:
         """Calibration snapshot for HTTP /api/router/realtime cold start."""
         with self._lock:
@@ -360,7 +337,7 @@ class RouterRealtimeEngine:
             "uploadBps": 0,
             "downloadBps": 0,
             "wanIp": "",
-            "message": "正在准备数据",
+            "message": "等待路由器本地实时采样",
             "sampleEpochMs": 0,
             "serverEpochMs": int(time.time() * 1000),
             "sampleAgeMs": 0,

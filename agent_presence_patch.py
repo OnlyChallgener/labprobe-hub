@@ -39,6 +39,13 @@ def _presence(hub: Any, router: str = "") -> Dict[str, Any]:
     if not isinstance(statuses, dict):
         statuses = {}
     heartbeat = statuses.get(target) if isinstance(statuses.get(target), dict) else {}
+    if not heartbeat:
+        primary = hub.clean_saved_value(hub.primary_router_name()) if hasattr(hub, "primary_router_name") else "router"
+        for candidate in (primary, "router", router_status.get("router")):
+            candidate = hub.clean_saved_value(candidate)
+            if candidate and isinstance(statuses.get(candidate), dict):
+                heartbeat = statuses.get(candidate)
+                break
     runtime_epoch = _epoch(router_status.get("receivedEpoch"))
     heartbeat_epoch = _epoch(heartbeat.get("lastSeenEpoch") or heartbeat.get("lastSeenAt"))
     seen_epoch = max(runtime_epoch, heartbeat_epoch)

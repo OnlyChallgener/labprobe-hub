@@ -179,11 +179,29 @@ def _save_router_config(body: dict) -> dict:
         )
     except (TypeError, ValueError):
         session_seconds = 3600
+    verify_tls = (
+        bool(body.get("verifyTls", False))
+        if "verifyTls" in body
+        else bool(current.get("verifyTls", router_session_mgr.verify_tls))
+    )
+
+    # Transactional save: if test=True and address+password provided, verify candidate first
+    if bool(body.get("test", True)) and address and password:
+        candidate_mgr = ReyeeSessionManager(
+            address=address,
+            password=password,
+            username=username,
+            timeout=router_session_mgr.http_timeout,
+            verify_tls=verify_tls,
+            session_seconds=session_seconds,
+        )
+        candidate_mgr._perform_login()
+
     saved = router_config_store.save(
         address,
         password,
         session_seconds,
-        bool(body.get("verifyTls", current.get("verifyTls", False))),
+        verify_tls,
         username=username,
         name=name,
     )
@@ -199,15 +217,6 @@ def _save_router_config(body: dict) -> dict:
     monitor = getattr(router_driver, "router_ws_monitor", None)
     if monitor is not None and hasattr(monitor, "restart"):
         monitor.restart()
-    if bool(body.get("test", True)):
-        router_driver.login(force=True)
-        try:
-            router_driver.rpc("devSta.get", "sysinfo", no_parse=True)
-        except Exception:
-            try:
-                router_driver.rpc("acConfig.get", "network_group", no_parse=True)
-            except Exception:
-                pass
     return _public_router_config()
 
 # Existing App dashboard projection remains the public contract, but every

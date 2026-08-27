@@ -6,12 +6,14 @@ on:
     branches:
       - main
       - refactor/router-core-v1
+      - fix/router-core-production-recovery
     tags:
       - 'v*'
   pull_request:
     branches:
       - main
       - refactor/router-core-v1
+      - fix/router-core-production-recovery
 
 concurrency:
   group: hub-ci-${{ github.ref }}

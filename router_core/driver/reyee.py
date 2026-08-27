@@ -165,13 +165,19 @@ class ReyeeEWebDriver(RouterDriver):
                 has_pass = bool(pwd) if (pwd is not None and not isinstance(pwd, type(lambda: None))) else True
                 configured = has_address and has_pass
                 valid = bool(mgr.is_valid())
+                state = "connected" if valid else ("syncing" if configured else "unconfigured")
+                message = (
+                    "路由连接正常"
+                    if valid
+                    else ("正在准备路由控制数据" if configured else "尚未配置路由器管理地址和密码")
+                )
                 return {
                     "configured": configured,
-                    "state": "connected" if valid else ("syncing" if configured else "unconfigured"),
+                    "state": state,
                     "connected": valid,
                     "sessionConnected": valid,
                     "dataAvailable": valid,
-                    "message": "路由连接正常" if valid else ("正在准备路由控制数据" if configured else "尚未配置路由器管理地址和密码"),
+                    "message": message,
                     "errorCode": "" if configured else "ROUTER_NOT_CONFIGURED",
                     "lastSuccessAt": 0,
                 }

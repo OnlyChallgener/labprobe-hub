@@ -8,6 +8,11 @@ on:
     tags:
       - 'v*'
   workflow_dispatch:
+    inputs:
+      image_tag:
+        description: 'Docker image tag (e.g. 0.11.6-recovery-test)'
+        required: false
+        default: '0.11.6-recovery-test'
 
 jobs:
   docker:
@@ -30,7 +35,18 @@ jobs:
         run: |
           python -m pip install --upgrade pip
           python -m pip install -r requirements.txt pytest
-          python -m py_compile             hub.py hub_entry.py hub_realtime_ws.py             hub0934_fixes.py hub0935_sync_fix.py             final_stability_patch.py followup_stability_patch.py             agent_presence_patch.py device_history_patch.py portmap_persistence_patch.py             labrelay_sync_patch.py lab_ddns.py lab_ddns_providers.py             labprobe_storage.py             router_compat.py router_core/errors.py             router_core/driver/reyee_session.py router_core/driver/reyee_rpc.py             router_core/driver/reyee.py router_core/cache/router_cache.py             router_core/realtime/router_realtime.py router_core/service/router_service.py             router_core/service/blueprint.py
+          python -m py_compile \
+            hub.py hub_entry.py hub_realtime_ws.py \
+            hub0934_fixes.py hub0935_sync_fix.py \
+            final_stability_patch.py followup_stability_patch.py \
+            agent_presence_patch.py device_history_patch.py portmap_persistence_patch.py \
+            labrelay_sync_patch.py lab_ddns.py lab_ddns_providers.py \
+            labprobe_storage.py \
+            router_compat.py router_core/errors.py \
+            router_core/driver/reyee_session.py router_core/driver/reyee_rpc.py \
+            router_core/driver/reyee.py router_core/cache/router_cache.py \
+            router_core/realtime/router_realtime.py router_core/service/router_service.py \
+            router_core/service/blueprint.py
           python -m pytest -q
 
       - name: Set up QEMU
@@ -45,6 +61,20 @@ jobs:
           username: ${{ secrets.DOCKERHUB_USERNAME }}
           password: ${{ secrets.DOCKERHUB_TOKEN }}
 
+      - name: Calculate image tags
+        id: tags
+        shell: bash
+        run: |
+          USERNAME="${{ secrets.DOCKERHUB_USERNAME }}"
+          [ -z "$USERNAME" ] && USERNAME="onlychallgener"
+          if [ "${{ github.event_name }}" = "workflow_dispatch" ]; then
+            TAG="${{ inputs.image_tag }}"
+            [ -z "$TAG" ] && TAG="0.11.6-recovery-test"
+            echo "tags=${USERNAME}/labprobe-hub:${TAG}" >> $GITHUB_OUTPUT
+          else
+            echo "tags=${USERNAME}/labprobe-hub:latest,${USERNAME}/labprobe-hub:0.11.6,${USERNAME}/labprobe-hub:v0.11.6" >> $GITHUB_OUTPUT
+          fi
+
       - name: Build and Push Hub
         uses: docker/build-push-action@v6
         with:
@@ -52,7 +82,4 @@ jobs:
           file: ./Dockerfile
           push: true
           platforms: linux/amd64,linux/arm64
-          tags: |
-            ${{ secrets.DOCKERHUB_USERNAME }}/labprobe-hub:latest
-            ${{ secrets.DOCKERHUB_USERNAME }}/labprobe-hub:0.11.6
-            ${{ secrets.DOCKERHUB_USERNAME }}/labprobe-hub:v0.11.6
+          tags: ${{ steps.tags.outputs.tags }}

@@ -449,12 +449,6 @@ class RouterRpcCompatibilitySync:
             public = self.hub._router_dashboard_public()
         self.hub._persist_router_dashboard_if_due(force=False)
         self.hub.MQTT_PUBLISHER.publish_dashboard(public)
-        realtime = getattr(self.hub, "ROUTER_REALTIME", None)
-        if realtime and hasattr(realtime, "seed_from_dashboard"):
-            try:
-                realtime.seed_from_dashboard(normalized)
-            except Exception:
-                pass
         return public
 
     def dashboard_snapshot(self, force: bool = False) -> Dict[str, Any]:

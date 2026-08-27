@@ -374,14 +374,12 @@ class ReyeeSessionManager(RouterSessionProtocol):
         sid = str(data.get("sid") or data.get("sessionId") or data.get("session_id") or "").strip()
         serial = str(data.get("sn") or data.get("serialNumber") or data.get("devSn") or "").strip()
 
-        # If serial is not in data, check cookies
+        # If serial is not in data, check cookies from response
         if not serial:
             for cookie in self._http.cookies:
                 if cookie.name.upper() == "SN" and cookie.value:
                     serial = cookie.value.strip()
                     break
-        if not serial:
-            serial = "router"
 
         # If sid is present but token is missing, token = sid, and vice-versa
         if not token and sid:
@@ -404,10 +402,13 @@ class ReyeeSessionManager(RouterSessionProtocol):
             msg = root.get("message") or root.get("msg") or "Login credentials rejected"
             raise RouterAuthError(f"Router login failed: {msg} (code={code})")
 
-        # Captured BE72 browser traffic uses the serial number as cookie name.
-        cookie_header = f"{serial}={sid}"
+        # Captured BE72 browser traffic uses SN cookie and/or sysauth cookie
         self._http.cookies.clear()
-        self._http.cookies.set(serial, sid, path="/")
+        if serial:
+            self._http.cookies.set(serial, sid, path="/")
+            cookie_header = f"{serial}={sid}"
+        else:
+            cookie_header = f"sysauth={sid}"
         self._http.cookies.set("sysauth", sid, path="/")
 
         session = ReyeeSession(

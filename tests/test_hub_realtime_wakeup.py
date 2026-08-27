@@ -34,7 +34,7 @@ def test_new_app_socket_wakes_agent_even_when_old_lease_is_still_active():
     client = websocket._register()
     try:
         demand = service.demand_payload()
-        assert demand["devicesActive"] is False
+        assert demand["devicesActive"] is True
         assert demand["sequence"] == before + 1
         assert demand["demandClientCount"] == 2
     finally:

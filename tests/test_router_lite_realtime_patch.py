@@ -70,7 +70,8 @@ def test_app_socket_wakes_relay_long_poll_but_does_not_request_router_samples():
     thread.join(timeout=0.8)
 
     assert not thread.is_alive()
-    assert result["devicesActive"] is False
+    assert result["devicesActive"] is True
+    assert result["routerActive"] is False
     assert result["sequence"] >= 1
 
 
@@ -84,7 +85,7 @@ def test_app_demand_lease_expires_and_relay_push_is_not_cached():
         "devices": [{"mac": "aa", "uploadBps": 2, "downloadBps": 3, "connectionCount": 4}],
     })
     assert accepted["acceptedRouter"] is False
-    assert accepted["acceptedDevices"] is False
+    assert accepted["acceptedDevices"] is True
 
     service.set_wss_demand("app-test", False)
 
@@ -174,8 +175,9 @@ def test_relay_push_is_acknowledged_without_becoming_a_data_source():
 
     assert response["ok"] is True
     assert response["acceptedRouter"] is False
-    assert response["acceptedDevices"] is False
+    assert response["acceptedDevices"] is True
     router = service.router_payload()
+    assert "uploadBps" not in router
     devices = service.devices_payload()
     assert "uploadBps" not in router
     assert router["source"] == "waiting_router_eweb_ws_fast"

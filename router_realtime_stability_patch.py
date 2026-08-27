@@ -274,12 +274,11 @@ def install_router_status_localization(hub: Any, sync: Any) -> None:
                 except Exception:
                     pass
         session_connected = bool(state.get("connected"))
-        realtime_service = getattr(hub, "ROUTER_LITE_REALTIME", None)
-        realtime_payload = realtime_service.router_payload() if realtime_service is not None else {}
+        engine = getattr(hub, "ROUTER_REALTIME", None)
+        realtime_payload = engine.router_payload() if engine is not None and hasattr(engine, "router_payload") else {}
         realtime_epoch_ms = int(_dict(realtime_payload).get("sampleEpochMs") or 0)
-        realtime_fresh = bool(realtime_epoch_ms and not _dict(realtime_payload).get("stale"))
-        with hub.ROUTER_DASHBOARD_LOCK:
-            data_available = realtime_fresh or dashboard_has_data(hub.ROUTER_DASHBOARD_CACHE, require_fresh=True)
+        realtime_fresh = bool(realtime_epoch_ms > 0 and not _dict(realtime_payload).get("stale"))
+        data_available = realtime_fresh
 
         error_code = str(state.get("lastErrorCode") or "")
         if realtime_fresh:
