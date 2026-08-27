@@ -5,6 +5,7 @@ on:
     branches:
       - main
       - refactor/router-core-v1
+      - fix/be72-signed-rpc-recovery
     tags:
       - 'v*'
   workflow_dispatch:
@@ -71,6 +72,8 @@ jobs:
             TAG="${{ inputs.image_tag }}"
             [ -z "$TAG" ] && TAG="0.11.6-recovery-test"
             echo "tags=${USERNAME}/labprobe-hub:${TAG}" >> $GITHUB_OUTPUT
+          elif [ "${{ github.ref_name }}" = "fix/be72-signed-rpc-recovery" ]; then
+            echo "tags=${USERNAME}/labprobe-hub:0.11.6-be72-rpc-test" >> $GITHUB_OUTPUT
           else
             echo "tags=${USERNAME}/labprobe-hub:latest,${USERNAME}/labprobe-hub:0.11.6,${USERNAME}/labprobe-hub:v0.11.6" >> $GITHUB_OUTPUT
           fi
