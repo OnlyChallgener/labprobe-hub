@@ -23,7 +23,6 @@ import router_rpc_v010
 
 
 WS_MESSAGE_TYPES = {"static", "slow", "fast", "recent_wan", "daily_wan", "ping"}
-WS_SUBPROTOCOL = "sysinfo-stream"
 FAST_START_GRACE_SECONDS = 8.0
 FAST_STALL_SECONDS = 8.0
 FAST_SOCKET_POLL_SECONDS = 1.0
@@ -468,21 +467,6 @@ class RouterWebSocketMonitor:
                 pass
         return 0
 
-    @classmethod
-    def _bad_status_requires_login(cls, exc: Exception) -> bool:
-        """Classify only proven authentication handshake failures."""
-        status_code = cls._bad_status_code(exc)
-        if status_code in {401, 403}:
-            return True
-        if status_code not in {301, 302, 303, 307, 308}:
-            return False
-        headers = getattr(exc, "resp_headers", None) or {}
-        try:
-            location = str(headers.get("Location") or headers.get("location") or "").lower()
-        except Exception:
-            location = ""
-        return "luci" in location
-
     def _keepalive_loop(self, ws: websocket.WebSocket, stop: threading.Event) -> None:
         while not self._stop.wait(10.0) and not stop.is_set():
             try:
@@ -504,7 +488,6 @@ class RouterWebSocketMonitor:
             timeout=6,
             origin=origin,
             cookie=cookie or None,
-            subprotocols=[WS_SUBPROTOCOL],
             sslopt=sslopt or {},
             http_no_proxy=[hostname] if hostname else None,
             enable_multithread=True,
@@ -579,7 +562,8 @@ class RouterWebSocketMonitor:
                 retry = 1.0
             except websocket.WebSocketBadStatusException as exc:
                 message = f"{type(exc).__name__}: {exc}"
-                force_login = self._bad_status_requires_login(exc)
+                status_code = self._bad_status_code(exc)
+                force_login = status_code in {401, 403}
                 self._set_connected(False, ws_url, message if message != last_logged_error else "")
                 last_logged_error = message
                 self._stop.wait(1.0 if force_login else retry)
