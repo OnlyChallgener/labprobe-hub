@@ -14,7 +14,7 @@ import json
 from typing import Any, Dict, Optional, Tuple, Iterable
 import requests
 
-from router_core.driver.reyee_session import ReyeeSessionManager
+from router_core.driver.reyee_session import ReyeeSessionManager, _normalize_endpoint_url
 from router_core.errors import (
     RouterAuthError,
     RouterAuthExpiredError,
@@ -85,8 +85,12 @@ class ReyeeRpcClient:
     ) -> requests.Response:
         wire = self._wire_json(payload)
         auth = auth_param or getattr(session, "sid", "") or getattr(session, "token", "")
+        url = _normalize_endpoint_url(
+            self._session_manager.address,
+            f"{endpoint_path}?auth={auth}",
+        )
         return self._session_manager.http_session.post(
-            f"{self._session_manager.address}{endpoint_path}?auth={auth}",
+            url,
             data=wire.encode("utf-8"),
             headers=self._headers(endpoint_path, wire, session.cookie_header),
             timeout=timeout or self._session_manager.http_timeout,

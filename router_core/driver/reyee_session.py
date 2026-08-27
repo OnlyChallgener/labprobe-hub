@@ -131,9 +131,15 @@ def _clean_address(raw: str) -> str:
         return ""
     if not re.match(r"^https?://", addr, re.I):
         addr = f"http://{addr}"
-    addr = re.sub(r"/cgi-bin/luci.*$", "", addr, flags=re.I)
-    addr = re.sub(r"/index\.(?:html?|php).*$", "", addr, flags=re.I)
     return addr.rstrip("/")
+
+
+def _normalize_endpoint_url(base: str, path: str) -> str:
+    base = str(base or "").strip().rstrip("/")
+    path = "/" + str(path or "").strip().lstrip("/")
+    if base.endswith("/cgi-bin/luci") and path.startswith("/cgi-bin/luci/"):
+        path = path[len("/cgi-bin/luci"):]
+    return base + path
 
 
 class ReyeeSessionManager(RouterSessionProtocol):
@@ -246,10 +252,13 @@ class ReyeeSessionManager(RouterSessionProtocol):
                 raise
 
     def _fetch_encryption_key(self) -> str:
+        root_addr = re.sub(r"/cgi-bin/luci.*$", "", self.address, flags=re.I)
         candidates = [
-            f"{self.address}/cgi-bin/luci/",
-            f"{self.address}/",
-            f"{self.address}/index.html",
+            _normalize_endpoint_url(self.address, "/cgi-bin/luci/"),
+            self.address + "/",
+            root_addr + "/",
+            root_addr + "/index.html",
+            _normalize_endpoint_url(self.address, "/index.html"),
         ]
         last_error = None
         fetched_login_page = False
@@ -287,9 +296,10 @@ class ReyeeSessionManager(RouterSessionProtocol):
     def _validate_session(self, session: ReyeeSession) -> None:
         payload = {"method": "getDeviceInfo", "params": None}
         wire = self._wire_json(payload)
+        url = _normalize_endpoint_url(self.address, f"/cgi-bin/luci/api/overview?auth={session.sid}")
         try:
             response = self._http.post(
-                f"{self.address}/cgi-bin/luci/api/overview?auth={session.sid}",
+                url,
                 data=wire.encode("utf-8"),
                 timeout=self.http_timeout,
                 verify=self.verify_tls,
@@ -336,7 +346,7 @@ class ReyeeSessionManager(RouterSessionProtocol):
         }
         wire = self._wire_json(payload)
 
-        url = f"{self.address}/cgi-bin/luci/api/auth"
+        url = _normalize_endpoint_url(self.address, "/cgi-bin/luci/api/auth")
         try:
             resp = self._http.post(
                 url,
