@@ -58,18 +58,18 @@ def _evp_bytes_to_key(password: bytes, salt: bytes, key_len: int = 32, iv_len: i
 
 def gibberish_aes_encrypt(plain_text: str, encryption_key: str, custom_salt: Optional[bytes] = None) -> str:
     """Encrypts plain_text using OpenSSL / GibberishAES compatible AES-256-CBC.
-    
+
     Format: 'Salted__' + 8-byte salt + ciphertext (PKCS#7 padded) -> Base64 without whitespace.
     """
     salt = custom_salt if custom_salt is not None else os.urandom(8)
     if len(salt) != 8:
         raise ValueError("Salt must be exactly 8 bytes")
-    
+
     key, iv = _evp_bytes_to_key(encryption_key.encode("utf-8"), salt, key_len=32, iv_len=16)
     padded_data = pad(plain_text.encode("utf-8"), AES.block_size)
     cipher = AES.new(key, AES.MODE_CBC, iv)
     ciphertext = cipher.encrypt(padded_data)
-    
+
     raw = b"Salted__" + salt + ciphertext
     b64_str = base64.b64encode(raw).decode("ascii")
     return re.sub(r"\s+", "", b64_str)
@@ -81,11 +81,11 @@ def gibberish_aes_decrypt(b64_cipher: str, encryption_key: str) -> str:
     raw = base64.b64decode(clean_b64)
     if len(raw) < 16 or raw[:8] != b"Salted__":
         raise ValueError("Invalid OpenSSL Salted__ ciphertext header")
-    
+
     salt = raw[8:16]
     ciphertext = raw[16:]
     key, iv = _evp_bytes_to_key(encryption_key.encode("utf-8"), salt, key_len=32, iv_len=16)
-    
+
     cipher = AES.new(key, AES.MODE_CBC, iv)
     padded_data = cipher.decrypt(ciphertext)
     plain_bytes = unpad(padded_data, AES.block_size)
@@ -116,7 +116,6 @@ class ReyeeSession:
     def is_valid_locally(self) -> bool:
         if not self.sid or not self.cookie_header:
             return False
-        # Idle timeout check (session_seconds is an idle expiration window)
         idle_elapsed = time.time() - self.last_activity_at
         return idle_elapsed < self.session_seconds
 
@@ -170,7 +169,7 @@ class ReyeeSessionManager(RouterSessionProtocol):
         else:
             self.http_timeout = http_timeout
         self._http = session_factory() if session_factory else requests.Session()
-        
+
         self._session: Optional[ReyeeSession] = None
         self._lock = threading.Lock()
         self._blocked_until: float = 0.0
@@ -216,20 +215,17 @@ class ReyeeSessionManager(RouterSessionProtocol):
 
     def get_session(self, force: bool = False) -> ReyeeSession:
         """Thread-safe acquisition of a valid ReyeeSession using Single-Flight execution."""
-        # Fast path: locally valid session
         if not force:
             current = self._session
             if current and current.is_valid_locally:
                 return current
 
         with self._lock:
-            # Re-check under lock (Single-Flight double-checked locking)
             if not force:
                 current = self._session
                 if current and current.is_valid_locally:
                     return current
 
-            # Check circuit breaker backoff
             now = time.time()
             if now < self._blocked_until:
                 remaining = int(self._blocked_until - now)
@@ -244,7 +240,7 @@ class ReyeeSessionManager(RouterSessionProtocol):
                 self._consecutive_failures = 0
                 self._blocked_until = 0.0
                 return new_session
-            except Exception as exc:
+            except Exception:
                 self._session = None
                 self._consecutive_failures += 1
                 if self._consecutive_failures >= 3:
@@ -282,8 +278,6 @@ class ReyeeSessionManager(RouterSessionProtocol):
                 continue
 
         if fetched_login_page:
-            # BE72 firmware builds that keep the key outside the returned HTML use
-            # the same fixed key as the browser bundle on the exact auth endpoint.
             return BE72_AES_PASSWORD
         if last_error:
             raise RouterUnreachableError(f"Unable to connect to router login page: {last_error}") from last_error
@@ -309,25 +303,24 @@ class ReyeeSessionManager(RouterSessionProtocol):
                     "Cookie": session.cookie_header,
                 },
             )
-            # Only treat explicit 401/403 as auth failure
-            if response.status_code in (401, 403):
-                raise RouterAuthExpiredError(
-                    f"BE72 login session validation returned HTTP {response.status_code}"
-                )
-            if response.status_code < 400:
-                try:
-                    root = response.json()
-                    if isinstance(root, dict):
-                        err_text = str(root.get("error") or "").lower()
-                        if "auth" in err_text or "token" in err_text or "permission" in err_text:
-                            raise RouterAuthExpiredError(f"Router validation error: {root.get('error')}")
-                except (ValueError, TypeError):
-                    pass
-        except (RouterAuthExpiredError, RouterUnreachableError):
-            raise
-        except Exception:
-            # Tolerant: do not drop session on benign network probe timeout or non-standard overview responses
-            pass
+        except requests.RequestException as exc:
+            raise RouterUnreachableError(f"Unable to validate router login session: {exc}") from exc
+        if response.status_code >= 400:
+            raise RouterAuthExpiredError(
+                f"BE72 login session validation returned HTTP {response.status_code}"
+            )
+        try:
+            root = response.json()
+        except Exception as exc:
+            raise RouterAuthError(f"Invalid JSON returned by router session validation: {exc}") from exc
+        if not isinstance(root, dict):
+            raise RouterAuthError("Router session validation response was not a JSON object")
+        try:
+            code = int(root.get("code") or 0)
+        except (TypeError, ValueError):
+            code = -1
+        if root.get("error") or code != 0:
+            raise RouterAuthExpiredError("BE72 login succeeded but SID session validation failed")
 
     def _perform_login(self) -> ReyeeSession:
         encryption_key = self._fetch_encryption_key()
@@ -370,23 +363,9 @@ class ReyeeSessionManager(RouterSessionProtocol):
         if not isinstance(root, dict):
             raise RouterAuthError("Router login response was not a JSON object")
         data = root.get("data") if isinstance(root.get("data"), dict) else {}
-        token = str(data.get("token") or data.get("auth_token") or data.get("auth") or "").strip()
-        sid = str(data.get("sid") or data.get("sessionId") or data.get("session_id") or "").strip()
-        serial = str(data.get("sn") or data.get("serialNumber") or data.get("devSn") or "").strip()
-
-        # If serial is not in data, check cookies from response
-        if not serial:
-            for cookie in self._http.cookies:
-                if cookie.name.upper() == "SN" and cookie.value:
-                    serial = cookie.value.strip()
-                    break
-
-        # If sid is present but token is missing, token = sid, and vice-versa
-        if not token and sid:
-            token = sid
-        if not sid and token:
-            sid = token
-
+        token = str(data.get("token") or "").strip()
+        sid = str(data.get("sid") or "").strip()
+        serial = str(data.get("sn") or "").strip()
         try:
             sessiontime = int(data.get("sessiontime") or data.get("sessionTime") or self.session_seconds)
         except (TypeError, ValueError):
@@ -397,19 +376,14 @@ class ReyeeSessionManager(RouterSessionProtocol):
             code = int(root.get("code") or 0)
         except (TypeError, ValueError):
             code = -1
-        if code != 0 or not sid:
-            code = root.get("code")
+        if code != 0 or not token or not sid or not serial:
+            raw_code = root.get("code")
             msg = root.get("message") or root.get("msg") or "Login credentials rejected"
-            raise RouterAuthError(f"Router login failed: {msg} (code={code})")
+            raise RouterAuthError(f"Router login failed: {msg} (code={raw_code})")
 
-        # Captured BE72 browser traffic uses SN cookie and/or sysauth cookie
+        cookie_header = f"{serial}={sid}"
         self._http.cookies.clear()
-        if serial:
-            self._http.cookies.set(serial, sid, path="/")
-            cookie_header = f"{serial}={sid}"
-        else:
-            cookie_header = f"sysauth={sid}"
-        self._http.cookies.set("sysauth", sid, path="/")
+        self._http.cookies.set(serial, sid, path="/")
 
         session = ReyeeSession(
             sid=sid,
