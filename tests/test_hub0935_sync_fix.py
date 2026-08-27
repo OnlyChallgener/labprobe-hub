@@ -70,7 +70,7 @@ def test_router_native_ws_is_passive_and_sends_no_application_keepalive(monkeypa
     assert monitor.connected[0][0] is True
     assert monitor.messages == [{"type": "fast", "data": {"up": 1}}]
     assert socket.closed is True
-    assert connection_options["subprotocols"] == ["sysinfo-stream"]
+    assert "subprotocols" not in connection_options
     # FakeSocket deliberately has no send()/ping() method.  Reaching this line
     # proves the receiver did not emit the old {"action":"keepalive"} frame.
 
