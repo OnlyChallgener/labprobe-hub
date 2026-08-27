@@ -1,16 +1,15 @@
 """Reyee JSON-RPC Client.
 
-Implements the official Wire Protocol:
-- Path: /cgi-bin/luci/api/cmd?auth=<sid> (or module path)
-- Headers: Cookie: <cookie_header>, Content-Type: application/json
+Implements the BE72-proven eWeb wire protocol:
+- Path: /cgi-bin/luci/api/cmd?auth=<token> (or module path)
+- Headers: Content-Accept/Contents-Accept exactly match the legacy production client
 - Body: {"method": "<method>", "params": <params>}
-- Auto-recovery: On HTTP 401/403, LuCI login redirect/page, or application session
-  invalid, performs single-flight re-login and retries the request at most ONCE.
-- Circuit breaker protects against infinite retry loops.
+- Auto-recovery: On explicit auth expiry, performs single-flight re-login and retries once.
 """
 
 import hashlib
 import json
+import time
 from typing import Any, Dict, Optional, Tuple, Iterable
 import requests
 
@@ -36,6 +35,10 @@ class ReyeeRpcClient:
         if mgr is None:
             raise ValueError("session_manager is required")
         self._session_manager = mgr
+        self._last_success_at_ms = 0
+        self._last_error_at_ms = 0
+        self._last_error_code = ""
+        self._last_error_message = ""
 
     @property
     def session_manager(self) -> ReyeeSessionManager:
@@ -44,6 +47,10 @@ class ReyeeRpcClient:
     @staticmethod
     def _wire_json(value: Any) -> str:
         return json.dumps(value, ensure_ascii=False, separators=(",", ":"))
+
+    @staticmethod
+    def _stable_json(value: Any) -> str:
+        return json.dumps(value, ensure_ascii=False, separators=(",", ":"), sort_keys=True)
 
     @staticmethod
     def _eweb_byte_length(value: str) -> int:
@@ -58,17 +65,52 @@ class ReyeeRpcClient:
                 total += 4
         return total
 
+    def control_status(self) -> Dict[str, Any]:
+        checked = bool(self._last_success_at_ms or self._last_error_at_ms)
+        connected = bool(
+            self._last_success_at_ms
+            and self._last_success_at_ms >= self._last_error_at_ms
+        )
+        return {
+            "checked": checked,
+            "connected": connected,
+            "lastSuccessAt": int(self._last_success_at_ms),
+            "lastErrorAt": int(self._last_error_at_ms),
+            "lastErrorCode": self._last_error_code,
+            "lastErrorMessage": self._last_error_message,
+        }
+
+    def _record_success(self) -> None:
+        self._last_success_at_ms = int(time.time() * 1000)
+        self._last_error_code = ""
+        self._last_error_message = ""
+
+    def _record_error(self, code: str, message: str) -> None:
+        self._last_error_at_ms = int(time.time() * 1000)
+        self._last_error_code = str(code or "RPC_FAILED")
+        self._last_error_message = str(message or "Router RPC failed")
+
     @classmethod
-    def _headers(cls, endpoint_path: str, wire: str, cookie: str) -> Dict[str, str]:
+    def _headers(
+        cls,
+        endpoint_path: str,
+        payload: Dict[str, Any],
+        wire: str,
+        cookie: str,
+    ) -> Dict[str, str]:
         headers = {
             "Content-Type": "application/json;charset=UTF-8",
             "Cookie": cookie,
             "User-Agent": "LabProbe-Hub/0.11.2",
         }
         if endpoint_path.rstrip("/").endswith("/cmd"):
+            # This is the exact signing contract used by the last known-good
+            # production client (router_rpc.py / b130c52): Content-Accept signs
+            # stable sorted JSON, while Contents-Accept signs the transmitted wire.
             secret = "Web@Rj$2020!"
+            stable = cls._stable_json(payload)
             headers["Content-Accept"] = hashlib.md5(
-                (secret + str(cls._eweb_byte_length(wire))).encode("utf-8")
+                (secret + stable).encode("utf-8")
             ).hexdigest()
             headers["Contents-Accept"] = hashlib.md5(
                 (secret + wire).encode("utf-8")
@@ -84,7 +126,13 @@ class ReyeeRpcClient:
         auth_param: Optional[str] = None,
     ) -> requests.Response:
         wire = self._wire_json(payload)
-        auth = auth_param or getattr(session, "sid", "") or getattr(session, "token", "")
+        # BE72 uses different values for browser-session SID and signed-RPC auth.
+        # /ws authenticates with SID; /api/cmd uses the login auth token.
+        auth = (
+            auth_param
+            or getattr(session, "token", "")
+            or getattr(session, "sid", "")
+        )
         url = _normalize_endpoint_url(
             self._session_manager.address,
             f"{endpoint_path}?auth={auth}",
@@ -92,7 +140,7 @@ class ReyeeRpcClient:
         return self._session_manager.http_session.post(
             url,
             data=wire.encode("utf-8"),
-            headers=self._headers(endpoint_path, wire, session.cookie_header),
+            headers=self._headers(endpoint_path, payload, wire, session.cookie_header),
             timeout=timeout or self._session_manager.http_timeout,
             verify=self._session_manager.verify_tls,
             allow_redirects=False,
@@ -105,6 +153,7 @@ class ReyeeRpcClient:
                 session,
                 {"method": "getDeviceInfo", "params": None},
                 timeout,
+                auth_param=getattr(session, "sid", "") or getattr(session, "token", ""),
             )
             if response.status_code >= 400:
                 return False
@@ -117,7 +166,6 @@ class ReyeeRpcClient:
 
     @staticmethod
     def _is_login_redirect(response: requests.Response) -> bool:
-        """Recognize the LuCI login redirect observed on expired BE72 sessions."""
         if response.status_code not in {301, 302, 303, 307, 308}:
             return False
         location = str(response.headers.get("Location") or "").lower()
@@ -125,7 +173,6 @@ class ReyeeRpcClient:
 
     @staticmethod
     def _looks_like_login_page(text: str) -> bool:
-        """Use the same narrow login-page markers as the BE72-proven client."""
         low = str(text or "").lower()
         return 'id="password"' in low and 'id="login"' in low and "api/auth" in low
 
@@ -147,11 +194,9 @@ class ReyeeRpcClient:
         try:
             resp = self._post(endpoint_path, session, payload, timeout)
         except requests.RequestException as exc:
+            self._record_error("ROUTER_UNREACHABLE", str(exc))
             raise RouterUnreachableError(f"Network error executing RPC '{method}': {exc}") from exc
 
-        # An expired BE72 SID can be reported as 401/403, a redirect to LuCI,
-        # or an HTTP-200 login page. These are the same narrow conditions used
-        # by the previous client after real-device verification.
         login_redirect = self._is_login_redirect(resp)
         login_page = self._looks_like_login_page(getattr(resp, "text", ""))
 
@@ -163,40 +208,49 @@ class ReyeeRpcClient:
                 and endpoint_path.rstrip("/").endswith("/cmd")
                 and self._session_probe_ok(session, timeout)
             ):
+                message = "Router session is valid, but the signed cmd RPC was rejected"
+                self._record_error("RPC_SIGNATURE_REJECTED", message)
                 raise RouterRpcExecutionError(
-                    "Router session is valid, but the signed cmd RPC was rejected",
+                    message,
                     code="RPC_SIGNATURE_REJECTED",
                     status_code=502,
                 )
             self._session_manager.invalidate_session()
             if retry_auth:
-                # Re-login under single-flight and retry exactly once
                 return self.call(method, params, endpoint_path, timeout, retry_auth=False)
-            raise RouterAuthExpiredError(
-                f"Router authentication expired for method '{method}' (HTTP {resp.status_code})"
-            )
+            message = f"Router authentication expired for method '{method}' (HTTP {resp.status_code})"
+            self._record_error("AUTH_EXPIRED", message)
+            raise RouterAuthExpiredError(message)
 
         if resp.status_code >= 400:
-            raise RouterRpcExecutionError(f"Router HTTP error {resp.status_code} on method '{method}'")
+            message = f"Router HTTP error {resp.status_code} on method '{method}'"
+            self._record_error("RPC_HTTP_ERROR", message)
+            raise RouterRpcExecutionError(message)
 
         try:
             root = resp.json()
         except Exception as exc:
-            raise RouterRpcExecutionError(f"Invalid JSON response for method '{method}': {exc}") from exc
+            message = f"Invalid JSON response for method '{method}': {exc}"
+            self._record_error("RPC_INVALID_RESPONSE", message)
+            raise RouterRpcExecutionError(message) from exc
 
-        # Check for application-level session invalidation in JSON body
         if not isinstance(root, dict):
-            raise RouterRpcExecutionError(f"Router returned a non-object response for '{method}'")
+            message = f"Router returned a non-object response for '{method}'"
+            self._record_error("RPC_INVALID_RESPONSE", message)
+            raise RouterRpcExecutionError(message)
         code = root.get("code")
         if str(code) in {"401", "403", "1001"} or root.get("error") == "session_expired":
             self._session_manager.invalidate_session()
             if retry_auth:
                 return self.call(method, params, endpoint_path, timeout, retry_auth=False)
-            raise RouterAuthExpiredError(f"Router application session invalid on '{method}' (code={code})")
+            message = f"Router application session invalid on '{method}' (code={code})"
+            self._record_error("AUTH_EXPIRED", message)
+            raise RouterAuthExpiredError(message)
 
         if root.get("error"):
             error = root.get("error")
             message = error.get("message") if isinstance(error, dict) else str(error)
+            self._record_error("RPC_REJECTED", message or f"Router rejected method '{method}'")
             raise RouterRpcExecutionError(message or f"Router rejected method '{method}'")
         try:
             numeric_code = int(code or 0)
@@ -204,10 +258,11 @@ class ReyeeRpcClient:
             numeric_code = -1
         if numeric_code != 0:
             message = root.get("message") or root.get("msg") or f"Router API code {numeric_code}"
+            self._record_error("RPC_REJECTED", str(message))
             raise RouterRpcExecutionError(str(message), code="RPC_REJECTED", status_code=409)
 
-        # Record activity on success (Idle Timeout refresh)
         self._session_manager.record_activity()
+        self._record_success()
         return root
 
     def rpc(
