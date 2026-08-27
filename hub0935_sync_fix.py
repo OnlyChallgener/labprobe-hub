@@ -44,7 +44,6 @@ def _run_router_connection_without_app_keepalive(
         timeout=6,
         origin=origin,
         cookie=cookie or None,
-        subprotocols=[router_ws_patch.WS_SUBPROTOCOL],
         sslopt=sslopt or {},
         http_no_proxy=[hostname] if hostname else None,
         enable_multithread=True,
