@@ -1,8 +1,8 @@
 """Reyee JSON-RPC Client.
 
 Implements the BE72-proven eWeb wire protocol:
-- Path: /cgi-bin/luci/api/cmd?auth=<token> (or module path)
-- Headers: Content-Accept/Contents-Accept exactly match the legacy production client
+- Path: /cgi-bin/luci/api/cmd?auth=<sid> (or module path)
+- Headers: Content-Accept signs eWeb wire byte length; Contents-Accept signs the transmitted wire
 - Body: {"method": "<method>", "params": <params>}
 - Auto-recovery: On explicit auth expiry, performs single-flight re-login and retries once.
 """
@@ -47,10 +47,6 @@ class ReyeeRpcClient:
     @staticmethod
     def _wire_json(value: Any) -> str:
         return json.dumps(value, ensure_ascii=False, separators=(",", ":"))
-
-    @staticmethod
-    def _stable_json(value: Any) -> str:
-        return json.dumps(value, ensure_ascii=False, separators=(",", ":"), sort_keys=True)
 
     @staticmethod
     def _eweb_byte_length(value: str) -> int:
@@ -104,13 +100,9 @@ class ReyeeRpcClient:
             "User-Agent": "LabProbe-Hub/0.11.2",
         }
         if endpoint_path.rstrip("/").endswith("/cmd"):
-            # This is the exact signing contract used by the last known-good
-            # production client (router_rpc.py / b130c52): Content-Accept signs
-            # stable sorted JSON, while Contents-Accept signs the transmitted wire.
             secret = "Web@Rj$2020!"
-            stable = cls._stable_json(payload)
             headers["Content-Accept"] = hashlib.md5(
-                (secret + stable).encode("utf-8")
+                (secret + str(cls._eweb_byte_length(wire))).encode("utf-8")
             ).hexdigest()
             headers["Contents-Accept"] = hashlib.md5(
                 (secret + wire).encode("utf-8")
@@ -126,13 +118,7 @@ class ReyeeRpcClient:
         auth_param: Optional[str] = None,
     ) -> requests.Response:
         wire = self._wire_json(payload)
-        # BE72 uses different values for browser-session SID and signed-RPC auth.
-        # /ws authenticates with SID; /api/cmd uses the login auth token.
-        auth = (
-            auth_param
-            or getattr(session, "token", "")
-            or getattr(session, "sid", "")
-        )
+        auth = auth_param or getattr(session, "sid", "")
         url = _normalize_endpoint_url(
             self._session_manager.address,
             f"{endpoint_path}?auth={auth}",
@@ -153,7 +139,7 @@ class ReyeeRpcClient:
                 session,
                 {"method": "getDeviceInfo", "params": None},
                 timeout,
-                auth_param=getattr(session, "sid", "") or getattr(session, "token", ""),
+                auth_param=getattr(session, "sid", ""),
             )
             if response.status_code >= 400:
                 return False
