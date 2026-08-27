@@ -242,7 +242,19 @@ def install_hub0934_fixes(hub: Any) -> None:
         return root
 
     hub.build_sync_snapshot = build_sync_snapshot
-    hub.build_watched_devices = lambda online: canonical_watched_devices(hub, online)
+
+    def build_watched_devices(
+        online: List[Dict[str, Any]],
+        *,
+        emit_events: bool = True,
+    ) -> List[Dict[str, Any]]:
+        # ``canonical_watched_devices`` is projection-only and never emits
+        # transition events. Keep the current Hub helper signature so the
+        # Router Core durable writer can explicitly disable legacy emission.
+        del emit_events
+        return canonical_watched_devices(hub, online)
+
+    hub.build_watched_devices = build_watched_devices
 
     def api_devices() -> Any:
         if not hub.check_read_token():

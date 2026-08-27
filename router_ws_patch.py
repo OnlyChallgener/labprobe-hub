@@ -23,6 +23,7 @@ import router_rpc_v010
 
 
 WS_MESSAGE_TYPES = {"static", "slow", "fast", "recent_wan", "daily_wan", "ping"}
+WS_SUBPROTOCOL = "sysinfo-stream"
 FAST_START_GRACE_SECONDS = 8.0
 FAST_STALL_SECONDS = 8.0
 FAST_SOCKET_POLL_SECONDS = 1.0
@@ -503,6 +504,7 @@ class RouterWebSocketMonitor:
             timeout=6,
             origin=origin,
             cookie=cookie or None,
+            subprotocols=[WS_SUBPROTOCOL],
             sslopt=sslopt or {},
             http_no_proxy=[hostname] if hostname else None,
             enable_multithread=True,

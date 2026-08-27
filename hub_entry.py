@@ -133,14 +133,23 @@ hub.ROUTER_REALTIME = router_realtime
 def _public_router_config() -> dict:
     config = router_config_store.load()
     status = router_driver.get_status()
+    address = str(config.get("address") or router_session_mgr.address or "").strip()
+    username = str(config.get("username") or router_session_mgr.username or "admin").strip() or "admin"
+    password_configured = bool(config.get("password") or router_session_mgr.password)
+    session_seconds = int(config.get("sessionSeconds") or router_session_mgr.session_seconds or 3600)
+    verify_tls = (
+        bool(config.get("verifyTls", False))
+        if config.get("managed")
+        else bool(router_session_mgr.verify_tls)
+    )
     return {
         "ok": True,
         "name": str(config.get("name") or hub.primary_router_name() or "").strip(),
-        "username": str(config.get("username") or "admin").strip(),
-        "address": str(config.get("address") or "").strip(),
-        "passwordConfigured": bool(config.get("password")),
-        "sessionSeconds": int(config.get("sessionSeconds") or 3600),
-        "verifyTls": bool(config.get("verifyTls", False)),
+        "username": username,
+        "address": address,
+        "passwordConfigured": password_configured,
+        "sessionSeconds": session_seconds,
+        "verifyTls": verify_tls,
         "connected": bool(status.get("connected", False)),
         "state": str(status.get("state") or "unconfigured"),
         "message": str(status.get("message") or ""),
@@ -149,12 +158,21 @@ def _public_router_config() -> dict:
 
 def _save_router_config(body: dict) -> dict:
     current = router_config_store.load()
-    address = str(body.get("address") or current.get("address") or "").strip()
-    username = str(body.get("username") or current.get("username") or "admin").strip() or "admin"
+    address = str(body.get("address") or current.get("address") or router_session_mgr.address or "").strip()
+    username = str(body.get("username") or current.get("username") or router_session_mgr.username or "admin").strip() or "admin"
     name = str(body.get("name") if "name" in body else current.get("name") or "").strip()
-    password = body.get("password") if "password" in body and str(body.get("password") or "") else None
+    password = (
+        str(body.get("password") or "")
+        if "password" in body and str(body.get("password") or "").strip()
+        else str(current.get("password") or router_session_mgr.password or "")
+    )
     try:
-        session_seconds = int(body.get("sessionSeconds") or current.get("sessionSeconds") or 3600)
+        session_seconds = int(
+            body.get("sessionSeconds")
+            or current.get("sessionSeconds")
+            or router_session_mgr.session_seconds
+            or 3600
+        )
     except (TypeError, ValueError):
         session_seconds = 3600
     saved = router_config_store.save(
