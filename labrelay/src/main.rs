@@ -525,33 +525,15 @@ impl Manager {
             _ => unreachable!("validate_rule normalizes transportProtocol"),
         };
         if rule.kind == "stun" {
-            let confirmation = timeout(Duration::from_secs(30), async {
-                loop {
-                    let current = shared.snapshot().await;
-                    if current.state == "mapped" && !current.public_endpoint.is_empty() {
-                        return Ok(());
-                    }
-                    if !current.last_error.is_empty() {
-                        bail!(current.last_error);
-                    }
-                    sleep(Duration::from_millis(100)).await;
-                }
-            })
-            .await;
-            let startup_error = match confirmation {
-                Ok(Ok(())) => None,
-                Ok(Err(error)) => Some(error),
-                Err(_) => Some(anyhow!("STUN startup confirmation timed out")),
-            };
-            if let Some(error) = startup_error {
+            if let Err(error) = confirm_stun_startup(&shared, Duration::from_secs(30)).await {
                 let _ = cancel_tx.send(true);
                 if timeout(Duration::from_secs(3), &mut join).await.is_err() {
                     join.abort();
                     let _ = join.await;
                 }
-                self.set_cached_state(&rule, "error", &error.to_string())
-                    .await;
-                return Err(error.context("confirm first STUN binding"));
+                let message = format!("confirm first STUN binding: {error:#}");
+                self.set_cached_state(&rule, "error", &message).await;
+                return Err(anyhow!(message));
             }
         }
         self.runtimes.lock().await.insert(
@@ -848,6 +830,30 @@ async fn mark_stun_mapping(shared: &Arc<RuntimeShared>, endpoint: SocketAddr) {
     base.public_port = endpoint.port();
     base.mapping_updated_at = Some(now_epoch());
     base.last_error.clear();
+}
+
+async fn confirm_stun_startup(shared: &Arc<RuntimeShared>, wait: Duration) -> Result<()> {
+    let mut last_error = String::new();
+    let confirmation = timeout(wait, async {
+        loop {
+            let current = shared.snapshot().await;
+            if current.state == "mapped" && !current.public_endpoint.is_empty() {
+                return;
+            }
+            if !current.last_error.is_empty() {
+                last_error = current.last_error;
+            }
+            sleep(Duration::from_millis(100)).await;
+        }
+    })
+    .await;
+    if confirmation.is_ok() {
+        return Ok(());
+    }
+    if last_error.is_empty() {
+        bail!("STUN startup confirmation timed out");
+    }
+    bail!("STUN startup confirmation timed out; last error: {last_error}")
 }
 
 async fn resolve_stun_server(value: &str) -> Result<SocketAddr> {
@@ -2424,6 +2430,54 @@ mod tests {
         normalize_rule(&mut rule);
         validate_rule(&rule, 20000, 20020).unwrap();
         assert_eq!(rule.forward_mode, "router_native");
+    }
+
+    #[tokio::test]
+    async fn stun_startup_confirmation_allows_a_transient_error_to_recover() {
+        let rule = Rule {
+            id: "stun-transient".into(),
+            name: "STUN transient".into(),
+            kind: "stun".into(),
+            ..Rule::default()
+        };
+        let mut snapshot = RuntimeSnapshot::stopped(&rule);
+        snapshot.state = "mapping".into();
+        snapshot.last_error = "temporary DNS failure".into();
+        let shared = Arc::new(RuntimeShared::new(snapshot));
+        let updater = shared.clone();
+        let mapping = tokio::spawn(async move {
+            sleep(Duration::from_millis(25)).await;
+            mark_stun_mapping(&updater, "203.0.113.9:20001".parse().unwrap()).await;
+        });
+
+        confirm_stun_startup(&shared, Duration::from_millis(500))
+            .await
+            .unwrap();
+        mapping.await.unwrap();
+        assert_eq!(shared.snapshot().await.state, "mapped");
+    }
+
+    #[tokio::test]
+    async fn stun_startup_confirmation_timeout_keeps_the_last_real_error() {
+        let rule = Rule {
+            id: "stun-timeout".into(),
+            name: "STUN timeout".into(),
+            kind: "stun".into(),
+            ..Rule::default()
+        };
+        let mut snapshot = RuntimeSnapshot::stopped(&rule);
+        snapshot.state = "mapping".into();
+        snapshot.last_error = "STUN UDP receive failed: network unreachable".into();
+        let shared = Arc::new(RuntimeShared::new(snapshot));
+
+        let error = confirm_stun_startup(&shared, Duration::from_millis(20))
+            .await
+            .unwrap_err();
+
+        assert_eq!(
+            error.to_string(),
+            "STUN startup confirmation timed out; last error: STUN UDP receive failed: network unreachable"
+        );
     }
 
     #[test]
