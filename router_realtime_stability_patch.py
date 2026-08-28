@@ -255,8 +255,24 @@ def install_router_status_localization(hub: Any, sync: Any) -> None:
     def status_view():
         if not hub.check_app_token():
             return jsonify({"ok": False, "error": "unauthorized", "message": "APP Token 无效"}), 401
-        state = sync.client.status(probe=False)
+        state = sync.client.status(probe=False) if hasattr(sync.client, "status") else sync.client.get_status()
         configured = bool(state.get("configured"))
+        if not configured:
+            if hasattr(sync.client, "get_capabilities"):
+                try:
+                    configured = bool(sync.client.get_capabilities().get("configured"))
+                except Exception:
+                    pass
+            elif hasattr(sync.client, "capabilities"):
+                try:
+                    configured = bool(sync.client.capabilities().get("configured"))
+                except Exception:
+                    pass
+            elif hasattr(sync.client, "configured"):
+                try:
+                    configured = bool(sync.client.configured())
+                except Exception:
+                    pass
         session_connected = bool(state.get("connected"))
         realtime_service = getattr(hub, "ROUTER_LITE_REALTIME", None)
         realtime_payload = realtime_service.router_payload() if realtime_service is not None else {}

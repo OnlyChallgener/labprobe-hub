@@ -1,15 +1,155 @@
-//! Phase 1: read-only WireGuard capability and status detection.
+//! WireGuard capability detection and the Agent-owned server control plane.
 //!
-//! Everything here is intentionally non-mutating: no interface creation, no
-//! UCI/firewall writes, no service restarts, and no private key handling.
-//! Detection failures degrade into [`WireGuardStatus::error`] and never
-//! propagate into the Agent/Relay lifecycle.
+//! Detection remains non-mutating. Provisioning is an explicit Agent command:
+//! it uses the kernel Generic Netlink backend, keeps the private key on the
+//! router, and never accepts arbitrary shell input.
 
 use anyhow::{bail, Context, Result};
 use serde::{Deserialize, Serialize};
-use std::fs;
-use std::path::Path;
+use std::fs::{self, OpenOptions};
+use std::io::Write;
+use std::net::IpAddr;
+use std::path::{Path, PathBuf};
 use std::process::Command;
+use wireguard_control::{Backend, Device, DeviceUpdate, InterfaceName, Key, KeyPair, PeerConfigBuilder};
+
+const DEFAULT_PRIVATE_KEY_PATH: &str = "/etc/labprobe/wireguard/private.key";
+
+/// A public endpoint profile belongs to exactly one updater.  DDNS and STUN
+/// are separate profiles so two background jobs can never race on one client
+/// endpoint.  The Agent does not resolve these values; it only preserves and
+/// reports the selected source as part of the desired configuration.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Default)]
+#[serde(rename_all = "camelCase")]
+pub struct WireGuardEndpointProfile {
+    pub id: String,
+    pub endpoint_source: String,
+    /// Stable updater identity (`ddns:<profile-id>` or `stun:<rule-id>`).
+    /// Manual profiles have no owner and reject automatic updates.
+    #[serde(default)]
+    pub owner: String,
+    #[serde(default)]
+    pub hostname: String,
+    #[serde(default)]
+    pub public_endpoint: String,
+    #[serde(default)]
+    pub resolved_endpoint: String,
+    #[serde(default)]
+    pub stun_rule_id: String,
+    #[serde(default)]
+    pub binding_mode: String,
+    #[serde(default)]
+    pub forward_mode: String,
+    #[serde(default)]
+    pub transport_protocol: String,
+    #[serde(default)]
+    pub local_target_port: u16,
+    #[serde(default)]
+    pub port: u16,
+    #[serde(default)]
+    pub endpoint_revision: u64,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+#[serde(rename_all = "camelCase")]
+pub struct WireGuardEndpointUpdate {
+    pub profile_id: String,
+    pub endpoint_source: String,
+    pub owner: String,
+    pub endpoint: String,
+    pub expected_endpoint_revision: u64,
+    pub endpoint_revision: u64,
+}
+
+/// Apply a public endpoint observation without changing the server/kernel
+/// revision. This is deliberately a separate state transition from applying
+/// WireGuard interface configuration.
+pub fn apply_endpoint_update(
+    profiles: &mut [WireGuardEndpointProfile],
+    update: &WireGuardEndpointUpdate,
+) -> Result<WireGuardEndpointProfile> {
+    let profile = profiles
+        .iter_mut()
+        .find(|profile| profile.id == update.profile_id)
+        .ok_or_else(|| anyhow::anyhow!("endpoint profile not found"))?;
+    if profile.endpoint_source == "manual" {
+        bail!("manual endpoint profile cannot be changed by an automatic updater");
+    }
+    if profile.endpoint_source != update.endpoint_source {
+        bail!("endpoint updater source does not match profile");
+    }
+    if profile.owner.is_empty() || profile.owner != update.owner {
+        bail!("endpoint updater owner does not match profile");
+    }
+    if profile.endpoint_revision == update.endpoint_revision
+        && profile.resolved_endpoint == update.endpoint
+    {
+        return Ok(profile.clone());
+    }
+    if profile.endpoint_revision != update.expected_endpoint_revision {
+        bail!("endpoint revision conflict");
+    }
+    if update.endpoint_revision != update.expected_endpoint_revision.saturating_add(1) {
+        bail!("endpoint revision must advance exactly once");
+    }
+    if update.endpoint.trim().is_empty() {
+        bail!("endpoint cannot be empty");
+    }
+    profile.resolved_endpoint = update.endpoint.clone();
+    profile.endpoint_revision = update.endpoint_revision;
+    Ok(profile.clone())
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+#[serde(rename_all = "camelCase")]
+pub struct WireGuardPeerDesired {
+    pub id: String,
+    #[serde(default)]
+    pub name: String,
+    pub public_key: String,
+    pub allowed_ips: Vec<String>,
+    #[serde(default)]
+    pub persistent_keepalive_seconds: u16,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+#[serde(rename_all = "camelCase")]
+pub struct WireGuardServerDesired {
+    #[serde(default = "default_interface_name")]
+    pub interface_name: String,
+    #[serde(default = "default_server_address")]
+    pub address: String,
+    #[serde(default = "default_listen_port")]
+    pub listen_port: u16,
+    #[serde(default = "default_mtu")]
+    pub mtu: u16,
+    #[serde(default = "default_true")]
+    pub enabled: bool,
+    #[serde(default)]
+    pub revision: u64,
+    #[serde(default)]
+    pub peers: Vec<WireGuardPeerDesired>,
+    #[serde(default)]
+    pub endpoint_profiles: Vec<WireGuardEndpointProfile>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+#[serde(rename_all = "camelCase")]
+pub struct WireGuardApplyResult {
+    pub ok: bool,
+    pub interface_name: String,
+    pub public_key: String,
+    pub listen_port: u16,
+    pub peer_count: usize,
+    pub enabled: bool,
+    pub revision: u64,
+    pub control_backend: String,
+}
+
+fn default_interface_name() -> String { "labwg0".into() }
+fn default_server_address() -> String { "10.77.0.1/24".into() }
+fn default_listen_port() -> u16 { 51820 }
+fn default_true() -> bool { true }
 
 /// Per-interface WireGuard status. Public key is safe to report; the private
 /// key is never read, parsed, logged or serialized.
@@ -33,6 +173,12 @@ pub struct WireGuardInterfaceStatus {
 pub struct WireGuardStatus {
     pub supported: bool,
     pub wg_tool_available: bool,
+    pub kernel_supported: bool,
+    pub control_tool_available: bool,
+    /// True when Agent can provision through Generic Netlink even if `wg`
+    /// is not installed.
+    pub provisioning_ready: bool,
+    pub control_backend: String,
     pub kernel_support: bool,
     pub installed: bool,
     /// `true` when UCI contains a real `proto='wireguard'` interface OR a
@@ -52,10 +198,16 @@ impl WireGuardStatus {
     /// located; never treated as an error condition by callers.
     fn without_wg_tool(kernel_support: bool, uci_error: Option<String>) -> Self {
         Self {
-            supported: false,
+            // Runtime configuration uses the kernel Generic Netlink API and
+            // does not require the optional `wg` CLI.
+            supported: kernel_support,
             wg_tool_available: false,
+            kernel_supported: kernel_support,
+            control_tool_available: false,
+            provisioning_ready: kernel_support,
+            control_backend: if kernel_support { "kernel-netlink".into() } else { "unavailable".into() },
             kernel_support,
-            installed: false,
+            installed: kernel_support,
             configured: false,
             running: false,
             interfaces: Vec::new(),
@@ -71,6 +223,10 @@ impl WireGuardStatus {
         Self {
             supported: kernel_support,
             wg_tool_available: true,
+            kernel_supported: kernel_support,
+            control_tool_available: true,
+            provisioning_ready: kernel_support,
+            control_backend: if kernel_support { "kernel-netlink".into() } else { "unavailable".into() },
             kernel_support,
             installed: true,
             configured: false,
@@ -351,6 +507,282 @@ fn is_ascii_interface_name(name: &str) -> bool {
             .all(|ch| ch.is_ascii_alphanumeric() || matches!(ch, '.' | '-' | '_' | '@'))
 }
 
+/// Return the parameterized `ip` arguments needed to create an interface.
+/// Keeping this decision pure makes first-apply behavior testable on CI hosts
+/// that do not have a WireGuard kernel module.
+pub fn interface_create_args(interface_exists: bool, interface_name: &str) -> Option<Vec<String>> {
+    if interface_exists {
+        None
+    } else {
+        Some(vec![
+            "link".into(),
+            "add".into(),
+            "dev".into(),
+            interface_name.into(),
+            "type".into(),
+            "wireguard".into(),
+        ])
+    }
+}
+
+fn parse_cidr(value: &str) -> Result<(IpAddr, u8)> {
+    let (address, prefix) = value
+        .split_once('/')
+        .ok_or_else(|| anyhow::anyhow!("CIDR prefix is required"))?;
+    let address: IpAddr = address.parse().context("invalid IP address")?;
+    let prefix: u8 = prefix.parse().context("invalid CIDR prefix")?;
+    let maximum = if address.is_ipv4() { 32 } else { 128 };
+    if prefix > maximum {
+        bail!("CIDR prefix out of range");
+    }
+    Ok((address, prefix))
+}
+
+fn default_mtu() -> u16 {
+    1420
+}
+
+/// Validate an untrusted Hub document before it reaches the kernel API.
+/// Private/preshared keys are deliberately not part of this schema.
+pub fn validate_server_desired(config: &WireGuardServerDesired) -> Result<()> {
+    if !is_ascii_interface_name(&config.interface_name)
+        || config.interface_name.len() > 15
+        || config.interface_name == "lo"
+    {
+        bail!("invalid WireGuard interface name");
+    }
+    if config.listen_port == 0 {
+        bail!("WireGuard server requires a fixed UDP listen port");
+    }
+    if config.mtu != 0 && !(1280..=1500).contains(&config.mtu) {
+        bail!("WireGuard server MTU must be between 1280 and 1500 (received {})", config.mtu);
+    }
+    let (server_ip, _) = parse_cidr(&config.address)?;
+    if !server_ip.is_ipv4() {
+        bail!("MVP server address must be IPv4");
+    }
+    let mut profile_ids = std::collections::BTreeSet::new();
+    for profile in &config.endpoint_profiles {
+        if profile.id.is_empty() || !profile_ids.insert(profile.id.as_str()) {
+            bail!("endpoint profile ids must be unique");
+        }
+        if !matches!(profile.endpoint_source.as_str(), "manual" | "ddns" | "stun") {
+            bail!("endpointSource must be manual, ddns or stun");
+        }
+        if profile.endpoint_source == "manual"
+            && (!profile.owner.is_empty()
+                || profile.binding_mode != "manual"
+                || profile.resolved_endpoint.trim().is_empty())
+        {
+            bail!("manual endpoint profile requires an immutable endpoint and no updater owner");
+        }
+        if profile.endpoint_source == "ddns"
+            && (profile.hostname.trim().is_empty()
+                || profile.owner != format!("ddns:{}", profile.id))
+        {
+            bail!("DDNS endpoint profile requires hostname");
+        }
+        if profile.endpoint_source == "ddns" && profile.binding_mode != "fixed-port" {
+            bail!("DDNS endpoint profile requires fixed-port binding");
+        }
+        if profile.endpoint_source == "stun" && !profile.hostname.trim().is_empty() {
+            bail!("STUN endpoint profile cannot share a DDNS hostname");
+        }
+        if profile.endpoint_source == "stun"
+            && (profile.stun_rule_id.is_empty()
+                || profile.owner != format!("stun:{}", profile.stun_rule_id)
+                || profile.binding_mode != "router-native"
+                || profile.forward_mode != "router_native"
+                || profile.transport_protocol != "UDP"
+                || profile.local_target_port != config.listen_port)
+        {
+            bail!("STUN endpoint profile requires an enabled UDP router-native mapping to the fixed WireGuard port");
+        }
+    }
+    let mut peer_ids = std::collections::BTreeSet::new();
+    let mut peer_keys = std::collections::BTreeSet::new();
+    for peer in &config.peers {
+        if peer.id.is_empty() || !peer_ids.insert(peer.id.as_str()) {
+            bail!("peer ids must be unique");
+        }
+        Key::from_base64(peer.public_key.trim()).map_err(|_| anyhow::anyhow!("invalid peer public key"))?;
+        if !peer_keys.insert(peer.public_key.trim()) {
+            bail!("peer public keys must be unique");
+        }
+        if peer.allowed_ips.is_empty() {
+            bail!("peer requires at least one allowed IP");
+        }
+        for allowed in &peer.allowed_ips {
+            parse_cidr(allowed)?;
+        }
+        if peer.persistent_keepalive_seconds > 600 {
+            bail!("persistent keepalive is out of range");
+        }
+    }
+    Ok(())
+}
+
+fn private_key_path() -> PathBuf {
+    std::env::var_os("LABPROBE_WIREGUARD_PRIVATE_KEY")
+        .map(PathBuf::from)
+        .unwrap_or_else(|| PathBuf::from(DEFAULT_PRIVATE_KEY_PATH))
+}
+
+fn load_or_create_keypair(path: &Path) -> Result<KeyPair> {
+    if path.exists() {
+        let raw = fs::read_to_string(path).context("read local WireGuard key")?;
+        let private = Key::from_base64(raw.trim())
+            .map_err(|_| anyhow::anyhow!("local WireGuard key is invalid"))?;
+        return Ok(KeyPair::from_private(private));
+    }
+    if let Some(parent) = path.parent() {
+        fs::create_dir_all(parent).context("create WireGuard key directory")?;
+    }
+    let pair = KeyPair::generate();
+    let mut options = OpenOptions::new();
+    options.write(true).create_new(true);
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::OpenOptionsExt;
+        options.mode(0o600);
+    }
+    let mut file = options.open(path).context("create local WireGuard key")?;
+    file.write_all(pair.private.to_base64().as_bytes())
+        .context("write local WireGuard key")?;
+    file.write_all(b"\n").context("finish local WireGuard key")?;
+    file.sync_all().context("sync local WireGuard key")?;
+    Ok(pair)
+}
+
+#[cfg(target_os = "linux")]
+fn configure_link(config: &WireGuardServerDesired) -> Result<()> {
+    let ip = find_tool("ip").ok_or_else(|| anyhow::anyhow!("ip tool is required to assign the tunnel address"))?;
+    let mtu = if (1280..=1500).contains(&config.mtu) { config.mtu } else { 1420 };
+    let mtu_str = mtu.to_string();
+    // No shell is involved; every argument is validated and passed directly.
+    run_capture(&ip, &["address", "replace", &config.address, "dev", &config.interface_name])?;
+    run_capture(&ip, &["link", "set", "dev", &config.interface_name, "mtu", &mtu_str, if config.enabled { "up" } else { "down" }])?;
+    Ok(())
+}
+
+
+#[cfg(target_os = "linux")]
+fn ensure_interface(ip_tool: &str, interface_name: &str) -> Result<()> {
+    let exists = Command::new(ip_tool)
+        .args(["link", "show", "dev", interface_name])
+        .output()
+        .with_context(|| format!("probe WireGuard interface {interface_name}"))?
+        .status
+        .success();
+    let Some(args) = interface_create_args(exists, interface_name) else {
+        return Ok(());
+    };
+    let output = Command::new(ip_tool)
+        .args(&args)
+        .output()
+        .with_context(|| format!("create WireGuard interface {interface_name}"))?;
+    if output.status.success() {
+        return Ok(());
+    }
+    // Another apply can win the create race between the probe and add.  An
+    // EEXIST-style response is therefore an idempotent success.
+    let stderr = String::from_utf8_lossy(&output.stderr).to_ascii_lowercase();
+    if stderr.contains("file exists") || stderr.contains("already exists") {
+        return Ok(());
+    }
+    bail!(
+        "ip failed to create WireGuard interface {interface_name}: {}",
+        stderr.trim()
+    )
+}
+
+/// Apply the desired server through the kernel Generic Netlink backend.  This
+/// does not invoke `wg` and therefore works on the BE72 firmware where the
+/// kernel module exists but wireguard-tools is absent.
+#[cfg(target_os = "linux")]
+pub fn apply_server(config: &WireGuardServerDesired) -> Result<WireGuardApplyResult> {
+    validate_server_desired(config)?;
+    let _ = ensure_openwrt_wg_zone(config.listen_port);
+    let ip = find_tool("ip").ok_or_else(|| anyhow::anyhow!("ip tool is required to create the WireGuard interface"))?;
+    ensure_interface(&ip, &config.interface_name)?;
+    let keypair = load_or_create_keypair(&private_key_path())?;
+    let interface: InterfaceName = config.interface_name.parse()
+        .map_err(|_| anyhow::anyhow!("invalid WireGuard interface name"))?;
+    let mut update = DeviceUpdate::new()
+        .set_private_key(keypair.private.clone())
+        .set_listen_port(config.listen_port)
+        .replace_peers();
+    for peer in &config.peers {
+        let public = Key::from_base64(peer.public_key.trim())
+            .map_err(|_| anyhow::anyhow!("invalid peer public key"))?;
+        let mut builder = PeerConfigBuilder::new(&public).replace_allowed_ips();
+        for allowed in &peer.allowed_ips {
+            let (address, prefix) = parse_cidr(allowed)?;
+            builder = builder.add_allowed_ip(address, prefix);
+        }
+        if peer.persistent_keepalive_seconds > 0 {
+            builder = builder.set_persistent_keepalive_interval(peer.persistent_keepalive_seconds);
+        } else {
+            builder = builder.unset_persistent_keepalive();
+        }
+        update = update.add_peer(builder);
+    }
+    update.apply(&interface, Backend::Kernel).context("apply WireGuard kernel configuration")?;
+    configure_link(config)?;
+    Ok(WireGuardApplyResult {
+        ok: true,
+        interface_name: config.interface_name.clone(),
+        public_key: keypair.public.to_base64(),
+        listen_port: config.listen_port,
+        peer_count: config.peers.len(),
+        enabled: config.enabled,
+        revision: config.revision,
+        control_backend: "kernel-netlink".into(),
+    })
+}
+
+#[cfg(not(target_os = "linux"))]
+pub fn apply_server(config: &WireGuardServerDesired) -> Result<WireGuardApplyResult> {
+    validate_server_desired(config)?;
+    bail!("WireGuard kernel control is supported only on Linux")
+}
+
+pub fn stop_server(interface_name: &str) -> Result<()> {
+    if !is_ascii_interface_name(interface_name) || interface_name.len() > 15 {
+        bail!("invalid WireGuard interface name");
+    }
+    #[cfg(target_os = "linux")]
+    {
+        let ip = find_tool("ip").ok_or_else(|| anyhow::anyhow!("ip tool is unavailable"))?;
+        run_capture(&ip, &["link", "set", "dev", interface_name, "down"])?;
+        Ok(())
+    }
+    #[cfg(not(target_os = "linux"))]
+    bail!("WireGuard kernel control is supported only on Linux")
+}
+
+pub fn delete_server(interface_name: &str) -> Result<()> {
+    if !is_ascii_interface_name(interface_name) || interface_name.len() > 15 {
+        bail!("invalid WireGuard interface name");
+    }
+    #[cfg(target_os = "linux")]
+    {
+        let interface: InterfaceName = interface_name.parse()
+            .map_err(|_| anyhow::anyhow!("invalid WireGuard interface name"))?;
+        let exists = Device::list(Backend::Kernel)
+            .context("list WireGuard devices")?
+            .iter()
+            .any(|name| name == &interface);
+        if !exists {
+            return Ok(());
+        }
+        let device = Device::get(&interface, Backend::Kernel).context("read WireGuard device")?;
+        device.delete().context("delete WireGuard device")
+    }
+    #[cfg(not(target_os = "linux"))]
+    bail!("WireGuard kernel control is supported only on Linux")
+}
+
 /// Find a tool on PATH, preferring the plain name and falling back to a couple
 /// of conventional absolute locations used on OpenWrt.
 fn find_tool(name: &str) -> Option<String> {
@@ -416,6 +848,155 @@ fn kernel_support_status(wg_tool: &Option<String>) -> (bool, Vec<String>) {
     (false, errors)
 }
 
+/// Parse `uci show firewall` or `/etc/config/firewall` output to check if a
+/// zone named `wg` associated with network `labwg0` is already configured.
+pub fn parse_uci_firewall_has_wg_zone(raw: &str) -> bool {
+    let lower = raw.to_ascii_lowercase();
+    let has_wg_name = lower.contains("name='wg'")
+        || lower.contains("name=\"wg\"")
+        || lower.contains("name 'wg'")
+        || lower.contains("name \"wg\"")
+        || lower.contains("name='labprobe_wg'")
+        || lower.contains("name=\"labprobe_wg\"")
+        || lower.contains("name 'labprobe_wg'")
+        || lower.contains("name \"labprobe_wg\"");
+    let has_wg_net = lower.contains("network='labwg0'")
+        || lower.contains("network=\"labwg0\"")
+        || lower.contains("network 'labwg0'")
+        || lower.contains("network \"labwg0\"")
+        || lower.contains("device='labwg0'")
+        || lower.contains("device=\"labwg0\"")
+        || lower.contains("device 'labwg0'")
+        || lower.contains("device \"labwg0\"");
+    has_wg_name || has_wg_net
+}
+
+/// Parse `uci show firewall` or `/etc/config/firewall` output to check if a
+/// forwarding rule from `wg` to `lan` is already configured.
+pub fn parse_uci_firewall_has_wg_forwarding(raw: &str) -> bool {
+    let lower = raw.to_ascii_lowercase();
+    let has_src_wg = lower.contains("src='wg'")
+        || lower.contains("src=\"wg\"")
+        || lower.contains("src 'wg'")
+        || lower.contains("src \"wg\"")
+        || lower.contains("src='labprobe_wg'")
+        || lower.contains("src=\"labprobe_wg\"")
+        || lower.contains("src 'labprobe_wg'")
+        || lower.contains("src \"labprobe_wg\"");
+    let has_dest_lan = lower.contains("dest='lan'")
+        || lower.contains("dest=\"lan\"")
+        || lower.contains("dest 'lan'")
+        || lower.contains("dest \"lan\"");
+    has_src_wg && has_dest_lan
+}
+
+/// Parse `uci show firewall` or `/etc/config/firewall` output to check if a
+/// forwarding rule from `wg` to `wan` is already configured.
+pub fn parse_uci_firewall_has_wg_wan_forwarding(raw: &str) -> bool {
+    let lower = raw.to_ascii_lowercase();
+    let has_src_wg = lower.contains("src='wg'")
+        || lower.contains("src=\"wg\"")
+        || lower.contains("src 'wg'")
+        || lower.contains("src \"wg\"")
+        || lower.contains("src='labprobe_wg'")
+        || lower.contains("src=\"labprobe_wg\"")
+        || lower.contains("src 'labprobe_wg'")
+        || lower.contains("src \"labprobe_wg\"");
+    let has_dest_wan = lower.contains("dest='wan'")
+        || lower.contains("dest=\"wan\"")
+        || lower.contains("dest 'wan'")
+        || lower.contains("dest \"wan\"");
+    has_src_wg && has_dest_wan
+}
+
+/// Parse `uci show firewall` or `/etc/config/firewall` output to check if an
+/// inbound rule for the WireGuard UDP listening port is already configured on the WAN zone.
+pub fn parse_uci_firewall_has_wg_inbound_rule(raw: &str, port: u16) -> bool {
+    let lower = raw.to_ascii_lowercase();
+    let port_str = port.to_string();
+    let has_port = lower.contains(&format!("dest_port='{port_str}'"))
+        || lower.contains(&format!("dest_port=\"{port_str}\""))
+        || lower.contains(&format!("dest_port '{port_str}'"))
+        || lower.contains(&format!("dest_port \"{port_str}\""))
+        || lower.contains(&format!("dest_port={port_str}"));
+    let has_src_wan = lower.contains("src='wan'")
+        || lower.contains("src=\"wan\"")
+        || lower.contains("src 'wan'")
+        || lower.contains("src \"wan\"")
+        || lower.contains("src=wan");
+    let has_proto_udp = lower.contains("proto='udp'")
+        || lower.contains("proto=\"udp\"")
+        || lower.contains("proto 'udp'")
+        || lower.contains("proto \"udp\"")
+        || lower.contains("proto=udp");
+    has_port && has_src_wan && has_proto_udp
+}
+
+/// Non-blocking, idempotent setup of OpenWrt firewall `wg` zone, `wg -> lan` / `wg -> wan`
+/// forwarding rules, and WAN UDP port inbound allowance rule using `uci`. Safe on non-OpenWrt systems.
+pub fn ensure_openwrt_wg_zone(listen_port: u16) -> Result<()> {
+    let Some(uci) = find_tool("uci") else {
+        return Ok(());
+    };
+    let port = if listen_port > 0 { listen_port } else { 51820 };
+    let firewall_text = run_capture(&uci, &["show", "firewall"]).unwrap_or_default();
+    let has_zone = parse_uci_firewall_has_wg_zone(&firewall_text);
+    let has_forwarding = parse_uci_firewall_has_wg_forwarding(&firewall_text);
+    let has_wan_forwarding = parse_uci_firewall_has_wg_wan_forwarding(&firewall_text);
+    let has_inbound = parse_uci_firewall_has_wg_inbound_rule(&firewall_text, port);
+
+    if has_zone && has_forwarding && has_wan_forwarding && has_inbound {
+        return Ok(());
+    }
+
+    let mut changed = false;
+    if !has_zone {
+        let _ = run_capture(&uci, &["add", "firewall", "zone"]);
+        let _ = run_capture(&uci, &["set", "firewall.@zone[-1].name=wg"]);
+        let _ = run_capture(&uci, &["set", "firewall.@zone[-1].network=labwg0"]);
+        let _ = run_capture(&uci, &["set", "firewall.@zone[-1].device=labwg0"]);
+        let _ = run_capture(&uci, &["set", "firewall.@zone[-1].masq=1"]);
+        let _ = run_capture(&uci, &["set", "firewall.@zone[-1].input=ACCEPT"]);
+        let _ = run_capture(&uci, &["set", "firewall.@zone[-1].output=ACCEPT"]);
+        let _ = run_capture(&uci, &["set", "firewall.@zone[-1].forward=ACCEPT"]);
+        changed = true;
+    }
+
+    if !has_forwarding {
+        let _ = run_capture(&uci, &["add", "firewall", "forwarding"]);
+        let _ = run_capture(&uci, &["set", "firewall.@forwarding[-1].src=wg"]);
+        let _ = run_capture(&uci, &["set", "firewall.@forwarding[-1].dest=lan"]);
+        changed = true;
+    }
+
+    if !has_wan_forwarding {
+        let _ = run_capture(&uci, &["add", "firewall", "forwarding"]);
+        let _ = run_capture(&uci, &["set", "firewall.@forwarding[-1].src=wg"]);
+        let _ = run_capture(&uci, &["set", "firewall.@forwarding[-1].dest=wan"]);
+        changed = true;
+    }
+
+    if !has_inbound {
+        let _ = run_capture(&uci, &["add", "firewall", "rule"]);
+        let _ = run_capture(&uci, &["set", "firewall.@rule[-1].name=Allow-WireGuard-Inbound"]);
+        let _ = run_capture(&uci, &["set", "firewall.@rule[-1].src=wan"]);
+        let _ = run_capture(&uci, &["set", "firewall.@rule[-1].proto=udp"]);
+        let _ = run_capture(&uci, &["set", &format!("firewall.@rule[-1].dest_port={port}")]);
+        let _ = run_capture(&uci, &["set", "firewall.@rule[-1].target=ACCEPT"]);
+        changed = true;
+    }
+
+    if changed {
+        let _ = run_capture(&uci, &["commit", "firewall"]);
+        if let Some(fw_init) = find_tool("/etc/init.d/firewall") {
+            let _ = run_capture(&fw_init, &["reload"]);
+        }
+    }
+    Ok(())
+}
+
+
+
 /// Read-only UCI check: does the current network configuration contain a
 /// `proto wireguard` interface? Never writes to UCI.
 fn uci_wireguard_configured() -> (bool, Option<String>) {
@@ -428,6 +1009,7 @@ fn uci_wireguard_configured() -> (bool, Option<String>) {
         Err(error) => (false, Some(format!("uci show network failed: {error:#}"))),
     }
 }
+
 
 /// Collect link state and CIDR addresses for an interface with a single
 /// `ip link show` call. `link_up` is `None` only when the command failed.
@@ -507,6 +1089,10 @@ pub fn detect_wireguard() -> WireGuardStatus {
     let mut status = WireGuardStatus {
         supported: wg_and_kernel,
         wg_tool_available: true,
+        kernel_supported: kernel_support,
+        control_tool_available: true,
+        provisioning_ready: kernel_support,
+        control_backend: if kernel_support { "kernel-netlink".into() } else { "unavailable".into() },
         kernel_support,
         installed: wg_and_kernel,
         configured: uci_configured || !interfaces.is_empty(),
@@ -580,6 +1166,153 @@ mod tests {
         assert!(!status.running);
         assert!(status.interfaces.is_empty());
         assert_eq!(status.peer_count, 0);
+    }
+
+    #[test]
+    fn missing_interface_gets_parameterized_create_command() {
+        assert_eq!(
+            interface_create_args(false, "labwg0"),
+            Some(vec![
+                "link", "add", "dev", "labwg0", "type", "wireguard"
+            ].into_iter().map(String::from).collect())
+        );
+    }
+
+    #[test]
+    fn existing_interface_is_not_recreated() {
+        assert_eq!(interface_create_args(true, "labwg0"), None);
+    }
+
+    #[test]
+    fn server_contract_keeps_endpoint_sources_separate() {
+        let peer = KeyPair::generate();
+        let desired = WireGuardServerDesired {
+            interface_name: "labwg0".into(),
+            address: "10.77.0.1/24".into(),
+            listen_port: 51820,
+            mtu: 1420,
+            enabled: true,
+            revision: 7,
+            peers: vec![WireGuardPeerDesired {
+                id: "phone".into(),
+                name: "Phone".into(),
+                public_key: peer.public.to_base64(),
+                allowed_ips: vec!["10.77.0.2/32".into()],
+                persistent_keepalive_seconds: 25,
+            }],
+            endpoint_profiles: vec![
+                WireGuardEndpointProfile {
+                    id: "wg-ddns".into(),
+                    endpoint_source: "ddns".into(),
+                    owner: "ddns:wg-ddns".into(),
+                    hostname: "wg.example.test".into(),
+                    public_endpoint: String::new(),
+                    binding_mode: "fixed-port".into(),
+                    port: 51820,
+                    ..WireGuardEndpointProfile::default()
+                },
+                WireGuardEndpointProfile {
+                    id: "wg-stun".into(),
+                    endpoint_source: "stun".into(),
+                    owner: "stun:stun-wireguard".into(),
+                    hostname: String::new(),
+                    public_endpoint: "203.0.113.8:24567".into(),
+                    stun_rule_id: "stun-wireguard".into(),
+                    binding_mode: "router-native".into(),
+                    forward_mode: "router_native".into(),
+                    transport_protocol: "UDP".into(),
+                    local_target_port: 51820,
+                    port: 24567,
+                    ..WireGuardEndpointProfile::default()
+                },
+            ],
+        };
+        validate_server_desired(&desired).unwrap();
+        assert_eq!(desired.endpoint_profiles[0].endpoint_source, "ddns");
+        assert_eq!(desired.endpoint_profiles[1].endpoint_source, "stun");
+    }
+
+    #[test]
+    fn server_contract_rejects_mixed_stun_ddns_profile() {
+        let desired = WireGuardServerDesired {
+            interface_name: "labwg0".into(),
+            address: "10.77.0.1/24".into(),
+            listen_port: 51820,
+            mtu: 1420,
+            enabled: true,
+            revision: 1,
+            peers: Vec::new(),
+            endpoint_profiles: vec![WireGuardEndpointProfile {
+                id: "bad".into(),
+                endpoint_source: "stun".into(),
+                owner: "stun:stun-wireguard".into(),
+                hostname: "wg.example.test".into(),
+                public_endpoint: "203.0.113.8:24567".into(),
+                stun_rule_id: "stun-wireguard".into(),
+                binding_mode: "router-native".into(),
+                forward_mode: "router_native".into(),
+                transport_protocol: "UDP".into(),
+                local_target_port: 51820,
+                port: 24567,
+                ..WireGuardEndpointProfile::default()
+            }],
+        };
+        assert!(validate_server_desired(&desired).is_err());
+    }
+
+
+    #[test]
+    fn automatic_endpoint_updates_are_owned_versioned_and_idempotent() {
+        let mut profiles = vec![WireGuardEndpointProfile {
+            id: "wg-ddns".into(),
+            endpoint_source: "ddns".into(),
+            owner: "ddns:wg-ddns".into(),
+            hostname: "wg.example.test".into(),
+            binding_mode: "fixed-port".into(),
+            port: 51820,
+            ..WireGuardEndpointProfile::default()
+        }];
+        let update = WireGuardEndpointUpdate {
+            profile_id: "wg-ddns".into(),
+            endpoint_source: "ddns".into(),
+            owner: "ddns:wg-ddns".into(),
+            endpoint: "wg.example.test:51820".into(),
+            expected_endpoint_revision: 0,
+            endpoint_revision: 1,
+        };
+        let first = apply_endpoint_update(&mut profiles, &update).unwrap();
+        assert_eq!(first.endpoint_revision, 1);
+        assert_eq!(first.resolved_endpoint, "wg.example.test:51820");
+        let repeated = apply_endpoint_update(&mut profiles, &update).unwrap();
+        assert_eq!(repeated, first);
+
+        let mut wrong_owner = update.clone();
+        wrong_owner.expected_endpoint_revision = 1;
+        wrong_owner.endpoint_revision = 2;
+        wrong_owner.owner = "ddns:someone-else".into();
+        assert!(apply_endpoint_update(&mut profiles, &wrong_owner).is_err());
+    }
+
+    #[test]
+    fn manual_endpoint_rejects_automatic_updates() {
+        let mut profiles = vec![WireGuardEndpointProfile {
+            id: "office".into(),
+            endpoint_source: "manual".into(),
+            binding_mode: "manual".into(),
+            resolved_endpoint: "198.51.100.20:51820".into(),
+            port: 51820,
+            ..WireGuardEndpointProfile::default()
+        }];
+        let update = WireGuardEndpointUpdate {
+            profile_id: "office".into(),
+            endpoint_source: "ddns".into(),
+            owner: "ddns:office".into(),
+            endpoint: "other.example.test:51820".into(),
+            expected_endpoint_revision: 0,
+            endpoint_revision: 1,
+        };
+        assert!(apply_endpoint_update(&mut profiles, &update).is_err());
+        assert_eq!(profiles[0].resolved_endpoint, "198.51.100.20:51820");
     }
 
     #[test]
@@ -742,6 +1475,10 @@ mod tests {
         let status = WireGuardStatus {
             supported: true,
             wg_tool_available: true,
+            kernel_supported: true,
+            control_tool_available: true,
+            provisioning_ready: true,
+            control_backend: "kernel-netlink".into(),
             kernel_support: true,
             installed: true,
             configured: !interfaces.is_empty(),
@@ -779,6 +1516,10 @@ mod tests {
         let status = WireGuardStatus {
             supported: true,
             wg_tool_available: true,
+            kernel_supported: true,
+            control_tool_available: true,
+            provisioning_ready: true,
+            control_backend: "kernel-netlink".into(),
             kernel_support: true,
             installed: true,
             configured: true,
@@ -805,6 +1546,10 @@ mod tests {
         let status = WireGuardStatus {
             supported: true,
             wg_tool_available: true,
+            kernel_supported: true,
+            control_tool_available: true,
+            provisioning_ready: true,
+            control_backend: "kernel-netlink".into(),
             kernel_support: true,
             installed: true,
             configured: true,
@@ -856,4 +1601,58 @@ network.wg0.private_key='REDACTED-BY-TOOL'
         let roundtrip = serde_json::from_value::<serde_json::Value>(old).unwrap();
         assert!(roundtrip.get("wireguard").is_none());
     }
+
+    #[test]
+    fn uci_firewall_wg_zone_and_forwarding_detected() {
+        let raw = "\
+firewall.cfg01e345=zone
+firewall.cfg01e345.name='wg'
+firewall.cfg01e345.network='labwg0'
+firewall.cfg01e345.input='ACCEPT'
+firewall.cfg01e345.output='ACCEPT'
+firewall.cfg01e345.forward='ACCEPT'
+firewall.cfg02f678=forwarding
+firewall.cfg02f678.src='wg'
+firewall.cfg02f678.dest='lan'
+";
+        assert!(parse_uci_firewall_has_wg_zone(raw));
+        assert!(parse_uci_firewall_has_wg_forwarding(raw));
+    }
+
+    #[test]
+    fn uci_firewall_existing_user_zones_unaffected() {
+        let raw = "\
+firewall.cfg01=zone
+firewall.cfg01.name='lan'
+firewall.cfg01.network='lan'
+firewall.cfg02=zone
+firewall.cfg02.name='wan'
+firewall.cfg02.network='wan'
+firewall.cfg03=forwarding
+firewall.cfg03.src='lan'
+firewall.cfg03.dest='wan'
+";
+        assert!(!parse_uci_firewall_has_wg_zone(raw));
+        assert!(!parse_uci_firewall_has_wg_forwarding(raw));
+    }
+
+    #[test]
+    fn uci_firewall_wg_wan_forwarding_and_inbound_rule_detected() {
+        let raw = "\
+firewall.cfg01=forwarding
+firewall.cfg01.src='wg'
+firewall.cfg01.dest='wan'
+firewall.cfg02=rule
+firewall.cfg02.name='Allow-WireGuard-Inbound'
+firewall.cfg02.src='wan'
+firewall.cfg02.proto='udp'
+firewall.cfg02.dest_port='51820'
+firewall.cfg02.target='ACCEPT'
+";
+        assert!(parse_uci_firewall_has_wg_wan_forwarding(raw));
+        assert!(parse_uci_firewall_has_wg_inbound_rule(raw, 51820));
+        assert!(!parse_uci_firewall_has_wg_inbound_rule(raw, 40000));
+    }
 }
+
+

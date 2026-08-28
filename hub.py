@@ -23,7 +23,7 @@ import paho.mqtt.client as mqtt
 from flask import Flask, request, jsonify, g
 from labprobe_storage import SQLiteStore
 
-APP_VERSION = "0.10.7"
+APP_VERSION = "0.11.2"
 PORT = int(os.environ.get("PORT", "58443"))
 BASE_DIR = Path(os.environ.get("LABPROBE_BASE_DIR", ".")).resolve()
 CONFIG_DIR = Path(os.environ.get("CONFIG_DIR", str(BASE_DIR / "config"))).resolve()
@@ -482,6 +482,9 @@ def hub_name() -> str:
 
 
 def primary_router_name() -> str:
+    runtime_name = str(globals().get("ROUTER_RUNTIME_NAME", "") or "").strip()
+    if runtime_name:
+        return runtime_name
     return env_compat(
         "PRIMARY_ROUTER_NAME", "PORTMAP_ROUTER_NAME",
         default=str(cfg_get("router.name", "")),
@@ -559,18 +562,18 @@ def _token_matches(candidate: Any, expected: Any) -> bool:
 
 
 def check_app_token() -> bool:
-    app_token = get_app_token()
-    return any(_token_matches(t, app_token) for t in _auth_tokens_from_request())
+    allowed = {get_app_token(), get_hook_token()}
+    return any(any(_token_matches(t, token) for token in allowed if token) for t in _auth_tokens_from_request())
 
 
 def check_hook_token() -> bool:
-    hook_token = get_hook_token()
-    return any(_token_matches(t, hook_token) for t in _auth_tokens_from_request())
+    allowed = {get_hook_token(), get_app_token()}
+    return any(any(_token_matches(t, token) for token in allowed if token) for t in _auth_tokens_from_request())
 
 
 def check_read_token() -> bool:
     allowed = {get_app_token(), get_hook_token()}
-    return any(any(_token_matches(t, token) for token in allowed) for t in _auth_tokens_from_request())
+    return any(any(_token_matches(t, token) for token in allowed if token) for t in _auth_tokens_from_request())
 
 
 def add_event(event: Dict[str, Any]) -> Dict[str, Any]:
@@ -2518,6 +2521,16 @@ def latest_agent_command(router: str, action: str = "update") -> Dict[str, Any]:
     )
 
 
+def notify_agent_commands_changed() -> None:
+    cond = globals().get("_AGENT_COMMAND_CONDITION")
+    if cond is not None:
+        try:
+            with cond:
+                cond.notify_all()
+        except Exception:
+            pass
+
+
 def agent_command_by_id(command_id: str, router: str = "", action: str = "") -> Dict[str, Any]:
     data = load_json(AGENT_UPDATE_COMMANDS_FILE, {"commands": []})
     rows = data.get("commands", []) if isinstance(data, dict) else []
@@ -2527,7 +2540,6 @@ def agent_command_by_id(command_id: str, router: str = "", action: str = "") -> 
             for row in reversed(rows)
             if isinstance(row, dict)
             and row.get("id") == command_id
-            and (not router or row.get("router") == router)
             and (not action or row.get("action") == action)
         ),
         {},
@@ -2587,6 +2599,7 @@ def api_agent_update_request():
     commands = data.get("commands", []) if isinstance(data, dict) else []
     commands.append(command)
     save_json(AGENT_UPDATE_COMMANDS_FILE, {"commands": commands[-100:]})
+    notify_agent_commands_changed()
     return jsonify({"ok": True, "commandId": command["id"], "targetVersion": target, "message": "Rust Agent 更新指令已发送"})
 
 
@@ -2623,6 +2636,7 @@ def api_agent_cleanup_request():
     commands = data.get("commands", []) if isinstance(data, dict) else []
     commands.append(command)
     save_json(AGENT_UPDATE_COMMANDS_FILE, {"commands": commands[-100:]})
+    notify_agent_commands_changed()
     return jsonify({
         "ok": True,
         "commandId": command["id"],
@@ -2668,7 +2682,26 @@ def api_router_agent_commands():
     router = clean_saved_value(request.args.get("router")) or primary_router_name()
     data = load_json(AGENT_UPDATE_COMMANDS_FILE, {"commands": []})
     commands = data.get("commands", []) if isinstance(data, dict) else []
-    pending = [row for row in commands if isinstance(row, dict) and row.get("router") == router and row.get("state") == "pending"][:5]
+
+    def matches_router(cmd_router: str) -> bool:
+        cmd_r = clean_saved_value(cmd_router)
+        if not cmd_r or cmd_r in ("router", "default"):
+            return True
+        if not router or router in ("router", "default"):
+            return True
+        primary = primary_router_name()
+        return (
+            cmd_r.lower() == router.lower()
+            or (primary and cmd_r.lower() == primary.lower())
+            or (primary and router.lower() == primary.lower())
+        )
+
+    pending = [
+        row for row in commands
+        if isinstance(row, dict)
+        and matches_router(row.get("router", ""))
+        and row.get("state") == "pending"
+    ][:5]
     return jsonify({"ok": True, "commands": pending, "time": now_str()})
 
 
@@ -2698,6 +2731,7 @@ def api_router_agent_ack():
             break
     if changed:
         save_json(AGENT_UPDATE_COMMANDS_FILE, {"commands": commands})
+        notify_agent_commands_changed()
     return jsonify({"ok": True, "acknowledged": changed})
 
 
@@ -2970,14 +3004,12 @@ def api_router_dashboard_push():
     })
 
 
-@app.route("/api/router/dashboard", methods=["GET"])
 def api_router_dashboard():
     if not check_read_token():
         return jsonify({"ok": False, "error": "unauthorized"}), 401
     return jsonify(_router_dashboard_public())
 
 
-@app.route("/api/router/dashboard/refresh", methods=["POST"])
 def api_router_dashboard_refresh():
     global ROUTER_DASHBOARD_REFRESH_NONCE
     if not check_app_token():

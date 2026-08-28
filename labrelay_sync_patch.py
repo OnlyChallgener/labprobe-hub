@@ -115,10 +115,12 @@ def install_labrelay_sync_patch(hub: Any) -> None:
             if expired is not None and expired <= now and desired == "running":
                 actual, sync = "expired", "synced"
                 local["state"] = "expired"
-            elif state == "running" and not error:
-                # New daemon success is authoritative and must erase an old bind error.
+            elif state == "running":
+                # Listener/runtime state is authoritative for synchronization.
+                # A connection-level error (for example, a peer reset) is useful
+                # diagnostic history but must not make an active rule look as if
+                # the Agent is still applying its configuration.
                 actual, sync = "running", "synced"
-                local["lastError"] = ""
             elif state in {"starting", "waiting_target", "draining"}:
                 actual, sync = state, "syncing"
             elif state == "error" and error:

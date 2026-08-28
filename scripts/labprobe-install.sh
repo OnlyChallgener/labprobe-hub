@@ -73,10 +73,12 @@ check_router() {
   command -v ip >/dev/null 2>&1 || fail "缺少 ip 命令"
   if command -v curl >/dev/null 2>&1; then
     DOWNLOADER="curl"
-  elif command -v wget >/dev/null 2>&1; then
-    DOWNLOADER="wget"
   else
-    fail "缺少 curl 或 wget，无法下载安装包"
+    if command -v wget >/dev/null 2>&1; then
+      DOWNLOADER="wget"
+    else
+      fail "缺少 curl 或 wget，无法下载安装包"
+    fi
   fi
   command -v sha256sum >/dev/null 2>&1 || fail "缺少 sha256sum，无法校验下载"
   [ -r /etc/rc.common ] || fail "未检测到兼容的锐捷/OpenWrt 服务环境"

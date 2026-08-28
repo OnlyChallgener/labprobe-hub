@@ -5,9 +5,13 @@ on:
   push:
     branches:
       - main
+      - refactor/router-core-v1
+    tags:
+      - 'v*'
   pull_request:
     branches:
       - main
+      - refactor/router-core-v1
 
 concurrency:
   group: hub-ci-${{ github.ref }}
@@ -40,8 +44,12 @@ jobs:
             final_stability_patch.py followup_stability_patch.py \
             device_history_patch.py portmap_persistence_patch.py agent_presence_patch.py \
             router_task_manager_patch.py router_config_sync_patch.py stun_service.py \
-            router_device_live_sync_patch.py router_lite_realtime_patch.py \
-            labrelay_sync_patch.py router/firewall_automation.py
+            wireguard_service.py router_device_live_sync_patch.py router_lite_realtime_patch.py \
+            labrelay_sync_patch.py router/firewall_automation.py router_compat.py \
+            router_core/errors.py router_core/driver/reyee_session.py router_core/driver/reyee_rpc.py \
+            router_core/driver/reyee.py router_core/cache/router_cache.py \
+            router_core/realtime/router_realtime.py router_core/service/router_service.py \
+            router_core/service/blueprint.py
           python -m py_compile assistant/*.py
 
       - name: Run Hub tests
@@ -50,9 +58,10 @@ jobs:
       - name: Verify release versions
         run: |
           set -e
-          grep -q 'HUB_VERSION = "0.10.7"' hub_entry.py
+          grep -q 'HUB_VERSION = "0.11.5"' hub_entry.py
+          grep -q 'create_router_blueprint_v1' hub_entry.py
+          grep -q 'create_ai_blueprint' hub_entry.py
           grep -q 'install_hub0934_fixes(hub)' hub_entry.py
-          grep -q 'install_router_ws_passive_fix()' hub_entry.py
           grep -q 'install_hub0935_device_sync_fix(hub)' hub_entry.py
           grep -q 'labrelay_hook' hub0935_sync_fix.py
           grep -q 'liveRouterPollPersistence' hub0935_sync_fix.py
@@ -60,13 +69,11 @@ jobs:
           ! grep -q 'target=self._keepalive_loop' hub0935_sync_fix.py
           grep -q 'canonical_watched_devices' hub0934_fixes.py
           grep -q '_normalize_portmap_payload' hub0934_fixes.py
-          grep -q 'install_router_task_manager_patch(hub)' hub_entry.py
           grep -q 'install_router_device_live_sync_patch' hub_entry.py
-          grep -q '"devices_snapshot"' router_device_live_sync_patch.py
           grep -q '/api/realtime/ws' hub_realtime_ws.py
           test ! -e assistant/wechat.py
           ! git grep -qi -E 'wechat|clawbot|openclaw' -- '*.py' '*.md' '*.env*' 'Dockerfile'
-          grep -q 'version = "0.2.23"' labrelay/Cargo.toml
+          grep -q 'version = "0.2.29"' labrelay/Cargo.toml
           sh -n agent/install.sh
           sh -n scripts/labprobe-install.sh
 
@@ -78,6 +85,6 @@ jobs:
 
       - name: Build Hub Docker image
         run: |
-          docker build --pull=false -t labprobe-hub:0.10.7 .
-          docker run --rm --entrypoint python labprobe-hub:0.10.7 -c \
-            'import hub_entry, hub0934_fixes, hub0935_sync_fix, labrelay_sync_patch; print("Hub 0.10.7 imports OK")'
+          docker build --pull=false -t labprobe-hub:0.11.5 .
+          docker run --rm --entrypoint python labprobe-hub:0.11.5 -c \
+            'import hub_entry, assistant, router_core, hub0934_fixes, hub0935_sync_fix, labrelay_sync_patch; print("Hub 0.11.5 imports OK")'

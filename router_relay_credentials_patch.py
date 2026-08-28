@@ -203,15 +203,27 @@ def _relay_dashboard_ack(self: Any):
         ddns_store = getattr(self.hub, "LAB_DDNS", None)
         if ddns_store is not None:
             ddns_store.accept_address(payload.get("ddnsAddress"))
+        # WireGuard remains a Relay-owned extension. Preserve that status while
+        # continuing to ignore Relay router telemetry/dashboard fields.
+        wireguard = payload.get("wireguard")
+        if isinstance(wireguard, dict) and hasattr(self.hub, "ROUTER_DASHBOARD_LOCK"):
+            with self.hub.ROUTER_DASHBOARD_LOCK:
+                self.hub.ROUTER_DASHBOARD_CACHE["wireguard"] = dict(wireguard)
+            if hasattr(self.hub, "_persist_router_dashboard_if_due"):
+                self.hub._persist_router_dashboard_if_due(force=False)
 
-    with self.hub.ROUTER_DASHBOARD_LOCK:
-        completed = _safe_int(payload.get("refreshNonce"), 0) if isinstance(payload, dict) else 0
-        if completed > _safe_int(self.hub.ROUTER_DASHBOARD_CACHE.get("refreshCompletedNonce"), 0):
-            self.hub.ROUTER_DASHBOARD_CACHE["refreshCompletedNonce"] = completed
-            self.hub.ROUTER_DASHBOARD_CACHE["refreshCompletedAt"] = self.hub.now_str()
-        dashboard_nonce = self.hub.ROUTER_DASHBOARD_REFRESH_NONCE
-    with self.hub.ROUTER_CREDENTIALS_LOCK:
-        credentials_nonce = self.hub.ROUTER_CREDENTIALS_REFRESH_NONCE
+    dashboard_nonce = 0
+    if hasattr(self.hub, "ROUTER_DASHBOARD_LOCK"):
+        with self.hub.ROUTER_DASHBOARD_LOCK:
+            completed = _safe_int(payload.get("refreshNonce"), 0) if isinstance(payload, dict) else 0
+            if completed > _safe_int(self.hub.ROUTER_DASHBOARD_CACHE.get("refreshCompletedNonce"), 0):
+                self.hub.ROUTER_DASHBOARD_CACHE["refreshCompletedNonce"] = completed
+                self.hub.ROUTER_DASHBOARD_CACHE["refreshCompletedAt"] = self.hub.now_str()
+            dashboard_nonce = self.hub.ROUTER_DASHBOARD_REFRESH_NONCE
+    credentials_nonce = 0
+    if hasattr(self.hub, "ROUTER_CREDENTIALS_LOCK"):
+        with self.hub.ROUTER_CREDENTIALS_LOCK:
+            credentials_nonce = self.hub.ROUTER_CREDENTIALS_REFRESH_NONCE
 
     return jsonify({
         "ok": True,
@@ -318,13 +330,45 @@ def _relay_credentials_push_view(self: Any):
     return jsonify({"ok": True, "time": self.hub.now_str(), "refreshNonce": requested})
 
 
+def _matches_router(hub: Any, cmd_router: str, target_router: str) -> bool:
+    clean = getattr(hub, "clean_saved_value", lambda v: str(v or "").strip())
+    cmd_r = clean(cmd_router)
+    target_r = clean(target_router)
+    if not cmd_r or cmd_r in ("router", "default"):
+        return True
+    if not target_r or target_r in ("router", "default"):
+        return True
+    primary_fn = getattr(hub, "primary_router_name", None)
+    primary = primary_fn() if callable(primary_fn) else ""
+    return (
+        cmd_r.lower() == target_r.lower()
+        or (primary and cmd_r.lower() == primary.lower())
+        or (primary and target_r.lower() == primary.lower())
+    )
+
+
 def _agent_command_snapshot(self: Any, router: str) -> tuple[list[Dict[str, Any]], int, int]:
     data = self.hub.load_json(self.hub.AGENT_UPDATE_COMMANDS_FILE, {"commands": []})
     commands = data.get("commands", []) if isinstance(data, dict) else []
+    changed = False
+    now_epoch = time.time()
+    for row in commands:
+        if not isinstance(row, dict) or not _matches_router(self.hub, row.get("router", ""), router) or row.get("state") != "pending":
+            continue
+        updated_epoch = self.hub.time_to_epoch(row.get("updatedAt") or row.get("createdAt") or 0)
+        if updated_epoch > 0 and now_epoch - updated_epoch > 900:
+            row.update({
+                "state": "failed",
+                "updatedAt": self.hub.now_str(),
+                "message": "指令等待领取超时，请重新发起",
+            })
+            changed = True
+    if changed:
+        self.hub.save_json(self.hub.AGENT_UPDATE_COMMANDS_FILE, {"commands": commands[-100:]})
     pending = [
         row for row in commands
-        if isinstance(row, dict) and row.get("router") == router and row.get("state") == "pending"
-    ][:5]
+        if isinstance(row, dict) and _matches_router(self.hub, row.get("router", ""), router) and row.get("state") == "pending"
+    ][-20:]
     with self.hub.ROUTER_CREDENTIALS_LOCK:
         requested = self.hub.ROUTER_CREDENTIALS_REFRESH_NONCE
         completed = _safe_int(self.hub.ROUTER_CREDENTIALS_CACHE.get("refreshCompletedNonce"), 0)
@@ -363,6 +407,7 @@ def install_router_relay_credentials_patch() -> None:
 
     def start_with_scoped_routes(self: Any) -> Any:
         result = original_start(self)
+        self.hub._AGENT_COMMAND_CONDITION = _AGENT_COMMAND_CONDITION
         if "api_router_credentials_refresh" in self.hub.app.view_functions:
             self.hub.app.view_functions["api_router_credentials_refresh"] = self.direct_credentials_refresh_view
         if "api_router_credentials_push" in self.hub.app.view_functions:

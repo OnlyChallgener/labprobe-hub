@@ -59,9 +59,10 @@ def _clean_source(value: Any) -> str:
 
 
 class RouterLiteRealtimeService:
-    def __init__(self, hub: Any, router_sync: Any = None):
+    def __init__(self, hub: Any, router_sync: Any = None, router_realtime: Any = None):
         self.hub = hub
         self.sync = router_sync
+        self.router_realtime = router_realtime
         self.logger = hub.LOGGER
         self._lock = threading.RLock()
         self._demand = threading.Condition(threading.RLock())
@@ -85,8 +86,12 @@ class RouterLiteRealtimeService:
     def start(self) -> None:
         monitor = getattr(getattr(self.sync, "client", None), "router_ws_monitor", None)
         if monitor is not None and hasattr(monitor, "set_fast_handler"):
-            monitor.set_fast_handler(self.accept_router_fast)
-            self.logger.info("router eweb /ws fast realtime bridge enabled; relay handles devices only")
+            handler = (
+                getattr(self.router_realtime, "accept_router_fast", None)
+                or self.accept_router_fast
+            )
+            monitor.set_fast_handler(handler)
+            self.logger.info("router eweb /ws fast connected to Router Core realtime; relay handles devices only")
         else:
             self.logger.info("router realtime cache enabled; waiting for eweb /ws monitor")
 
@@ -130,12 +135,11 @@ class RouterLiteRealtimeService:
         self._client_demand_until = {
             key: until for key, until in self._client_demand_until.items() if until > now
         }
-        active = bool(self._client_demand_until)
         return {
             "ok": True,
             "sequence": self._demand_sequence,
             "routerActive": False,
-            "devicesActive": active,
+            "devicesActive": False,
             "demandClientCount": len(self._client_demand_until),
             "serverEpochMs": int(now * 1000),
         }
@@ -229,60 +233,32 @@ class RouterLiteRealtimeService:
     def accept_push(self, payload: Any) -> Dict[str, Any]:
         if not isinstance(payload, dict):
             raise ValueError("invalid realtime payload")
-
-        # Snapshot the APP-owned lease before touching sample memory. A Relay push
-        # never renews demand and cannot keep high-frequency collection alive.
         with self._demand:
             demand = self._demand_payload_locked()
-        devices_active = bool(demand["devicesActive"])
-
-        sample_epoch_ms = self._sample_epoch_ms(payload.get("sampleEpochMs"))
-        source = _clean_source(payload.get("source"))
-        agent_version = str(payload.get("agentVersion") or "").strip()[:32]
-        devices_supplied = devices_active and isinstance(payload.get("devices"), list)
-        devices = self._device_rows(payload.get("devices")) if devices_supplied else []
-
-        devices_event: Dict[str, Any] = {}
-        with self._lock:
-            if devices_supplied:
-                previous = {row["mac"]: row for row in self._devices}
-                changed_rows = [
-                    row for row in devices
-                    if previous.get(row["mac"]) != row
-                ]
-                changed = devices != self._devices or sample_epoch_ms != self._devices_epoch_ms
-                self._devices = devices
-                self._devices_epoch_ms = sample_epoch_ms
-                self._devices_source = source
-                self._devices_agent_version = agent_version
-                if changed:
-                    self._devices_sequence += 1
-                devices_event = {
-                    "ok": True,
-                    "sampleEpochMs": sample_epoch_ms,
-                    "sequence": self._devices_sequence,
-                    "source": source,
-                    "delta": True,
-                    "onlineDeviceCount": len(devices),
-                    "devices": changed_rows,
-                }
-
-        with self._lock:
-            publisher = self._app_realtime_publisher
-        if devices_event and publisher is not None:
-            publisher.publish_devices_realtime(devices_event)
-
         demand["acceptedRouter"] = False
-        demand["acceptedDevices"] = devices_supplied
+        demand["acceptedDevices"] = False
+        demand["source"] = "router_core"
         return demand
 
     def router_payload(self) -> Dict[str, Any]:
+        if self.router_realtime is not None:
+            return self.router_realtime.router_payload()
         with self._lock:
             sample = dict(self._router_sample)
             epoch_ms = self._router_epoch_ms
             sequence = self._router_sequence
             source = self._router_source
             agent_version = self._router_agent_version
+
+        if not epoch_ms and self.hub:
+            with getattr(self.hub, "ROUTER_DASHBOARD_LOCK", threading.Lock()):
+                cache = getattr(self.hub, "ROUTER_DASHBOARD_CACHE", {})
+                telemetry = cache.get("telemetry") if isinstance(cache.get("telemetry"), dict) else {}
+                if telemetry:
+                    sample = self._router_fields(telemetry)
+                    epoch_ms = int(cache.get("telemetryEpoch") or time.time()) * 1000
+                    source = "hub_dashboard_telemetry_cache"
+
         now_ms = int(time.time() * 1000)
         age_ms = max(0, now_ms - epoch_ms) if epoch_ms else 0
         return {
@@ -299,6 +275,8 @@ class RouterLiteRealtimeService:
         }
 
     def devices_payload(self) -> Dict[str, Any]:
+        if self.router_realtime is not None:
+            return self.router_realtime.devices_payload()
         with self._lock:
             devices = [dict(row) for row in self._devices]
             epoch_ms = self._devices_epoch_ms
@@ -323,12 +301,16 @@ class RouterLiteRealtimeService:
         }
 
 
-def install_router_lite_realtime_patch(hub: Any, router_sync: Any) -> RouterLiteRealtimeService:
+def install_router_lite_realtime_patch(
+    hub: Any,
+    router_sync: Any,
+    router_realtime: Any = None,
+) -> RouterLiteRealtimeService:
     existing = getattr(hub, "ROUTER_LITE_REALTIME", None)
     if existing is not None:
         return existing
 
-    service = RouterLiteRealtimeService(hub, router_sync)
+    service = RouterLiteRealtimeService(hub, router_sync, router_realtime)
 
     @hub.app.get("/api/router/realtime")
     def api_router_realtime():

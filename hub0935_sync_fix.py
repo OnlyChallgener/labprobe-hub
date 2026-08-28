@@ -240,5 +240,5 @@ def install_hub0935_device_sync_fix(hub: Any) -> None:
     hub.DEVICE_SYNC_SOURCE_STATE = source_state
     hub.HUB0935_DEVICE_SYNC_FIXED = True
     hub.LOGGER.info(
-        "Hub 0.9.35 device authority enabled: Relay hook durable, router live poll memory-only"
+        "Hub device authority enabled: Relay hook durable, router live poll memory-only"
     )

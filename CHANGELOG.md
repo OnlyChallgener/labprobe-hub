@@ -1,5 +1,62 @@
 # LabProbe 变更记录
 
+## 0.11.5
+
+- **STUN 规则可靠性**：保留自定义内网目标端口，切换传输协议发生同协议监听冲突时安全重分配监听端口，并正确解析字符串布尔值。
+- **执行状态可见**：向 App 返回 Agent 同步错误与路由器原生映射错误，停止规则不再被旧运行状态误报为已映射。
+- **状态文件治理**：压缩已完成命令记录，删除规则时同步清理地址历史，避免长期运行后状态文件持续膨胀。
+
+## 0.11.4
+
+- **Router Native DDNS 身份修复**：读取时分别保留路由器原生记录 ID（`service`）与服务商名称（`service_name`），返回字段继续兼容现有 App 契约。
+- **Router Native DDNS 开关修复**：写入时将 App 的 `enable` 映射为路由器原生 `enabled` 字段，并保持 `ddnsCfg` RPC envelope 与路由器 Web 管理端一致。
+- **部署固定版本**：Docker Compose 默认镜像更新为 `onlychallgener/labprobe-hub:0.11.4`，发布仅更新 `latest`、`0.11.4` 与 `v0.11.4` 标签。
+
+## 0.11.3
+
+- **Router Native DDNS 解析修复**：修复 Reyee BE72 固件 `devSta.get ddnsCfg` 返回 JSON 数组字符串或列表对象时被误判为非 dict 导致返回空列表的问题；同时输出 `list` 与 `services` 保证对 App 的完全兼容。
+- **部署固定版本**：Docker Compose 默认镜像更新为 `onlychallgener/labprobe-hub:0.11.3`。
+
+## 0.11.2
+
+- **Router Core 数据恢复**：原生 DDNS 正确解包 BE72 的 JSON/嵌套响应；eWeb WebSocket 的 2.4G、5G 温度和存储占用进入 Core realtime 与 Dashboard。
+- **宽带凭据恢复**：重新接入旧 main 已验证的 Hub 直读凭据入口，保留凭据仅驻内存；Relay 只在固件未暴露完整字段时执行原有路由器本地扩展读取。
+- **Agent 运维恢复**：更新命令使用实际解析成功的 GitHub/镜像源地址，过期命令不再阻塞“立即更新”和“一键清理”。
+- **Relay 扩展边界**：继续忽略 Relay 路由遥测，同时保留 LabProbe DDNS 地址与 WireGuard 扩展状态上报。
+- **路由连接设置**：新增受 APP Token 保护的 `GET/PUT /api/router/config`，配置加密落盘并在 Hub 内热切换 Router Core 会话与 WebSocket。
+- **接口验收**：CI 逐项核对 APP 的 76 个 HTTP 契约与 Hub 生产路由表。
+- **部署固定版本**：Docker Compose 默认镜像更新为 `onlychallgener/labprobe-hub:0.11.2`。
+
+## 0.11.1
+
+- **BE72 生产认证**：恢复固件实际使用的 AES 登录载荷、序列号会话 Cookie、SID 校验与签名 CMD 请求。
+- **Router Core 唯一数据源**：Dashboard、路由状态、设备与配置 API 统一由 `ReyeeEWebDriver` 提供，RouterLite 只保留 Relay demand/ack 控制端点且不再接收实时数据。
+- **实时首帧恢复**：BE72 `fast` WebSocket 帧直接进入 `RouterRealtimeEngine`，生产 WSS 输出 APP 契约字段，并在数据流停滞时快速重连。
+- **原生能力接通**：设备、IPv6、端口映射、UPnP、防火墙、DDNS、NAT、自检和 Beta 查询均使用经旧版验证的 eWeb module envelope。
+- **部署固定版本**：Docker Compose 默认镜像固定为 `onlychallgener/labprobe-hub:0.11.1`，保留既有 APP/HOOK Token、MQTT 与 `config.yaml` 配置。
+
+## 0.11.1-rc1
+
+- **Router Core 实时主链路**: Reyee eWeb `fast` 帧直接进入 `RouterRealtimeEngine`，生产 WSS 订阅 Core 引擎并向 APP 推送首帧与后续帧。
+- **APP contract 修复**: 路由实时字段统一为 `uploadBps`、`downloadBps`、`cpuPercent`、`memoryPercent` 与 `sampleEpochMs`。
+- **升级兼容**: Router Core 继续读取既有 `ROUTER_EWEB_*` Compose 变量与加密 `config/router_eweb.json`，保留 APP、HOOK 与 MQTT 配置行为。
+
+## 0.11.0 / LabRelay 0.2.28
+
+- **Router Core v1 架构生产切流**: 生产主干正式由 `RouterService` 与 `create_router_blueprint_v1` 接管，统一承载 30 个原生路由 API 端点；
+- **单一职责实现收口**: 核心鉴权由 `ReyeeSessionManager`（动态 Key 提取 + EVP MD5 AES-256-CBC + 3600s Idle Timeout + Single-Flight 并发防重登录锁）统一收拢；
+- **RPC 与缓存优化**: `ReyeeRpcClient` 原生对接 `/api/cmd?auth=<sid>` Wire 协议并内置断路器；引入 `RouterCache` SWR 引擎降低路由器 CPU 负载；
+- **实时事件规范化**: `RouterRealtimeEngine` 提供 3.0s 空闲心跳广播，严密适配 Android Client 45s 断线看门狗容差；
+- **BE72 Shadow 验证工具链就绪**: 提供 `api/be72_shadow_validation.py`，支持 12 大能力 Dual-Read 字段对比与安全可逆写操作门禁；
+- **LabRelay 自研核心能力 100% 保留**: LabProbe DDNS、6→4/6→6 映射转发、STUN NAT 穿透、WireGuard VPN、Agent 双进程拓扑完整兼容，LabRelay 保持 0.2.28 不变。
+
+
+## 0.10.12 / LabRelay 0.2.28
+
+- WireGuard 服务端支持 `POST` 别名方法与 `enabled: false/true` 开关控制；
+- 下发服务端停用命令时自动将 `labwg0` 接口置为 down 并释放相关防火墙规则，避免与官方固件或第三方服务端冲突；
+- LabRelay 升级至 0.2.28，配套 APP v0.10.52 build 207。
+
 ## 0.9.19 / LabRelay 0.2.11
 
 - APP v0.10.15 build152 使用轻量路由接口成功响应作为 5 秒实时连接租约；APP 与 Hub 失联后停止终端实时请求、200ms 平滑渲染和缓存计算。

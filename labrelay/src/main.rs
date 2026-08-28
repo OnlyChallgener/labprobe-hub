@@ -1,7 +1,7 @@
 use anyhow::{anyhow, bail, Context, Result};
 use serde::{Deserialize, Serialize};
 use serde_json::{json, Value};
-use socket2::{Domain, Protocol, SockAddr, Socket, Type};
+use socket2::{Domain, Protocol, Socket, Type};
 use std::collections::HashMap;
 use std::fs;
 use std::io::{BufRead, BufReader, Read, Write};
@@ -13,7 +13,7 @@ use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::Arc;
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 use tokio::io::{AsyncBufReadExt, AsyncReadExt, AsyncWriteExt, BufReader as TokioBufReader};
-use tokio::net::{TcpListener, TcpStream, UdpSocket, UnixListener};
+use tokio::net::{TcpListener, TcpSocket, TcpStream, UdpSocket, UnixListener};
 use tokio::sync::{watch, Mutex, RwLock, Semaphore};
 use tokio::task::{JoinHandle, JoinSet};
 use tokio::time::{sleep, timeout};
@@ -27,6 +27,9 @@ const DEFAULT_CONFIG: &str = "/etc/labprobe/relay.json";
 const DEFAULT_SOCKET: &str = "/tmp/labrelay.sock";
 const DEFAULT_STATE: &str = "/tmp/labrelay/state.json";
 const DEFAULT_PID: &str = "/tmp/labrelay.pid";
+const DEFAULT_UDP_STUN_SERVER: &str = "stun.cloudflare.com:3478";
+const DEFAULT_TCP_STUN_SERVER: &str = "stunserver2025.stunprotocol.org:3478";
+const LEGACY_TCP_STUN_SERVER: &str = DEFAULT_UDP_STUN_SERVER;
 
 fn default_true() -> bool {
     true
@@ -40,8 +43,15 @@ fn default_idle_timeout() -> u64 {
 fn default_rule_kind() -> String {
     "portmap".to_string()
 }
-fn default_stun_server() -> String {
-    "stun.cloudflare.com:3478".to_string()
+fn default_forward_mode() -> String {
+    "relay_proxy".to_string()
+}
+fn default_stun_server(protocol: &str) -> String {
+    if protocol.eq_ignore_ascii_case("TCP") {
+        DEFAULT_TCP_STUN_SERVER.to_string()
+    } else {
+        DEFAULT_UDP_STUN_SERVER.to_string()
+    }
 }
 
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
@@ -61,6 +71,7 @@ struct Rule {
     target_port: u16,
     transport_protocol: String,
     service_type: String,
+    forward_mode: String,
     stun_server: String,
     prefer_current_prefix: bool,
     expires_at: Option<u64>,
@@ -89,7 +100,8 @@ impl Default for Rule {
             target_port: 0,
             transport_protocol: "TCP".to_string(),
             service_type: "Custom".to_string(),
-            stun_server: default_stun_server(),
+            forward_mode: default_forward_mode(),
+            stun_server: default_stun_server("TCP"),
             prefer_current_prefix: default_true(),
             expires_at: None,
             max_connections: default_max_connections(),
@@ -276,6 +288,33 @@ impl Manager {
         }
     }
 
+    async fn restore_previous_rule(&self, id: &str, previous: Option<&Rule>) -> Result<()> {
+        match previous {
+            Some(old) => {
+                self.rules
+                    .write()
+                    .await
+                    .insert(id.to_string(), old.clone());
+                self.persist().await.context("persist previous rule")?;
+                if old.enabled {
+                    self.start_rule(id)
+                        .await
+                        .context("restart previous runtime")?;
+                } else {
+                    self.stop_runtime(id, true).await;
+                    self.set_cached_state(old, "stopped", "").await;
+                }
+            }
+            None => {
+                self.rules.write().await.remove(id);
+                self.persist().await.context("remove failed new rule")?;
+                self.stop_runtime(id, false).await;
+                self.last_status.write().await.remove(id);
+            }
+        }
+        Ok(())
+    }
+
     async fn upsert(&self, mut rule: Rule) -> Result<Value> {
         normalize_rule(&mut rule);
         validate_rule(&rule, self.port_min, self.port_max)?;
@@ -294,26 +333,38 @@ impl Manager {
             }
         }
         self.rules.write().await.insert(id.clone(), rule);
-        self.persist().await?;
+        if let Err(error) = self.persist().await {
+            match previous.as_ref() {
+                Some(old) => {
+                    self.rules.write().await.insert(id.clone(), old.clone());
+                }
+                None => {
+                    self.rules.write().await.remove(&id);
+                }
+            }
+            return Err(error.context("persist new rule"));
+        }
         if enabled {
             if let Err(error) = self.start_rule(&id).await {
-                // Do not leave a previously working rule replaced by a failed
-                // rebind. Restore its desired configuration and best-effort
-                // runtime so Hub reconciliation can observe the real state.
-                if let Some(old) = previous {
-                    self.rules.write().await.insert(id.clone(), old.clone());
-                    self.persist().await?;
-                    if old.enabled {
-                        let _ = self.start_rule(&id).await;
+                if let Err(restore_error) = self
+                    .restore_previous_rule(&id, previous.as_ref())
+                    .await
+                {
+                    let combined = format!(
+                        "new runtime start failed: {error:#}; previous runtime restore failed: {restore_error:#}"
+                    );
+                    if let Some(current) = self.rules.read().await.get(&id).cloned() {
+                        self.set_cached_state(&current, "error", &combined).await;
                     }
-                } else {
-                    self.rules.write().await.remove(&id);
-                    self.persist().await?;
+                    return Err(anyhow!(combined));
                 }
                 return Err(error);
             }
         } else {
-            self.stop_rule(&id, true).await?;
+            self.stop_runtime(&id, true).await;
+            if let Some(current) = self.rules.read().await.get(&id).cloned() {
+                self.set_cached_state(&current, "stopped", "").await;
+            }
         }
         Ok(json!({"ok": true, "id": id}))
     }
@@ -346,10 +397,14 @@ impl Manager {
             } else {
                 format!("[::]:{}", rule.listen_port)
             },
-            resolved_target: previous
-                .as_ref()
-                .map(|x| x.resolved_target.clone())
-                .unwrap_or_default(),
+            resolved_target: if rule.kind == "stun" {
+                String::new()
+            } else {
+                previous
+                    .as_ref()
+                    .map(|x| x.resolved_target.clone())
+                    .unwrap_or_default()
+            },
             active_connections: 0,
             active_peers: 0,
             total_upload_bytes: previous.as_ref().map(|x| x.total_upload_bytes).unwrap_or(0),
@@ -369,16 +424,32 @@ impl Manager {
             expires_at: rule.expires_at,
             last_resolved_at: None,
             last_error: String::new(),
-            public_endpoint: previous
-                .as_ref()
-                .map(|x| x.public_endpoint.clone())
-                .unwrap_or_default(),
-            public_ip: previous
-                .as_ref()
-                .map(|x| x.public_ip.clone())
-                .unwrap_or_default(),
-            public_port: previous.as_ref().map(|x| x.public_port).unwrap_or(0),
-            mapping_updated_at: previous.as_ref().and_then(|x| x.mapping_updated_at),
+            public_endpoint: if rule.kind == "stun" {
+                String::new()
+            } else {
+                previous
+                    .as_ref()
+                    .map(|x| x.public_endpoint.clone())
+                    .unwrap_or_default()
+            },
+            public_ip: if rule.kind == "stun" {
+                String::new()
+            } else {
+                previous
+                    .as_ref()
+                    .map(|x| x.public_ip.clone())
+                    .unwrap_or_default()
+            },
+            public_port: if rule.kind == "stun" {
+                0
+            } else {
+                previous.as_ref().map(|x| x.public_port).unwrap_or(0)
+            },
+            mapping_updated_at: if rule.kind == "stun" {
+                None
+            } else {
+                previous.as_ref().and_then(|x| x.mapping_updated_at)
+            },
         };
         let shared = Arc::new(RuntimeShared::new(snapshot));
         let target = Arc::new(RwLock::new(
@@ -391,7 +462,17 @@ impl Manager {
         let target_task = target.clone();
         let rule_task = rule.clone();
         let lan_if = self.lan_if.clone();
-        let join = match rule.transport_protocol.as_str() {
+        let mut join = match rule.transport_protocol.as_str() {
+            // Lucky's direct TCP path deliberately does not listen/proxy on
+            // this port.  The router's native port mapping delivers inbound
+            // traffic straight to the selected LAN service, while this socket
+            // keeps that same channel port alive at the upstream NAT and
+            // observes its current public endpoint.
+            "TCP" if rule.kind == "stun" && rule.forward_mode == "router_native" => {
+                tokio::spawn(async move {
+                    run_tcp_stun_keepalive(rule_task, shared_task, cancel_rx).await;
+                })
+            }
             "TCP" => match if rule.kind == "stun" {
                 create_ipv4_listener(rule.listen_port)
             } else {
@@ -419,6 +500,11 @@ impl Manager {
             } else {
                 create_ipv6_udp_listener(rule.listen_port)
             } {
+                Ok(socket) if rule.kind == "stun" && rule.forward_mode == "router_native" => {
+                    tokio::spawn(async move {
+                        run_udp_stun_keepalive(socket, rule_task, shared_task, cancel_rx).await;
+                    })
+                }
                 Ok(socket) => tokio::spawn(async move {
                     run_udp_listener(
                         socket,
@@ -438,6 +524,18 @@ impl Manager {
             },
             _ => unreachable!("validate_rule normalizes transportProtocol"),
         };
+        if rule.kind == "stun" {
+            if let Err(error) = confirm_stun_startup(&shared, Duration::from_secs(30)).await {
+                let _ = cancel_tx.send(true);
+                if timeout(Duration::from_secs(3), &mut join).await.is_err() {
+                    join.abort();
+                    let _ = join.await;
+                }
+                let message = format!("confirm first STUN binding: {error:#}");
+                self.set_cached_state(&rule, "error", &message).await;
+                return Err(anyhow!(message));
+            }
+        }
         self.runtimes.lock().await.insert(
             id.to_string(),
             RuntimeHandle {
@@ -734,6 +832,30 @@ async fn mark_stun_mapping(shared: &Arc<RuntimeShared>, endpoint: SocketAddr) {
     base.last_error.clear();
 }
 
+async fn confirm_stun_startup(shared: &Arc<RuntimeShared>, wait: Duration) -> Result<()> {
+    let mut last_error = String::new();
+    let confirmation = timeout(wait, async {
+        loop {
+            let current = shared.snapshot().await;
+            if current.state == "mapped" && !current.public_endpoint.is_empty() {
+                return;
+            }
+            if !current.last_error.is_empty() {
+                last_error = current.last_error;
+            }
+            sleep(Duration::from_millis(100)).await;
+        }
+    })
+    .await;
+    if confirmation.is_ok() {
+        return Ok(());
+    }
+    if last_error.is_empty() {
+        bail!("STUN startup confirmation timed out");
+    }
+    bail!("STUN startup confirmation timed out; last error: {last_error}")
+}
+
 async fn resolve_stun_server(value: &str) -> Result<SocketAddr> {
     tokio::net::lookup_host(value)
         .await
@@ -743,27 +865,20 @@ async fn resolve_stun_server(value: &str) -> Result<SocketAddr> {
 }
 
 async fn connect_tcp_stun(local_port: u16, server: SocketAddr) -> Result<TcpStream> {
-    let socket = Socket::new(Domain::IPV4, Type::STREAM, Some(Protocol::TCP))?;
-    socket.set_reuse_address(true)?;
-    #[cfg(unix)]
-    socket.set_reuse_port(true)?;
-    socket.set_nonblocking(true)?;
-    socket.bind(&SocketAddrV4::new(Ipv4Addr::UNSPECIFIED, local_port).into())?;
-    let server_addr = SockAddr::from(server);
-    match socket.connect(&server_addr) {
-        Ok(_) => {}
-        Err(error) if matches!(error.kind(), std::io::ErrorKind::WouldBlock | std::io::ErrorKind::Interrupted) => {}
-        Err(error) => return Err(error.into()),
-    }
-    let std_stream: std::net::TcpStream = socket.into();
-    let stream = TcpStream::from_std(std_stream)?;
-    timeout(Duration::from_secs(8), stream.writable())
+    // TcpSocket owns the nonblocking connect state and lets Tokio handle
+    // EINPROGRESS/EALREADY consistently on musl/BusyBox routers.  The old
+    // socket2 + writable()/SO_ERROR sequence could surface raw errno 115
+    // after the initial connect had already been accepted as pending.
+    let socket = TcpSocket::new_v4()?;
+    socket.set_reuseaddr(true)?;
+    socket.bind(SocketAddr::V4(SocketAddrV4::new(
+        Ipv4Addr::UNSPECIFIED,
+        local_port,
+    )))?;
+    timeout(Duration::from_secs(8), socket.connect(server))
         .await
-        .context("STUN TCP connect timeout")??;
-    if let Some(error) = stream.take_error()? {
-        return Err(error.into());
-    }
-    Ok(stream)
+        .context("STUN TCP connect timeout")?
+        .context("STUN TCP connect")
 }
 
 async fn run_tcp_stun_keepalive(
@@ -824,7 +939,7 @@ async fn run_tcp_listener(
     shared: Arc<RuntimeShared>,
     mut cancel: watch::Receiver<bool>,
 ) {
-    let stun_task = if rule.kind == "stun" {
+    let stun_task = if rule.kind == "stun" && rule.forward_mode == "relay_proxy" {
         Some(tokio::spawn(run_tcp_stun_keepalive(
             rule.clone(),
             shared.clone(),
@@ -919,6 +1034,68 @@ async fn run_tcp_listener(
     }
 }
 
+// Lucky's direct UDP mode follows the same split as direct TCP: the router
+// owns WAN -> LAN delivery, while this socket uses the channel port only to
+// maintain the upstream NAT mapping and learn the current public endpoint.
+// Packets from arbitrary visitors are deliberately ignored here; the router's
+// native DNAT rule sends those directly to the selected LAN service.
+async fn run_udp_stun_keepalive(
+    socket: UdpSocket,
+    rule: Rule,
+    shared: Arc<RuntimeShared>,
+    mut cancel: watch::Receiver<bool>,
+) {
+    let mut recv_buffer = vec![0u8; 65_535];
+    let mut stun_tick = tokio::time::interval(Duration::from_secs(20));
+    stun_tick.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
+    let mut stun_server: Option<SocketAddr> = None;
+
+    loop {
+        tokio::select! {
+            _ = cancel.changed() => {
+                if *cancel.borrow() { break; }
+            }
+            _ = stun_tick.tick() => {
+                match resolve_stun_server(&rule.stun_server).await {
+                    Ok(server) => {
+                        stun_server = Some(server);
+                        let request = stun_binding_request();
+                        if let Err(error) = socket.send_to(&request, server).await {
+                            shared.base.write().await.last_error = format!("STUN UDP send failed: {}", error);
+                        }
+                    }
+                    Err(error) => {
+                        let mut base = shared.base.write().await;
+                        if base.public_endpoint.is_empty() { base.state = "mapping".to_string(); }
+                        base.last_error = error.to_string();
+                    }
+                }
+            }
+            received = socket.recv_from(&mut recv_buffer) => {
+                match received {
+                    Ok((size, peer)) if stun_server == Some(peer) => {
+                        match parse_stun_mapped_address(&recv_buffer[..size]) {
+                            Ok(endpoint) => mark_stun_mapping(&shared, endpoint).await,
+                            Err(error) => shared.base.write().await.last_error = error.to_string(),
+                        }
+                    }
+                    Ok(_) => {
+                        // Direct forwarding bypasses LabRelay, so neither
+                        // consume nor account visitor traffic here.
+                    }
+                    Err(error) => {
+                        shared.base.write().await.last_error = format!("STUN UDP receive failed: {}", error);
+                    }
+                }
+            }
+        }
+    }
+    let mut base = shared.base.write().await;
+    if base.state != "expired" {
+        base.state = "stopped".to_string();
+    }
+}
+
 async fn udp_upstream_socket(target: SocketAddr) -> Result<UdpSocket> {
     let bind = if target.is_ipv4() {
         "0.0.0.0:0"
@@ -965,7 +1142,7 @@ async fn run_udp_listener(
                 if *cancel.borrow() { break; }
             }
             _ = peer_tasks.join_next(), if !peer_tasks.is_empty() => {}
-            _ = stun_tick.tick(), if rule.kind == "stun" => {
+            _ = stun_tick.tick(), if rule.kind == "stun" && rule.forward_mode == "relay_proxy" => {
                 match resolve_stun_server(&rule.stun_server).await {
                     Ok(server) => {
                         stun_server = Some(server);
@@ -1010,7 +1187,7 @@ async fn run_udp_listener(
                         continue;
                     }
                 };
-                if rule.kind == "stun" && stun_server == Some(client) {
+                if rule.kind == "stun" && rule.forward_mode == "relay_proxy" && stun_server == Some(client) {
                     match parse_stun_mapped_address(&recv_buffer[..size]) {
                         Ok(endpoint) => mark_stun_mapping(&shared, endpoint).await,
                         Err(error) => shared.base.write().await.last_error = error.to_string(),
@@ -1446,12 +1623,16 @@ fn normalize_rule(rule: &mut Rule) {
     rule.target_mac = normalize_mac(&rule.target_mac);
     rule.transport_protocol = rule.transport_protocol.trim().to_ascii_uppercase();
     rule.service_type = rule.service_type.trim().to_string();
+    rule.forward_mode = rule.forward_mode.trim().to_ascii_lowercase();
     rule.stun_server = rule.stun_server.trim().to_string();
     if rule.kind == "stun" {
         rule.mode = "stun".to_string();
         rule.target_mode = "ipv4".to_string();
-        if rule.stun_server.is_empty() {
-            rule.stun_server = default_stun_server();
+        rule.forward_mode = "router_native".to_string();
+        if rule.stun_server.is_empty()
+            || (rule.transport_protocol == "TCP" && rule.stun_server == LEGACY_TCP_STUN_SERVER)
+        {
+            rule.stun_server = default_stun_server(&rule.transport_protocol);
         }
     }
     if rule.transport_protocol.is_empty() {
@@ -1497,6 +1678,9 @@ fn validate_rule(rule: &Rule, port_min: u16, port_max: u16) -> Result<()> {
     }
     if rule.kind == "stun" && !rule.stun_server.contains(':') {
         bail!("invalid STUN server");
+    }
+    if rule.kind == "stun" && !matches!(rule.forward_mode.as_str(), "router_native" | "relay_proxy") {
+        bail!("unsupported STUN forwardMode: {}", rule.forward_mode);
     }
     if matches!(rule.mode.as_str(), "6to4" | "stun") {
         let ip = Ipv4Addr::from_str(&rule.target_ipv4).context("invalid targetIpv4")?;
@@ -1658,10 +1842,20 @@ async fn unix_server_fixed(manager: Manager, socket_path: PathBuf) -> Result<()>
     }
 }
 
+fn ctl_read_timeout(request: &Value) -> Duration {
+    let is_stun_upsert = request.get("action").and_then(Value::as_str) == Some("upsert")
+        && request
+            .get("rule")
+            .and_then(|rule| rule.get("kind"))
+            .and_then(Value::as_str)
+            == Some("stun");
+    Duration::from_secs(if is_stun_upsert { 70 } else { 8 })
+}
+
 pub(crate) fn ctl_request(socket_path: &Path, request: &Value) -> Result<Value> {
     let mut stream = std::os::unix::net::UnixStream::connect(socket_path)
         .with_context(|| format!("connect {}", socket_path.display()))?;
-    stream.set_read_timeout(Some(Duration::from_secs(8)))?;
+    stream.set_read_timeout(Some(ctl_read_timeout(request)))?;
     stream.set_write_timeout(Some(Duration::from_secs(3)))?;
     stream.write_all(format!("{}\n", request).as_bytes())?;
     let mut line = String::new();
@@ -2218,5 +2412,193 @@ mod tests {
         validate_rule(&rule, 20000, 20020).unwrap();
         assert_eq!(rule.mode, "stun");
         assert_eq!(rule.target_mode, "ipv4");
+        assert_eq!(rule.forward_mode, "router_native");
+    }
+
+    #[test]
+    fn udp_stun_normalizes_to_router_native() {
+        let mut rule = Rule {
+            id: "stun-udp".into(),
+            name: "STUN UDP".into(),
+            kind: "stun".into(),
+            target_ipv4: "192.168.5.46".into(),
+            target_port: 51820,
+            listen_port: 20001,
+            transport_protocol: "UDP".into(),
+            ..Rule::default()
+        };
+        normalize_rule(&mut rule);
+        validate_rule(&rule, 20000, 20020).unwrap();
+        assert_eq!(rule.forward_mode, "router_native");
+    }
+
+    #[tokio::test]
+    async fn stun_startup_confirmation_allows_a_transient_error_to_recover() {
+        let rule = Rule {
+            id: "stun-transient".into(),
+            name: "STUN transient".into(),
+            kind: "stun".into(),
+            ..Rule::default()
+        };
+        let mut snapshot = RuntimeSnapshot::stopped(&rule);
+        snapshot.state = "mapping".into();
+        snapshot.last_error = "temporary DNS failure".into();
+        let shared = Arc::new(RuntimeShared::new(snapshot));
+        let updater = shared.clone();
+        let mapping = tokio::spawn(async move {
+            sleep(Duration::from_millis(25)).await;
+            mark_stun_mapping(&updater, "203.0.113.9:20001".parse().unwrap()).await;
+        });
+
+        confirm_stun_startup(&shared, Duration::from_millis(500))
+            .await
+            .unwrap();
+        mapping.await.unwrap();
+        assert_eq!(shared.snapshot().await.state, "mapped");
+    }
+
+    #[tokio::test]
+    async fn stun_startup_confirmation_timeout_keeps_the_last_real_error() {
+        let rule = Rule {
+            id: "stun-timeout".into(),
+            name: "STUN timeout".into(),
+            kind: "stun".into(),
+            ..Rule::default()
+        };
+        let mut snapshot = RuntimeSnapshot::stopped(&rule);
+        snapshot.state = "mapping".into();
+        snapshot.last_error = "STUN UDP receive failed: network unreachable".into();
+        let shared = Arc::new(RuntimeShared::new(snapshot));
+
+        let error = confirm_stun_startup(&shared, Duration::from_millis(20))
+            .await
+            .unwrap_err();
+
+        assert_eq!(
+            error.to_string(),
+            "STUN startup confirmation timed out; last error: STUN UDP receive failed: network unreachable"
+        );
+    }
+
+    #[test]
+    fn only_stun_upsert_extends_the_local_control_timeout() {
+        assert_eq!(
+            ctl_read_timeout(&json!({"action": "upsert", "rule": {"kind": "stun"}})),
+            Duration::from_secs(70)
+        );
+        assert_eq!(
+            ctl_read_timeout(&json!({"action": "upsert", "rule": {"kind": "portmap"}})),
+            Duration::from_secs(8)
+        );
+        assert_eq!(
+            ctl_read_timeout(&json!({"action": "status", "scope": "stun"})),
+            Duration::from_secs(8)
+        );
+    }
+
+    #[tokio::test]
+    async fn upsert_persist_failure_restores_previous_rule_in_memory() {
+        let root = std::env::temp_dir().join(format!(
+            "labrelay-stun-persist-{}-{}",
+            std::process::id(),
+            now_epoch()
+        ));
+        fs::create_dir_all(&root).unwrap();
+        let config_path = root.join("config.json");
+        fs::create_dir(&config_path).unwrap();
+        let state_path = root.join("state.json");
+        let previous = Rule {
+            id: "stun-persist".into(),
+            name: "Previous".into(),
+            enabled: false,
+            kind: "stun".into(),
+            mode: "stun".into(),
+            listen_port: 20001,
+            target_mode: "ipv4".into(),
+            target_ipv4: "192.168.5.46".into(),
+            target_port: 443,
+            transport_protocol: "TCP".into(),
+            forward_mode: "router_native".into(),
+            ..Rule::default()
+        };
+        let manager = Manager {
+            rules: Arc::new(RwLock::new(HashMap::from([(
+                previous.id.clone(),
+                previous.clone(),
+            )]))),
+            runtimes: Arc::new(Mutex::new(HashMap::new())),
+            operation_lock: Arc::new(Mutex::new(())),
+            last_status: Arc::new(RwLock::new(HashMap::new())),
+            config_path,
+            state_path,
+            port_min: 20000,
+            port_max: 20020,
+            lan_if: "lan".into(),
+        };
+        let replacement = Rule {
+            name: "Replacement".into(),
+            target_port: 8443,
+            ..previous.clone()
+        };
+
+        let error = manager.upsert(replacement).await.unwrap_err();
+
+        assert!(format!("{error:#}").contains("persist new rule"));
+        assert_eq!(
+            manager.rules.read().await.get("stun-persist").unwrap().name,
+            "Previous"
+        );
+        assert_eq!(
+            manager
+                .rules
+                .read()
+                .await
+                .get("stun-persist")
+                .unwrap()
+                .target_port,
+            443
+        );
+        fs::remove_dir_all(&root).unwrap();
+    }
+
+    #[tokio::test]
+    async fn tcp_stun_connect_keeps_the_same_port_as_the_listener() {
+        // Reserve a port briefly, then release it before the outbound socket
+        // binds. The production path has only the STUN socket on this port;
+        // keeping this helper listener alive would create a false conflict.
+        let inbound = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let source_port = inbound.local_addr().unwrap().port();
+        drop(inbound);
+        let server = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let server_addr = server.local_addr().unwrap();
+
+        let stream = timeout(Duration::from_secs(2), connect_tcp_stun(source_port, server_addr))
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(stream.local_addr().unwrap().port(), source_port);
+        let (_, peer) = timeout(Duration::from_secs(2), server.accept())
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(peer.port(), source_port);
+        drop(stream);
+    }
+
+    #[test]
+    fn tcp_stun_uses_a_tcp_capable_default() {
+        let mut rule = Rule {
+            id: "tcp-default".into(),
+            name: "TCP default".into(),
+            kind: "stun".into(),
+            target_ipv4: "192.168.5.46".into(),
+            target_port: 443,
+            listen_port: 20001,
+            transport_protocol: "TCP".into(),
+            stun_server: LEGACY_TCP_STUN_SERVER.into(),
+            ..Rule::default()
+        };
+        normalize_rule(&mut rule);
+        assert_eq!(rule.stun_server, DEFAULT_TCP_STUN_SERVER);
     }
 }

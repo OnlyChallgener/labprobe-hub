@@ -9,6 +9,7 @@
 from __future__ import annotations
 
 import threading
+import time
 from types import MethodType
 from typing import Any, Dict
 
@@ -53,9 +54,9 @@ def _start_manifest_refresh(hub: Any, command_id: str = "", force: bool = False)
                     {
                         "state": "pending",
                         "targetVersion": target,
-                        "repositoryRoot": hub.UPDATE_REPOSITORY_ROOT,
-                        "manifestUrl": hub.AGENT_MANIFEST_URL,
-                        "installerUrl": hub.AGENT_INSTALLER_URL,
+                        "repositoryRoot": manifest.get("_repositoryRoot") or hub.UPDATE_REPOSITORY_ROOT,
+                        "manifestUrl": manifest.get("_manifestUrl") or hub.AGENT_MANIFEST_URL,
+                        "installerUrl": manifest.get("_installerUrl") or hub.AGENT_INSTALLER_URL,
                         "message": "更新清单已就绪，等待路由器领取指令",
                     },
                 )
@@ -125,6 +126,23 @@ def _install_agent_update_routes(hub: Any) -> None:
         ) or "router"
         data = hub.load_json(hub.AGENT_UPDATE_COMMANDS_FILE, {"commands": []})
         commands = data.get("commands", []) if isinstance(data, dict) else []
+        changed = False
+        now_epoch = time.time()
+        for row in commands:
+            if not isinstance(row, dict) or row.get("router") != router:
+                continue
+            if row.get("action") != "update" or row.get("state") not in {"preparing", "pending", "accepted", "scheduled"}:
+                continue
+            updated_epoch = hub.time_to_epoch(row.get("updatedAt") or row.get("createdAt") or 0)
+            if updated_epoch > 0 and now_epoch - updated_epoch > 900:
+                row.update({
+                    "state": "failed",
+                    "updatedAt": hub.now_str(),
+                    "message": "旧更新任务已过期，请重新发起",
+                })
+                changed = True
+        if changed:
+            hub.save_json(hub.AGENT_UPDATE_COMMANDS_FILE, {"commands": commands[-100:]})
         active = next(
             (
                 row for row in reversed(commands)
@@ -199,8 +217,8 @@ def _install_agent_update_routes(hub: Any) -> None:
             "state": command_state,
             "message": message,
             "lastSeenAt": status.get("lastSeenAt", ""),
-            "manifestUrl": hub.AGENT_MANIFEST_URL,
-            "installerUrl": hub.AGENT_INSTALLER_URL,
+            "manifestUrl": manifest.get("_manifestUrl") or hub.AGENT_MANIFEST_URL,
+            "installerUrl": manifest.get("_installerUrl") or hub.AGENT_INSTALLER_URL,
         })
 
     hub.app.view_functions["api_agent_update_request"] = update_request
