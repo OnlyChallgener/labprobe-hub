@@ -151,6 +151,10 @@ class StunService:
             "rules": [dict(row) for row in raw.get("rules", []) if isinstance(row, dict)],
         }
 
+    def rules_snapshot(self) -> Dict[str, Any]:
+        """Read-only desired-rules snapshot for assistant tools and dashboards."""
+        return self._document()
+
     def _save_rules(self, rows: Iterable[Dict[str, Any]]) -> Dict[str, Any]:
         previous = self._document()
         document = {

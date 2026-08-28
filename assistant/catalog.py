@@ -8,7 +8,7 @@ from __future__ import annotations
 
 from typing import Any, Dict, List
 
-CATALOG_REVISION = "2026-08-23.2"
+CATALOG_REVISION = "2026-08-28.2"
 
 _TOOLS: List[Dict[str, Any]] = [
     {
@@ -181,6 +181,54 @@ _TOOLS: List[Dict[str, Any]] = [
             "additionalProperties": False,
         },
     },
+    {
+        "id": "events.list",
+        "version": "1",
+        "name": "查询事件",
+        "description": "查询最近的设备上下线、端口映射和系统事件。",
+        "examples": ["最近有哪些设备上线", "查看最近事件"],
+        "risk": "read",
+        "confirmation": "none",
+        "scope": "events.read",
+        "inputSchema": {
+            "type": "object",
+            "properties": {"limit": {"type": "integer", "minimum": 1, "maximum": 100}},
+            "additionalProperties": False,
+        },
+    },
+    {
+        "id": "agent.status",
+        "version": "1",
+        "name": "查询 Agent 状态",
+        "description": "查询路由器上 LabRelay Agent 的连接与上报状态。",
+        "examples": ["Agent 在线吗", "Relay 最近一次上报是什么时候"],
+        "risk": "read",
+        "confirmation": "none",
+        "scope": "agent.read",
+        "inputSchema": {"type": "object", "properties": {}, "additionalProperties": False},
+    },
+    {
+        "id": "stun.rules.list",
+        "version": "1",
+        "name": "查询 STUN 穿透规则",
+        "description": "列出 STUN 端口穿透规则与期望状态。",
+        "examples": ["查看 STUN 规则", "STUN 穿透现在有哪些规则"],
+        "risk": "read",
+        "confirmation": "none",
+        "scope": "router.read",
+        "inputSchema": {"type": "object", "properties": {}, "additionalProperties": False},
+    },
+    {
+        "id": "wireguard.status",
+        "version": "1",
+        "name": "查询 WireGuard 状态",
+        "description": "查询 WireGuard 服务端与对端的配置状态（不含私钥）。",
+        "examples": ["WireGuard 配置好了吗", "查看 WG 对端列表"],
+        "risk": "read",
+        "confirmation": "none",
+        "scope": "router.read",
+        "inputSchema": {"type": "object", "properties": {}, "additionalProperties": False},
+    },
 ]
 
 
@@ -190,6 +238,25 @@ def catalog() -> Dict[str, Any]:
 
 def tool_spec(tool_id: str) -> Dict[str, Any] | None:
     return next((dict(tool) for tool in _TOOLS if tool["id"] == tool_id), None)
+
+
+def register_tool(spec: Dict[str, Any]) -> None:
+    """Runtime extension point for feature modules to publish assistant tools.
+
+    The spec follows the same shape as the built-in entries. Registration only
+    makes a tool discoverable: execution additionally requires a handler on
+    ToolExecutor and passes the same risk/confirmation policy. Registered tools
+    live for the process lifetime, so feature modules should register during
+    hub_entry install.
+    """
+    tool_id = str(spec.get("id") or "").strip()
+    if not tool_id or tool_spec(tool_id) is not None:
+        raise ValueError(f"assistant tool id already catalogued or invalid: {tool_id!r}")
+    if spec.get("risk") not in ("read", "write") or spec.get("confirmation") not in ("none", "always"):
+        raise ValueError(f"assistant tool {tool_id} must declare risk and confirmation")
+    if not isinstance(spec.get("inputSchema"), dict):
+        raise ValueError(f"assistant tool {tool_id} must declare an inputSchema object")
+    _TOOLS.append(dict(spec))
 
 
 def function_name(tool_id: str) -> str:

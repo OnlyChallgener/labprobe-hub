@@ -8,7 +8,7 @@ from flask import Flask
 from assistant.api import create_ai_blueprint
 from assistant.provider import ProviderError, usage_from_chunk
 from assistant.security import MasterKeyUnavailable, encrypt_secret
-from assistant.storage import AIStore
+from assistant.storage import AIStore, utc_now
 from assistant.catalog import CATALOG_REVISION
 
 
@@ -298,3 +298,41 @@ def test_notification_inbox_deduplicates_watched_events_and_daily_summary(tmp_pa
     rows = store.list_notifications()
     assert [row["kind"] for row in rows] == ["device", "daily"]
     assert "30 Token" in rows[1]["content"]
+
+
+def test_prune_history_bounds_growth(tmp_path):
+    store = AIStore(tmp_path / "ai.db")
+    store.initialize()
+    now = datetime.now(timezone.utc)
+    stale = (now - timedelta(days=120)).isoformat(timespec="seconds")
+    fresh = now.isoformat(timespec="seconds")
+    with store._connect() as conn:
+        conn.execute("INSERT INTO conversations(id,title,created_at,updated_at) VALUES('c-old','旧','" + stale + "','" + stale + "')")
+        conn.execute("INSERT INTO messages(conversation_id,role,content,created_at) VALUES('c-old','user','hi','" + stale + "')")
+        conn.execute("INSERT INTO conversations(id,title,created_at,updated_at) VALUES('c-new','新','" + fresh + "','" + fresh + "')")
+        conn.execute("INSERT INTO messages(conversation_id,role,content,created_at) VALUES('c-new','user','hi','" + fresh + "')")
+        for index in range(8):
+            conn.execute(
+                "INSERT INTO ai_tool_audit(request_id,tool_id,risk,status,arguments_json,created_at) VALUES(?,?,?,?,?,?)",
+                (f"r{index}", "status.get", "read", "ok", "{}", utc_now()),
+            )
+    deleted = store.prune_history(idle_days=90, max_messages=10, max_audit_rows=5, max_notifications=5)
+    assert deleted["conversations"] == 1
+    with store._connect() as conn:
+        assert conn.execute("SELECT COUNT(*) AS c FROM messages WHERE conversation_id='c-old'").fetchone()["c"] == 0
+        assert conn.execute("SELECT COUNT(*) AS c FROM messages WHERE conversation_id='c-new'").fetchone()["c"] == 1
+        assert conn.execute("SELECT COUNT(*) AS c FROM ai_tool_audit").fetchone()["c"] == 5
+    # Usage rows are the cumulative audit trail and are never pruned.
+    store.add_usage("c-new", "deepseek", "deepseek-v4-flash", {"prompt_tokens": 1, "completion_tokens": 2, "total_tokens": 3})
+    store.prune_history(idle_days=90, max_messages=10, max_audit_rows=5, max_notifications=5)
+    with store._connect() as conn:
+        assert conn.execute("SELECT COUNT(*) AS c FROM ai_usage").fetchone()["c"] == 1
+
+
+def test_prune_history_clears_expired_pending_confirmations(tmp_path):
+    store = AIStore(tmp_path / "ai.db")
+    store.initialize()
+    past = (datetime.now(timezone.utc) - timedelta(minutes=1)).isoformat(timespec="seconds")
+    store.create_confirmation("expired-1", "device.wol", {"device": "ANS"}, {"toolId": "device.wol"}, past)
+    deleted = store.prune_history()
+    assert deleted["expired_confirmations"] == 1

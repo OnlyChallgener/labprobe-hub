@@ -17,7 +17,7 @@ class ToolError(RuntimeError):
         self.status_code = status_code
 
 
-_SENSITIVE_PARTS = ("token", "password", "secret", "api_key", "apikey", "authorization", "cookie", "credential")
+_SENSITIVE_PARTS = ("token", "password", "secret", "api_key", "apikey", "authorization", "cookie", "credential", "privatekey", "presharedkey", "psk")
 _DEVICE_FIELDS = (
     "name", "alias", "deviceAliasName", "hostName", "mac", "ip", "lastIp",
     "ipv6", "ipv6List", "online", "lastSeenAt", "onlineSince", "offlineAt",
@@ -52,6 +52,21 @@ def _rows(value: Any) -> List[Dict[str, Any]]:
 class ToolExecutor:
     def __init__(self, hub_runtime: Any):
         self.hub = hub_runtime
+        self._handlers: Dict[str, Any] = {}
+        self._previews: Dict[str, Any] = {}
+
+    def register_handler(self, tool_id: str, handler) -> None:
+        """Extension point for feature modules: attach an executable handler
+        for a catalogued tool id; the same risk/confirmation policy applies."""
+        if tool_spec(tool_id) is None:
+            raise ValueError(f"cannot register handler for unknown tool id: {tool_id}")
+        self._handlers[tool_id] = handler
+
+    def register_preview(self, tool_id: str, preview) -> None:
+        """Extension point: confirmation-card builder for a write tool."""
+        if tool_spec(tool_id) is None:
+            raise ValueError(f"cannot register preview for unknown tool id: {tool_id}")
+        self._previews[tool_id] = preview
 
     def validate(self, tool_id: str, arguments: Any) -> tuple[Dict[str, Any], Dict[str, Any]]:
         spec = tool_spec(tool_id)
@@ -154,6 +169,9 @@ class ToolExecutor:
         spec, args = self.validate(tool_id, arguments)
         if spec["risk"] != "write":
             raise ToolError("只读指令无需确认", "CONFIRMATION_NOT_REQUIRED", 409)
+        preview_fn = self._previews.get(tool_id)
+        if preview_fn is not None:
+            return preview_fn(self, args, client_context)
         if tool_id == "device.wol":
             device = self.resolve_device(args["device"])
             mac = str(device.get("mac") or "").strip()
@@ -219,6 +237,9 @@ class ToolExecutor:
         spec, args = self.validate(tool_id, arguments)
         if spec["risk"] == "write" and not allow_write:
             raise ToolError("该操作需要二次确认", "CONFIRMATION_REQUIRED", 409)
+        handler = self._handlers.get(tool_id)
+        if handler is not None:
+            return _sanitized(handler(self, args, client_context))
         if tool_id == "status.get":
             return {"status": _sanitized(self.hub.status_document())}
         if tool_id == "devices.list":
@@ -244,6 +265,35 @@ class ToolExecutor:
             if not isinstance(data, (dict, list)):
                 raise ToolError("防火墙缓存尚未同步，请稍后重试", "SNAPSHOT_UNAVAILABLE", 503)
             return {"revision": frame.get("revision"), "updatedAt": frame.get("updatedAt"), "rules": _sanitized(_rows(data))}
+        if tool_id == "events.list":
+            events = self.hub.load_json(self.hub.EVENTS_FILE, [])
+            rows = [dict(row) for row in events if isinstance(row, dict) and not row.get("deleted")]
+            try:
+                limit = int(args.get("limit") or 30)
+            except (TypeError, ValueError):
+                limit = 30
+            limit = max(1, min(100, limit))
+            return {"events": [_sanitized(row) for row in reversed(rows[-limit:])], "total": len(rows)}
+        if tool_id == "agent.status":
+            snapshot = getattr(self.hub, "agent_presence_snapshot", None)
+            if not callable(snapshot):
+                raise ToolError("Agent 状态尚未就绪", "AGENT_SNAPSHOT_UNAVAILABLE", 503)
+            return {"agent": _sanitized(snapshot())}
+        if tool_id == "stun.rules.list":
+            service = getattr(self.hub, "STUN_SERVICE", None)
+            if service is None:
+                raise ToolError("STUN 服务未启用", "SERVICE_UNAVAILABLE", 503)
+            document = service.rules_snapshot()
+            return {
+                "revision": document.get("revision"),
+                "updatedAt": document.get("updatedAt"),
+                "rules": _sanitized(document.get("rules") or []),
+            }
+        if tool_id == "wireguard.status":
+            service = getattr(self.hub, "WIREGUARD_SERVICE", None)
+            if service is None:
+                raise ToolError("WireGuard 服务未启用", "SERVICE_UNAVAILABLE", 503)
+            return {"wireguard": _sanitized(service.document())}
         if tool_id == "app.settings.get":
             return {"settings": self._client_context(client_context)["settings"]}
         if tool_id == "app.favorite.list":

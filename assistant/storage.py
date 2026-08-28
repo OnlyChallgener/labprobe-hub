@@ -4,7 +4,8 @@ from __future__ import annotations
 
 import json
 import sqlite3
-from datetime import datetime, timezone
+import time
+from datetime import datetime, timedelta, timezone
 from pathlib import Path
 from typing import Any, Dict, Optional
 
@@ -14,8 +15,18 @@ def utc_now() -> str:
 
 
 class AIStore:
+    # Bounded growth for chat history, audit rows and notifications. Usage rows
+    # are never pruned: they are the cumulative token audit trail and ~100
+    # bytes each, so a personal hub stays in the low MBs for years.
+    PRUNE_IDLE_CONVERSATION_DAYS = 90
+    PRUNE_MAX_MESSAGES = 2000
+    PRUNE_MAX_AUDIT_ROWS = 1000
+    PRUNE_MAX_NOTIFICATIONS = 500
+    PRUNE_INTERVAL_SEC = 86_400
+
     def __init__(self, db_path: Path):
         self.db_path = Path(db_path)
+        self._next_prune_monotonic = time.monotonic() + self.PRUNE_INTERVAL_SEC
 
     def _connect(self) -> sqlite3.Connection:
         conn = sqlite3.connect(str(self.db_path), timeout=15, isolation_level=None)
@@ -91,6 +102,44 @@ class AIStore:
             config_columns = {row["name"] for row in conn.execute("PRAGMA table_info(ai_config)")}
             if "enabled" not in config_columns:
                 conn.execute("ALTER TABLE ai_config ADD COLUMN enabled INTEGER NOT NULL DEFAULT 1")
+        self._maybe_prune()
+
+    def _maybe_prune(self) -> None:
+        now = time.monotonic()
+        if now < self._next_prune_monotonic:
+            return
+        self._next_prune_monotonic = now + self.PRUNE_INTERVAL_SEC
+        try:
+            self.prune_history()
+        except sqlite3.Error:
+            pass
+
+    def prune_history(self, *, idle_days: int = PRUNE_IDLE_CONVERSATION_DAYS,
+                      max_messages: int = PRUNE_MAX_MESSAGES,
+                      max_audit_rows: int = PRUNE_MAX_AUDIT_ROWS,
+                      max_notifications: int = PRUNE_MAX_NOTIFICATIONS) -> Dict[str, int]:
+        """Delete stale and overflowing AI rows; returns per-table delete counts."""
+        idle_cutoff = (datetime.now(timezone.utc) - timedelta(days=max(1, int(idle_days)))).isoformat(timespec="seconds")
+        deleted: Dict[str, int] = {}
+        with self._connect() as conn:
+            deleted["conversations"] = conn.execute(
+                "DELETE FROM conversations WHERE updated_at < ?", (idle_cutoff,),
+            ).rowcount
+            for table, keep in (("messages", max_messages), ("ai_tool_audit", max_audit_rows),
+                                ("ai_notifications", max_notifications)):
+                row = conn.execute(
+                    f"SELECT MIN(id) AS cutoff FROM (SELECT id FROM {table} ORDER BY id DESC LIMIT ?)",
+                    (max(0, int(keep)),),
+                ).fetchone()
+                cutoff_id = row["cutoff"] if row else None
+                if cutoff_id is not None:
+                    deleted[table] = conn.execute(
+                        f"DELETE FROM {table} WHERE id < ?", (cutoff_id,),
+                    ).rowcount
+            deleted["expired_confirmations"] = conn.execute(
+                "DELETE FROM ai_tool_confirmations WHERE status='pending' AND expires_at < ?", (utc_now(),),
+            ).rowcount
+        return deleted
 
     def get_config(self) -> Optional[Dict[str, Any]]:
         with self._connect() as conn:
@@ -145,6 +194,7 @@ class AIStore:
                 int(usage.get("prompt_tokens") or 0), int(usage.get("completion_tokens") or 0),
                 int(usage.get("total_tokens") or 0), status, int(bool(usage)),
                 json.dumps(usage, separators=(",", ":")) if usage else None, utc_now()))
+        self._maybe_prune()
 
     def usage_summary(self) -> Dict[str, int]:
         with self._connect() as conn:

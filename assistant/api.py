@@ -14,6 +14,8 @@ from .provider import OpenAICompatibleProvider, ProviderError, usage_from_chunk
 from .security import MasterKeyUnavailable, decrypt_secret, encrypt_secret, mask_secret
 from .storage import AIStore
 from .catalog import catalog, provider_tools, tool_id_from_function, tool_spec
+from .domains import register_builtin
+from .extend import drain_pending
 from .notifications import AssistantNotificationService
 from .tools import ToolError, ToolExecutor
 
@@ -23,9 +25,11 @@ MAX_MESSAGES = 40
 MAX_MESSAGE_CHARS = 32_000
 MAX_REQUEST_CHARS = 80_000
 TOOL_SYSTEM_PROMPT = (
-    "你是极客网探 Hub 助手。涉及当前网络、设备、IPv6、每日记录、防火墙或端口映射时，"
-    "必须调用提供的工具，不得猜测。只读工具可以直接调用；写入工具只能生成确认请求，"
-    "在收到工具执行成功结果前绝不能声称操作已经完成。回答使用简洁中文。"
+    "你是极客网探 Hub 助手，可以查看和控制整个网络：设备、事件、Agent/Relay、STUN 穿透、"
+    "WireGuard、路由器端口映射、IPv6、每日记录、防火墙，以及让 APP 跳转页面或刷新数据。"
+    "涉及查询时必须调用工具，不得猜测。只读工具可以直接调用；写入操作（新增/删除/启停端口映射"
+    "或穿透规则、升级 Agent）只能生成确认请求，在收到工具执行成功结果前绝不能声称操作已经完成。"
+    "回答使用简洁中文。"
 )
 
 
@@ -41,6 +45,13 @@ def create_ai_blueprint(*, check_app_token: Callable[[], bool], db_path, logger,
     store = AIStore(db_path)
     store.initialize()
     executor = ToolExecutor(hub_runtime) if hub_runtime is not None else None
+    if executor is not None:
+        # Feature modules attach tool handlers via the hub runtime during
+        # hub_entry install, before the first chat request arrives. Buffered
+        # registrations are drained here, then the built-in domains bind.
+        setattr(hub_runtime, "ASSISTANT_TOOL_EXECUTOR", executor)
+        drain_pending(executor)
+        register_builtin(executor)
     notification_service = None
     if hub_runtime is not None and enable_notifications:
         notification_service = AssistantNotificationService(hub_runtime, store, logger)
@@ -311,6 +322,7 @@ def create_ai_blueprint(*, check_app_token: Callable[[], bool], db_path, logger,
             internal_messages.insert(0, {"role": "system", "content": TOOL_SYSTEM_PROMPT})
         accumulated_usage: Dict[str, int] = {}
         executions: List[Dict[str, Any]] = []
+        client_actions: List[Dict[str, Any]] = []
         try:
             for _ in range(4):
                 result = provider.chat(internal_messages, tools=provider_tools() if executor is not None else None)
@@ -328,6 +340,7 @@ def create_ai_blueprint(*, check_app_token: Callable[[], bool], db_path, logger,
                         "message": {"role": "assistant", "content": result.content},
                         "usage": accumulated_usage,
                         "toolExecutions": executions,
+                        "clientActions": client_actions,
                     })
                 internal_messages.append(assistant_message)
                 for call in tool_calls[:4]:
@@ -367,12 +380,15 @@ def create_ai_blueprint(*, check_app_token: Callable[[], bool], db_path, logger,
                                     "message": {"role": "assistant", "content": content},
                                     "usage": accumulated_usage,
                                     "toolExecutions": executions,
+                                    "clientActions": client_actions,
                                     "confirmation": {"confirmationId": confirmation_id, "expiresAt": expires_at, "preview": preview},
                                 })
                         else:
                             try:
                                 tool_result = require_executor().execute(tool_id, arguments, client_context=client_context)
                                 tool_payload = {"ok": True, "result": tool_result}
+                                if isinstance(tool_result, dict) and isinstance(tool_result.get("clientAction"), dict):
+                                    client_actions.append(tool_result["clientAction"])
                                 store.add_tool_audit(call_id, tool_id, str(spec["risk"]), "completed", arguments, tool_result)
                             except ToolError as exc:
                                 tool_payload = {"ok": False, "code": exc.code, "error": str(exc)}
