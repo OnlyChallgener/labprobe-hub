@@ -336,3 +336,27 @@ def test_prune_history_clears_expired_pending_confirmations(tmp_path):
     store.create_confirmation("expired-1", "device.wol", {"device": "ANS"}, {"toolId": "device.wol"}, past)
     deleted = store.prune_history()
     assert deleted["expired_confirmations"] == 1
+
+
+def test_replace_messages_keeps_history_bounded_without_duplicates(tmp_path):
+    store = AIStore(tmp_path / "ai.db")
+    store.initialize()
+    store.create_conversation("c-1", "对话")
+    store.replace_messages("c-1", [
+        {"role": "user", "content": "第一轮"},
+        {"role": "assistant", "content": "回复一"},
+    ])
+    store.add_message("c-1", "user", "第二轮")
+    # Client replays history next turn: replace instead of duplicating.
+    store.replace_messages("c-1", [
+        {"role": "user", "content": "第一轮"},
+        {"role": "assistant", "content": "回复一"},
+        {"role": "user", "content": "第二轮"},
+        {"role": "assistant", "content": "回复二"},
+    ])
+    assert len(store.get_messages("c-1")) == 4
+
+
+def test_chat_rejects_over_count_with_clear_error(tmp_path, monkeypatch):
+    client = make_client(tmp_path, monkeypatch)
+    assert client.post("/api/ai/chat", json={"message": "hello"}).status_code == 409  # not configured

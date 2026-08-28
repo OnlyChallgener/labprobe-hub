@@ -103,7 +103,8 @@ def test_builtin_domains_are_catalogued_and_bound():
         assert executor._handlers.get(tool_id) is not None
     for tool_id in PREVIEWS:
         assert executor._previews.get(tool_id) is not None
-    assert set(NAVIGATE_ROUTES) <= {"home", "devices", "router", "tools", "ai_chat", "favorites", "settings", "stun", "wireguard", "roaming"}
+    assert set(NAVIGATE_ROUTES) <= {"home", "devices", "router", "tools", "ai_chat", "favorites",
+                                    "settings", "stun", "wireguard", "ipv6", "portmap", "ddns", "nat", "wol"}
 
 
 def test_write_tool_requires_confirmation():

@@ -24,7 +24,8 @@ from typing import Any, Dict, List
 from . import catalog
 from .tools import ToolError
 
-NAVIGATE_ROUTES = ("home", "devices", "router", "tools", "ai_chat", "favorites", "settings", "stun", "wireguard", "roaming")
+NAVIGATE_ROUTES = ("home", "devices", "router", "tools", "ai_chat", "favorites", "settings",
+                   "stun", "wireguard", "ipv6", "portmap", "ddns", "nat", "wol")
 
 
 def _spec(tool_id: str, name: str, description: str, examples: List[str], scope: str,
@@ -141,8 +142,8 @@ _SPECS: List[Dict[str, Any]] = [
     ),
     _spec(
         "app.navigate", "打开 APP 页面",
-        "让 APP 跳转到指定页面，如设备、路由器、工具或 AI 助手。",
-        ["打开路由器页面", "带我去工具页"],
+        "让 APP 跳转到指定页面。理解近似说法：IPv6 设置、网络自检、NAT 诊断、端口映射、DDNS、STUN、WireGuard、WOL 等，映射到最接近的页面。",
+        ["打开ipv6设置", "去网络自检", "看看NAT诊断", "打开端口映射"],
         "app.action", "read", "none",
         {
             "type": "object",
@@ -176,14 +177,19 @@ STUN_VIEW_FIELDS = ("id", "name", "listenPort", "targetIpv4", "targetPort", "tra
 PORTMAP_VIEW_FIELDS = ("id", "name", "mode", "listenPort", "targetIpv4", "targetPort", "transportProtocol", "enabled", "updatedAt")
 
 
+def _normalize_rule_text(value: Any) -> str:
+    return "".join(str(value or "").lower().split())
+
+
 def _resolve_rule(rows: List[Dict[str, Any]], needle: str, kind: str) -> Dict[str, Any]:
-    query = str(needle or "").strip().lower()
+    query = _normalize_rule_text(needle)
     if not query:
         raise ToolError(f"请提供{kind}规则 ID 或名称", "RULE_REQUIRED")
-    keys = lambda row: {str(row.get("id") or "").lower(), str(row.get("name") or "").lower()}  # noqa: E731
+    def keys(row: Dict[str, Any]) -> set:
+        return {_normalize_rule_text(row.get("id")), _normalize_rule_text(row.get("name"))}
     matches = [row for row in rows if query in keys(row)]
     if not matches:
-        matches = [row for row in rows if query in str(row.get("name") or "").lower()]
+        matches = [row for row in rows if query in _normalize_rule_text(row.get("name"))]
     if not matches:
         raise ToolError(f"没有找到{kind}规则：{needle}", "RULE_NOT_FOUND", 404)
     if len(matches) > 1:

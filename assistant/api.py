@@ -21,7 +21,7 @@ from .tools import ToolError, ToolExecutor
 
 DEFAULT_BASE_URL = "https://api.deepseek.com"
 DEFAULT_MODEL = "deepseek-v4-flash"
-MAX_MESSAGES = 40
+MAX_MESSAGES = 80
 MAX_MESSAGE_CHARS = 32_000
 MAX_REQUEST_CHARS = 80_000
 TOOL_SYSTEM_PROMPT = (
@@ -124,7 +124,8 @@ def create_ai_blueprint(*, check_app_token: Callable[[], bool], db_path, logger,
             limit = int(request.args.get("limit", 50))
         except (TypeError, ValueError):
             return jsonify({"error": "limit must be an integer"}), 400
-        return jsonify({**store.usage_summary(), "recent": store.list_usage(limit)})
+        return jsonify({**store.usage_summary(), "recent": store.list_usage(limit),
+                        "daily": store.usage_daily(14), "storage": store.conversation_storage()})
 
     @bp.get("/conversations")
     def list_conversations():
@@ -276,8 +277,10 @@ def create_ai_blueprint(*, check_app_token: Callable[[], bool], db_path, logger,
         supplied = body.get("messages")
         if supplied is None and isinstance(body.get("message"), str):
             supplied = [{"role": "user", "content": body["message"]}]
-        if not isinstance(supplied, list) or not supplied or len(supplied) > MAX_MESSAGES:
+        if not isinstance(supplied, list) or not supplied:
             return jsonify({"error": "messages must be a non-empty list"}), 400
+        if len(supplied) > MAX_MESSAGES:
+            return jsonify({"error": f"messages exceed the count limit (max {MAX_MESSAGES}); send only the latest turns"}), 400
         messages: List[Dict[str, str]] = []
         total_chars = 0
         for item in supplied:
@@ -298,8 +301,9 @@ def create_ai_blueprint(*, check_app_token: Callable[[], bool], db_path, logger,
             return jsonify({"error": str(exc)}), 503
         conversation_id = str(body.get("conversationId") or uuid.uuid4())
         store.create_conversation(conversation_id)
-        for message in messages:
-            store.add_message(conversation_id, message["role"], message["content"])
+        # The APP replays the visible history on every turn; replace stored
+        # history instead of re-inserting it, or rows duplicate per request.
+        store.replace_messages(conversation_id, messages)
         provider = OpenAICompatibleProvider(row["base_url"], key, row["model"])
         if body.get("stream"):
             def generate():

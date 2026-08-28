@@ -31,8 +31,20 @@ def usage_from_chunk(chunk: Dict[str, Any]) -> Optional[Dict[str, int]]:
     usage = chunk.get("usage")
     if not isinstance(usage, dict):
         return None
-    return {key: int(usage[key]) for key in ("prompt_tokens", "completion_tokens", "total_tokens")
-            if key in usage and usage[key] is not None}
+    values: Dict[str, int] = {key: int(usage[key]) for key in ("prompt_tokens", "completion_tokens", "total_tokens")
+                              if key in usage and usage[key] is not None}
+    # Cache-hit reporting: DeepSeek names them prompt_cache_*; Anthropic-style
+    # providers use cache_read/cache_creation. Normalise into hit/miss pairs.
+    hit = usage.get("prompt_cache_hit_tokens", usage.get("cache_read_input_tokens"))
+    miss = usage.get("prompt_cache_miss_tokens", usage.get("cache_creation_input_tokens"))
+    try:
+        if hit is not None:
+            values["cache_hit_tokens"] = int(hit)
+        if miss is not None:
+            values["cache_miss_tokens"] = int(miss)
+    except (TypeError, ValueError):
+        pass
+    return values or None
 
 
 @dataclass

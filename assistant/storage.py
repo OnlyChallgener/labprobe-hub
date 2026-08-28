@@ -99,6 +99,10 @@ class AIStore:
                 conn.execute("ALTER TABLE ai_usage ADD COLUMN usage_known INTEGER NOT NULL DEFAULT 0")
             if "usage_json" not in columns:
                 conn.execute("ALTER TABLE ai_usage ADD COLUMN usage_json TEXT")
+            if "cache_hit_tokens" not in columns:
+                conn.execute("ALTER TABLE ai_usage ADD COLUMN cache_hit_tokens INTEGER NOT NULL DEFAULT 0")
+            if "cache_miss_tokens" not in columns:
+                conn.execute("ALTER TABLE ai_usage ADD COLUMN cache_miss_tokens INTEGER NOT NULL DEFAULT 0")
             config_columns = {row["name"] for row in conn.execute("PRAGMA table_info(ai_config)")}
             if "enabled" not in config_columns:
                 conn.execute("ALTER TABLE ai_config ADD COLUMN enabled INTEGER NOT NULL DEFAULT 1")
@@ -186,15 +190,71 @@ class AIStore:
                          (conversation_id, role, content, utc_now()))
             conn.execute("UPDATE conversations SET updated_at=? WHERE id=?", (utc_now(), conversation_id))
 
+    def replace_messages(self, conversation_id: str, messages: List[Dict[str, str]]) -> None:
+        """Make stored history match exactly what the client sent.
+
+        The APP replays the visible history on every turn; re-inserting it
+        verbatim duplicates rows on every request, so each send replaces the
+        conversation's stored history in one transaction."""
+        now = utc_now()
+        with self._connect() as conn:
+            conn.execute("BEGIN IMMEDIATE")
+            try:
+                conn.execute("DELETE FROM messages WHERE conversation_id=?", (conversation_id,))
+                conn.executemany(
+                    "INSERT INTO messages(conversation_id,role,content,created_at) VALUES(?,?,?,?)",
+                    [(conversation_id, str(m["role"]), str(m["content"]), now) for m in messages],
+                )
+                conn.execute("UPDATE conversations SET updated_at=? WHERE id=?", (now, conversation_id))
+                conn.execute("COMMIT")
+            except Exception:
+                conn.execute("ROLLBACK")
+                raise
+
     def add_usage(self, conversation_id: str, provider: str, model: str, usage: Dict[str, Any],
                   status: str = "completed") -> None:
         with self._connect() as conn:
-            conn.execute("""INSERT INTO ai_usage(conversation_id,provider,model,prompt_tokens,completion_tokens,total_tokens,status,usage_known,usage_json,created_at)
-                VALUES(?,?,?,?,?,?,?,?,?,?)""", (conversation_id, provider, model,
+            conn.execute("""INSERT INTO ai_usage(conversation_id,provider,model,prompt_tokens,completion_tokens,total_tokens,status,usage_known,usage_json,cache_hit_tokens,cache_miss_tokens,created_at)
+                VALUES(?,?,?,?,?,?,?,?,?,?,?,?)""", (conversation_id, provider, model,
                 int(usage.get("prompt_tokens") or 0), int(usage.get("completion_tokens") or 0),
                 int(usage.get("total_tokens") or 0), status, int(bool(usage)),
-                json.dumps(usage, separators=(",", ":")) if usage else None, utc_now()))
+                json.dumps(usage, separators=(",", ":")) if usage else None,
+                int(usage.get("cache_hit_tokens") or 0), int(usage.get("cache_miss_tokens") or 0), utc_now()))
         self._maybe_prune()
+
+    def usage_daily(self, days: int = 14) -> List[Dict[str, Any]]:
+        """Per-Beijing-day token totals for the usage trend chart (oldest first)."""
+        bounded = max(1, min(int(days), 60))
+        window = (f'-{bounded} days',)
+        with self._connect() as conn:
+            rows = conn.execute(
+                "SELECT date(datetime(created_at, '+8 hours')) AS day,"
+                " COUNT(*) AS requests,"
+                " COALESCE(SUM(total_tokens),0) AS total_tokens,"
+                " COALESCE(SUM(cache_hit_tokens),0) AS cache_hit_tokens,"
+                " COALESCE(SUM(cache_miss_tokens),0) AS cache_miss_tokens"
+                " FROM ai_usage"
+                " WHERE created_at >= datetime('now', ?, '-8 hours')"
+                " GROUP BY day ORDER BY day", window,
+            ).fetchall()
+            models = conn.execute(
+                "SELECT date(datetime(created_at, '+8 hours')) AS day, model,"
+                " COALESCE(SUM(total_tokens),0) AS total_tokens"
+                " FROM ai_usage"
+                " WHERE created_at >= datetime('now', ?, '-8 hours')"
+                " GROUP BY day, model", window,
+            ).fetchall()
+        model_map: Dict[str, Dict[str, int]] = {}
+        for row in models:
+            model_map.setdefault(row["day"], {})[row["model"]] = int(row["total_tokens"])
+        return [{
+            "date": row["day"],
+            "requests": int(row["requests"]),
+            "total_tokens": int(row["total_tokens"]),
+            "cache_hit_tokens": int(row["cache_hit_tokens"]),
+            "cache_miss_tokens": int(row["cache_miss_tokens"]),
+            "models": model_map.get(row["day"], {}),
+        } for row in rows]
 
     def usage_summary(self) -> Dict[str, int]:
         with self._connect() as conn:
@@ -209,6 +269,19 @@ class AIStore:
         result["today_requests"] = int(today["requests"] or 0)
         result["today_total_tokens"] = int(today["total_tokens"] or 0)
         return result
+
+    def conversation_storage(self) -> Dict[str, int]:
+        """How much space the stored AI conversations occupy."""
+        with self._connect() as conn:
+            row = conn.execute(
+                "SELECT COUNT(DISTINCT conversation_id) AS conversations, COUNT(*) AS messages,"
+                " COALESCE(SUM(LENGTH(content)),0) AS bytes FROM messages"
+            ).fetchone()
+        return {
+            "conversations": int(row["conversations"] or 0),
+            "messages": int(row["messages"] or 0),
+            "bytes": int(row["bytes"] or 0),
+        }
 
     def list_usage(self, limit: int = 50) -> list[Dict[str, Any]]:
         """Return a bounded metadata-only task list for the usage API."""
