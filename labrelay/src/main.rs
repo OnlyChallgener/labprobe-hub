@@ -288,6 +288,33 @@ impl Manager {
         }
     }
 
+    async fn restore_previous_rule(&self, id: &str, previous: Option<&Rule>) -> Result<()> {
+        match previous {
+            Some(old) => {
+                self.rules
+                    .write()
+                    .await
+                    .insert(id.to_string(), old.clone());
+                self.persist().await.context("persist previous rule")?;
+                if old.enabled {
+                    self.start_rule(id)
+                        .await
+                        .context("restart previous runtime")?;
+                } else {
+                    self.stop_runtime(id, true).await;
+                    self.set_cached_state(old, "stopped", "").await;
+                }
+            }
+            None => {
+                self.rules.write().await.remove(id);
+                self.persist().await.context("remove failed new rule")?;
+                self.stop_runtime(id, false).await;
+                self.last_status.write().await.remove(id);
+            }
+        }
+        Ok(())
+    }
+
     async fn upsert(&self, mut rule: Rule) -> Result<Value> {
         normalize_rule(&mut rule);
         validate_rule(&rule, self.port_min, self.port_max)?;
@@ -306,26 +333,38 @@ impl Manager {
             }
         }
         self.rules.write().await.insert(id.clone(), rule);
-        self.persist().await?;
+        if let Err(error) = self.persist().await {
+            match previous.as_ref() {
+                Some(old) => {
+                    self.rules.write().await.insert(id.clone(), old.clone());
+                }
+                None => {
+                    self.rules.write().await.remove(&id);
+                }
+            }
+            return Err(error.context("persist new rule"));
+        }
         if enabled {
             if let Err(error) = self.start_rule(&id).await {
-                // Do not leave a previously working rule replaced by a failed
-                // rebind. Restore its desired configuration and best-effort
-                // runtime so Hub reconciliation can observe the real state.
-                if let Some(old) = previous {
-                    self.rules.write().await.insert(id.clone(), old.clone());
-                    self.persist().await?;
-                    if old.enabled {
-                        let _ = self.start_rule(&id).await;
+                if let Err(restore_error) = self
+                    .restore_previous_rule(&id, previous.as_ref())
+                    .await
+                {
+                    let combined = format!(
+                        "new runtime start failed: {error:#}; previous runtime restore failed: {restore_error:#}"
+                    );
+                    if let Some(current) = self.rules.read().await.get(&id).cloned() {
+                        self.set_cached_state(&current, "error", &combined).await;
                     }
-                } else {
-                    self.rules.write().await.remove(&id);
-                    self.persist().await?;
+                    return Err(anyhow!(combined));
                 }
                 return Err(error);
             }
         } else {
-            self.stop_rule(&id, true).await?;
+            self.stop_runtime(&id, true).await;
+            if let Some(current) = self.rules.read().await.get(&id).cloned() {
+                self.set_cached_state(&current, "stopped", "").await;
+            }
         }
         Ok(json!({"ok": true, "id": id}))
     }
@@ -358,10 +397,14 @@ impl Manager {
             } else {
                 format!("[::]:{}", rule.listen_port)
             },
-            resolved_target: previous
-                .as_ref()
-                .map(|x| x.resolved_target.clone())
-                .unwrap_or_default(),
+            resolved_target: if rule.kind == "stun" {
+                String::new()
+            } else {
+                previous
+                    .as_ref()
+                    .map(|x| x.resolved_target.clone())
+                    .unwrap_or_default()
+            },
             active_connections: 0,
             active_peers: 0,
             total_upload_bytes: previous.as_ref().map(|x| x.total_upload_bytes).unwrap_or(0),
@@ -381,16 +424,32 @@ impl Manager {
             expires_at: rule.expires_at,
             last_resolved_at: None,
             last_error: String::new(),
-            public_endpoint: previous
-                .as_ref()
-                .map(|x| x.public_endpoint.clone())
-                .unwrap_or_default(),
-            public_ip: previous
-                .as_ref()
-                .map(|x| x.public_ip.clone())
-                .unwrap_or_default(),
-            public_port: previous.as_ref().map(|x| x.public_port).unwrap_or(0),
-            mapping_updated_at: previous.as_ref().and_then(|x| x.mapping_updated_at),
+            public_endpoint: if rule.kind == "stun" {
+                String::new()
+            } else {
+                previous
+                    .as_ref()
+                    .map(|x| x.public_endpoint.clone())
+                    .unwrap_or_default()
+            },
+            public_ip: if rule.kind == "stun" {
+                String::new()
+            } else {
+                previous
+                    .as_ref()
+                    .map(|x| x.public_ip.clone())
+                    .unwrap_or_default()
+            },
+            public_port: if rule.kind == "stun" {
+                0
+            } else {
+                previous.as_ref().map(|x| x.public_port).unwrap_or(0)
+            },
+            mapping_updated_at: if rule.kind == "stun" {
+                None
+            } else {
+                previous.as_ref().and_then(|x| x.mapping_updated_at)
+            },
         };
         let shared = Arc::new(RuntimeShared::new(snapshot));
         let target = Arc::new(RwLock::new(
@@ -403,7 +462,7 @@ impl Manager {
         let target_task = target.clone();
         let rule_task = rule.clone();
         let lan_if = self.lan_if.clone();
-        let join = match rule.transport_protocol.as_str() {
+        let mut join = match rule.transport_protocol.as_str() {
             // Lucky's direct TCP path deliberately does not listen/proxy on
             // this port.  The router's native port mapping delivers inbound
             // traffic straight to the selected LAN service, while this socket
@@ -465,6 +524,36 @@ impl Manager {
             },
             _ => unreachable!("validate_rule normalizes transportProtocol"),
         };
+        if rule.kind == "stun" {
+            let confirmation = timeout(Duration::from_secs(30), async {
+                loop {
+                    let current = shared.snapshot().await;
+                    if current.state == "mapped" && !current.public_endpoint.is_empty() {
+                        return Ok(());
+                    }
+                    if !current.last_error.is_empty() {
+                        bail!(current.last_error);
+                    }
+                    sleep(Duration::from_millis(100)).await;
+                }
+            })
+            .await;
+            let startup_error = match confirmation {
+                Ok(Ok(())) => None,
+                Ok(Err(error)) => Some(error),
+                Err(_) => Some(anyhow!("STUN startup confirmation timed out")),
+            };
+            if let Some(error) = startup_error {
+                let _ = cancel_tx.send(true);
+                if timeout(Duration::from_secs(3), &mut join).await.is_err() {
+                    join.abort();
+                    let _ = join.await;
+                }
+                self.set_cached_state(&rule, "error", &error.to_string())
+                    .await;
+                return Err(error.context("confirm first STUN binding"));
+            }
+        }
         self.runtimes.lock().await.insert(
             id.to_string(),
             RuntimeHandle {
@@ -1747,10 +1836,20 @@ async fn unix_server_fixed(manager: Manager, socket_path: PathBuf) -> Result<()>
     }
 }
 
+fn ctl_read_timeout(request: &Value) -> Duration {
+    let is_stun_upsert = request.get("action").and_then(Value::as_str) == Some("upsert")
+        && request
+            .get("rule")
+            .and_then(|rule| rule.get("kind"))
+            .and_then(Value::as_str)
+            == Some("stun");
+    Duration::from_secs(if is_stun_upsert { 70 } else { 8 })
+}
+
 pub(crate) fn ctl_request(socket_path: &Path, request: &Value) -> Result<Value> {
     let mut stream = std::os::unix::net::UnixStream::connect(socket_path)
         .with_context(|| format!("connect {}", socket_path.display()))?;
-    stream.set_read_timeout(Some(Duration::from_secs(8)))?;
+    stream.set_read_timeout(Some(ctl_read_timeout(request)))?;
     stream.set_write_timeout(Some(Duration::from_secs(3)))?;
     stream.write_all(format!("{}\n", request).as_bytes())?;
     let mut line = String::new();
@@ -2325,6 +2424,87 @@ mod tests {
         normalize_rule(&mut rule);
         validate_rule(&rule, 20000, 20020).unwrap();
         assert_eq!(rule.forward_mode, "router_native");
+    }
+
+    #[test]
+    fn only_stun_upsert_extends_the_local_control_timeout() {
+        assert_eq!(
+            ctl_read_timeout(&json!({"action": "upsert", "rule": {"kind": "stun"}})),
+            Duration::from_secs(70)
+        );
+        assert_eq!(
+            ctl_read_timeout(&json!({"action": "upsert", "rule": {"kind": "portmap"}})),
+            Duration::from_secs(8)
+        );
+        assert_eq!(
+            ctl_read_timeout(&json!({"action": "status", "scope": "stun"})),
+            Duration::from_secs(8)
+        );
+    }
+
+    #[tokio::test]
+    async fn upsert_persist_failure_restores_previous_rule_in_memory() {
+        let root = std::env::temp_dir().join(format!(
+            "labrelay-stun-persist-{}-{}",
+            std::process::id(),
+            now_epoch()
+        ));
+        fs::create_dir_all(&root).unwrap();
+        let config_path = root.join("config.json");
+        fs::create_dir(&config_path).unwrap();
+        let state_path = root.join("state.json");
+        let previous = Rule {
+            id: "stun-persist".into(),
+            name: "Previous".into(),
+            enabled: false,
+            kind: "stun".into(),
+            mode: "stun".into(),
+            listen_port: 20001,
+            target_mode: "ipv4".into(),
+            target_ipv4: "192.168.5.46".into(),
+            target_port: 443,
+            transport_protocol: "TCP".into(),
+            forward_mode: "router_native".into(),
+            ..Rule::default()
+        };
+        let manager = Manager {
+            rules: Arc::new(RwLock::new(HashMap::from([(
+                previous.id.clone(),
+                previous.clone(),
+            )]))),
+            runtimes: Arc::new(Mutex::new(HashMap::new())),
+            operation_lock: Arc::new(Mutex::new(())),
+            last_status: Arc::new(RwLock::new(HashMap::new())),
+            config_path,
+            state_path,
+            port_min: 20000,
+            port_max: 20020,
+            lan_if: "lan".into(),
+        };
+        let replacement = Rule {
+            name: "Replacement".into(),
+            target_port: 8443,
+            ..previous.clone()
+        };
+
+        let error = manager.upsert(replacement).await.unwrap_err();
+
+        assert!(format!("{error:#}").contains("persist new rule"));
+        assert_eq!(
+            manager.rules.read().await.get("stun-persist").unwrap().name,
+            "Previous"
+        );
+        assert_eq!(
+            manager
+                .rules
+                .read()
+                .await
+                .get("stun-persist")
+                .unwrap()
+                .target_port,
+            443
+        );
+        fs::remove_dir_all(&root).unwrap();
     }
 
     #[tokio::test]

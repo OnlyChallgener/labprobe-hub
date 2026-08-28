@@ -1,5 +1,6 @@
 from pathlib import Path
 from types import SimpleNamespace
+import copy
 import threading
 
 from flask import Flask
@@ -18,14 +19,20 @@ class _Client:
         self.cache = _Cache()
         self.rules = []
         self.native_rules = []
+        self.firewall_reads = 0
+        self.native_reads = 0
+        self.rpc_calls = []
 
     def firewall(self, _force=False):
+        self.firewall_reads += 1
         return {"list": [dict(row) for row in self.rules], "maxLen": 20}
 
     def native_port_mapping(self, _force=False):
+        self.native_reads += 1
         return {"portMapping": [dict(row) for row in self.native_rules]}
 
     def rpc(self, operation, module, payload):
+        self.rpc_calls.append((operation, module, copy.deepcopy(payload)))
         if module == "ip_firewall":
             if operation == "devConfig.add":
                 for row in payload["list"]:
@@ -64,6 +71,23 @@ def _hub(tmp_path):
         check_read_token=lambda: True,
         check_hook_token=lambda: True,
     )
+
+
+def _running_rule(tmp_path, payload=None):
+    hub = _hub(tmp_path)
+    client = _Client()
+    service = StunService(hub, client)
+    rule = service.clean_rule(payload or {
+        "serviceType": "HTTPS",
+        "targetIpv4": "192.168.5.46",
+        "targetPort": 443,
+        "name": "家庭 HTTPS",
+    })
+    assert service.ensure_native_mapping(rule)["state"] == "ready"
+    service._save_rules([rule])
+    service._save_commands([])
+    hub.app.register_blueprint(create_stun_blueprint(hub, service))
+    return hub, client, service, rule, hub.app.test_client()
 
 
 def test_service_templates_choose_protocol_and_skip_portmap_reservation(tmp_path):
@@ -197,6 +221,209 @@ def test_protocol_change_reallocates_a_listen_port_that_conflicts_in_new_protoco
 
     assert updated["transportProtocol"] == "UDP"
     assert updated["listenPort"] != old["listenPort"]
+
+
+def test_running_rule_name_only_save_does_not_touch_router_or_queue_reapply(tmp_path):
+    _, router, service, rule, app = _running_rule(tmp_path)
+    rule["stunServer"] = "stun.internal.example:3478"
+    service._save_rules([rule])
+    reads_before = (router.native_reads, router.firewall_reads)
+    writes_before = list(router.rpc_calls)
+
+    response = app.put(f"/api/stun/{rule['id']}", json={"name": "新的备注"})
+
+    assert response.status_code == 200
+    assert service._document()["rules"][0]["name"] == "新的备注"
+    assert service._document()["rules"][0]["stunServer"] == "stun.internal.example:3478"
+    assert (router.native_reads, router.firewall_reads) == reads_before
+    assert router.rpc_calls == writes_before
+    assert service._commands() == []
+
+
+def test_target_port_change_updates_mapping_and_queues_exactly_one_upsert(tmp_path):
+    _, router, service, rule, app = _running_rule(tmp_path)
+
+    response = app.put(f"/api/stun/{rule['id']}", json={"targetPort": 8443})
+
+    assert response.status_code == 200
+    assert router.native_rules[0]["destPort"] == "8443"
+    commands = service._commands()
+    assert len(commands) == 1
+    assert commands[0]["action"] == "upsert"
+    assert commands[0]["payload"]["rule"]["targetPort"] == 8443
+
+
+def test_target_ipv4_change_updates_mapping_and_queues_exactly_one_upsert(tmp_path):
+    _, router, service, rule, app = _running_rule(tmp_path)
+
+    response = app.put(f"/api/stun/{rule['id']}", json={"targetIpv4": "192.168.5.47"})
+
+    assert response.status_code == 200
+    assert router.native_rules[0]["destIp"] == "192.168.5.47"
+    commands = service._commands()
+    assert len(commands) == 1
+    assert commands[0]["payload"]["rule"]["targetIpv4"] == "192.168.5.47"
+
+
+def test_protocol_change_uses_controlled_reapply_and_one_command(tmp_path):
+    _, router, service, rule, app = _running_rule(tmp_path, {
+        "serviceType": "OpenVPN",
+        "transportProtocol": "TCP",
+        "targetIpv4": "192.168.5.46",
+        "targetPort": 1194,
+    })
+
+    response = app.put(
+        f"/api/stun/{rule['id']}",
+        json={"serviceType": "OpenVPN", "transportProtocol": "UDP"},
+    )
+
+    assert response.status_code == 200
+    assert router.native_rules[0]["proto"] == "udp"
+    commands = service._commands()
+    assert len(commands) == 1
+    assert commands[0]["payload"]["rule"]["transportProtocol"] == "UDP"
+
+
+def test_mapping_update_failure_restores_mapping_desired_and_commands(tmp_path):
+    _, router, service, rule, app = _running_rule(tmp_path)
+    desired_before = copy.deepcopy(service._document())
+    commands_before = copy.deepcopy(service._commands())
+    mapping_before = copy.deepcopy(router.native_rules)
+    original_rpc = router.rpc
+    fail_once = {"value": True}
+
+    def fail_after_native_update(operation, module, payload):
+        if operation == "devConfig.update" and module == "port_mapping" and fail_once["value"]:
+            fail_once["value"] = False
+            original_rpc(operation, module, payload)
+            raise RuntimeError("router update interrupted")
+        return original_rpc(operation, module, payload)
+
+    router.rpc = fail_after_native_update
+    response = app.put(f"/api/stun/{rule['id']}", json={"targetPort": 8443})
+
+    assert response.status_code == 400
+    assert "router update interrupted" in response.get_json()["error"]
+    assert service._document() == desired_before
+    assert service._commands() == commands_before
+    assert router.native_rules == mapping_before
+
+
+def test_desired_save_failure_restores_native_mapping(tmp_path):
+    hub, router, service, rule, app = _running_rule(tmp_path)
+    desired_before = copy.deepcopy(service._document())
+    mapping_before = copy.deepcopy(router.native_rules)
+    original_save = hub.save_json
+    fail_once = {"value": True}
+
+    def fail_new_desired(path, value):
+        if Path(path) == service.rules_path and fail_once["value"] and value.get("revision") == desired_before["revision"] + 1:
+            fail_once["value"] = False
+            original_save(path, value)
+            raise OSError("desired store unavailable")
+        original_save(path, value)
+
+    hub.save_json = fail_new_desired
+    response = app.put(f"/api/stun/{rule['id']}", json={"targetPort": 8443})
+
+    assert response.status_code == 400
+    assert "desired store unavailable" in response.get_json()["error"]
+    assert service._document() == desired_before
+    assert service._commands() == []
+    assert router.native_rules == mapping_before
+
+
+def test_command_save_failure_restores_desired_and_native_mapping(tmp_path):
+    hub, router, service, rule, app = _running_rule(tmp_path)
+    desired_before = copy.deepcopy(hub.load_json(service.rules_path, {}))
+    desired_before["transactionMarker"] = "preserve-exactly"
+    hub.save_json(service.rules_path, copy.deepcopy(desired_before))
+    commands_before = {"commands": [], "transactionMarker": "preserve-exactly"}
+    hub.save_json(service.commands_path, copy.deepcopy(commands_before))
+    mapping_before = copy.deepcopy(router.native_rules)
+    original_save = hub.save_json
+    fail_once = {"value": True}
+
+    def fail_new_command(path, value):
+        if Path(path) == service.commands_path and fail_once["value"]:
+            fail_once["value"] = False
+            original_save(path, value)
+            raise OSError("command store unavailable")
+        original_save(path, value)
+
+    hub.save_json = fail_new_command
+    response = app.put(f"/api/stun/{rule['id']}", json={"targetIpv4": "192.168.5.47"})
+
+    assert response.status_code == 400
+    assert "command store unavailable" in response.get_json()["error"]
+    assert hub.load_json(service.rules_path, {}) == desired_before
+    assert service._command_document() == commands_before
+    assert router.native_rules == mapping_before
+
+
+def test_old_failed_ack_cannot_override_new_revision_sync_state(tmp_path):
+    _, _, service, rule, app = _running_rule(tmp_path)
+    first = app.put(f"/api/stun/{rule['id']}", json={"targetPort": 8443})
+    assert first.status_code == 200
+    delivered = app.get("/api/router/stun/commands?router=router").get_json()["commands"]
+    old_command = delivered[0]
+
+    second = app.put(f"/api/stun/{rule['id']}", json={"targetIpv4": "192.168.5.47"})
+    assert second.status_code == 200
+    current_revision = service._document()["revision"]
+    assert current_revision > old_command["revision"]
+
+    ack = app.post(
+        "/api/router/stun/ack?router=router",
+        json={"acks": [{"id": old_command["id"], "ok": False, "result": {"error": "old apply failed"}}]},
+    )
+    assert ack.status_code == 200
+    assert service._document()["rules"][0]["targetIpv4"] == "192.168.5.47"
+    assert service.rows()[0]["syncError"] == ""
+    commands = service._commands()
+    assert len(commands) == 1
+    assert commands[0]["revision"] == current_revision
+
+
+def test_runtime_rule_mismatch_cannot_report_ready_but_keeps_endpoint_history(tmp_path):
+    hub, _, service, rule, _ = _running_rule(tmp_path)
+    stale_rule = {**rule, "targetPort": 9443}
+    hub.save_json(service.status_path, {
+        "status": {"rules": [{
+            "rule": stale_rule,
+            "runtime": {
+                "id": rule["id"],
+                "state": "mapped",
+                "publicEndpoint": "203.0.113.9:20001",
+            },
+        }]},
+    })
+
+    current = service.rows()[0]
+    assert current["actualState"] == "mapping"
+    assert current["runtime"]["publicEndpoint"] == "203.0.113.9:20001"
+
+
+def test_status_reconciliation_reuses_same_command_id_for_same_revision(tmp_path):
+    _, _, service, rule, app = _running_rule(tmp_path)
+    payload = {"rules": []}
+
+    assert app.post("/api/router/stun/status?router=router", json=payload).status_code == 200
+    first = service._commands()
+    assert len(first) == 1
+    same_revision = service.queue(
+        "stop",
+        {"id": rule["id"]},
+        revision=service._document()["revision"],
+    )
+    assert same_revision["id"] == first[0]["id"]
+    assert app.post("/api/router/stun/status?router=router", json=payload).status_code == 200
+    second = service._commands()
+
+    assert len(second) == 1
+    assert second[0]["id"] == first[0]["id"]
+    assert second[0]["revision"] == service._document()["revision"]
 
 
 def test_rows_expose_agent_and_native_mapping_errors_and_stop_disabled_runtime(tmp_path):

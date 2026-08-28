@@ -10,6 +10,7 @@ router iptables directly.
 """
 from __future__ import annotations
 
+import copy
 import hashlib
 import ipaddress
 import json
@@ -42,6 +43,33 @@ SERVICE_TEMPLATES = {
 DEFAULT_STUN_UDP_SERVER = "stun.cloudflare.com:3478"
 DEFAULT_STUN_TCP_SERVER = "stunserver2025.stunprotocol.org:3478"
 LEGACY_TCP_STUN_SERVER = DEFAULT_STUN_UDP_SERVER
+
+# Fields that change Relay execution or the router-owned forwarding path.
+# Presentation metadata such as name/updatedAt is intentionally excluded.
+STUN_RUNTIME_FIELDS = (
+    "enabled",
+    "kind",
+    "mode",
+    "listenPort",
+    "targetMode",
+    "targetIpv4",
+    "targetPort",
+    "serviceType",
+    "transportProtocol",
+    "forwardMode",
+    "stunServer",
+    "maxConnections",
+    "idleTimeoutSec",
+)
+
+STUN_NATIVE_MAPPING_FIELDS = (
+    "enabled",
+    "listenPort",
+    "targetIpv4",
+    "targetPort",
+    "transportProtocol",
+    "forwardMode",
+)
 
 
 def _text(value: Any) -> str:
@@ -89,6 +117,14 @@ def _stun_server(protocol: str) -> str:
 def _rule_fingerprint(row: Dict[str, Any]) -> str:
     data = {str(key): value for key, value in row.items() if str(key) not in {"stats", "uuid"}}
     return hashlib.sha256(json.dumps(data, ensure_ascii=False, sort_keys=True, separators=(",", ":"), default=str).encode()).hexdigest()
+
+
+def _runtime_projection(rule: Dict[str, Any]) -> Dict[str, Any]:
+    return {field: rule.get(field) for field in STUN_RUNTIME_FIELDS}
+
+
+def _same_runtime(left: Dict[str, Any], right: Dict[str, Any]) -> bool:
+    return _runtime_projection(left) == _runtime_projection(right)
 
 
 class StunService:
@@ -146,10 +182,10 @@ class StunService:
             migrated.append(rule)
         if not changed:
             return
-        self._save_rules(migrated)
+        saved = self._save_rules(migrated)
         for rule in migrated:
             if _bool(rule.get("enabled")) and _text(rule.get("kind")).lower() == "stun":
-                self.queue("upsert", {"rule": rule})
+                self.queue("upsert", {"rule": rule}, revision=saved["revision"])
 
     def _router_name(self) -> str:
         value = getattr(self.hub, "_portmap_router_name", None)
@@ -185,6 +221,8 @@ class StunService:
         protocol = _text(payload.get("transportProtocol") or old.get("transportProtocol") or default_protocol).upper()
         if protocol not in protocols:
             raise ValueError(f"{service} 不支持 {protocol} 穿透")
+        old_protocol = _text(old.get("transportProtocol")).upper()
+        stun_server = _text(old.get("stunServer")) if old and protocol == old_protocol else ""
         target_ip = _text(payload.get("targetIpv4") or old.get("targetIpv4"))
         try:
             address = ipaddress.ip_address(target_ip)
@@ -221,7 +259,7 @@ class StunService:
             # public NAT mapping alive.  This is Lucky's direct mode and
             # works for either selected transport on current Lucky releases.
             "forwardMode": "router_native",
-            "stunServer": _stun_server(protocol),
+            "stunServer": stun_server or _stun_server(protocol),
             "maxConnections": max(1, min(256, _int(payload.get("maxConnections"), _int(old.get("maxConnections"), 32)) or 32)),
             "idleTimeoutSec": max(30, min(3600, _int(payload.get("idleTimeoutSec"), _int(old.get("idleTimeoutSec"), 300)) or 300)),
             "createdAt": _text(old.get("createdAt")) or _now_text(),
@@ -229,8 +267,12 @@ class StunService:
         }
 
     def _commands(self) -> List[Dict[str, Any]]:
-        raw = self.hub.load_json(self.commands_path, {"commands": []})
+        raw = self._command_document()
         return [dict(row) for row in raw.get("commands", []) if isinstance(row, dict)] if isinstance(raw, dict) else []
+
+    def _command_document(self) -> Dict[str, Any]:
+        raw = self.hub.load_json(self.commands_path, {"commands": []})
+        return copy.deepcopy(raw) if isinstance(raw, dict) else {"commands": []}
 
     def _save_commands(self, commands: Iterable[Dict[str, Any]]) -> None:
         self.hub.save_json(self.commands_path, {"commands": [dict(row) for row in commands]})
@@ -249,7 +291,7 @@ class StunService:
             if row.get("status") not in {"done", "failed"} or _text(row.get("id")) in keep_terminal
         ]
 
-    def _command_sync_errors(self) -> Dict[str, str]:
+    def _command_sync_errors(self, desired: Dict[str, Dict[str, Any]]) -> Dict[str, str]:
         errors: Dict[str, str] = {}
         for command in self._commands():
             if command.get("status") not in {"done", "failed"}:
@@ -258,6 +300,10 @@ class StunService:
             rule = payload.get("rule") if isinstance(payload.get("rule"), dict) else {}
             rule_id = _text(payload.get("id") or rule.get("id"))
             if not rule_id:
+                continue
+            desired_rule = desired.get(rule_id)
+            has_runtime_payload = any(field in rule for field in STUN_RUNTIME_FIELDS)
+            if desired_rule is not None and has_runtime_payload and not _same_runtime(rule, desired_rule):
                 continue
             if command.get("status") == "done":
                 errors.pop(rule_id, None)
@@ -270,22 +316,45 @@ class StunService:
             errors[rule_id] = message or f"Agent 执行 {_text(command.get('action')) or '命令'} 失败"
         return errors
 
-    def queue(self, action: str, payload: Dict[str, Any], router: str = "") -> None:
+    def queue(self, action: str, payload: Dict[str, Any], router: str = "", revision: int = 0) -> Dict[str, Any]:
         router = router or self._router_name()
         rule_id = _text(payload.get("id") or (payload.get("rule") or {}).get("id"))
         with self.lock:
             commands = self._commands()
-            commands = [row for row in commands if not (row.get("router") == router and row.get("action") == action and _text((row.get("payload") or {}).get("id") or ((row.get("payload") or {}).get("rule") or {}).get("id")) == rule_id and row.get("status") in {"pending", "delivered"})]
-            commands.append({"id": f"stun-cmd-{uuid.uuid4().hex[:12]}", "router": router, "action": action, "payload": payload, "status": "pending", "createdAt": _now_text(), "attempts": 0})
+            same_revision = next((row for row in reversed(commands) if (
+                row.get("router") == router
+                and _text((row.get("payload") or {}).get("id") or ((row.get("payload") or {}).get("rule") or {}).get("id")) == rule_id
+                and _int(row.get("revision")) == revision
+            )), None)
+            if same_revision is not None:
+                return same_revision
+            commands = [row for row in commands if not (
+                row.get("router") == router
+                and _text((row.get("payload") or {}).get("id") or ((row.get("payload") or {}).get("rule") or {}).get("id")) == rule_id
+                and row.get("status") in {"pending", "delivered"}
+                and _int(row.get("revision")) < revision
+            )]
+            command = {
+                "id": f"stun-cmd-{uuid.uuid4().hex[:12]}",
+                "router": router,
+                "action": action,
+                "revision": revision,
+                "payload": payload,
+                "status": "pending",
+                "createdAt": _now_text(),
+                "attempts": 0,
+            }
+            commands.append(command)
             self._save_commands(self._compact_commands(commands))
+            return command
 
     def _status_record(self) -> Dict[str, Any]:
         raw = self.hub.load_json(self.status_path, {})
         return raw if isinstance(raw, dict) else {}
 
-    def _runtime(self) -> Dict[str, Dict[str, Any]]:
+    def _reported_rules(self) -> Dict[str, Dict[str, Dict[str, Any]]]:
         rows = self._status_record().get("status", {}).get("rules", [])
-        output: Dict[str, Dict[str, Any]] = {}
+        output: Dict[str, Dict[str, Dict[str, Any]]] = {}
         for row in rows if isinstance(rows, list) else []:
             if not isinstance(row, dict):
                 continue
@@ -293,8 +362,11 @@ class StunService:
             runtime = row.get("runtime") if isinstance(row.get("runtime"), dict) else {}
             rule_id = _text(rule.get("id") or runtime.get("id"))
             if rule_id:
-                output[rule_id] = dict(runtime)
+                output[rule_id] = {"rule": dict(rule), "runtime": dict(runtime)}
         return output
+
+    def _runtime(self) -> Dict[str, Dict[str, Any]]:
+        return {rule_id: row["runtime"] for rule_id, row in self._reported_rules().items()}
 
     def _history(self) -> Dict[str, List[Dict[str, Any]]]:
         raw = self.hub.load_json(self.history_path, {})
@@ -354,6 +426,51 @@ class StunService:
     @staticmethod
     def _native_mapping_matches(row: Dict[str, Any], expected: Dict[str, Any]) -> bool:
         return all(_text(row.get(key)) == _text(value) for key, value in expected.items())
+
+    def _snapshot_native_mapping(self, rule_id: str) -> Dict[str, Any]:
+        bindings = copy.deepcopy(self._native_mapping_bindings())
+        binding = bindings.get(rule_id, {})
+        rule_name = _text(binding.get("ruleName")) or f"LabProbe STUN {rule_id}"
+        current = self.client.native_port_mapping(True)
+        row = self._find_native_mapping(current, rule_name)
+        return {
+            "bindings": bindings,
+            "ruleName": rule_name,
+            "row": copy.deepcopy(row) if row else None,
+        }
+
+    def _restore_native_mapping(self, rule_id: str, snapshot: Dict[str, Any]) -> None:
+        rule_name = _text(snapshot.get("ruleName")) or f"LabProbe STUN {rule_id}"
+        old_row = copy.deepcopy(snapshot.get("row")) if isinstance(snapshot.get("row"), dict) else None
+        current = self.client.native_port_mapping(True)
+        existing = self._find_native_mapping(current, rule_name)
+        if old_row is None and existing is not None:
+            verified = self.controller.write_and_verify(
+                "native-portmap",
+                lambda: self.client.rpc("devConfig.del", "port_mapping", {"ruleName": [rule_name]}),
+                lambda: self.client.native_port_mapping(True),
+            )
+            if self._find_native_mapping(verified.get("data", {}), rule_name) is not None:
+                raise RuntimeError("旧路由器端口映射删除后未能确认")
+        elif old_row is not None and existing is None:
+            verified = self.controller.write_and_verify(
+                "native-portmap",
+                lambda: self.client.rpc("devConfig.add", "port_mapping", {"list": [old_row]}),
+                lambda: self.client.native_port_mapping(True),
+            )
+            restored = self._find_native_mapping(verified.get("data", {}), rule_name)
+            if restored is None or _rule_fingerprint(restored) != _rule_fingerprint(old_row):
+                raise RuntimeError("旧路由器端口映射恢复后未能确认")
+        elif old_row is not None and existing is not None and _rule_fingerprint(existing) != _rule_fingerprint(old_row):
+            verified = self.controller.write_and_verify(
+                "native-portmap",
+                lambda: self.client.rpc("devConfig.update", "port_mapping", {"old": existing, "new": old_row}),
+                lambda: self.client.native_port_mapping(True),
+            )
+            restored = self._find_native_mapping(verified.get("data", {}), rule_name)
+            if restored is None or _rule_fingerprint(restored) != _rule_fingerprint(old_row):
+                raise RuntimeError("旧路由器端口映射回滚后未能确认")
+        self._save_native_mapping_bindings(copy.deepcopy(snapshot.get("bindings", {})))
 
     def ensure_native_mapping(self, rule: Dict[str, Any]) -> Dict[str, Any]:
         """Create/update the one fixed TCP map owned by this STUN rule.
@@ -520,21 +637,66 @@ class StunService:
         bindings.pop(rule_id, None)
         self._save_firewall_bindings(bindings)
 
+    def _snapshot_firewall(self, rule_id: str) -> Dict[str, Any]:
+        bindings = copy.deepcopy(self._firewall_bindings())
+        binding = bindings.get(rule_id, {})
+        firewall_uuid = _text(binding.get("uuid"))
+        row = None
+        if firewall_uuid:
+            current = self.client.firewall(True)
+            row = self._find_firewall(current, firewall_uuid)
+        return {
+            "bindings": bindings,
+            "row": copy.deepcopy(row) if row else None,
+        }
+
+    def _restore_firewall(self, rule_id: str, snapshot: Dict[str, Any]) -> None:
+        bindings = copy.deepcopy(snapshot.get("bindings", {}))
+        old_row = copy.deepcopy(snapshot.get("row")) if isinstance(snapshot.get("row"), dict) else None
+        if old_row is not None:
+            old_uuid = _text(old_row.get("uuid"))
+            current = self.client.firewall(True)
+            existing = self._find_firewall(current, old_uuid)
+            if existing is None:
+                payload = {key: value for key, value in old_row.items() if key not in {"uuid", "stats"}}
+                verified = self.controller.write_and_verify(
+                    "firewall",
+                    lambda: self.client.rpc("devConfig.add", "ip_firewall", {"list": [payload]}),
+                    lambda: self.client.firewall(True),
+                )
+                rows = verified.get("data", {}).get("list", [])
+                restored = next(
+                    (dict(row) for row in rows if isinstance(row, dict) and _rule_fingerprint(row) == _rule_fingerprint(payload)),
+                    None,
+                )
+                if restored is None or not _text(restored.get("uuid")):
+                    raise RuntimeError("旧防火墙规则恢复后未能确认")
+                binding = dict(bindings.get(rule_id, {}))
+                binding.update({"uuid": _text(restored.get("uuid")), "fingerprint": _rule_fingerprint(restored)})
+                bindings[rule_id] = binding
+        self._save_firewall_bindings(bindings)
+
     def rows(self) -> List[Dict[str, Any]]:
-        runtime = self._runtime()
+        reported = self._reported_rules()
         firewall_bindings = self._firewall_bindings()
         native_bindings = self._native_mapping_bindings()
-        sync_errors = self._command_sync_errors()
+        document = self._document()
+        desired = {rule["id"]: rule for rule in document["rules"]}
+        sync_errors = self._command_sync_errors(desired)
         result = []
-        for rule in self._document()["rules"]:
+        for rule in document["rules"]:
             item = dict(rule)
-            current = runtime.get(rule["id"], {})
+            reported_row = reported.get(rule["id"], {})
+            local_rule = reported_row.get("rule", {})
+            current = reported_row.get("runtime", {})
             native_binding = native_bindings.get(rule["id"], {})
             native_state = _text(native_binding.get("state")) or ("ready" if native_binding.get("fingerprint") else "pending")
             firewall_state = "not_required" if self._is_native_forward(rule) else (_text(firewall_bindings.get(rule["id"], {}).get("state")) or ("ready" if firewall_bindings.get(rule["id"], {}).get("uuid") else "pending"))
             actual = _text(current.get("state"))
             if not _bool(rule.get("enabled")):
                 actual = "stopped"
+            elif current and (not local_rule or not _same_runtime(local_rule, rule)):
+                actual = "error" if actual == "error" or _text(current.get("lastError")) else "mapping"
             elif self._is_native_forward(rule) and actual == "mapped" and native_state != "ready":
                 actual = "router_mapping_error" if native_state not in {"pending", ""} else "router_mapping"
             elif not self._is_native_forward(rule) and actual == "mapped" and firewall_state != "ready":
@@ -568,15 +730,16 @@ def create_stun_blueprint(hub: Any, service: StunService) -> Blueprint:
         if (denied := app_auth()) is not None:
             return denied
         try:
-            rule = service.clean_rule(request.get_json(silent=True) or {})
-            if rule["enabled"] and service._is_native_forward(rule):
-                mapping = service.ensure_native_mapping(rule)
-                if mapping.get("state") != "ready":
-                    raise ValueError(_text(mapping.get("message")) or "路由器端口映射未就绪")
-            doc = service._document()
-            service._save_rules([*doc["rules"], rule])
-            service.queue("upsert", {"rule": rule})
-            return jsonify({"ok": True, "rule": rule}), 201
+            with service.lock:
+                rule = service.clean_rule(request.get_json(silent=True) or {})
+                if rule["enabled"] and service._is_native_forward(rule):
+                    mapping = service.ensure_native_mapping(rule)
+                    if mapping.get("state") != "ready":
+                        raise ValueError(_text(mapping.get("message")) or "路由器端口映射未就绪")
+                doc = service._document()
+                saved = service._save_rules([*doc["rules"], rule])
+                service.queue("upsert", {"rule": rule}, revision=saved["revision"])
+                return jsonify({"ok": True, "rule": rule}), 201
         except Exception as error:
             return jsonify({"ok": False, "error": str(error)}), 400
 
@@ -584,44 +747,87 @@ def create_stun_blueprint(hub: Any, service: StunService) -> Blueprint:
     def rule_item(rule_id: str):
         if (denied := app_auth()) is not None:
             return denied
-        doc = service._document()
-        old = next((row for row in doc["rules"] if _text(row.get("id")) == rule_id), None)
-        if not old:
-            return jsonify({"ok": False, "error": "rule not found"}), 404
         if request.method == "DELETE":
-            cleanup_error = ""
-            try:
-                service.remove_native_mapping(rule_id)
-                service.remove_firewall(rule_id)
-            except Exception as error:
-                return jsonify({"ok": False, "error": str(error)}), 409
-            service._save_rules([row for row in doc["rules"] if _text(row.get("id")) != rule_id])
-            service.queue("delete", {"id": rule_id})
-            history = service._history()
-            if rule_id in history:
-                history.pop(rule_id, None)
-                service.hub.save_json(service.history_path, history)
-            return jsonify({"ok": True, "id": rule_id, "deleted": True, "cleanupError": cleanup_error})
-        try:
-            payload = request.get_json(silent=True) or {}
-            payload["id"] = rule_id
-            rule = service.clean_rule(payload, old)
-            if service._is_native_forward(rule):
-                if rule["enabled"]:
-                    mapping = service.ensure_native_mapping(rule)
-                    if mapping.get("state") != "ready":
-                        raise ValueError(_text(mapping.get("message")) or "路由器端口映射未就绪")
-                else:
+            with service.lock:
+                doc = service._document()
+                old = next((row for row in doc["rules"] if _text(row.get("id")) == rule_id), None)
+                if not old:
+                    return jsonify({"ok": False, "error": "rule not found"}), 404
+                cleanup_error = ""
+                try:
                     service.remove_native_mapping(rule_id)
-                # A previous relay-proxy version may have installed the old
-                # automatic eWeb firewall entry.  TCP native forwarding does
-                # not need it, so remove only our fingerprinted entry.
-                service.remove_firewall(rule_id)
-            elif service._is_native_forward(old):
-                service.remove_native_mapping(rule_id)
-            service._save_rules([rule if _text(row.get("id")) == rule_id else row for row in doc["rules"]])
-            service.queue("upsert", {"rule": rule})
-            return jsonify({"ok": True, "rule": rule})
+                    service.remove_firewall(rule_id)
+                except Exception as error:
+                    return jsonify({"ok": False, "error": str(error)}), 409
+                saved = service._save_rules([row for row in doc["rules"] if _text(row.get("id")) != rule_id])
+                service.queue("delete", {"id": rule_id}, revision=saved["revision"])
+                history = service._history()
+                if rule_id in history:
+                    history.pop(rule_id, None)
+                    service.hub.save_json(service.history_path, history)
+                return jsonify({"ok": True, "id": rule_id, "deleted": True, "cleanupError": cleanup_error})
+        try:
+            with service.lock:
+                doc = service._document()
+                old = next((row for row in doc["rules"] if _text(row.get("id")) == rule_id), None)
+                if not old:
+                    return jsonify({"ok": False, "error": "rule not found"}), 404
+                payload = request.get_json(silent=True) or {}
+                payload["id"] = rule_id
+                rule = service.clean_rule(payload, old)
+                replacement = [rule if _text(row.get("id")) == rule_id else row for row in doc["rules"]]
+
+                # Presentation-only changes are desired-document metadata. They
+                # must not touch router state or restart the Relay runtime.
+                if _same_runtime(old, rule):
+                    service._save_rules(replacement)
+                    return jsonify({"ok": True, "rule": rule})
+
+                desired_before = copy.deepcopy(service.hub.load_json(service.rules_path, doc))
+                commands_before = service._command_document()
+                native_changed = any(old.get(field) != rule.get(field) for field in STUN_NATIVE_MAPPING_FIELDS)
+                native_snapshot = service._snapshot_native_mapping(rule_id) if native_changed else None
+                firewall_snapshot = service._snapshot_firewall(rule_id) if native_changed else None
+                try:
+                    if native_changed:
+                        if service._is_native_forward(rule):
+                            if rule["enabled"]:
+                                mapping = service.ensure_native_mapping(rule)
+                                if mapping.get("state") != "ready":
+                                    raise ValueError(_text(mapping.get("message")) or "路由器端口映射未就绪")
+                            else:
+                                service.remove_native_mapping(rule_id)
+                            # Remove only the obsolete, fingerprint-owned
+                            # relay-proxy firewall entry.
+                            service.remove_firewall(rule_id)
+                        elif service._is_native_forward(old):
+                            service.remove_native_mapping(rule_id)
+                    saved = service._save_rules(replacement)
+                    service.queue("upsert", {"rule": rule}, revision=saved["revision"])
+                    return jsonify({"ok": True, "rule": rule})
+                except Exception as error:
+                    rollback_errors = []
+                    if native_snapshot is not None:
+                        try:
+                            service._restore_native_mapping(rule_id, native_snapshot)
+                        except Exception as rollback_error:
+                            rollback_errors.append(f"native mapping: {rollback_error}")
+                    if firewall_snapshot is not None:
+                        try:
+                            service._restore_firewall(rule_id, firewall_snapshot)
+                        except Exception as rollback_error:
+                            rollback_errors.append(f"firewall: {rollback_error}")
+                    try:
+                        service.hub.save_json(service.rules_path, copy.deepcopy(desired_before))
+                    except Exception as rollback_error:
+                        rollback_errors.append(f"desired: {rollback_error}")
+                    try:
+                        service.hub.save_json(service.commands_path, copy.deepcopy(commands_before))
+                    except Exception as rollback_error:
+                        rollback_errors.append(f"commands: {rollback_error}")
+                    if rollback_errors:
+                        raise RuntimeError(f"{error}; STUN 回滚失败：{'；'.join(rollback_errors)}") from error
+                    raise
         except Exception as error:
             return jsonify({"ok": False, "error": str(error)}), 400
 
@@ -631,32 +837,33 @@ def create_stun_blueprint(hub: Any, service: StunService) -> Blueprint:
             return denied
         if action not in {"start", "stop"}:
             return jsonify({"ok": False, "error": "invalid action"}), 400
-        doc = service._document()
-        rule = next((dict(row) for row in doc["rules"] if _text(row.get("id")) == rule_id), None)
-        if not rule:
-            return jsonify({"ok": False, "error": "rule not found"}), 404
-        if action == "start" and service._is_native_forward(rule):
-            try:
-                mapping = service.ensure_native_mapping(rule)
-                if mapping.get("state") != "ready":
-                    raise ValueError(_text(mapping.get("message")) or "路由器端口映射未就绪")
-            except Exception as error:
-                return jsonify({"ok": False, "error": str(error)}), 409
-        if action == "stop" and service._is_native_forward(rule):
-            try:
-                service.remove_native_mapping(rule_id)
-            except Exception as error:
-                return jsonify({"ok": False, "error": str(error)}), 409
-        rule["enabled"] = action == "start"
-        rule["updatedAt"] = _now_text()
-        service._save_rules([rule if _text(row.get("id")) == rule_id else row for row in doc["rules"]])
-        service.queue("upsert" if action == "start" else "stop", {"rule": rule} if action == "start" else {"id": rule_id})
-        if action == "stop" and not service._is_native_forward(rule):
-            try:
-                service.remove_firewall(rule_id)
-            except Exception:
-                pass
-        return jsonify({"ok": True, "rule": rule, "action": action})
+        with service.lock:
+            doc = service._document()
+            rule = next((dict(row) for row in doc["rules"] if _text(row.get("id")) == rule_id), None)
+            if not rule:
+                return jsonify({"ok": False, "error": "rule not found"}), 404
+            if action == "start" and service._is_native_forward(rule):
+                try:
+                    mapping = service.ensure_native_mapping(rule)
+                    if mapping.get("state") != "ready":
+                        raise ValueError(_text(mapping.get("message")) or "路由器端口映射未就绪")
+                except Exception as error:
+                    return jsonify({"ok": False, "error": str(error)}), 409
+            if action == "stop" and service._is_native_forward(rule):
+                try:
+                    service.remove_native_mapping(rule_id)
+                except Exception as error:
+                    return jsonify({"ok": False, "error": str(error)}), 409
+            rule["enabled"] = action == "start"
+            rule["updatedAt"] = _now_text()
+            saved = service._save_rules([rule if _text(row.get("id")) == rule_id else row for row in doc["rules"]])
+            service.queue("upsert" if action == "start" else "stop", {"rule": rule} if action == "start" else {"id": rule_id}, revision=saved["revision"])
+            if action == "stop" and not service._is_native_forward(rule):
+                try:
+                    service.remove_firewall(rule_id)
+                except Exception:
+                    pass
+            return jsonify({"ok": True, "rule": rule, "action": action})
 
     @bp.get("/stun/<rule_id>/addresses")
     def addresses(rule_id: str):
@@ -672,22 +879,23 @@ def create_stun_blueprint(hub: Any, service: StunService) -> Blueprint:
             return jsonify({"ok": False, "error": "bad hook token"}), 401
         router = _text(request.args.get("router")) or service._router_name()
         limit = max(1, min(50, _int(request.args.get("limit"), 20)))
-        now = _now()
-        selected = []
-        commands = service._commands()
-        changed = False
-        for command in commands:
-            if command.get("router") != router:
-                continue
-            retry = command.get("status") == "delivered" and now - _int(command.get("deliveredEpoch")) >= 15 and _int(command.get("attempts")) < 5
-            if command.get("status") == "pending" or retry:
-                command.update({"status": "delivered", "deliveredAt": _now_text(), "deliveredEpoch": now, "attempts": _int(command.get("attempts")) + 1})
-                selected.append({key: command.get(key) for key in ["id", "action", "payload", "createdAt"]})
-                changed = True
-                if len(selected) >= limit:
-                    break
-        if changed:
-            service._save_commands(service._compact_commands(commands))
+        with service.lock:
+            now = _now()
+            selected = []
+            commands = service._commands()
+            changed = False
+            for command in commands:
+                if command.get("router") != router:
+                    continue
+                retry = command.get("status") == "delivered" and now - _int(command.get("deliveredEpoch")) >= 15 and _int(command.get("attempts")) < 5
+                if command.get("status") == "pending" or retry:
+                    command.update({"status": "delivered", "deliveredAt": _now_text(), "deliveredEpoch": now, "attempts": _int(command.get("attempts")) + 1})
+                    selected.append({key: command.get(key) for key in ["id", "action", "revision", "payload", "createdAt"]})
+                    changed = True
+                    if len(selected) >= limit:
+                        break
+            if changed:
+                service._save_commands(service._compact_commands(commands))
         return jsonify({"ok": True, "commands": selected})
 
     @bp.post("/router/stun/ack")
@@ -696,15 +904,16 @@ def create_stun_blueprint(hub: Any, service: StunService) -> Blueprint:
             return jsonify({"ok": False, "error": "bad hook token"}), 401
         acks = (request.get_json(silent=True) or {}).get("acks", [])
         values = {_text(row.get("id")): row for row in acks if isinstance(row, dict)} if isinstance(acks, list) else {}
-        commands = service._commands()
-        changed = 0
-        for command in commands:
-            ack = values.get(_text(command.get("id")))
-            if ack:
-                command.update({"status": "done" if _bool(ack.get("ok")) else "failed", "result": ack.get("result"), "finishedAt": _now_text()})
-                changed += 1
-        if changed:
-            service._save_commands(service._compact_commands(commands))
+        with service.lock:
+            commands = service._commands()
+            changed = 0
+            for command in commands:
+                ack = values.get(_text(command.get("id")))
+                if ack:
+                    command.update({"status": "done" if _bool(ack.get("ok")) else "failed", "result": ack.get("result"), "finishedAt": _now_text()})
+                    changed += 1
+            if changed:
+                service._save_commands(service._compact_commands(commands))
         return jsonify({"ok": True, "acknowledged": changed})
 
     @bp.post("/router/stun/status")
@@ -712,49 +921,50 @@ def create_stun_blueprint(hub: Any, service: StunService) -> Blueprint:
         if not hub.check_hook_token():
             return jsonify({"ok": False, "error": "bad hook token"}), 401
         payload = request.get_json(silent=True) or {}
-        record = {"router": _text(request.args.get("router")) or service._router_name(), "receivedAt": _now_text(), "receivedEpoch": _now(), "status": payload}
-        service.hub.save_json(service.status_path, record)
-        runtime = service._runtime()
-        firewall_bindings = service._firewall_bindings()
-        rules = service._document()["rules"]
-        desired = {rule["id"]: rule for rule in rules}
-        local_rules = {}
-        for row in payload.get("rules", []) if isinstance(payload.get("rules"), list) else []:
-            if isinstance(row, dict) and isinstance(row.get("rule"), dict):
-                local = row["rule"]
-                if _text(local.get("id")):
-                    local_rules[_text(local.get("id"))] = local
-        compare = ["enabled", "kind", "listenPort", "targetIpv4", "targetPort", "serviceType", "transportProtocol", "forwardMode", "stunServer", "maxConnections", "idleTimeoutSec"]
-        for rule_id, rule in desired.items():
-            local = local_rules.get(rule_id)
-            if local is None or any(local.get(key) != rule.get(key) for key in compare):
-                service.queue("upsert", {"rule": rule}, record["router"])
-        for rule_id in set(local_rules) - set(desired):
-            service.queue("delete", {"id": rule_id}, record["router"])
-        for rule in rules:
-            current = runtime.get(rule["id"], {})
-            service._remember_endpoint(rule["id"], current)
-            if _bool(rule.get("enabled")) and service._is_native_forward(rule):
-                try:
-                    service.ensure_native_mapping(rule)
-                except Exception as error:
-                    native = service._native_mapping_bindings()
-                    native[rule["id"]] = {**native.get(rule["id"], {}), "state": "error", "message": str(error)}
-                    service._save_native_mapping_bindings(native)
-                # Clean up the obsolete firewall entry created by an earlier
-                # build, but never touch a manually edited rule.
-                try:
-                    service.remove_firewall(rule["id"])
-                except Exception:
-                    pass
-            elif _bool(rule.get("enabled")) and _text(current.get("state")) == "mapped":
-                try:
-                    result = service.ensure_firewall(rule)
-                except Exception as error:
-                    result = {"state": "error", "message": str(error)}
-                firewall_bindings[rule["id"]] = {**firewall_bindings.get(rule["id"], {}), **result}
-        service._save_firewall_bindings(firewall_bindings)
-        return jsonify({"ok": True, "receivedAt": record["receivedAt"]})
+        with service.lock:
+            document = service._document()
+            record = {"router": _text(request.args.get("router")) or service._router_name(), "receivedAt": _now_text(), "receivedEpoch": _now(), "status": payload}
+            service.hub.save_json(service.status_path, record)
+            runtime = service._runtime()
+            firewall_bindings = service._firewall_bindings()
+            rules = document["rules"]
+            desired = {rule["id"]: rule for rule in rules}
+            local_rules = {}
+            for row in payload.get("rules", []) if isinstance(payload.get("rules"), list) else []:
+                if isinstance(row, dict) and isinstance(row.get("rule"), dict):
+                    local = row["rule"]
+                    if _text(local.get("id")):
+                        local_rules[_text(local.get("id"))] = local
+            for rule_id, rule in desired.items():
+                local = local_rules.get(rule_id)
+                if local is None or not _same_runtime(local, rule):
+                    service.queue("upsert", {"rule": rule}, record["router"], document["revision"])
+            for rule_id in set(local_rules) - set(desired):
+                service.queue("delete", {"id": rule_id}, record["router"], document["revision"])
+            for rule in rules:
+                current = runtime.get(rule["id"], {})
+                service._remember_endpoint(rule["id"], current)
+                if _bool(rule.get("enabled")) and service._is_native_forward(rule):
+                    try:
+                        service.ensure_native_mapping(rule)
+                    except Exception as error:
+                        native = service._native_mapping_bindings()
+                        native[rule["id"]] = {**native.get(rule["id"], {}), "state": "error", "message": str(error)}
+                        service._save_native_mapping_bindings(native)
+                    # Clean up the obsolete firewall entry created by an earlier
+                    # build, but never touch a manually edited rule.
+                    try:
+                        service.remove_firewall(rule["id"])
+                    except Exception:
+                        pass
+                elif _bool(rule.get("enabled")) and _text(current.get("state")) == "mapped":
+                    try:
+                        result = service.ensure_firewall(rule)
+                    except Exception as error:
+                        result = {"state": "error", "message": str(error)}
+                    firewall_bindings[rule["id"]] = {**firewall_bindings.get(rule["id"], {}), **result}
+            service._save_firewall_bindings(firewall_bindings)
+            return jsonify({"ok": True, "receivedAt": record["receivedAt"]})
 
     return bp
 
