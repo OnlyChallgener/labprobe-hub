@@ -360,3 +360,40 @@ def test_replace_messages_keeps_history_bounded_without_duplicates(tmp_path):
 def test_chat_rejects_over_count_with_clear_error(tmp_path, monkeypatch):
     client = make_client(tmp_path, monkeypatch)
     assert client.post("/api/ai/chat", json={"message": "hello"}).status_code == 409  # not configured
+
+
+def test_batch_write_tools_need_single_confirmation(tmp_path, monkeypatch):
+    client = make_client(tmp_path, monkeypatch, hub_runtime=fake_hub(tmp_path))
+
+    class FakeBatchProvider:
+        def __init__(self, *args, **kwargs):
+            pass
+
+        def chat(self, messages, tools=None):
+            from assistant.provider import ChatResult
+            return ChatResult("", {"total_tokens": 6}, {
+                "role": "assistant", "content": None,
+                "tool_calls": [
+                    {"id": "c1", "type": "function", "function": {"name": "device_wol", "arguments": '{"device":"Mate60"}'}},
+                    {"id": "c2", "type": "function", "function": {"name": "device_wol", "arguments": '{"device":"ANS"}'}},
+                ],
+            })
+
+    monkeypatch.setattr("assistant.api.OpenAICompatibleProvider", FakeBatchProvider)
+    assert client.put("/api/ai/config", json={"apiKey": "sk-test"}).status_code == 200
+    response = client.post("/api/ai/chat", json={"message": "把两台设备都唤醒"})
+    assert response.status_code == 200
+    confirmation = response.json["confirmation"]
+    assert confirmation["preview"]["toolId"] == "batch"
+    assert "2 项" in confirmation["preview"]["title"]
+    confirmed = client.post("/api/ai/tools/confirm", json={"confirmationId": confirmation["confirmationId"]})
+    assert confirmed.status_code == 200
+    assert "2/2" in confirmed.json["result"]["message"]
+
+
+def test_conversation_title_comes_from_latest_message(tmp_path):
+    store = AIStore(tmp_path / "ai.db")
+    store.initialize()
+    store.create_conversation("t-1", "  帮我看看今天的设备流量变化  ")
+    row = store.list_conversations()[0]
+    assert row["title"] == "帮我看看今天的设备流量变化"

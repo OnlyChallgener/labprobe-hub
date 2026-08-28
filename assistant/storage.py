@@ -165,7 +165,7 @@ class AIStore:
         now = utc_now()
         with self._connect() as conn:
             conn.execute("INSERT OR IGNORE INTO conversations(id,title,created_at,updated_at) VALUES(?,?,?,?)",
-                         (conversation_id, title, now, now))
+                         (conversation_id, (str(title) or "").strip()[:32] or None, now, now))
 
     def list_conversations(self, limit: int = 20) -> list[Dict[str, Any]]:
         with self._connect() as conn:

@@ -230,6 +230,30 @@ def create_ai_blueprint(*, check_app_token: Callable[[], bool], db_path, logger,
                 "clientAction": pending["preview"],
                 "result": result,
             })
+        if pending["tool_id"] == "batch":
+            items = pending["arguments"].get("tools") or []
+            results = []
+            failed = False
+            for item in items:
+                tool_id = str(item.get("toolId") or "")
+                arguments = item.get("arguments") or {}
+                try:
+                    item_result = require_executor().execute(tool_id, arguments, allow_write=True)
+                    results.append({"toolId": tool_id, "ok": True, "result": item_result})
+                    store.add_tool_audit(f"{confirmation_id}:{tool_id}", tool_id, "write", "completed", arguments, item_result)
+                except ToolError as exc:
+                    results.append({"toolId": tool_id, "ok": False, "error": str(exc)})
+                    store.add_tool_audit(f"{confirmation_id}:{tool_id}", tool_id, "write", "failed", arguments, {"code": exc.code, "error": str(exc)})
+                    failed = True
+                    break
+                except Exception:
+                    results.append({"toolId": tool_id, "ok": False, "error": "操作执行失败"})
+                    store.add_tool_audit(f"{confirmation_id}:{tool_id}", tool_id, "write", "failed", arguments, {"code": "TOOL_EXECUTION_FAILED"})
+                    failed = True
+                    break
+            summary_result = {"ok": not failed, "message": f"已完成 {sum(1 for r in results if r['ok'])}/{len(items)} 项操作", "items": results}
+            store.finish_confirmation(confirmation_id, "failed" if failed else "completed", summary_result)
+            return jsonify({"confirmationId": confirmation_id, "toolId": "batch", "result": summary_result})
         try:
             result = require_executor().execute(pending["tool_id"], pending["arguments"], allow_write=True)
             store.finish_confirmation(confirmation_id, "completed", result)
@@ -300,7 +324,7 @@ def create_ai_blueprint(*, check_app_token: Callable[[], bool], db_path, logger,
         except (MasterKeyUnavailable, ValueError) as exc:
             return jsonify({"error": str(exc)}), 503
         conversation_id = str(body.get("conversationId") or uuid.uuid4())
-        store.create_conversation(conversation_id)
+        store.create_conversation(conversation_id, title=messages[-1]["content"] if messages else None)
         # The APP replays the visible history on every turn; replace stored
         # history instead of re-inserting it, or rows duplicate per request.
         store.replace_messages(conversation_id, messages)
@@ -327,6 +351,7 @@ def create_ai_blueprint(*, check_app_token: Callable[[], bool], db_path, logger,
         accumulated_usage: Dict[str, int] = {}
         executions: List[Dict[str, Any]] = []
         client_actions: List[Dict[str, Any]] = []
+        pending_writes: List[Dict[str, Any]] = []
         try:
             for _ in range(4):
                 result = provider.chat(internal_messages, tools=provider_tools() if executor is not None else None)
@@ -338,11 +363,14 @@ def create_ai_blueprint(*, check_app_token: Callable[[], bool], db_path, logger,
                     if not result.content:
                         raise ProviderError("AI provider returned an empty response")
                     store.add_message(conversation_id, "assistant", result.content)
+                    if not accumulated_usage:
+                        LOGGER.warning("ai: provider returned no usage tokens (model=%s)", row["model"])
                     store.add_usage(conversation_id, row["provider"], row["model"], accumulated_usage)
                     return jsonify({
                         "conversationId": conversation_id,
                         "message": {"role": "assistant", "content": result.content},
                         "usage": accumulated_usage,
+                        "usageKnown": bool(accumulated_usage),
                         "toolExecutions": executions,
                         "clientActions": client_actions,
                     })
@@ -372,21 +400,13 @@ def create_ai_blueprint(*, check_app_token: Callable[[], bool], db_path, logger,
                                 tool_payload = {"ok": False, "code": exc.code, "error": str(exc)}
                                 store.add_tool_audit(call_id, tool_id, "write", "rejected", arguments, tool_payload)
                             else:
-                                confirmation_id = str(uuid.uuid4())
-                                expires_at = (datetime.now(timezone.utc) + timedelta(minutes=5)).isoformat(timespec="seconds")
-                                store.create_confirmation(confirmation_id, tool_id, arguments, preview, expires_at)
-                                store.add_tool_audit(confirmation_id, tool_id, "write", "confirmation_required", arguments, preview)
-                                content = "需要你的确认：" + str(preview.get("summary") or preview.get("title") or tool_id)
-                                store.add_message(conversation_id, "assistant", content)
-                                store.add_usage(conversation_id, row["provider"], row["model"], accumulated_usage)
-                                return jsonify({
-                                    "conversationId": conversation_id,
-                                    "message": {"role": "assistant", "content": content},
-                                    "usage": accumulated_usage,
-                                    "toolExecutions": executions,
-                                    "clientActions": client_actions,
-                                    "confirmation": {"confirmationId": confirmation_id, "expiresAt": expires_at, "preview": preview},
-                                })
+                                signature = tool_id + "|" + json.dumps(arguments, sort_keys=True, ensure_ascii=False)
+                                if signature not in {p["signature"] for p in pending_writes}:
+                                    pending_writes.append({
+                                        "signature": signature, "toolId": tool_id,
+                                        "arguments": arguments, "preview": preview,
+                                    })
+                                continue
                         else:
                             try:
                                 tool_result = require_executor().execute(tool_id, arguments, client_context=client_context)
@@ -401,6 +421,42 @@ def create_ai_blueprint(*, check_app_token: Callable[[], bool], db_path, logger,
                     internal_messages.append({
                         "role": "tool", "tool_call_id": call_id,
                         "content": json.dumps(tool_payload, ensure_ascii=False, separators=(",", ":")),
+                    })
+                if pending_writes:
+                    confirmation_id = str(uuid.uuid4())
+                    expires_at = (datetime.now(timezone.utc) + timedelta(minutes=5)).isoformat(timespec="seconds")
+                    if len(pending_writes) == 1:
+                        first = pending_writes[0]
+                        preview = dict(first["preview"])
+                        confirm_tool_id = first["toolId"]
+                        confirm_arguments = first["arguments"]
+                    else:
+                        confirm_tool_id = "batch"
+                        confirm_arguments = {"tools": [{"toolId": p["toolId"], "arguments": p["arguments"]} for p in pending_writes]}
+                        preview = {
+                            "toolId": "batch",
+                            "title": f"确认执行 {len(pending_writes)} 项操作",
+                            "summary": "；".join(
+                                str(p["preview"].get("summary") or p["preview"].get("title") or p["toolId"])
+                                for p in pending_writes
+                            ),
+                            "arguments": confirm_arguments,
+                            "executor": "hub",
+                        }
+                    store.create_confirmation(confirmation_id, confirm_tool_id, confirm_arguments, preview, expires_at)
+                    for item in pending_writes:
+                        store.add_tool_audit(confirmation_id, item["toolId"], "write", "confirmation_required", item["arguments"], item["preview"])
+                    content = "需要你的确认：" + str(preview.get("summary") or preview.get("title") or confirm_tool_id)
+                    store.add_message(conversation_id, "assistant", content)
+                    store.add_usage(conversation_id, row["provider"], row["model"], accumulated_usage)
+                    return jsonify({
+                        "conversationId": conversation_id,
+                        "message": {"role": "assistant", "content": content},
+                        "usage": accumulated_usage,
+                        "usageKnown": bool(accumulated_usage),
+                        "toolExecutions": executions,
+                        "clientActions": client_actions,
+                        "confirmation": {"confirmationId": confirmation_id, "expiresAt": expires_at, "preview": preview},
                     })
             raise ProviderError("AI tool call limit exceeded")
         except ProviderError as exc:
