@@ -507,6 +507,24 @@ def advertise_url() -> str:
     return env_compat("HUB_ADVERTISE_URL", default=f"http://127.0.0.1:{PORT}").rstrip("/")
 
 
+_QUERY_TOKEN_WARNED: set = set()
+
+
+def _warn_query_string_token() -> None:
+    """Tokens in URLs leak through reverse-proxy access logs; headers are the
+    supported form. Query tokens stay accepted for third-party senders that
+    cannot set headers, but each affected route is surfaced once per process."""
+    route = request.path
+    if route in _QUERY_TOKEN_WARNED or len(_QUERY_TOKEN_WARNED) >= 64:
+        return
+    _QUERY_TOKEN_WARNED.add(route)
+    app.logger.warning(
+        "auth: %s received a token via query string; switch to 'Authorization: Bearer <token>' "
+        "or the X-LabProbe-Token header (query tokens will be rejected in a future release)",
+        route,
+    )
+
+
 def _auth_tokens_from_request() -> List[str]:
     """Collect all supported auth token locations.
 
@@ -539,6 +557,7 @@ def _auth_tokens_from_request() -> List[str]:
     for arg in ["token", "app_token", "appToken", "hook_token", "hookToken", "key"]:
         v = request.args.get(arg, "").strip()
         if v:
+            _warn_query_string_token()
             tokens.append(v)
 
     return [t for t in tokens if t]
@@ -561,19 +580,90 @@ def _token_matches(candidate: Any, expected: Any) -> bool:
         return False
 
 
+def get_app_tokens() -> List[str]:
+    """Tokens accepted for APP-authenticated calls.
+
+    ``APP_TOKEN_PREVIOUS`` keeps rotation zero-downtime: set it to the old
+    token, restart, update every client, then remove it and restart again.
+    """
+    tokens = [get_app_token(), get_hook_token()]
+    previous = str(os.environ.get("APP_TOKEN_PREVIOUS", "") or "").strip()
+    if previous:
+        tokens.append(previous)
+    return [t for t in tokens if t]
+
+
+def get_hook_tokens() -> List[str]:
+    tokens = [get_hook_token(), get_app_token()]
+    previous = str(os.environ.get("HOOK_TOKEN_PREVIOUS", "") or "").strip()
+    if previous:
+        tokens.append(previous)
+    return [t for t in tokens if t]
+
+
+_AUTH_FAILURE_WINDOW_SEC = 600
+_AUTH_FAILURE_LIMIT = 15
+_AUTH_BLOCK_SEC = 600
+_AUTH_FAILURES: Dict[str, List[float]] = {}
+_AUTH_BLOCKED: Dict[str, float] = {}
+_AUTH_FAILURE_LOCK = threading.Lock()
+
+
+def _auth_throttled() -> bool:
+    """Bounded brute-force guard for token auth. Thresholds are generous so a
+    shared NAT or the local reverse proxy never locks out normal clients."""
+    ip = request.remote_addr or "unknown"
+    now = time.time()
+    with _AUTH_FAILURE_LOCK:
+        blocked_until = _AUTH_BLOCKED.get(ip, 0.0)
+        if blocked_until:
+            if now < blocked_until:
+                return True
+            _AUTH_BLOCKED.pop(ip, None)
+        if len(_AUTH_FAILURES) > 4096:
+            stale = [key for key, hits in _AUTH_FAILURES.items()
+                     if not hits or now - hits[-1] > _AUTH_FAILURE_WINDOW_SEC]
+            for key in stale:
+                _AUTH_FAILURES.pop(key, None)
+    return False
+
+
+def _register_auth_failure() -> None:
+    ip = request.remote_addr or "unknown"
+    now = time.time()
+    with _AUTH_FAILURE_LOCK:
+        hits = [t for t in _AUTH_FAILURES.get(ip, []) if now - t < _AUTH_FAILURE_WINDOW_SEC]
+        hits.append(now)
+        if len(hits) >= _AUTH_FAILURE_LIMIT:
+            _AUTH_BLOCKED[ip] = now + _AUTH_BLOCK_SEC
+            hits = []
+            LOGGER.warning("auth: %s temporarily blocked after %s failed token attempts", ip, _AUTH_FAILURE_LIMIT)
+        _AUTH_FAILURES[ip] = hits
+
+
+def _authorized(allowed: List[str]) -> bool:
+    if _auth_throttled():
+        return False
+    provided = _auth_tokens_from_request()
+    ok = any(any(_token_matches(t, token) for token in allowed if token) for t in provided)
+    if ok:
+        with _AUTH_FAILURE_LOCK:
+            _AUTH_FAILURES.pop(request.remote_addr or "unknown", None)
+    else:
+        _register_auth_failure()
+    return ok
+
+
 def check_app_token() -> bool:
-    allowed = {get_app_token(), get_hook_token()}
-    return any(any(_token_matches(t, token) for token in allowed if token) for t in _auth_tokens_from_request())
+    return _authorized(get_app_tokens())
 
 
 def check_hook_token() -> bool:
-    allowed = {get_hook_token(), get_app_token()}
-    return any(any(_token_matches(t, token) for token in allowed if token) for t in _auth_tokens_from_request())
+    return _authorized(get_hook_tokens())
 
 
 def check_read_token() -> bool:
-    allowed = {get_app_token(), get_hook_token()}
-    return any(any(_token_matches(t, token) for token in allowed if token) for t in _auth_tokens_from_request())
+    return _authorized(get_app_tokens())
 
 
 def add_event(event: Dict[str, Any]) -> Dict[str, Any]:

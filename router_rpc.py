@@ -107,12 +107,42 @@ def _deep_strip_runtime_fields(value: Any) -> Any:
 class EncryptedRouterConfigStore:
     """Persist the router password encrypted at rest with AES-GCM."""
 
+    # Historic key material used before per-install keys existed. Kept for
+    # decrypt-only migration so existing deployments keep their saved router
+    # password across the upgrade; save() re-encrypts it under the current key.
+    LEGACY_CONSTANT_KEY = "labprobe-router-config"
+
     def __init__(self, config_dir: Path):
         self.path = config_dir / "router_eweb.json"
         self.path.parent.mkdir(parents=True, exist_ok=True)
-        source = (os.environ.get("ROUTER_CONFIG_KEY") or os.environ.get("APP_TOKEN") or "labprobe-router-config").encode("utf-8")
-        self.key = hashlib.sha256(source).digest()
+        self.key = self._resolve_key(config_dir)
+        self._legacy_key = hashlib.sha256(self.LEGACY_CONSTANT_KEY.encode("utf-8")).digest()
         self._lock = threading.RLock()
+
+    @staticmethod
+    def _resolve_key(config_dir: Path) -> bytes:
+        configured = os.environ.get("ROUTER_CONFIG_KEY") or os.environ.get("APP_TOKEN")
+        if configured:
+            return hashlib.sha256(configured.encode("utf-8")).digest()
+        # No key material in the environment: derive the at-rest key from a
+        # random per-install key file instead of a public constant, so a leaked
+        # router_eweb.json alone stays undecryptable.
+        key_path = config_dir / "router_config.key"
+        try:
+            raw = key_path.read_bytes().strip() if key_path.exists() else b""
+            if len(raw) < 32:
+                raw = secrets.token_hex(32).encode("ascii")
+                key_path.write_bytes(raw)
+                try:
+                    os.chmod(key_path, 0o600)
+                except OSError:
+                    pass
+            return hashlib.sha256(raw).digest()
+        except OSError:
+            # Unusable key file: a per-process random key makes saved
+            # ciphertext undecryptable after restart (load() already treats
+            # that as "no password"), which is safer than a public constant.
+            return hashlib.sha256(secrets.token_bytes(32)).digest()
 
     def _encrypt(self, plain: str) -> Dict[str, str]:
         cipher = AES.new(self.key, AES.MODE_GCM)
@@ -124,8 +154,16 @@ class EncryptedRouterConfigStore:
         }
 
     def _decrypt(self, payload: Dict[str, Any]) -> str:
-        cipher = AES.new(self.key, AES.MODE_GCM, nonce=base64.b64decode(payload["nonce"]))
-        return cipher.decrypt_and_verify(base64.b64decode(payload["ciphertext"]), base64.b64decode(payload["tag"])).decode("utf-8")
+        last_error: Exception = ValueError("empty ciphertext payload")
+        for key in (self.key, self._legacy_key):
+            try:
+                cipher = AES.new(key, AES.MODE_GCM, nonce=base64.b64decode(payload["nonce"]))
+                return cipher.decrypt_and_verify(
+                    base64.b64decode(payload["ciphertext"]), base64.b64decode(payload["tag"])
+                ).decode("utf-8")
+            except Exception as error:  # try the next key source
+                last_error = error
+        raise last_error
 
     def load(self) -> Dict[str, Any]:
         with self._lock:
