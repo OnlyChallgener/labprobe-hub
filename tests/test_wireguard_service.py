@@ -1,10 +1,12 @@
 import base64
 from pathlib import Path
+import threading
 from types import SimpleNamespace
 
 import pytest
 from flask import Flask
 
+import wireguard_service as wireguard_module
 from wireguard_service import WireGuardService, install_wireguard_service
 
 
@@ -397,6 +399,15 @@ def test_listen_port_customization_updates_stun_target_port(tmp_path):
     service = WireGuardService(hub)
     service.put(_server(), 0)
 
+    save_order = []
+    original_save = hub.save_json
+
+    def tracking_save(path, value):
+        save_order.append(Path(path).name)
+        original_save(path, value)
+
+    hub.save_json = tracking_save
+
     # Now update listenPort to 40000
     server_data = _server()
     server_data["listenPort"] = 40000
@@ -408,6 +419,218 @@ def test_listen_port_customization_updates_stun_target_port(tmp_path):
     updated_stun_rules = hub.load_json(stun_rules_path, {})
     rule = updated_stun_rules["rules"][0]
     assert rule["targetPort"] == 40000
+    assert save_order.index("wireguard_server.json") < save_order.index("wireguard_commands.json")
+    assert save_order.index("wireguard_commands.json") < save_order.index("stun_rules.json")
+
+
+def test_failed_validation_does_not_mutate_stun_target_port(tmp_path):
+    hub = _hub(tmp_path)
+    service = WireGuardService(hub)
+    service.put(_server(), 0)
+
+    invalid = _server()
+    invalid["listenPort"] = 40000
+    invalid["mtu"] = 1200
+
+    with pytest.raises(ValueError, match="MTU"):
+        service.put(invalid, 1)
+
+    stun_document = hub.load_json(Path(tmp_path) / "stun_rules.json", {})
+    assert stun_document["rules"][0]["targetPort"] == 51820
+    assert service.document()["revision"] == 1
+    assert len(service.commands()) == 1
+
+
+def test_command_save_failure_restores_previous_desired_document(tmp_path):
+    hub = _hub(tmp_path)
+    service = WireGuardService(hub)
+    service.put(_server(), 0)
+    original_save = hub.save_json
+
+    def failing_command_save(path, value):
+        if Path(path) == service.commands_path:
+            raise OSError("command store unavailable")
+        original_save(path, value)
+
+    hub.save_json = failing_command_save
+
+    changed = _server()
+    changed["listenPort"] = 40000
+    with pytest.raises(OSError, match="command store unavailable"):
+        service.put(changed, 1)
+
+    restored = service.document()
+    assert restored["revision"] == 1
+    assert restored["server"]["listenPort"] == 51820
+    assert len(service.commands()) == 1
+    stun_document = hub.load_json(Path(tmp_path) / "stun_rules.json", {})
+    assert stun_document["rules"][0]["targetPort"] == 51820
+
+
+def test_agent_status_cannot_queue_rolled_back_revision_during_command_save_failure(tmp_path):
+    hub = _hub(tmp_path)
+    service = install_wireguard_service(hub)
+    service.put(_server(), 0)
+    original_save = hub.save_json
+    command_save_entered = threading.Event()
+    allow_command_failure = threading.Event()
+    failure_pending = {"value": True}
+    put_errors = []
+
+    def fail_once_after_status_can_arrive(path, value):
+        if Path(path) == service.commands_path and failure_pending["value"]:
+            failure_pending["value"] = False
+            command_save_entered.set()
+            assert allow_command_failure.wait(timeout=2)
+            raise OSError("command store unavailable")
+        original_save(path, value)
+
+    hub.save_json = fail_once_after_status_can_arrive
+    changed = _server()
+    changed["listenPort"] = 40000
+
+    def save_changed_server():
+        try:
+            service.put(changed, 1)
+        except Exception as error:
+            put_errors.append(error)
+
+    put_thread = threading.Thread(target=save_changed_server)
+    put_thread.start()
+    assert command_save_entered.wait(timeout=2)
+
+    status_started = threading.Event()
+    status_response = []
+
+    def report_old_applied_revision():
+        status_started.set()
+        with hub.app.test_client() as client:
+            status_response.append(client.post("/api/router/wireguard/status?router=Router", json={"revision": 1}))
+
+    status_thread = threading.Thread(target=report_old_applied_revision)
+    status_thread.start()
+    assert status_started.wait(timeout=2)
+    allow_command_failure.set()
+    put_thread.join(timeout=2)
+    status_thread.join(timeout=2)
+
+    assert not put_thread.is_alive()
+    assert not status_thread.is_alive()
+    assert len(put_errors) == 1
+    assert isinstance(put_errors[0], OSError)
+    assert status_response[0].status_code == 200
+    assert service.document()["revision"] == 1
+    assert all(command["revision"] != 2 for command in service.commands())
+    assert all(command["status"] != "pending" or command["revision"] == 1 for command in service.commands())
+
+
+def test_stun_target_port_save_failure_rolls_back_wireguard_command_and_desired(tmp_path):
+    hub = _hub(tmp_path)
+    service = install_wireguard_service(hub)
+    service.put(_server(), 0)
+    commands_before = service.commands()
+    original_save = hub.save_json
+
+    def failing_stun_save(path, value):
+        if Path(path) == Path(tmp_path) / "stun_rules.json":
+            raise OSError("STUN document unavailable")
+        original_save(path, value)
+
+    hub.save_json = failing_stun_save
+    changed = _server()
+    changed["expectedRevision"] = 1
+    changed["listenPort"] = 40000
+
+    client = hub.app.test_client()
+    response = client.put("/api/wireguard/server", json=changed)
+    assert response.status_code == 409
+    assert response.get_json()["ok"] is False
+    assert "STUN targetPort 同步失败" in response.get_json()["error"]
+
+    restored = service.document()
+    assert restored["revision"] == 1
+    assert restored["server"]["listenPort"] == 51820
+    assert service.commands() == commands_before
+    assert all(command["revision"] != 2 for command in service.commands())
+    stun_document = hub.load_json(Path(tmp_path) / "stun_rules.json", {})
+    assert stun_document["rules"][0]["targetPort"] == 51820
+    delivered = client.get("/api/router/wireguard/commands?router=Router").get_json()["commands"]
+    assert all(command["revision"] != 2 for command in delivered)
+
+
+def test_failed_apply_command_reuses_one_id_with_bounded_backoff(tmp_path, monkeypatch):
+    clock = {"now": 1_000}
+    monkeypatch.setattr(wireguard_module, "_now", lambda: clock["now"])
+
+    hub = _hub(tmp_path)
+    service = install_wireguard_service(hub)
+    client = hub.app.test_client()
+    service.put(_server(), 0)
+    command_id = service.commands()[0]["id"]
+    delays = [15, 30, 60, 120, 120]
+
+    for attempt, delay in enumerate(delays, start=1):
+        delivered = client.get("/api/router/wireguard/commands?router=Router").get_json()["commands"]
+        assert [row["id"] for row in delivered] == [command_id]
+
+        ack = client.post(
+            "/api/router/wireguard/ack?router=Router",
+            json={"acks": [{"id": command_id, "ok": False, "result": {"ok": False, "error": "apply failed"}}]},
+        )
+        assert ack.status_code == 200
+
+        failed = service.commands()
+        assert len(failed) == 1
+        assert failed[0]["status"] == "failed"
+        assert failed[0]["attempts"] == attempt
+        assert failed[0]["retryAfterEpoch"] == clock["now"] + delay
+
+        client.post("/api/router/wireguard/status?router=Router", json={"revision": 0})
+        assert len(service.commands()) == 1
+        assert service.commands()[0]["status"] == "failed"
+
+        if attempt < len(delays):
+            clock["now"] = failed[0]["retryAfterEpoch"] - 1
+            client.post("/api/router/wireguard/status?router=Router", json={"revision": 0})
+            assert service.commands()[0]["status"] == "failed"
+
+            clock["now"] += 1
+            client.post("/api/router/wireguard/status?router=Router", json={"revision": 0})
+            assert len(service.commands()) == 1
+            assert service.commands()[0]["status"] == "pending"
+            client.post("/api/router/wireguard/status?router=Router", json={"revision": 0})
+            assert len(service.commands()) == 1
+            assert service.commands()[0]["id"] == command_id
+
+    clock["now"] += 10_000
+    client.post("/api/router/wireguard/status?router=Router", json={"revision": 0})
+    terminal = service.commands()
+    assert len(terminal) == 1
+    assert terminal[0]["id"] == command_id
+    assert terminal[0]["status"] == "failed"
+    assert terminal[0]["attempts"] == 5
+
+
+def test_successful_apply_command_flow_remains_terminal(tmp_path):
+    hub = _hub(tmp_path)
+    service = install_wireguard_service(hub)
+    client = hub.app.test_client()
+    service.put(_server(), 0)
+
+    delivered = client.get("/api/router/wireguard/commands?router=Router").get_json()["commands"]
+    command_id = delivered[0]["id"]
+    response = client.post(
+        "/api/router/wireguard/ack?router=Router",
+        json={"acks": [{"id": command_id, "ok": True, "result": {"ok": True, "revision": 1}}]},
+    )
+    assert response.status_code == 200
+
+    client.post("/api/router/wireguard/status?router=Router", json={"revision": 1})
+    assert client.get("/api/router/wireguard/commands?router=Router").get_json()["commands"] == []
+    rows = service.commands()
+    assert len(rows) == 1
+    assert rows[0]["status"] == "done"
+    assert "retryAfterEpoch" not in rows[0]
 
 
 def test_old_config_without_listen_port_defaults_to_51820(tmp_path):

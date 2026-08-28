@@ -1690,7 +1690,15 @@ async fn sync_wireguard(
                     acks.push(json!({"id":id,"ok":true,"revision":revision,"result":value}));
                 }
                 Err(error) => {
-                    acks.push(json!({"id":id,"ok":false,"revision":revision,"result":{"ok":false,"error":error.to_string()}}));
+                    let error_text = format!("{error:#}");
+                    if action == "apply" && revision >= state.wireguard_revision {
+                        state.wireguard_apply_result = Some(json!({
+                            "ok": false,
+                            "revision": revision,
+                            "error": error_text.clone(),
+                        }));
+                    }
+                    acks.push(json!({"id":id,"ok":false,"revision":revision,"result":{"ok":false,"error":error_text}}));
                 }
             }
         }

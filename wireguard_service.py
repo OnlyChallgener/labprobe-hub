@@ -21,6 +21,9 @@ from flask import Blueprint, jsonify, request
 
 logger = logging.getLogger("wireguard_service")
 
+WIREGUARD_APPLY_MAX_ATTEMPTS = 5
+WIREGUARD_APPLY_RETRY_DELAYS = (15, 30, 60, 120)
+
 
 def _text(value: Any) -> str:
     return str(value or "").strip()
@@ -39,6 +42,11 @@ def _now() -> int:
 
 def _now_text() -> str:
     return time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime())
+
+
+def _apply_retry_delay(attempts: int) -> int:
+    index = max(0, min(attempts - 1, len(WIREGUARD_APPLY_RETRY_DELAYS) - 1))
+    return WIREGUARD_APPLY_RETRY_DELAYS[index]
 
 
 def _has_secret(value: Any) -> bool:
@@ -148,7 +156,12 @@ class WireGuardService:
                 except Exception:
                     pass
 
-    def _validate_stun_binding(self, rule_id: str, listen_port: int) -> Dict[str, Any]:
+    def _validate_stun_binding(
+        self,
+        rule_id: str,
+        listen_port: int,
+        previous_listen_port: Optional[int] = None,
+    ) -> Dict[str, Any]:
         rule = self._stun_rule(rule_id)
         if rule is None:
             raise ValueError("STUN Profile 关联规则不存在")
@@ -160,7 +173,11 @@ class WireGuardService:
             raise ValueError("WireGuard STUN Profile 必须关联 UDP 规则")
         if _text(rule.get("forwardMode")) != "router_native":
             raise ValueError("WireGuard STUN Profile 必须使用路由器原生端口映射")
-        if _int(rule.get("targetPort")) != listen_port:
+        target_port = _int(rule.get("targetPort"))
+        accepted_ports = {listen_port}
+        if previous_listen_port is not None:
+            accepted_ports.add(previous_listen_port)
+        if target_port not in accepted_ports:
             raise ValueError("STUN 规则目标端口必须等于 WireGuard 监听端口")
         target = _text(rule.get("targetIpv4"))
         try:
@@ -170,6 +187,50 @@ class WireGuardService:
         if address.version != 4 or not address.is_private:
             raise ValueError("STUN 规则目标必须是路由器/Agent 私有 IPv4 地址")
         return rule
+
+    def _sync_stun_target_ports_after_commit(
+        self,
+        old_server: Optional[Dict[str, Any]],
+        new_server: Dict[str, Any],
+    ) -> None:
+        old_port = _int((old_server or {}).get("listenPort"))
+        new_port = _int(new_server.get("listenPort"))
+        if not old_port or not new_port or old_port == new_port:
+            return
+        synced_rule_ids = set()
+        for profile in new_server.get("endpointProfiles", []):
+            if not isinstance(profile, dict) or _text(profile.get("endpointSource")).lower() != "stun":
+                continue
+            rule_id = _text(profile.get("stunRuleId"))
+            if rule_id:
+                synced_rule_ids.add(rule_id)
+        if not synced_rule_ids:
+            return
+
+        # Write every affected STUN target as one desired-document update.  The
+        # caller holds the WireGuard transaction lock and will compensate its
+        # own desired document/command if this save fails.
+        path = Path(self.hub.DATA_DIR) / "stun_rules.json"
+        raw = self.hub.load_json(path, {"revision": 0, "rules": []})
+        if not isinstance(raw, dict):
+            raise RuntimeError("STUN 规则文档无效")
+        rules = [dict(row) for row in raw.get("rules", []) if isinstance(row, dict)]
+        updated = False
+        for rule in rules:
+            rule_id = _text(rule.get("id"))
+            if rule_id not in synced_rule_ids:
+                continue
+            if _int(rule.get("targetPort")) == old_port:
+                rule["targetPort"] = new_port
+                updated = True
+        if not updated:
+            return
+        self.hub.save_json(path, {
+            **raw,
+            "rules": rules,
+            "revision": _int(raw.get("revision")) + 1,
+            "updatedAt": _now_text(),
+        })
 
 
     def _stun_lifecycle(self) -> Any:
@@ -450,11 +511,9 @@ class WireGuardService:
                 stun_rule_id = _text(raw.get("stunRuleId"))
                 if not re.fullmatch(r"[A-Za-z0-9_-]{1,64}", stun_rule_id):
                     raise ValueError("STUN Profile 需要独立的 UDP 穿透规则")
-                if old and _int(old.get("listenPort")) != listen_port:
-                    rule = self._stun_rule(stun_rule_id)
-                    if rule and _int(rule.get("targetPort")) == _int(old.get("listenPort")):
-                        self._sync_stun_rule_target_port(stun_rule_id, listen_port)
-                self._validate_stun_binding(stun_rule_id, listen_port)
+                old_listen_port = _int(old.get("listenPort")) if old else 0
+                previous_listen_port = old_listen_port if old_listen_port and old_listen_port != listen_port else None
+                self._validate_stun_binding(stun_rule_id, listen_port, previous_listen_port)
                 # STUN owns the public channel port; the router-native map
                 # forwards it to the Agent's fixed WireGuard listen port.
                 # WireGuard itself never binds the changing STUN port.
@@ -497,6 +556,37 @@ class WireGuardService:
         router = router or self._router_name() or "router"
         with self.lock:
             rows = self.commands()
+            if action == "apply":
+                active = next((row for row in reversed(rows) if (
+                    row.get("router") == router
+                    and row.get("action") == "apply"
+                    and _int(row.get("revision")) == revision
+                    and _text(row.get("revisionScope")) in {"", revision_scope}
+                    and row.get("status") in {"pending", "delivered"}
+                )), None)
+                if active is not None:
+                    return active
+                failed = next((row for row in reversed(rows) if (
+                    row.get("router") == router
+                    and row.get("action") == "apply"
+                    and _int(row.get("revision")) == revision
+                    and _text(row.get("revisionScope")) in {"", revision_scope}
+                    and row.get("status") == "failed"
+                )), None)
+                if failed is not None:
+                    attempts = max(1, _int(failed.get("attempts")))
+                    retry_after = _int(failed.get("retryAfterEpoch"))
+                    if not retry_after:
+                        retry_after = _int(failed.get("finishedEpoch")) + _apply_retry_delay(attempts)
+                    if attempts >= WIREGUARD_APPLY_MAX_ATTEMPTS or _now() < retry_after:
+                        return failed
+                    failed.update({
+                        "status": "pending",
+                        "retryScheduledAt": _now_text(),
+                        "retryAfterEpoch": retry_after,
+                    })
+                    self._save_commands(rows[-500:])
+                    return failed
             rows = [row for row in rows if not (
                 row.get("router") == router
                 and _text(row.get("revisionScope")) in {"", revision_scope}
@@ -534,7 +624,27 @@ class WireGuardService:
                 "tombstone": None,
             }
             self._save_document(saved)
-            self.queue("apply", revision, {"server": server})
+            commands_before = self.commands()
+            try:
+                self.queue("apply", revision, {"server": server})
+            except Exception:
+                self._save_document(document)
+                raise
+            try:
+                self._sync_stun_target_ports_after_commit(document.get("server"), server)
+            except Exception as error:
+                # The command is still invisible to Agent command delivery
+                # while this lock is held.  Restore the exact pre-PUT command
+                # document as well as the complete desired document before
+                # exposing either one again.
+                try:
+                    self._save_commands(commands_before)
+                    self._save_document(document)
+                except Exception as rollback_error:
+                    raise RuntimeError(
+                        f"WireGuard STUN targetPort 同步失败，且回滚失败：{rollback_error}"
+                    ) from error
+                raise RuntimeError(f"WireGuard STUN targetPort 同步失败：{error}") from error
             try:
                 self._sync_ddns_firewalls(document.get("server"), server)
                 self._sync_wireguard_lan_firewall(document.get("server"), server)
@@ -666,18 +776,19 @@ def create_wireguard_blueprint(hub: Any, service: WireGuardService) -> Blueprint
             return jsonify({"ok": False, "error": "bad hook token"}), 401
         router = _text(request.args.get("router")) or service._router_name()
         limit = max(1, min(20, _int(request.args.get("limit"), 10)))
-        rows = service.commands()
-        selected, changed, now = [], False, _now()
-        for row in rows:
-            retry = row.get("status") == "delivered" and now - _int(row.get("deliveredEpoch")) >= 15 and _int(row.get("attempts")) < 5
-            if row.get("router") == router and (row.get("status") == "pending" or retry):
-                row.update({"status": "delivered", "deliveredEpoch": now, "deliveredAt": _now_text(), "attempts": _int(row.get("attempts")) + 1})
-                selected.append({key: row.get(key) for key in ("id", "action", "revision", "payload", "createdAt")})
-                changed = True
-                if len(selected) >= limit:
-                    break
-        if changed:
-            service._save_commands(rows)
+        with service.lock:
+            rows = service.commands()
+            selected, changed, now = [], False, _now()
+            for row in rows:
+                retry = row.get("status") == "delivered" and now - _int(row.get("deliveredEpoch")) >= 15 and _int(row.get("attempts")) < WIREGUARD_APPLY_MAX_ATTEMPTS
+                if row.get("router") == router and (row.get("status") == "pending" or retry):
+                    row.update({"status": "delivered", "deliveredEpoch": now, "deliveredAt": _now_text(), "attempts": _int(row.get("attempts")) + 1})
+                    selected.append({key: row.get(key) for key in ("id", "action", "revision", "payload", "createdAt")})
+                    changed = True
+                    if len(selected) >= limit:
+                        break
+            if changed:
+                service._save_commands(rows)
         return jsonify({"ok": True, "commands": selected})
 
     @bp.post("/router/wireguard/ack")
@@ -685,14 +796,27 @@ def create_wireguard_blueprint(hub: Any, service: WireGuardService) -> Blueprint
         if not hub.check_hook_token():
             return jsonify({"ok": False, "error": "bad hook token"}), 401
         values = {_text(row.get("id")): row for row in (request.get_json(silent=True) or {}).get("acks", []) if isinstance(row, dict)}
-        rows, changed = service.commands(), 0
-        for row in rows:
-            ack = values.get(_text(row.get("id")))
-            if ack:
-                row.update({"status": "done" if ack.get("ok") else "failed", "result": ack.get("result"), "finishedAt": _now_text()})
-                changed += 1
-        if changed:
-            service._save_commands(rows)
+        with service.lock:
+            rows, changed = service.commands(), 0
+            for row in rows:
+                ack = values.get(_text(row.get("id")))
+                if ack:
+                    ok = bool(ack.get("ok"))
+                    finished_epoch = _now()
+                    row.update({
+                        "status": "done" if ok else "failed",
+                        "result": ack.get("result"),
+                        "finishedAt": _now_text(),
+                        "finishedEpoch": finished_epoch,
+                    })
+                    if ok:
+                        row.pop("retryAfterEpoch", None)
+                    elif row.get("action") == "apply":
+                        attempts = max(1, _int(row.get("attempts")))
+                        row["retryAfterEpoch"] = finished_epoch + _apply_retry_delay(attempts)
+                    changed += 1
+            if changed:
+                service._save_commands(rows)
         return jsonify({"ok": True, "acknowledged": changed})
 
     @bp.post("/router/wireguard/status")
@@ -705,15 +829,16 @@ def create_wireguard_blueprint(hub: Any, service: WireGuardService) -> Blueprint
         # private or preshared key, even if a future Agent regresses.
         if _has_secret(payload):
             return jsonify({"ok": False, "error": "secret material rejected"}), 400
-        record = {"router": router, "receivedAt": _now_text(), "receivedEpoch": _now(), **payload}
-        hub.save_json(service.status_path, record)
-        document = service.document()
-        agent_revision = _int(payload.get("revision"))
-        if agent_revision < document["revision"]:
-            if document.get("server"):
-                service.queue("apply", document["revision"], {"server": document["server"]}, router)
-            elif document.get("tombstone"):
-                service.queue("delete", document["revision"], {**document["tombstone"], "tombstone": True}, router)
+        with service.lock:
+            record = {"router": router, "receivedAt": _now_text(), "receivedEpoch": _now(), **payload}
+            hub.save_json(service.status_path, record)
+            document = service.document()
+            agent_revision = _int(payload.get("revision"))
+            if agent_revision < document["revision"]:
+                if document.get("server"):
+                    service.queue("apply", document["revision"], {"server": document["server"]}, router)
+                elif document.get("tombstone"):
+                    service.queue("delete", document["revision"], {**document["tombstone"], "tombstone": True}, router)
         return jsonify({"ok": True, "receivedAt": record["receivedAt"], "desiredRevision": document["revision"]})
 
     return bp
