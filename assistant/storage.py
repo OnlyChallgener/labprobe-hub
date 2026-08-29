@@ -138,7 +138,40 @@ class AIStore:
                     (cursor.lastrowid, legacy["provider"], legacy["model"]),
                 )
                 conn.execute("DELETE FROM ai_config WHERE id=1")
+        self._backfill_usage_config_ids()
         self._maybe_prune()
+
+    def _backfill_usage_config_ids(self) -> None:
+        """Attribute pre-multi-config usage rows to their matching API config.
+
+        Per-model totals cover every usage row, while per-config quota rows only
+        counted rows that already carried a config_id; without this backfill the
+        two cards on the usage page disagree for accounts used before the
+        config was created. Matching prefers the same provider+model pair and
+        falls back to the first config with the same model (position order).
+        """
+        with self._connect() as conn:
+            configs = conn.execute(
+                "SELECT id, provider, model FROM ai_provider_configs ORDER BY position ASC, id ASC"
+            ).fetchall()
+            if not configs:
+                return
+            by_pair = {(row["provider"], row["model"]): int(row["id"]) for row in configs}
+            by_model: Dict[str, int] = {}
+            for row in configs:
+                by_model.setdefault(str(row["model"]), int(row["id"]))
+            unattributed = conn.execute(
+                "SELECT provider, model FROM ai_usage WHERE config_id IS NULL GROUP BY provider, model"
+            ).fetchall()
+            for row in unattributed:
+                provider, model = str(row["provider"]), str(row["model"])
+                config_id = by_pair.get((provider, model)) or by_model.get(model)
+                if config_id is None:
+                    continue
+                conn.execute(
+                    "UPDATE ai_usage SET config_id=? WHERE config_id IS NULL AND provider=? AND model=?",
+                    (config_id, provider, model),
+                )
 
     def _maybe_prune(self) -> None:
         now = time.monotonic()

@@ -917,7 +917,7 @@ def test_plain_nat_intent_opens_app_tool_page_without_execution(tmp_path, monkey
     assert response.json["clientActions"] == [{"type": "navigate", "route": "nat"}]
     assert response.json["toolExecutions"] == []
     assert hub.task_calls == []
-    assert "NAT 检测" in response.json["message"]["content"]
+    assert "已打开工具箱页的「NAT 检测」" in response.json["message"]["content"]
     assert "路由NAT检测" in response.json["message"]["content"]
 
 
@@ -957,3 +957,22 @@ def test_agent_cleanup_status_reports_latest_command(tmp_path, monkeypatch):
     assert done.status_code == 200
     assert done.json["result"]["state"] == "succeeded"
     assert done.json["result"]["reclaimed"] == "2 KB"
+
+
+def test_usage_config_backfill_attributes_legacy_rows_by_model(tmp_path, monkeypatch):
+    monkeypatch.setenv("LABPROBE_AI_MASTER_KEY", "test-master-key")
+    store = AIStore(tmp_path / "ai.db")
+    store.initialize()
+    store.create_config("腾讯混元", "openai_compatible", "https://x.example", "hy3",
+                        encrypt_secret("sk-test"), True, None)
+    # 旧记录：单配置时期写入，config_id 为空，provider 命名也与现配置不同
+    store.add_usage("conv-1", "deepseek", "hy3", {"prompt_tokens": 7, "completion_tokens": 3, "total_tokens": 10})
+    store.add_usage("conv-1", "openai_compatible", "hy3", {"prompt_tokens": 2, "completion_tokens": 3, "total_tokens": 5})
+    store.initialize()  # 再次初始化触发回填
+
+    import sqlite3
+    ids = [row[0] for row in sqlite3.connect(tmp_path / "ai.db").execute(
+        "SELECT config_id FROM ai_usage ORDER BY id")]
+    assert ids == [1, 1]
+    per_config = store.usage_by_config()
+    assert per_config[0]["total_tokens"] == 15

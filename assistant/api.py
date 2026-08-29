@@ -859,7 +859,7 @@ def create_ai_blueprint(*, check_app_token: Callable[[], bool], db_path, logger,
         forced_tool_id = diagnostic_tool_intent(latest_user_text)
         if forced_tool_id == "navigate.tool_nat" and executor is not None:
             content = (
-                "已打开工具箱的「NAT 检测」页面：在那里选择检测模式和 STUN 服务器即可开始检测。\n"
+                "已打开工具箱页的「NAT 检测」。\n"
                 "如需我直接读取路由器原生的 NAT 类型与映射/过滤行为，请说「路由NAT检测」。"
             )
             store.add_message(conversation_id, "assistant", content)
