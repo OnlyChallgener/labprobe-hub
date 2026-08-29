@@ -47,6 +47,32 @@ def usage_from_chunk(chunk: Dict[str, Any]) -> Optional[Dict[str, int]]:
     return values or None
 
 
+def accumulate_tool_call_fragment(acc: Dict[str, Dict[str, str]], delta_tool_calls: Any) -> None:
+    """Merge one chunk's delta.tool_calls into {index: {"id","name","arguments"}}."""
+    if not isinstance(delta_tool_calls, list):
+        return
+    for fragment in delta_tool_calls:
+        if not isinstance(fragment, dict):
+            continue
+        try:
+            index = int(fragment.get("index") or 0)
+        except (TypeError, ValueError):
+            index = 0
+        slot = acc.setdefault(index, {"id": "", "name": "", "arguments": ""})
+        slot["id"] += str(fragment.get("id") or "")
+        function = fragment.get("function") if isinstance(fragment.get("function"), dict) else {}
+        slot["name"] += str(function.get("name") or "")
+        slot["arguments"] += str(function.get("arguments") or "")
+
+
+def tool_calls_from_accumulated(acc: Dict[str, Dict[str, str]]) -> List[Dict[str, Any]]:
+    return [{
+        "id": slot["id"] or f"call_{index}",
+        "type": "function",
+        "function": {"name": slot["name"], "arguments": slot["arguments"] or "{}"},
+    } for index, slot in sorted(acc.items())]
+
+
 @dataclass
 class ChatResult:
     content: str
@@ -105,8 +131,8 @@ class OpenAICompatibleProvider:
         finally:
             response.close()
 
-    def stream(self, messages: List[Dict[str, Any]]) -> Iterator[Dict[str, Any]]:
-        response = self._request(messages, True)
+    def stream(self, messages: List[Dict[str, Any]], tools: Optional[List[Dict[str, Any]]] = None) -> Iterator[Dict[str, Any]]:
+        response = self._request(messages, True, tools)
         try:
             for raw in response.iter_lines(decode_unicode=True):
                 chunk = parse_sse_line(raw)

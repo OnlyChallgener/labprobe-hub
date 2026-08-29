@@ -8,7 +8,7 @@ from __future__ import annotations
 
 from typing import Any, Dict, List
 
-CATALOG_REVISION = "2026-08-29.1"
+CATALOG_REVISION = "2026-08-29.2"
 
 _TOOLS: List[Dict[str, Any]] = [
     {

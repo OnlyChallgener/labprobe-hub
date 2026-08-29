@@ -82,7 +82,7 @@ class AIStore:
                     id TEXT PRIMARY KEY, tool_id TEXT NOT NULL, arguments_json TEXT NOT NULL,
                     preview_json TEXT NOT NULL, status TEXT NOT NULL,
                     expires_at TEXT NOT NULL, created_at TEXT NOT NULL,
-                    confirmed_at TEXT, result_json TEXT
+                    confirmed_at TEXT, result_json TEXT, conversation_id TEXT
                 );
                 CREATE TABLE IF NOT EXISTS ai_notifications (
                     id INTEGER PRIMARY KEY AUTOINCREMENT, kind TEXT NOT NULL,
@@ -118,6 +118,11 @@ class AIStore:
             config_columns = {row["name"] for row in conn.execute("PRAGMA table_info(ai_config)")}
             if "enabled" not in config_columns:
                 conn.execute("ALTER TABLE ai_config ADD COLUMN enabled INTEGER NOT NULL DEFAULT 1")
+            confirmation_columns = {
+                row["name"] for row in conn.execute("PRAGMA table_info(ai_tool_confirmations)")
+            }
+            if "conversation_id" not in confirmation_columns:
+                conn.execute("ALTER TABLE ai_tool_confirmations ADD COLUMN conversation_id TEXT")
             # One-time migration from the phase-one singleton.  The old table
             # remains readable for rollback, but is cleared after a successful
             # copy so deleting all new configs cannot resurrect it on restart.
@@ -138,8 +143,23 @@ class AIStore:
                     (cursor.lastrowid, legacy["provider"], legacy["model"]),
                 )
                 conn.execute("DELETE FROM ai_config WHERE id=1")
-        self._backfill_usage_config_ids()
+        self._reattribute_usage_config_ids()
         self._maybe_prune()
+
+    def _reattribute_usage_config_ids(self) -> None:
+        """Null out usage rows whose config no longer exists, then backfill.
+
+        Deleting and re-creating an API config leaves old usage rows pointing
+        at the removed id; the per-config quota card would silently exclude
+        them while per-model totals still count them. Re-nullifying orphans
+        before the pair/model backfill lets them attach to the current config.
+        """
+        with self._connect() as conn:
+            conn.execute(
+                "UPDATE ai_usage SET config_id=NULL WHERE config_id IS NOT NULL "
+                "AND config_id NOT IN (SELECT id FROM ai_provider_configs)"
+            )
+        self._backfill_usage_config_ids()
 
     def _backfill_usage_config_ids(self) -> None:
         """Attribute pre-multi-config usage rows to their matching API config.
@@ -328,7 +348,12 @@ class AIStore:
         if target_id is None:
             return False
         with self._connect() as conn:
-            return bool(conn.execute("DELETE FROM ai_provider_configs WHERE id=?", (target_id,)).rowcount)
+            deleted = bool(conn.execute("DELETE FROM ai_provider_configs WHERE id=?", (target_id,)).rowcount)
+        if deleted:
+            # Re-attach the deleted config's usage rows to any remaining
+            # config with the same provider/model so quota cards stay truthful.
+            self._reattribute_usage_config_ids()
+        return deleted
 
     def create_conversation(self, conversation_id: str, title: Optional[str] = None) -> None:
         now = utc_now()
@@ -614,13 +639,14 @@ class AIStore:
             )
 
     def create_confirmation(self, confirmation_id: str, tool_id: str, arguments: Dict[str, Any],
-                            preview: Dict[str, Any], expires_at: str) -> None:
+                            preview: Dict[str, Any], expires_at: str,
+                            conversation_id: Optional[str] = None) -> None:
         with self._connect() as conn:
             conn.execute(
-                "INSERT INTO ai_tool_confirmations(id,tool_id,arguments_json,preview_json,status,expires_at,created_at) "
-                "VALUES(?,?,?,?,?,?,?)",
+                "INSERT INTO ai_tool_confirmations(id,tool_id,arguments_json,preview_json,status,expires_at,created_at,conversation_id) "
+                "VALUES(?,?,?,?,?,?,?,?)",
                 (confirmation_id, tool_id, json.dumps(arguments, ensure_ascii=False),
-                 json.dumps(preview, ensure_ascii=False), "pending", expires_at, utc_now()),
+                 json.dumps(preview, ensure_ascii=False), "pending", expires_at, utc_now(), conversation_id),
             )
 
     def claim_confirmation(self, confirmation_id: str) -> Optional[Dict[str, Any]]:

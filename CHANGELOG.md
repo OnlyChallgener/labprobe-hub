@@ -2,7 +2,13 @@
 
 ## 0.12.0 / LabRelay 0.2.30
 
-- **AI 助手多 API**：新增 `ai_provider_configs` 多配置 CRUD，按顺序自动 failover；流式响应先缓冲后切换，避免半截重复内容；腾讯混元默认地址 `https://tokenhub.tencentmaas.com/v1`。
+- **确认结果回传会话**：工具确认的执行结果以〔操作记录〕写入对话转录，APP 增量模式下模型不再对已完成的操作重复要求确认（此前会导致重复下发 Agent 清理/升级指令）；批量确认与 APP 本机执行结果同样回传。
+- **写操作结果可读**：STUN/端口映射/原生映射/UPnP/防火墙等写工具返回人话 `message`，APP 确认执行后显示具体改动而非统一“操作已完成”。
+- **用量归属修复**：删除并重建 API 配置遗留的孤儿 usage 记录，在启动时与删除配置时按 provider+model 重新归因；模型分布与配置额度两张卡对齐，额度余量不再偏乐观。
+- **防火墙规则工具**：新增 `router.firewall.rule.create/update/remove`（转发/入站/出站、IPv4/IPv6、协议、允许/丢弃、源目的 IP 与端口、出入接口），全部经二次确认执行，直通 Router Core 原生能力，字段与 APP 防火墙编辑器一致。
+- **流式对话（SSE）**：`/api/ai/chat` 流式路径升级为 typed 事件（delta/tool/confirmation/done/error），支持完整工具调用循环与多配置 failover，中断轮次下发 `reset` 信号；强制意图与确认请求在流式下同样可用。
+- **通知 SSE 与任务事件**：新增 `GET /api/ai/notifications/stream`（SSE 推送替代 APP 轮询）；NAT 检测/路由器自检完成后自动进入通知收件箱并推送到 APP。
+- **AI 助手多 API**：新增 `ai_provider_configs` 多配置 CRUD，按顺序自动 failover；腾讯混元默认地址 `https://tokenhub.tencentmaas.com/v1`。
 - **Token 额度与用量**：每配置/每模型额度、已用与剩余百分比；`/api/ai/usage` 返回 14 天北京时间日柱状数据（含输入/输出与缓存分段）与按配置累计用量。
 - **历史对话管理**：对话按北京时间自然日折叠展示，新增 `PATCH /api/ai/conversations/{id}` 重命名接口；消息总存储限额 8 MiB 自动治理。
 - **AI 工具扩展**：Router Core 只读能力（UPnP、原生端口映射、防火墙、DDNS、IPv6、NAT、自检）与需二次确认的写操作（UPnP 启停、映射增删、防火墙规则启停）；网络自检/路由自检/NAT 检测真实执行，不再误触发 APP 导航。

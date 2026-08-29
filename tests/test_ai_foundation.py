@@ -656,7 +656,7 @@ def test_chat_skips_disabled_config_and_never_retries_exhausted_pool(tmp_path, m
     assert calls == ["https://a.example/v1", "https://b.example/v1"]
 
 
-def test_stream_chat_buffers_before_safe_failover(tmp_path, monkeypatch):
+def test_stream_chat_fails_over_and_signals_reset(tmp_path, monkeypatch):
     client = make_client(tmp_path, monkeypatch)
     first = client.put("/api/ai/config", json={
         "apiKey": "sk-a", "baseUrl": "https://a.example/v1", "model": "a",
@@ -670,9 +670,10 @@ def test_stream_chat_buffers_before_safe_failover(tmp_path, monkeypatch):
         def __init__(self, base_url, *_args):
             self.base_url = base_url
 
-        def stream(self, messages):
+        def stream(self, messages, tools=None):
             calls.append(self.base_url)
             if "a.example" in self.base_url:
+                yield {"choices": [{"delta": {"content": "残句"}}]}
                 raise ProviderError("stream unavailable", 502)
             yield {"choices": [{"delta": {"content": "备用流"}}]}
             yield {"choices": [], "usage": {"total_tokens": 3}}
@@ -680,7 +681,14 @@ def test_stream_chat_buffers_before_safe_failover(tmp_path, monkeypatch):
     monkeypatch.setattr("assistant.api.OpenAICompatibleProvider", StreamProvider)
     response = client.post("/api/ai/chat", json={"message": "hello", "stream": True})
     assert response.status_code == 200
-    assert "备用流" in response.get_data(as_text=True)
+    body = response.get_data(as_text=True)
+    assert "备用流" in body
+    events = [json.loads(line[len("data: "):]) for line in body.splitlines() if line.startswith("data: ")]
+    kinds = [event["type"] for event in events]
+    assert "reset" in kinds, kinds
+    assert kinds.index("reset") < kinds.index("delta") + 1 or kinds[0] == "delta"
+    done = events[-1]
+    assert done["type"] == "done" and done["message"]["content"] == "备用流"
     assert calls == ["https://a.example/v1", "https://b.example/v1"]
     usage = {item["config_id"]: item for item in client.get("/api/ai/usage").json["config_usage"]}
     assert usage[first["id"]]["total_tokens"] == 0
@@ -976,3 +984,167 @@ def test_usage_config_backfill_attributes_legacy_rows_by_model(tmp_path, monkeyp
     assert ids == [1, 1]
     per_config = store.usage_by_config()
     assert per_config[0]["total_tokens"] == 15
+
+
+def test_confirmation_outcome_is_recorded_in_conversation_transcript(tmp_path, monkeypatch):
+    client = make_client(tmp_path, monkeypatch, hub_runtime=fake_hub(tmp_path))
+    assert client.put("/api/ai/config", json={"apiKey": "sk-test"}).status_code == 200
+
+    class FakeWriteProvider:
+        def __init__(self, *args, **kwargs):
+            pass
+
+        def chat(self, messages, tools=None):
+            from assistant.provider import ChatResult
+            return ChatResult("", {"total_tokens": 3}, {
+                "role": "assistant", "content": None,
+                "tool_calls": [{
+                    "id": "call-wol", "type": "function",
+                    "function": {"name": "device_wol", "arguments": '{"device":"Mate60"}'},
+                }],
+            })
+
+    monkeypatch.setattr("assistant.api.OpenAICompatibleProvider", FakeWriteProvider)
+    chat = client.post("/api/ai/chat", json={"message": "唤醒 Mate60"})
+    assert chat.status_code == 200
+    conversation_id = chat.json["conversationId"]
+    confirmed = client.post("/api/ai/tools/confirm",
+                            json={"confirmationId": chat.json["confirmation"]["confirmationId"]})
+    assert confirmed.status_code == 200
+    messages = client.get(f"/api/ai/conversations/{conversation_id}/messages").json["messages"]
+    notes = [row for row in messages if row["content"].startswith("〔操作记录〕")]
+    assert notes and "唤醒设备" in notes[-1]["content"]
+
+
+def test_stream_chat_runs_tool_loop_and_emits_typed_events(tmp_path, monkeypatch):
+    client = make_client(tmp_path, monkeypatch, hub_runtime=fake_hub(tmp_path))
+    assert client.put("/api/ai/config", json={"apiKey": "sk-test"}).status_code == 200
+
+    class FakeStreamProvider:
+        rounds = 0
+
+        def __init__(self, *args, **kwargs):
+            pass
+
+        def chat(self, messages, tools=None):  # pragma: no cover - stream path only
+            raise AssertionError("stream request must not use non-stream chat")
+
+        def stream(self, messages, tools=None):
+            from assistant.provider import ChatResult  # noqa: F401
+            self.__class__.rounds += 1
+            if self.__class__.rounds == 1:
+                assert tools and any(row["function"]["name"] == "device_ipv6" for row in tools)
+                yield {"choices": [{"delta": {"tool_calls": [
+                    {"index": 0, "id": "call-1", "function": {"name": "device_ipv6", "arguments": ""}},
+                ]}}]}
+                yield {"choices": [{"delta": {"tool_calls": [
+                    {"index": 0, "function": {"arguments": '{"device":"Mate60"}'}},
+                ]}}]}
+                yield {"choices": [{"delta": {}}], "usage": {"prompt_tokens": 7}}
+                return
+            assert messages[-1]["role"] == "tool"
+            yield {"choices": [{"delta": {"content": "Mate60 的"}}]}
+            yield {"choices": [{"delta": {"content": "IPv6 是 240e::60。"}}]}
+            yield {"choices": [{"delta": {}}],
+                   "usage": {"prompt_tokens": 3, "completion_tokens": 5, "total_tokens": 8}}
+
+    monkeypatch.setattr("assistant.api.OpenAICompatibleProvider", FakeStreamProvider)
+    response = client.post("/api/ai/chat", json={"message": "告诉我 Mate60 的 IPv6 地址", "stream": True})
+    assert response.status_code == 200
+    assert response.content_type.startswith("text/event-stream")
+    events = [json.loads(line[len("data: "):]) for line in response.get_data(as_text=True).splitlines()
+              if line.startswith("data: ")]
+    kinds = [event["type"] for event in events]
+    assert kinds.count("tool") == 1 and events[kinds.index("tool")]["toolId"] == "device.ipv6"
+    deltas = "".join(event["content"] for event in events if event["type"] == "delta")
+    assert deltas == "Mate60 的IPv6 是 240e::60。"
+    done = events[-1]
+    assert done["type"] == "done"
+    assert done["message"]["content"] == "Mate60 的IPv6 是 240e::60。"
+    assert done["usage"]["total_tokens"] == 8
+    assert done["usageKnown"] is True
+    assert done["toolExecutions"] == [{"toolId": "device.ipv6", "status": "completed"}]
+
+
+def test_stream_chat_emits_confirmation_payload_for_write_tools(tmp_path, monkeypatch):
+    client = make_client(tmp_path, monkeypatch, hub_runtime=fake_hub(tmp_path))
+    assert client.put("/api/ai/config", json={"apiKey": "sk-test"}).status_code == 200
+
+    class FakeStreamWriter:
+        def __init__(self, *args, **kwargs):
+            pass
+
+        def chat(self, messages, tools=None):  # pragma: no cover
+            raise AssertionError("stream request must not use non-stream chat")
+
+        def stream(self, messages, tools=None):
+            yield {"choices": [{"delta": {"tool_calls": [
+                {"index": 0, "id": "call-wol", "function": {"name": "device_wol", "arguments": '{"device":"Mate60"}'}},
+            ]}}]}
+            yield {"choices": [{"delta": {}}], "usage": {"total_tokens": 4}}
+
+    monkeypatch.setattr("assistant.api.OpenAICompatibleProvider", FakeStreamWriter)
+    response = client.post("/api/ai/chat", json={"message": "唤醒 Mate60", "stream": True})
+    events = [json.loads(line[len("data: "):]) for line in response.get_data(as_text=True).splitlines()
+              if line.startswith("data: ")]
+    assert len(events) == 1 and events[0]["type"] == "confirmation"
+    assert events[0]["confirmation"]["preview"]["title"] == "确认唤醒设备"
+    assert "需要你的确认" in events[0]["message"]["content"]
+    confirmed = client.post("/api/ai/tools/confirm",
+                            json={"confirmationId": events[0]["confirmation"]["confirmationId"]})
+    assert confirmed.status_code == 200
+
+
+def test_orphaned_usage_config_ids_are_reattributed(tmp_path):
+    store = AIStore(tmp_path / "ai.db")
+    store.initialize()
+    hunyuan = store.create_config("混元", "hunyuan", "https://api.example", "hy3", "v1:abc", True, None)
+    other = store.create_config("DeepSeek", "deepseek", "https://api.example", "deepseek-v4-flash", "v1:abc", True, None)
+    store.add_usage("c", "hunyuan", "hy3", {"total_tokens": 100}, config_id=999)
+    store.add_usage("c", "hunyuan", "hy3", {"total_tokens": 50})
+    store.initialize()
+    totals = {row["config_id"]: row["total_tokens"] for row in store.usage_by_config()}
+    assert totals[hunyuan["id"]] == 150 and totals[other["id"]] == 0
+    assert store.delete_config(hunyuan["id"]) is True
+    totals = {row["config_id"]: row["total_tokens"] for row in store.usage_by_config()}
+    assert totals[other["id"]] == 0
+    unattributed = store.usage_for_date.__self__  # placeholder to keep lint quiet
+    with store._connect() as conn:
+        rows = conn.execute("SELECT config_id FROM ai_usage WHERE model='hy3'").fetchall()
+    assert all(row["config_id"] is None for row in rows)
+
+
+def test_notifications_stream_emits_inbox_rows(tmp_path, monkeypatch):
+    client = make_client(tmp_path, monkeypatch)
+    store = AIStore(tmp_path / "ai.db")
+    store.initialize()
+    store.add_notification("device", "ANS 上线", "ANS 上线 · 10:00", "event:1")
+    response = client.get("/api/ai/notifications/stream?after=0")
+    assert response.status_code == 200
+    assert response.content_type.startswith("text/event-stream")
+    iterator = response.response
+    first = next(iterator).decode("utf-8")
+    second = next(iterator).decode("utf-8")
+    assert first.startswith(": connected")
+    assert "ANS 上线" in second and '"type": "notification"' in second.replace(", ", ", ").replace('":"', '": "')
+    response.close()
+
+
+def test_task_completion_publishes_notification_once(tmp_path, monkeypatch):
+    from assistant.notifications import AssistantNotificationService
+
+    hub = fake_hub(tmp_path)
+    states = {"nat": "running"}
+    hub.ROUTER_TASK_MANAGER = SimpleNamespace(snapshot=lambda kind: {"state": states[kind], "taskId": "nat-9"})
+    store = AIStore(tmp_path / "ai.db")
+    store.initialize()
+    service = AssistantNotificationService(hub, store, None)
+    service._publish_task_transitions()
+    states["nat"] = "succeeded"
+    service._publish_task_transitions()
+    states["nat"] = "succeeded"
+    service._publish_task_transitions()
+    rows = store.list_notifications(after_id=0, limit=10)
+    task_rows = [row for row in rows if row["kind"] == "task"]
+    assert len(task_rows) == 1
+    assert "NAT 检测完成" in task_rows[0]["title"]

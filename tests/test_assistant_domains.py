@@ -113,6 +113,25 @@ class FakeRouterService:
                 row["enabled"] = enabled
         return {"data": {"rules": [dict(row) for row in self.firewall["rules"]]}}
 
+    def add_firewall_rule(self, rule):
+        self.calls.append(("firewall_add", dict(rule)))
+        row = dict(rule)
+        row["uuid"] = str(row.get("uuid") or f"fw-new-{len(self.firewall['rules'])}")
+        self.firewall["rules"].append(row)
+        return {"data": {"rules": [dict(row) for row in self.firewall["rules"]]}}
+
+    def update_firewall_rule(self, uuid, rule):
+        self.calls.append(("firewall_update", uuid, dict(rule)))
+        for row in self.firewall["rules"]:
+            if row["uuid"] == uuid:
+                row.update(rule)
+        return {"data": {"rules": [dict(row) for row in self.firewall["rules"]]}}
+
+    def delete_firewall_rule(self, uuid):
+        self.calls.append(("firewall_delete", uuid))
+        self.firewall["rules"] = [row for row in self.firewall["rules"] if row["uuid"] != uuid]
+        return {"data": {"rules": [dict(row) for row in self.firewall["rules"]]}}
+
 
 def make_hub():
     saved_rules = []
@@ -428,3 +447,64 @@ def test_extend_registration_before_executor_is_drained_later():
     assert drain_pending(executor) == 1
     assert executor.execute("demo.future", {}) == {"future": True}
     catalog._TOOLS[:] = [tool for tool in catalog._TOOLS if tool["id"] != "demo.future"]
+
+
+def test_firewall_rule_create_defaults_summary_and_message():
+    hub, executor = make_executor()
+    with pytest.raises(ToolError) as excinfo:
+        executor.execute("router.firewall.rule.create", {"ruleName": "Web"})
+    assert excinfo.value.code == "CONFIRMATION_REQUIRED"
+    preview = executor.preview("router.firewall.rule.create", {"ruleName": "Web", "destPort": "9443"})
+    assert "Web" in preview["summary"] and "转发" in preview["summary"]
+    result = executor.execute("router.firewall.rule.create", {
+        "ruleName": "Web", "destPort": "9443", "ipVersion": "ipv6",
+    }, allow_write=True)
+    assert result["ok"] is True
+    assert "已创建防火墙规则" in result["message"]
+    kind, payload = hub.ROUTER_SERVICE.calls[-1]
+    assert kind == "firewall_add"
+    assert payload["direction"] == "forward" and payload["ipVersion"] == "ipv6"
+    assert payload["destPort"] == "9443" and payload["target"] == "ACCEPT"
+    assert payload["inIface"] == "wan" and payload["outIface"] == "lan" and payload["enable"] == "1"
+
+
+def test_firewall_rule_create_outbound_clears_inbound_interface():
+    hub, executor = make_executor()
+    executor.execute("router.firewall.rule.create", {
+        "ruleName": "Out", "direction": "outbound", "proto": "udp",
+    }, allow_write=True)
+    _, payload = hub.ROUTER_SERVICE.calls[-1]
+    assert payload["inIface"] == "" and payload["outIface"] == "lan"
+
+
+def test_firewall_rule_update_pins_uuid_and_merges_existing_fields():
+    hub, executor = make_executor()
+    preview = executor.preview("router.firewall.rule.update", {"rule": "Sun", "destPort": "2186,9001"})
+    assert preview["arguments"]["rule"] == "fw-sun"
+    result = executor.execute("router.firewall.rule.update", {"rule": "fw-sun", "destPort": "2186,9001"},
+                              allow_write=True)
+    assert result["ok"] is True and "已修改防火墙规则" in result["message"]
+    kind, uuid_value, payload = hub.ROUTER_SERVICE.calls[-1]
+    assert kind == "firewall_update" and uuid_value == "fw-sun"
+    assert payload["destPort"] == "2186,9001"
+    assert payload["ruleName"] == "Sun"
+    assert "uuid" not in payload
+
+
+def test_firewall_rule_remove_resolves_by_name():
+    hub, executor = make_executor()
+    result = executor.execute("router.firewall.rule.remove", {"rule": "Sun"}, allow_write=True)
+    assert result["deleted"] is True
+    assert "已删除防火墙规则" in result["message"]
+    assert hub.ROUTER_SERVICE.calls[-1] == ("firewall_delete", "fw-sun")
+    assert hub.ROUTER_SERVICE.get_firewall()["data"]["rules"] == []
+
+
+def test_stun_and_portmap_write_results_carry_readable_messages():
+    _, executor = make_executor()
+    added = executor.execute("relay.stun.rule.add", {
+        "targetIpv4": "192.168.5.30", "targetPort": 5001,
+    }, allow_write=True)
+    assert "已新增 STUN 穿透规则" in added["message"]
+    removed = executor.execute("relay.stun.rule.remove", {"rule": added["rule"]["name"]}, allow_write=True)
+    assert "已删除 STUN 穿透规则" in removed["message"]

@@ -12,7 +12,8 @@ from urllib.parse import urlparse
 
 from flask import Blueprint, Response, jsonify, request, stream_with_context
 
-from .provider import OpenAICompatibleProvider, ProviderError, usage_from_chunk
+from .provider import OpenAICompatibleProvider, ProviderError, usage_from_chunk, \
+    accumulate_tool_call_fragment, tool_calls_from_accumulated
 from .security import MasterKeyUnavailable, decrypt_secret, encrypt_secret, mask_secret
 from .storage import AIStore
 from .catalog import catalog, provider_tools, tool_id_from_function, tool_spec
@@ -29,9 +30,13 @@ MAX_MESSAGE_CHARS = 32_000
 MAX_REQUEST_CHARS = 80_000
 TOOL_SYSTEM_PROMPT = (
     "你是极客网探 Hub 助手，可以查看和控制整个网络：设备、事件、Agent/Relay、STUN 穿透、"
-    "WireGuard、路由器端口映射、IPv6、每日记录、防火墙，以及让 APP 跳转页面或刷新数据。"
-    "涉及查询时必须调用工具，不得猜测。只读工具可以直接调用；写入操作（新增/删除/启停端口映射"
-    "或穿透规则、升级 Agent）只能生成确认请求，在收到工具执行成功结果前绝不能声称操作已经完成。"
+    "WireGuard、路由器端口映射、IPv6、每日记录、防火墙（转发/入站/出站规则的查询、启停、"
+    "新建、修改、删除），以及让 APP 跳转页面或刷新数据。"
+    "涉及查询时必须调用工具，不得猜测。只读工具可以直接调用；写入操作（新增/删除/启停端口映射、"
+    "穿透规则或防火墙规则，升级 Agent）只能生成确认请求，在对话中出现对应的〔操作记录〕之前"
+    "绝不能声称操作已经完成。"
+    "确认后的执行结果会以〔操作记录〕消息出现在对话中；判断之前的写操作是否已执行，"
+    "以〔操作记录〕或状态查询工具（如 agent.cleanup.status）为准，不得无视记录要求用户重新确认。"
     "用户说‘网络自检’时调用 network.self_check；说‘路由网络自检/路由器自检’时调用 router.diagnostic；"
     "说‘NAT检测’时调用 router.nat.diagnostic。检测和自检绝不能调用 app.navigate，只有明确要求打开/进入/跳转页面时才允许导航。"
     "回答使用简洁中文。"
@@ -409,6 +414,27 @@ def _wait_router_task(hub_runtime: Any, kind: str, timeout_seconds: float = 40.0
         last = _task_snapshot(hub_runtime, kind) or last
 
 
+def tool_display_name(tool_id: str) -> str:
+    spec = tool_spec(tool_id)
+    return str(spec["name"]) if spec else str(tool_id)
+
+
+def record_confirmation_note(store, pending: Any, text: str) -> None:
+    """Append a tool outcome to the conversation transcript.
+
+    The APP runs incremental chat and never posts its local result bubbles,
+    so without this note the model has no record that a confirmed write
+    executed and will ask the user to confirm the same operation again.
+    """
+    conversation_id = pending.get("conversation_id") if isinstance(pending, dict) else None
+    if not conversation_id:
+        return
+    try:
+        store.add_message(str(conversation_id), "assistant", "〔操作记录〕" + str(text)[:600])
+    except Exception:
+        pass
+
+
 def create_ai_blueprint(*, check_app_token: Callable[[], bool], db_path, logger,
                         hub_runtime: Any = None, enable_notifications: bool = False) -> Blueprint:
     store = AIStore(db_path)
@@ -640,6 +666,38 @@ def create_ai_blueprint(*, check_app_token: Callable[[], bool], db_path, logger,
         rows = store.list_notifications(after_id=after, limit=100)
         return jsonify({"notifications": rows, "latestId": rows[-1]["id"] if rows else after})
 
+    @bp.get("/notifications/stream")
+    def notifications_stream():
+        """Server-sent events feed of assistant notifications.
+
+        Replaces the APP's fixed-interval polling while it is in the
+        foreground; the generator polls the local SQLite inbox so no
+        cross-thread signalling is required.
+        """
+        denial = authorized()
+        if denial:
+            return denial
+        try:
+            after = max(int(request.args.get("after", "0")), 0)
+        except ValueError:
+            after = 0
+
+        def generate():
+            cursor = after
+            last_heartbeat = time.monotonic()
+            yield ": connected\n\n"
+            while True:
+                for row in store.list_notifications(after_id=cursor, limit=50):
+                    cursor = int(row["id"])
+                    yield "data: " + json.dumps({"type": "notification", "notification": row},
+                                                ensure_ascii=False, separators=(",", ":")) + "\n\n"
+                if time.monotonic() - last_heartbeat >= 10:
+                    last_heartbeat = time.monotonic()
+                    yield ": ping\n\n"
+                time.sleep(2)
+
+        return Response(stream_with_context(generate()), content_type="text/event-stream")
+
     def require_executor():
         if executor is None:
             raise ToolError("Hub 工具运行时尚未就绪", "RUNTIME_UNAVAILABLE", 503)
@@ -730,21 +788,29 @@ def create_ai_blueprint(*, check_app_token: Callable[[], bool], db_path, logger,
                     break
             summary_result = {"ok": not failed, "message": f"已完成 {sum(1 for r in results if r['ok'])}/{len(items)} 项操作", "items": results}
             store.finish_confirmation(confirmation_id, "failed" if failed else "completed", summary_result)
+            record_confirmation_note(store, pending, summary_result["message"])
             return jsonify({"confirmationId": confirmation_id, "toolId": "batch", "result": summary_result})
         try:
             result = require_executor().execute(pending["tool_id"], pending["arguments"], allow_write=True)
             store.finish_confirmation(confirmation_id, "completed", result)
             store.add_tool_audit(confirmation_id, pending["tool_id"], "write", "completed", pending["arguments"], result)
+            detail = str((result or {}).get("message") or "").strip() if isinstance(result, dict) else ""
+            record_confirmation_note(store, pending,
+                                     f"用户已确认，{tool_display_name(pending['tool_id'])}：" + (detail or "执行成功"))
             return jsonify({"confirmationId": confirmation_id, "toolId": pending["tool_id"], "result": result})
         except ToolError as exc:
             failure = {"code": exc.code, "error": str(exc)}
             store.finish_confirmation(confirmation_id, "failed", failure)
             store.add_tool_audit(confirmation_id, pending["tool_id"], "write", "failed", pending["arguments"], failure)
+            record_confirmation_note(store, pending,
+                                     f"{tool_display_name(pending['tool_id'])}执行失败：{exc}")
             return tool_error_response(exc)
         except Exception:
             failure = {"code": "TOOL_EXECUTION_FAILED", "error": "操作执行失败"}
             store.finish_confirmation(confirmation_id, "failed", failure)
             store.add_tool_audit(confirmation_id, pending["tool_id"], "write", "failed", pending["arguments"], failure)
+            record_confirmation_note(store, pending,
+                                     f"{tool_display_name(pending['tool_id'])}执行失败：操作执行失败")
             return jsonify(failure), 500
 
     @bp.post("/tools/complete")
@@ -765,6 +831,10 @@ def create_ai_blueprint(*, check_app_token: Callable[[], bool], db_path, logger,
         store.add_tool_audit(
             confirmation_id, pending["tool_id"], "write", "completed" if ok else "failed",
             pending["arguments"], result,
+        )
+        record_confirmation_note(
+            store, pending,
+            f"APP {tool_display_name(pending['tool_id'])}{'执行成功' if ok else '执行失败'}：{message}",
         )
         return jsonify({"confirmationId": confirmation_id, "toolId": pending["tool_id"], "result": result})
 
@@ -856,6 +926,16 @@ def create_ai_blueprint(*, check_app_token: Callable[[], bool], db_path, logger,
         latest_user_text = next(
             (item["content"] for item in reversed(messages) if item["role"] == "user"), "",
         )
+        wants_stream = bool(body.get("stream"))
+
+        def stream_event(event: Dict[str, Any]) -> str:
+            return "data: " + json.dumps(event, ensure_ascii=False, separators=(",", ":")) + "\n\n"
+
+        def sse_done(payload: Dict[str, Any]) -> Response:
+            def emit():
+                yield stream_event({"type": "done", **payload})
+            return Response(stream_with_context(emit()), content_type="text/event-stream")
+
         forced_tool_id = diagnostic_tool_intent(latest_user_text)
         if forced_tool_id == "navigate.tool_nat" and executor is not None:
             content = (
@@ -863,14 +943,15 @@ def create_ai_blueprint(*, check_app_token: Callable[[], bool], db_path, logger,
                 "如需我直接读取路由器原生的 NAT 类型与映射/过滤行为，请说「路由NAT检测」。"
             )
             store.add_message(conversation_id, "assistant", content)
-            return jsonify({
+            payload = {
                 "conversationId": conversation_id,
                 "message": {"role": "assistant", "content": content},
                 "usage": {},
                 "usageKnown": False,
                 "toolExecutions": [],
                 "clientActions": [{"type": "navigate", "route": "nat"}],
-            })
+            }
+            return sse_done(payload) if wants_stream else jsonify(payload)
         if forced_tool_id and executor is not None:
             if forced_tool_id == "network.self_check":
                 try:
@@ -896,51 +977,18 @@ def create_ai_blueprint(*, check_app_token: Callable[[], bool], db_path, logger,
                     task = _wait_router_task(hub_runtime, task_kind, 40.0) or started
                 content = nat_diagnostic_content(task) if task_kind == "nat" else router_diagnostic_content(task or {})
             store.add_message(conversation_id, "assistant", content)
-            return jsonify({
+            payload = {
                 "conversationId": conversation_id,
                 "message": {"role": "assistant", "content": content},
                 "usage": {},
                 "usageKnown": False,
                 "toolExecutions": [{"toolId": forced_tool_id, "status": "completed"}],
                 "clientActions": [],
-            })
+            }
+            return sse_done(payload) if wants_stream else jsonify(payload)
         config_rows = store.list_configs(enabled_only=True)
         if not config_rows:
             return jsonify({"error": "AI provider is not configured"}), 409
-        if body.get("stream"):
-            def generate():
-                last_error: Exception | None = None
-                for candidate in config_rows:
-                    parts: List[str] = []
-                    usage: Dict[str, int] = {}
-                    chunks: List[Dict[str, Any]] = []
-                    try:
-                        key = decrypt_secret(candidate["api_key_ciphertext"])
-                        provider = OpenAICompatibleProvider(candidate["base_url"], key, candidate["model"])
-                        for chunk in provider.stream(messages):
-                            chunks.append(chunk)
-                            delta = ((chunk.get("choices") or [{}])[0].get("delta") or {}).get("content", "")
-                            if delta:
-                                parts.append(delta)
-                            usage.update(usage_from_chunk(chunk) or {})
-                    except MasterKeyUnavailable as exc:
-                        last_error = exc
-                        break
-                    except (ValueError, ProviderError) as exc:
-                        last_error = exc
-                        store.add_usage(conversation_id, candidate["provider"], candidate["model"], usage,
-                                        status="failed", config_id=candidate["id"])
-                        continue
-                    store.add_message(conversation_id, "assistant", "".join(parts))
-                    store.add_usage(conversation_id, candidate["provider"], candidate["model"], usage,
-                                    config_id=candidate["id"])
-                    for chunk in chunks:
-                        yield "data: " + json.dumps(chunk, ensure_ascii=False) + "\n\n"
-                    return
-                yield "event: error\ndata: " + json.dumps(
-                    {"error": str(last_error or "AI provider is unavailable")}, ensure_ascii=False,
-                ) + "\n\n"
-            return Response(stream_with_context(generate()), content_type="text/event-stream")
         internal_messages: List[Dict[str, Any]] = list(messages)
         if not internal_messages or internal_messages[0].get("role") != "system":
             internal_messages.insert(0, {"role": "system", "content": TOOL_SYSTEM_PROMPT})
@@ -948,15 +996,15 @@ def create_ai_blueprint(*, check_app_token: Callable[[], bool], db_path, logger,
         config_index = -1
         active_row: Dict[str, Any] | None = None
         active_provider: Any = None
+        last_provider_error: ProviderError | None = None
 
-        def provider_chat(chat_messages, tools=None):
-            nonlocal config_index, active_row, active_provider, accumulated_usage
-            last_error: ProviderError | None = None
+        def next_provider():
+            nonlocal config_index, active_row, active_provider, last_provider_error
             while True:
                 if active_provider is None:
                     config_index += 1
                     if config_index >= len(config_rows):
-                        raise last_error or ProviderError("AI provider is unavailable")
+                        raise last_provider_error or ProviderError("AI provider is unavailable")
                     active_row = config_rows[config_index]
                     try:
                         key = decrypt_secret(active_row["api_key_ciphertext"])
@@ -966,26 +1014,218 @@ def create_ai_blueprint(*, check_app_token: Callable[[], bool], db_path, logger,
                         store.add_usage(conversation_id, active_row["provider"], active_row["model"], {},
                                         status="failed", config_id=active_row["id"])
                         active_row = None
-                        last_error = ProviderError(str(exc), 503)
+                        last_provider_error = ProviderError(str(exc), 503)
                         continue
                     active_provider = OpenAICompatibleProvider(
                         active_row["base_url"], key, active_row["model"],
                     )
+                return active_row, active_provider
+
+        def fail_active_provider(exc: ProviderError) -> None:
+            nonlocal accumulated_usage, active_row, active_provider, last_provider_error
+            last_provider_error = exc
+            if active_row is not None:
+                store.add_usage(
+                    conversation_id, active_row["provider"], active_row["model"], accumulated_usage,
+                    status="failed", config_id=active_row["id"],
+                )
+            accumulated_usage = {}
+            active_row = None
+            active_provider = None
+
+        def provider_chat(chat_messages, tools=None):
+            while True:
+                row, provider = next_provider()
                 try:
-                    result = active_provider.chat(chat_messages, tools=tools)
+                    result = provider.chat(chat_messages, tools=tools)
                 except ProviderError as exc:
-                    last_error = exc
-                    if active_row is not None:
-                        store.add_usage(
-                            conversation_id, active_row["provider"], active_row["model"], accumulated_usage,
-                            status="failed", config_id=active_row["id"],
-                        )
-                    accumulated_usage = {}
-                    active_row = None
-                    active_provider = None
+                    fail_active_provider(exc)
                     continue
                 merge_usage(accumulated_usage, result.usage)
                 return result
+
+        def process_tool_call(call, executions, client_actions, pending_writes):
+            """Run one model tool call. Returns (call_id, tool_id, payload);
+
+            payload is None when a write was queued for user confirmation."""
+            call_id = str(call.get("id") or uuid.uuid4()) if isinstance(call, dict) else str(uuid.uuid4())
+            function = call.get("function") if isinstance(call, dict) else {}
+            function = function if isinstance(function, dict) else {}
+            tool_id = tool_id_from_function(str(function.get("name") or ""))
+            try:
+                arguments = json.loads(str(function.get("arguments") or "{}"))
+                if not isinstance(arguments, dict):
+                    raise ValueError("arguments must be an object")
+            except (ValueError, json.JSONDecodeError):
+                arguments = {}
+                tool_payload = {"ok": False, "code": "INVALID_ARGUMENTS", "error": "工具参数不是有效 JSON"}
+            else:
+                tool_payload = {}
+            if tool_id is None:
+                tool_payload = {"ok": False, "code": "TOOL_NOT_FOUND", "error": "不支持该工具"}
+            elif not tool_payload:
+                guarded_tool_id = diagnostic_tool_intent(latest_user_text)
+                if tool_id == "app.navigate" and guarded_tool_id in {
+                    "router.nat.diagnostic", "router.diagnostic", "network.self_check",
+                }:
+                    tool_id = guarded_tool_id
+                    arguments = {}
+                spec = tool_spec(tool_id) or {"risk": "unknown"}
+                if spec["risk"] == "write":
+                    try:
+                        preview = require_executor().preview(tool_id, arguments, client_context=client_context)
+                    except ToolError as exc:
+                        tool_payload = {"ok": False, "code": exc.code, "error": str(exc)}
+                        store.add_tool_audit(call_id, tool_id, "write", "rejected", arguments, tool_payload)
+                    else:
+                        normalized_arguments = preview.get("arguments") if isinstance(preview.get("arguments"), dict) else arguments
+                        signature = tool_id + "|" + json.dumps(normalized_arguments, sort_keys=True, ensure_ascii=False)
+                        if signature not in {p["signature"] for p in pending_writes}:
+                            pending_writes.append({
+                                "signature": signature, "toolId": tool_id,
+                                "arguments": normalized_arguments, "preview": preview,
+                            })
+                        return call_id, tool_id, None
+                else:
+                    try:
+                        tool_result = require_executor().execute(tool_id, arguments, client_context=client_context)
+                        tool_payload = {"ok": True, "result": tool_result}
+                        if isinstance(tool_result, dict) and isinstance(tool_result.get("clientAction"), dict):
+                            client_actions.append(tool_result["clientAction"])
+                        store.add_tool_audit(call_id, tool_id, str(spec["risk"]), "completed", arguments, tool_result)
+                    except ToolError as exc:
+                        tool_payload = {"ok": False, "code": exc.code, "error": str(exc)}
+                        store.add_tool_audit(call_id, tool_id, str(spec["risk"]), "failed", arguments, tool_payload)
+            return call_id, tool_id, tool_payload
+
+        def build_confirmation_payload(executions, client_actions, pending_writes, usage_snapshot):
+            confirmation_id = str(uuid.uuid4())
+            expires_at = (datetime.now(timezone.utc) + timedelta(minutes=5)).isoformat(timespec="seconds")
+            if len(pending_writes) == 1:
+                first = pending_writes[0]
+                preview = dict(first["preview"])
+                confirm_tool_id = first["toolId"]
+                confirm_arguments = first["arguments"]
+            else:
+                confirm_tool_id = "batch"
+                confirm_arguments = {"tools": [{"toolId": p["toolId"], "arguments": p["arguments"]} for p in pending_writes]}
+                preview = {
+                    "toolId": "batch",
+                    "title": f"确认执行 {len(pending_writes)} 项操作",
+                    "summary": "；".join(
+                        str(p["preview"].get("summary") or p["preview"].get("title") or p["toolId"])
+                        for p in pending_writes
+                    ),
+                    "arguments": confirm_arguments,
+                    "executor": "hub",
+                }
+            store.create_confirmation(confirmation_id, confirm_tool_id, confirm_arguments, preview, expires_at,
+                                      conversation_id=conversation_id)
+            for item in pending_writes:
+                store.add_tool_audit(confirmation_id, item["toolId"], "write", "confirmation_required", item["arguments"], item["preview"])
+            content = "需要你的确认：" + str(preview.get("summary") or preview.get("title") or confirm_tool_id)
+            store.add_message(conversation_id, "assistant", content)
+            store.add_usage(conversation_id, active_row["provider"], active_row["model"],
+                            usage_snapshot, config_id=active_row["id"])
+            return {
+                "conversationId": conversation_id,
+                "message": {"role": "assistant", "content": content},
+                "usage": usage_snapshot,
+                "usageKnown": bool(usage_snapshot),
+                "configId": active_row["id"],
+                "provider": active_row["provider"],
+                "model": active_row["model"],
+                "toolExecutions": executions,
+                "clientActions": client_actions,
+                "confirmation": {"confirmationId": confirmation_id, "expiresAt": expires_at, "preview": preview},
+            }
+
+        if wants_stream:
+            def generate():
+                executions: List[Dict[str, Any]] = []
+                client_actions: List[Dict[str, Any]] = []
+                pending_writes: List[Dict[str, Any]] = []
+                try:
+                    for _ in range(4):
+                        content_parts: List[str] = []
+                        tool_acc: Dict[str, Dict[str, str]] = {}
+                        round_usage: Dict[str, int] = {}
+                        while True:
+                            row, provider = next_provider()
+                            try:
+                                for chunk in provider.stream(internal_messages, tools=provider_tools() if executor is not None else None):
+                                    merge_usage(round_usage, usage_from_chunk(chunk) or {})
+                                    choices = chunk.get("choices") if isinstance(chunk.get("choices"), list) else []
+                                    for choice in choices:
+                                        delta = choice.get("delta") if isinstance(choice, dict) else {}
+                                        delta = delta if isinstance(delta, dict) else {}
+                                        text = delta.get("content")
+                                        if text:
+                                            content_parts.append(str(text))
+                                            yield stream_event({"type": "delta", "content": str(text)})
+                                        accumulate_tool_call_fragment(tool_acc, delta.get("tool_calls"))
+                                break
+                            except ProviderError as exc:
+                                fail_active_provider(exc)
+                                if content_parts:
+                                    # Partial text of the failed attempt is already on the
+                                    # wire; tell the client to clear it before the retry.
+                                    content_parts.clear()
+                                    tool_acc.clear()
+                                    round_usage.clear()
+                                    yield stream_event({"type": "reset"})
+                        merge_usage(accumulated_usage, round_usage)
+                        tool_calls = tool_calls_from_accumulated(tool_acc)
+                        if tool_calls:
+                            internal_messages.append({
+                                "role": "assistant",
+                                "content": "".join(content_parts) or None,
+                                "tool_calls": tool_calls,
+                            })
+                            for call in tool_calls[:4]:
+                                call_id, tool_id, tool_payload = process_tool_call(call, executions, client_actions, pending_writes)
+                                if tool_payload is None:
+                                    continue
+                                succeeded = bool(tool_payload.get("ok"))
+                                executions.append({"toolId": tool_id, "status": "completed" if succeeded else "failed"})
+                                internal_messages.append({
+                                    "role": "tool", "tool_call_id": call_id,
+                                    "content": json.dumps(tool_payload, ensure_ascii=False, separators=(",", ":")),
+                                })
+                                yield stream_event({"type": "tool", "toolId": tool_id, "status": "completed" if succeeded else "failed"})
+                            if pending_writes:
+                                payload = build_confirmation_payload(executions, client_actions, pending_writes, accumulated_usage)
+                                yield stream_event({"type": "confirmation", **payload})
+                                return
+                            continue
+                        content_text = "".join(content_parts)
+                        if not content_text:
+                            raise ProviderError("AI provider returned an empty response")
+                        store.add_message(conversation_id, "assistant", content_text)
+                        if not accumulated_usage and logger is not None:
+                            logger.warning("ai: provider returned no usage tokens (model=%s)", active_row["model"])
+                        store.add_usage(conversation_id, active_row["provider"], active_row["model"],
+                                        accumulated_usage, config_id=active_row["id"])
+                        yield stream_event({
+                            "type": "done",
+                            "conversationId": conversation_id,
+                            "message": {"role": "assistant", "content": content_text},
+                            "usage": accumulated_usage,
+                            "usageKnown": bool(accumulated_usage),
+                            "configId": active_row["id"],
+                            "provider": active_row["provider"],
+                            "model": active_row["model"],
+                            "toolExecutions": executions,
+                            "clientActions": client_actions,
+                        })
+                        return
+                    raise ProviderError("AI tool call limit exceeded")
+                except ProviderError as exc:
+                    if active_row is not None:
+                        store.add_usage(conversation_id, active_row["provider"], active_row["model"],
+                                        accumulated_usage, status="failed", config_id=active_row["id"])
+                    yield stream_event({"type": "error", "error": str(exc)})
+            return Response(stream_with_context(generate()), content_type="text/event-stream")
         executions: List[Dict[str, Any]] = []
         client_actions: List[Dict[str, Any]] = []
         pending_writes: List[Dict[str, Any]] = []
@@ -1016,99 +1256,16 @@ def create_ai_blueprint(*, check_app_token: Callable[[], bool], db_path, logger,
                     })
                 internal_messages.append(assistant_message)
                 for call in tool_calls[:4]:
-                    call_id = str(call.get("id") or uuid.uuid4()) if isinstance(call, dict) else str(uuid.uuid4())
-                    function = call.get("function") if isinstance(call, dict) else {}
-                    function = function if isinstance(function, dict) else {}
-                    tool_id = tool_id_from_function(str(function.get("name") or ""))
-                    try:
-                        arguments = json.loads(str(function.get("arguments") or "{}"))
-                        if not isinstance(arguments, dict):
-                            raise ValueError("arguments must be an object")
-                    except (ValueError, json.JSONDecodeError):
-                        arguments = {}
-                        tool_payload = {"ok": False, "code": "INVALID_ARGUMENTS", "error": "工具参数不是有效 JSON"}
-                    else:
-                        tool_payload = {}
-                    if tool_id is None:
-                        tool_payload = {"ok": False, "code": "TOOL_NOT_FOUND", "error": "不支持该工具"}
-                    elif not tool_payload:
-                        guarded_tool_id = diagnostic_tool_intent(latest_user_text)
-                        if tool_id == "app.navigate" and guarded_tool_id in {
-                            "router.nat.diagnostic", "router.diagnostic", "network.self_check",
-                        }:
-                            tool_id = guarded_tool_id
-                            arguments = {}
-                        spec = tool_spec(tool_id) or {"risk": "unknown"}
-                        if spec["risk"] == "write":
-                            try:
-                                preview = require_executor().preview(tool_id, arguments, client_context=client_context)
-                            except ToolError as exc:
-                                tool_payload = {"ok": False, "code": exc.code, "error": str(exc)}
-                                store.add_tool_audit(call_id, tool_id, "write", "rejected", arguments, tool_payload)
-                            else:
-                                normalized_arguments = preview.get("arguments") if isinstance(preview.get("arguments"), dict) else arguments
-                                signature = tool_id + "|" + json.dumps(normalized_arguments, sort_keys=True, ensure_ascii=False)
-                                if signature not in {p["signature"] for p in pending_writes}:
-                                    pending_writes.append({
-                                        "signature": signature, "toolId": tool_id,
-                                        "arguments": normalized_arguments, "preview": preview,
-                                    })
-                                continue
-                        else:
-                            try:
-                                tool_result = require_executor().execute(tool_id, arguments, client_context=client_context)
-                                tool_payload = {"ok": True, "result": tool_result}
-                                if isinstance(tool_result, dict) and isinstance(tool_result.get("clientAction"), dict):
-                                    client_actions.append(tool_result["clientAction"])
-                                store.add_tool_audit(call_id, tool_id, str(spec["risk"]), "completed", arguments, tool_result)
-                            except ToolError as exc:
-                                tool_payload = {"ok": False, "code": exc.code, "error": str(exc)}
-                                store.add_tool_audit(call_id, tool_id, str(spec["risk"]), "failed", arguments, tool_payload)
+                    call_id, tool_id, tool_payload = process_tool_call(call, executions, client_actions, pending_writes)
+                    if tool_payload is None:
+                        continue
                     executions.append({"toolId": tool_id, "status": "completed" if tool_payload.get("ok") else "failed"})
                     internal_messages.append({
                         "role": "tool", "tool_call_id": call_id,
                         "content": json.dumps(tool_payload, ensure_ascii=False, separators=(",", ":")),
                     })
                 if pending_writes:
-                    confirmation_id = str(uuid.uuid4())
-                    expires_at = (datetime.now(timezone.utc) + timedelta(minutes=5)).isoformat(timespec="seconds")
-                    if len(pending_writes) == 1:
-                        first = pending_writes[0]
-                        preview = dict(first["preview"])
-                        confirm_tool_id = first["toolId"]
-                        confirm_arguments = first["arguments"]
-                    else:
-                        confirm_tool_id = "batch"
-                        confirm_arguments = {"tools": [{"toolId": p["toolId"], "arguments": p["arguments"]} for p in pending_writes]}
-                        preview = {
-                            "toolId": "batch",
-                            "title": f"确认执行 {len(pending_writes)} 项操作",
-                            "summary": "；".join(
-                                str(p["preview"].get("summary") or p["preview"].get("title") or p["toolId"])
-                                for p in pending_writes
-                            ),
-                            "arguments": confirm_arguments,
-                            "executor": "hub",
-                        }
-                    store.create_confirmation(confirmation_id, confirm_tool_id, confirm_arguments, preview, expires_at)
-                    for item in pending_writes:
-                        store.add_tool_audit(confirmation_id, item["toolId"], "write", "confirmation_required", item["arguments"], item["preview"])
-                    content = "需要你的确认：" + str(preview.get("summary") or preview.get("title") or confirm_tool_id)
-                    store.add_message(conversation_id, "assistant", content)
-                    store.add_usage(conversation_id, active_row["provider"], active_row["model"],
-                                    accumulated_usage, config_id=active_row["id"])
-                    return jsonify({
-                        "conversationId": conversation_id,
-                        "message": {"role": "assistant", "content": content},
-                        "usage": accumulated_usage,
-                        "usageKnown": bool(accumulated_usage),
-                        "configId": active_row["id"],
-                        "provider": active_row["provider"],
-                        "model": active_row["model"],
-                        "toolExecutions": executions,
-                        "clientActions": client_actions,
-                        "confirmation": {"confirmationId": confirmation_id, "expiresAt": expires_at, "preview": preview},
-                    })
+                    return jsonify(build_confirmation_payload(executions, client_actions, pending_writes, accumulated_usage))
             raise ProviderError("AI tool call limit exceeded")
         except ProviderError as exc:
             if active_row is not None:

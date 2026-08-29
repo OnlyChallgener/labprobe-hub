@@ -213,6 +213,74 @@ _SPECS: List[Dict[str, Any]] = [
         },
     ),
     _spec(
+        "router.firewall.rule.create", "新建防火墙规则",
+        "经二次确认后在路由器上新建一条防火墙规则，支持转发/入站/出站方向、IPv4/IPv6、协议、"
+        "允许/丢弃动作、源目的 IP 与 IPv6 后缀、源目的端口和入出接口。",
+        ["新建一条转发规则放行 TCP 9443", "加一条 IPv6 防火墙规则允许 UDP 51820"],
+        "router.write", "write", "always",
+        {
+            "type": "object",
+            "properties": {
+                "ruleName": {"type": "string", "maxLength": 64},
+                "direction": {"type": "string", "enum": ["forward", "inbound", "outbound"]},
+                "ipVersion": {"type": "string", "enum": ["ipv4", "ipv6"]},
+                "proto": {"type": "string", "enum": ["tcp", "udp"]},
+                "srcIP": {"type": "string", "maxLength": 64},
+                "destIP": {"type": "string", "maxLength": 64},
+                "srcPort": {"type": "string", "maxLength": 128},
+                "destPort": {"type": "string", "maxLength": 128},
+                "target": {"type": "string", "enum": ["ACCEPT", "DROP"]},
+                "enabled": {"type": "boolean"},
+                "ipv6SuffixSrc": {"type": "string", "maxLength": 64},
+                "ipv6SuffixDest": {"type": "string", "maxLength": 64},
+                "inIface": {"type": "string", "enum": ["wan", "wan1", "lan"]},
+                "outIface": {"type": "string", "enum": ["lan", "wan", "wan1"]},
+            },
+            "required": ["ruleName"],
+            "additionalProperties": False,
+        },
+    ),
+    _spec(
+        "router.firewall.rule.update", "修改防火墙规则",
+        "按 UUID 或名称匹配防火墙规则，经二次确认后修改其字段（端口、协议、动作、接口等）。",
+        ["把 L3 规则的目的端口加上 9001", "把 Sun 规则改成丢弃"],
+        "router.write", "write", "always",
+        {
+            "type": "object",
+            "properties": {
+                "rule": {"type": "string", "maxLength": 128},
+                "ruleName": {"type": "string", "maxLength": 64},
+                "direction": {"type": "string", "enum": ["forward", "inbound", "outbound"]},
+                "ipVersion": {"type": "string", "enum": ["ipv4", "ipv6"]},
+                "proto": {"type": "string", "enum": ["tcp", "udp"]},
+                "srcIP": {"type": "string", "maxLength": 64},
+                "destIP": {"type": "string", "maxLength": 64},
+                "srcPort": {"type": "string", "maxLength": 128},
+                "destPort": {"type": "string", "maxLength": 128},
+                "target": {"type": "string", "enum": ["ACCEPT", "DROP"]},
+                "enabled": {"type": "boolean"},
+                "ipv6SuffixSrc": {"type": "string", "maxLength": 64},
+                "ipv6SuffixDest": {"type": "string", "maxLength": 64},
+                "inIface": {"type": "string", "enum": ["wan", "wan1", "lan"]},
+                "outIface": {"type": "string", "enum": ["lan", "wan", "wan1"]},
+            },
+            "required": ["rule"],
+            "additionalProperties": False,
+        },
+    ),
+    _spec(
+        "router.firewall.rule.remove", "删除防火墙规则",
+        "按 UUID 或名称删除一条防火墙规则；确认卡会固定实际匹配的规则。",
+        ["删除防火墙里的 Drop 规则", "删除 UUID 开头是 fw-sun 的防火墙规则"],
+        "router.write", "write", "always",
+        {
+            "type": "object",
+            "properties": {"rule": {"type": "string", "maxLength": 128}},
+            "required": ["rule"],
+            "additionalProperties": False,
+        },
+    ),
+    _spec(
         "router.nat.diagnostic", "执行路由器 NAT 检测",
         "实际调用 Hub Router Core 在路由器上执行 NAT 检测，并返回任务进度或检测结果；这是检测操作，不会打开或跳转 APP 页面。",
         ["NAT检测", "执行路由器NAT检测", "检测当前NAT类型"],
@@ -363,7 +431,9 @@ def _stun_add(executor, args, client_context) -> Dict[str, Any]:
         doc = service._document()
         saved = service._save_rules([*doc["rules"], rule])
         service.queue("upsert", {"rule": rule}, revision=saved["revision"])
-    return {"ok": True, "rule": _rule_view(rule, STUN_VIEW_FIELDS), "revision": saved["revision"]}
+    return {"ok": True, "rule": _rule_view(rule, STUN_VIEW_FIELDS), "revision": saved["revision"],
+            "message": (f"已新增 STUN 穿透规则：{rule.get('name')}"
+                        f"（{rule.get('transportProtocol')} {rule.get('targetIpv4')}:{rule.get('targetPort')}）")}
 
 
 def _stun_remove(executor, args, client_context) -> Dict[str, Any]:
@@ -383,7 +453,8 @@ def _stun_remove(executor, args, client_context) -> Dict[str, Any]:
         if rule_id in history:
             history.pop(rule_id, None)
             service.hub.save_json(service.history_path, history)
-    return {"ok": True, "deleted": True, "id": rule_id, "name": target.get("name")}
+    return {"ok": True, "deleted": True, "id": rule_id, "name": target.get("name"),
+            "message": f"已删除 STUN 穿透规则：{target.get('name')}"}
 
 
 def _agent_upgrade(executor, args, client_context) -> Dict[str, Any]:
@@ -533,11 +604,13 @@ def _router_upnp_get(executor, args, client_context) -> Dict[str, Any]:
 
 def _router_upnp_set(executor, args, client_context) -> Dict[str, Any]:
     enabled = _required_bool(args, "enabled")
+    wan = str(args["wan"]).upper()
     try:
-        result = _router_core(executor).set_upnp(enabled, str(args["wan"]).upper())
+        result = _router_core(executor).set_upnp(enabled, wan)
     except Exception as error:
         raise _router_core_error(error, "ROUTER_UPNP_WRITE_FAILED") from error
-    return {"ok": True, "upnp": _router_data(result)}
+    return {"ok": True, "upnp": _router_data(result),
+            "message": f"已{'启用' if enabled else '停用'}路由器 UPnP（{wan}）"}
 
 
 def _router_native_portmap_list(executor, args, client_context) -> Dict[str, Any]:
@@ -569,7 +642,9 @@ def _router_native_portmap_create(executor, args, client_context) -> Dict[str, A
         result = _router_core(executor).add_port_mapping(rule)
     except Exception as error:
         raise _router_core_error(error, "ROUTER_PORTMAP_CREATE_FAILED") from error
-    return {"ok": True, "rule": rule, "portMappings": _router_data(result)}
+    return {"ok": True, "rule": rule, "portMappings": _router_data(result),
+            "message": (f"已创建路由器原生端口映射：{rule['proto'].upper()} {rule['interface']}:{rule['extPort']}"
+                        f" → {rule['intIp']}:{rule['intPort']}")}
 
 
 def _native_portmap_rules(executor) -> List[Dict[str, Any]]:
@@ -589,7 +664,8 @@ def _router_native_portmap_remove(executor, args, client_context) -> Dict[str, A
         result = _router_core(executor).delete_port_mapping(rule_name)
     except Exception as error:
         raise _router_core_error(error, "ROUTER_PORTMAP_DELETE_FAILED") from error
-    return {"ok": True, "deleted": True, "name": rule_name, "portMappings": _router_data(result)}
+    return {"ok": True, "deleted": True, "name": rule_name, "portMappings": _router_data(result),
+            "message": f"已删除路由器原生端口映射：{rule_name}"}
 
 
 def _router_ddns_list(executor, args, client_context) -> Dict[str, Any]:
@@ -638,7 +714,115 @@ def _router_firewall_toggle(executor, args, client_context) -> Dict[str, Any]:
         result = _router_core(executor).set_firewall_rule_enabled(uuid, enabled)
     except Exception as error:
         raise _router_core_error(error, "ROUTER_FIREWALL_WRITE_FAILED") from error
-    return {"ok": True, "uuid": uuid, "enabled": enabled, "firewall": _router_data(result)}
+    name = str(target.get("ruleName") or target.get("name") or uuid)
+    return {"ok": True, "uuid": uuid, "enabled": enabled, "firewall": _router_data(result),
+            "message": f"已{'启用' if enabled else '停用'}防火墙规则：{name}"}
+
+
+FIREWALL_DIRECTION_ZH = {"forward": "转发", "inbound": "入站", "outbound": "出站"}
+_FIREWALL_TEXT_FIELDS = ("ruleName", "srcIP", "destIP", "srcPort", "destPort",
+                         "ipv6SuffixSrc", "ipv6SuffixDest")
+_FIREWALL_ENUM_FIELDS = (("direction", "forward"), ("ipVersion", "ipv4"),
+                         ("proto", "tcp"), ("target", "ACCEPT"))
+_FIREWALL_MERGE_FIELDS = _FIREWALL_TEXT_FIELDS + tuple(field for field, _ in _FIREWALL_ENUM_FIELDS) + ("inIface", "outIface")
+_FIREWALL_CREATE_DEFAULTS = {"direction": "forward", "ipVersion": "ipv4",
+                             "proto": "tcp", "target": "ACCEPT", "inIface": "wan", "outIface": "lan"}
+
+
+def _firewall_rule_payload(args: Dict[str, Any], base: Dict[str, Any] | None = None) -> Dict[str, Any]:
+    """Merge assistant arguments into a Router Core firewall rule payload.
+
+    Mirrors the APP editor: unset fields take the editor defaults on create,
+    and switching direction clears the interface that direction ignores.
+    """
+    rule = dict(base or {})
+    for key in _FIREWALL_TEXT_FIELDS:
+        if args.get(key) not in (None, ""):
+            rule[key] = str(args[key]).strip()
+    for key, default in _FIREWALL_ENUM_FIELDS:
+        if args.get(key) not in (None, ""):
+            rule[key] = str(args[key]).strip()
+        elif base is None:
+            rule[key] = default
+    for key in ("inIface", "outIface"):
+        if args.get(key) not in (None, ""):
+            rule[key] = str(args[key]).strip()
+        elif base is None:
+            rule[key] = _FIREWALL_CREATE_DEFAULTS[key]
+    direction = str(rule.get("direction") or "forward").lower()
+    if direction == "outbound" and args.get("inIface") in (None, ""):
+        rule["inIface"] = ""
+    elif direction == "inbound" and args.get("outIface") in (None, ""):
+        rule["outIface"] = ""
+    if base is None:
+        rule["enable"] = "0" if args.get("enabled") is False else "1"
+    elif args.get("enabled") is not None:
+        rule["enable"] = "0" if not args["enabled"] else "1"
+    return rule
+
+
+def _firewall_rule_summary(rule: Dict[str, Any]) -> str:
+    direction = FIREWALL_DIRECTION_ZH.get(str(rule.get("direction") or "forward").lower(),
+                                         str(rule.get("direction") or "forward"))
+    version = "IPv6" if str(rule.get("ipVersion") or "ipv4").lower() == "ipv6" else "IPv4"
+    proto = str(rule.get("proto") or "tcp").upper()
+    action = "允许" if str(rule.get("target") or "ACCEPT").upper() == "ACCEPT" else "丢弃"
+    ports = str(rule.get("destPort") or "任意端口")
+    src = f"源 {rule['srcIP']} " if rule.get("srcIP") else ""
+    dest = f"目的 {rule['destIP']} " if rule.get("destIP") else ""
+    return f"{direction} · {version} · {proto} · {src}{dest}目的端口 {ports} · {action}"
+
+
+def _firewall_rule_uuid(target: Dict[str, Any]) -> str:
+    uuid_value = str(target.get("uuid") or target.get("id") or "").strip()
+    if not uuid_value:
+        raise ToolError("防火墙规则缺少 UUID", "RULE_UUID_MISSING", 409)
+    return uuid_value
+
+
+def _router_firewall_rule_create(executor, args, client_context) -> Dict[str, Any]:
+    rule = _firewall_rule_payload(dict(args))
+    try:
+        result = _router_core(executor).add_firewall_rule(rule)
+    except Exception as error:
+        raise _router_core_error(error, "ROUTER_FIREWALL_CREATE_FAILED") from error
+    return {"ok": True, "rule": rule, "firewall": _router_data(result),
+            "message": (f"已创建防火墙规则：{rule.get('ruleName')}（{_firewall_rule_summary(rule)}）")}
+
+
+def _router_firewall_rule_update(executor, args, client_context) -> Dict[str, Any]:
+    target = _resolve_rule(_firewall_rules(executor), args["rule"], "防火墙")
+    uuid_value = _firewall_rule_uuid(target)
+    base = {key: target.get(key) for key in _FIREWALL_MERGE_FIELDS
+            if target.get(key) not in (None, "")}
+    if "ruleName" not in base:
+        fallback_name = target.get("ruleName") or target.get("name")
+        if fallback_name:
+            base["ruleName"] = str(fallback_name)
+    existing_enable = target.get("enable", target.get("enabled"))
+    rule = _firewall_rule_payload(dict(args), base=base)
+    if "enable" not in rule and existing_enable is not None:
+        rule["enable"] = "0" if str(existing_enable).lower() in ("0", "false") else "1"
+    rule.pop("uuid", None)
+    try:
+        result = _router_core(executor).update_firewall_rule(uuid_value, rule)
+    except Exception as error:
+        raise _router_core_error(error, "ROUTER_FIREWALL_UPDATE_FAILED") from error
+    name = str(rule.get("ruleName") or target.get("ruleName") or target.get("name") or uuid_value)
+    return {"ok": True, "uuid": uuid_value, "rule": rule, "firewall": _router_data(result),
+            "message": f"已修改防火墙规则：{name}"}
+
+
+def _router_firewall_rule_remove(executor, args, client_context) -> Dict[str, Any]:
+    target = _resolve_rule(_firewall_rules(executor), args["rule"], "防火墙")
+    uuid_value = _firewall_rule_uuid(target)
+    name = str(target.get("ruleName") or target.get("name") or uuid_value)
+    try:
+        result = _router_core(executor).delete_firewall_rule(uuid_value)
+    except Exception as error:
+        raise _router_core_error(error, "ROUTER_FIREWALL_DELETE_FAILED") from error
+    return {"ok": True, "deleted": True, "uuid": uuid_value, "name": name, "firewall": _router_data(result),
+            "message": f"已删除防火墙规则：{name}"}
 
 
 def _router_task_error(error: Exception, fallback_code: str) -> ToolError:
@@ -739,7 +923,9 @@ def _portmap_create(executor, args, client_context) -> Dict[str, Any]:
     hub._queue_portmap_command("upsert", {"rule": rule}, reactivate=True)
     hub.add_event({"type": "portmap_created", "title": f"端口映射已创建（AI）：{rule['name']}",
                    "name": rule["name"], "newValue": f"IPv6:{rule['listenPort']}"})
-    return {"ok": True, "rule": _rule_view(rule, PORTMAP_VIEW_FIELDS)}
+    return {"ok": True, "rule": _rule_view(rule, PORTMAP_VIEW_FIELDS),
+            "message": (f"已创建端口映射：{rule['name']}"
+                        f"（{rule['listenPort']} → {rule.get('targetIpv4')}:{rule.get('targetPort')}）")}
 
 
 def _portmap_remove(executor, args, client_context) -> Dict[str, Any]:
@@ -751,7 +937,8 @@ def _portmap_remove(executor, args, client_context) -> Dict[str, Any]:
     hub._queue_portmap_command("delete", {"id": rule_id}, reactivate=True)
     hub.add_event({"type": "portmap_deleted", "title": f"端口映射已删除（AI）：{target.get('name')}",
                    "name": target.get("name"), "oldValue": str(target.get("listenPort"))})
-    return {"ok": True, "deleted": True, "id": rule_id, "name": target.get("name")}
+    return {"ok": True, "deleted": True, "id": rule_id, "name": target.get("name"),
+            "message": f"已删除端口映射：{target.get('name')}"}
 
 
 def _portmap_toggle(executor, args, client_context) -> Dict[str, Any]:
@@ -779,7 +966,8 @@ def _portmap_toggle(executor, args, client_context) -> Dict[str, Any]:
         {"rule": rule} if enabled else {"id": rule_id},
         reactivate=True,
     )
-    return {"ok": True, "rule": _rule_view(rule, PORTMAP_VIEW_FIELDS), "action": "start" if enabled else "stop"}
+    return {"ok": True, "rule": _rule_view(rule, PORTMAP_VIEW_FIELDS), "action": "start" if enabled else "stop",
+            "message": f"已{'启用' if enabled else '停用'}端口映射：{target.get('name')}"}
 
 
 def _app_navigate(executor, args, client_context) -> Dict[str, Any]:
@@ -806,6 +994,9 @@ HANDLERS: Dict[str, Any] = {
     "router.ddns.list": _router_ddns_list,
     "router.ipv6.inspect": _router_ipv6_inspect,
     "router.firewall.toggle": _router_firewall_toggle,
+    "router.firewall.rule.create": _router_firewall_rule_create,
+    "router.firewall.rule.update": _router_firewall_rule_update,
+    "router.firewall.rule.remove": _router_firewall_rule_remove,
     "router.firewall.list": _router_firewall_list,
     "router.nat.diagnostic": _router_nat_diagnostic,
     "router.diagnostic": _router_diagnostic,
@@ -978,6 +1169,52 @@ def _preview_firewall_toggle(executor, args, client_context) -> Dict[str, Any]:
     }
 
 
+def _preview_firewall_rule_create(executor, args, client_context) -> Dict[str, Any]:
+    rule = _firewall_rule_payload(dict(args))
+    return {
+        "toolId": "router.firewall.rule.create",
+        "executor": "hub",
+        "title": "确认新建防火墙规则",
+        "summary": f"新建防火墙规则：{rule.get('ruleName')}（{_firewall_rule_summary(rule)}）",
+        "arguments": dict(args),
+        "expiresInSeconds": 300,
+    }
+
+
+def _preview_firewall_rule_update(executor, args, client_context) -> Dict[str, Any]:
+    target = _resolve_rule(_firewall_rules(executor), args["rule"], "防火墙")
+    uuid_value = _firewall_rule_uuid(target)
+    changed = {key: args[key] for key in _FIREWALL_MERGE_FIELDS if key in args and key != "rule"}
+    if args.get("enabled") is not None:
+        changed["enabled"] = args["enabled"]
+    pinned = {"rule": uuid_value}
+    pinned.update({key: value for key, value in args.items() if key != "rule"})
+    name = str(target.get("ruleName") or target.get("name") or uuid_value)
+    change_text = "、".join(f"{key}={value}" for key, value in changed.items()) or "无字段变更"
+    return {
+        "toolId": "router.firewall.rule.update",
+        "executor": "hub",
+        "title": "确认修改防火墙规则",
+        "summary": f"修改防火墙规则：{name}（{change_text}）",
+        "arguments": pinned,
+        "expiresInSeconds": 300,
+    }
+
+
+def _preview_firewall_rule_remove(executor, args, client_context) -> Dict[str, Any]:
+    target = _resolve_rule(_firewall_rules(executor), args["rule"], "防火墙")
+    uuid_value = _firewall_rule_uuid(target)
+    name = str(target.get("ruleName") or target.get("name") or uuid_value)
+    return {
+        "toolId": "router.firewall.rule.remove",
+        "executor": "hub",
+        "title": "确认删除防火墙规则",
+        "summary": f"删除防火墙规则：{name}（{uuid_value}）",
+        "arguments": {"rule": uuid_value},
+        "expiresInSeconds": 300,
+    }
+
+
 PREVIEWS: Dict[str, Any] = {
     "relay.stun.rule.add": _preview_stun_add,
     "relay.stun.rule.remove": _preview_stun_remove,
@@ -990,6 +1227,9 @@ PREVIEWS: Dict[str, Any] = {
     "router.native_portmap.create": _preview_native_portmap_create,
     "router.native_portmap.remove": _preview_native_portmap_remove,
     "router.firewall.toggle": _preview_firewall_toggle,
+    "router.firewall.rule.create": _preview_firewall_rule_create,
+    "router.firewall.rule.update": _preview_firewall_rule_update,
+    "router.firewall.rule.remove": _preview_firewall_rule_remove,
 }
 
 

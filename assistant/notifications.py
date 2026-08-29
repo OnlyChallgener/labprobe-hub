@@ -11,12 +11,19 @@ from .storage import AIStore
 SHANGHAI = timezone(timedelta(hours=8), name="Asia/Shanghai")
 
 
+TERMINAL_TASK_STATES = {"succeeded", "completed", "failed", "timed_out"}
+ACTIVE_TASK_STATES = {"", "idle", "queued", "running"}
+
+TASK_KINDS = (("nat", "路由器 NAT 检测"), ("diagnostic", "路由器网络自检"))
+
+
 class AssistantNotificationService:
     def __init__(self, hub_runtime: Any, store: AIStore, logger: Any):
         self.hub = hub_runtime
         self.store = store
         self.logger = logger
         self.stop_event = threading.Event()
+        self._task_states: Dict[str, str] = {}
         self.thread = threading.Thread(target=self._run, name="assistant-notifications", daemon=True)
 
     def _is_watched(self, event: Dict[str, Any]) -> bool:
@@ -68,6 +75,45 @@ class AssistantNotificationService:
         notification_id = self.store.add_notification(
             "daily", "22:30 每日网络记录", content, f"daily:{day}", {"daily": daily},
         )
+    def _publish_task_transitions(self) -> None:
+        """Notify when a router NAT/diagnostic task reaches a terminal state.
+
+        The chat flow answers within its request window, but the user may have
+        navigated away; this turns the finished task into an inbox notification
+        that reaches the APP through the same channel as device events.
+        """
+        manager = getattr(self.hub, "ROUTER_TASK_MANAGER", None)
+        snapshot = getattr(manager, "snapshot", None)
+        if not callable(snapshot):
+            return
+        for kind, label in TASK_KINDS:
+            try:
+                task = snapshot(kind)
+            except Exception:
+                continue
+            if not isinstance(task, dict):
+                continue
+            state = str(task.get("state") or "")
+            previous = self._task_states.get(kind)
+            self._task_states[kind] = state
+            if previous is None or state == previous:
+                continue
+            if state in ACTIVE_TASK_STATES or previous not in ACTIVE_TASK_STATES:
+                continue
+            if state not in TERMINAL_TASK_STATES:
+                continue
+            # Imported lazily: assistant.api imports this module at startup.
+            from .api import nat_diagnostic_content, router_diagnostic_content
+
+            content = (nat_diagnostic_content(task) if kind == "nat"
+                       else router_diagnostic_content(task)).strip()[:600]
+            suffix = {"failed": "失败", "timed_out": "超时"}.get(state, "完成")
+            identity = str(task.get("taskId") or task.get("finishedAt") or task.get("updatedAt") or "")
+            self.store.add_notification(
+                "task", f"{label}{suffix}", content,
+                f"task:{kind}:{identity}:{state}", {"task": task},
+            )
+
     def start(self) -> None:
         original = getattr(self.hub, "add_event", None)
         if callable(original) and not getattr(original, "_assistant_notifications_wrapped", False):
@@ -89,6 +135,11 @@ class AssistantNotificationService:
 
     def _run(self) -> None:
         while not self.stop_event.wait(20):
+            try:
+                self._publish_task_transitions()
+            except Exception:
+                if self.logger:
+                    self.logger.debug("assistant task notification deferred", exc_info=True)
             try:
                 now = datetime.now(SHANGHAI)
                 if (now.hour, now.minute) >= (22, 30):
