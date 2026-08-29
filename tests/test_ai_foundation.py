@@ -727,3 +727,140 @@ def test_conversation_title_can_be_renamed_with_validation(tmp_path, monkeypatch
     assert client.patch("/api/ai/conversations/rename-me", json={"title": " "}).status_code == 400
     assert client.patch("/api/ai/conversations/rename-me", json={"title": "x" * 65}).status_code == 400
     assert client.patch("/api/ai/conversations/missing", json={"title": "名字"}).status_code == 404
+
+
+def test_router_network_self_check_intent_maps_to_router_diagnostic(tmp_path, monkeypatch):
+    from assistant.api import diagnostic_tool_intent
+
+    assert diagnostic_tool_intent("路由器网络自检") == "router.diagnostic"
+    assert diagnostic_tool_intent("路由器网络自检结果") == "router.diagnostic"
+    assert diagnostic_tool_intent("路由网络自检") == "router.diagnostic"
+    assert diagnostic_tool_intent("路由器自检") == "router.diagnostic"
+    assert diagnostic_tool_intent("网络自检") == "network.self_check"
+    assert diagnostic_tool_intent("综合网络自检") == "network.self_check"
+    assert diagnostic_tool_intent("NAT诊断结果") == "router.nat.diagnostic"
+    assert diagnostic_tool_intent("打开网络自检页面") is None
+    assert diagnostic_tool_intent("查询设备列表") is None
+
+
+def test_nat_forced_chat_polls_task_and_returns_readable_result(tmp_path, monkeypatch):
+    hub = fake_hub(tmp_path)
+    polls = {"count": 0}
+
+    def snapshot(kind):
+        polls["count"] += 1
+        if polls["count"] >= 2:
+            return {"state": "succeeded", "stage": "finished", "message": "检测完成",
+                    "result": {"nat_type": "symmetric", "external_address": "1.2.3.4:4500",
+                               "mode": "classic"}}
+        return {"state": "running", "stageText": "路由器正在执行 NAT 检测"}
+
+    hub.ROUTER_TASK_MANAGER = SimpleNamespace(
+        start_nat=lambda payload: {"state": "queued", "taskId": "nat-x"},
+        snapshot=snapshot,
+    )
+    client = make_client(tmp_path, monkeypatch, hub_runtime=hub)
+    response = client.post("/api/ai/chat", json={"message": "NAT检测"})
+    assert response.status_code == 200
+    content = response.json["message"]["content"]
+    assert "NAT 类型：对称型 NAT" in content
+    assert "公网映射地址：1.2.3.4:4500" in content
+    assert "{" not in content.split("\n")[0]
+    assert response.json["usageKnown"] is False
+
+
+def test_nat_result_query_reuses_existing_task_without_restart(tmp_path, monkeypatch):
+    hub = fake_hub(tmp_path)
+    task_calls = []
+
+    def start_nat(payload):
+        task_calls.append(payload)
+        return {"state": "queued", "taskId": "nat-new"}
+
+    hub.ROUTER_TASK_MANAGER = SimpleNamespace(
+        start_nat=start_nat,
+        snapshot=lambda kind: {
+            "state": "succeeded", "stage": "finished", "message": "检测完成",
+            "result": {"nat_type": "full cone", "mode": "rfc5780"},
+        },
+    )
+    client = make_client(tmp_path, monkeypatch, hub_runtime=hub)
+    response = client.post("/api/ai/chat", json={"message": "NAT诊断结果"})
+    assert response.status_code == 200
+    assert "完全锥形 NAT" in response.json["message"]["content"]
+    assert task_calls == []
+
+
+def test_router_diagnostic_content_is_readable_chinese():
+    from assistant.api import router_diagnostic_content
+
+    task = {
+        "state": "succeeded",
+        "result": {
+            "process": "100%",
+            "error_count": "1",
+            "list": [
+                {"type": "wan", "item": "WAN Port", "status": "OK",
+                 "list": [{"item": "WAN Port", "status": "OK",
+                           "result": "external network port network cable is OK"}]},
+                {"type": "lan", "item": "LAN Port", "status": "OK",
+                 "list": [{"item": "LAN Port", "status": "OK"}]},
+                {"type": "port", "item": "Negotiation Speed", "status": "Error",
+                 "tips": "check port negotiation speed",
+                 "list": [{"item": "Negotiation Speed", "status": "Error",
+                           "tips": "check internet connection status",
+                           "advise": "check network cable",
+                           "data": {"port": "LAN5/GAME"}}]},
+            ],
+        },
+    }
+    content = router_diagnostic_content(task)
+    assert "共 3 项检查" in content and "1 项异常" in content
+    assert "• 外网口连接：正常" in content
+    assert "• 局域网连接：正常" in content
+    assert "• 端口协商速率：异常（问题接口 LAN5/GAME）" in content
+    assert "请检查互联网连接状态" in content
+    assert "请检查对应接口的网线连接" in content
+
+
+def test_nat_diagnostic_content_reports_running_and_failure():
+    from assistant.api import nat_diagnostic_content
+
+    running = nat_diagnostic_content({"state": "running", "stageText": "路由器正在执行 NAT 检测"})
+    assert "进行中" in running and "NAT诊断结果" in running
+    failed = nat_diagnostic_content({"state": "failed", "message": "STUN 不可达"})
+    assert "失败" in failed and "STUN 不可达" in failed
+
+
+def test_network_self_check_content_is_readable_without_raw_json():
+    from assistant.api import network_self_check_content
+
+    content = network_self_check_content({
+        "summary": {
+            "router": {"name": "BE72", "onlineDeviceCount": 11, "exitIpv6": "2409::1", "routerStatus": "ok"},
+            "agent": {"online": True, "router": "BE72"},
+            "portmapRules": 2, "stunRules": 1, "wireguardEnabled": True,
+        },
+        "hub": {"hub": {"name": "test"}},
+    })
+    assert "非路由器内置自检" in content
+    assert "BE72" in content and "11 台设备在线" in content
+    assert "端口映射 2 条" in content
+    assert "{" not in content
+
+
+def test_conversation_delete_removes_messages_and_requires_auth(tmp_path, monkeypatch):
+    client = make_client(tmp_path, monkeypatch)
+    store = AIStore(tmp_path / "ai.db")
+    store.create_conversation("delete-me", "要删除的对话")
+    store.add_message("delete-me", "user", "你好")
+    store.add_message("delete-me", "assistant", "你好！")
+    anonymous = make_client(tmp_path, monkeypatch, authorized=False)
+    assert anonymous.delete("/api/ai/conversations/delete-me").status_code == 401
+    assert client.delete("/api/ai/conversations/delete-me").status_code == 200
+    assert client.delete("/api/ai/conversations/delete-me").status_code == 404
+    assert client.get("/api/ai/conversations/delete-me/messages").json["messages"] == []
+    assert client.get("/api/ai/conversations").json["conversations"] == []
+    rows = sqlite3.connect(tmp_path / "ai.db").execute(
+        "SELECT COUNT(*) FROM messages WHERE conversation_id='delete-me'").fetchone()
+    assert rows[0] == 0

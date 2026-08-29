@@ -304,6 +304,24 @@ class AIStore:
             conn.execute("INSERT OR IGNORE INTO conversations(id,title,created_at,updated_at) VALUES(?,?,?,?)",
                          (conversation_id, clean_title or "新对话", now, now))
 
+    def delete_conversation(self, conversation_id: str) -> bool:
+        clean_id = str(conversation_id or "").strip()
+        if not clean_id:
+            return False
+        with self._connect() as conn:
+            conn.execute("BEGIN")
+            try:
+                conn.execute("DELETE FROM messages WHERE conversation_id=?", (clean_id,))
+                deleted = conn.execute(
+                    "DELETE FROM conversations WHERE id=?", (clean_id,),
+                ).rowcount
+                conn.execute("COMMIT")
+            except Exception:
+                conn.execute("ROLLBACK")
+                raise
+        self.enforce_conversation_storage()
+        return bool(deleted)
+
     def rename_conversation(self, conversation_id: str, title: str) -> Optional[Dict[str, Any]]:
         clean_title = str(title or "").strip()
         if not clean_title or len(clean_title) > 64:

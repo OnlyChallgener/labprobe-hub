@@ -590,7 +590,8 @@ def _router_nat_diagnostic(executor, args, client_context) -> Dict[str, Any]:
     return {
         "ok": True,
         "kind": "nat",
-        "message": "路由器 NAT 检测已启动" if task.get("state") in {"queued", "running"} else "已取得路由器 NAT 检测结果",
+        "message": ("路由器 NAT 检测已启动，通常需要几十秒；完成后用户可追问“NAT诊断结果”获取最终类型"
+                    if task.get("state") in {"queued", "running"} else "已取得路由器 NAT 检测结果"),
         "task": task,
     }
 
@@ -604,7 +605,8 @@ def _router_diagnostic(executor, args, client_context) -> Dict[str, Any]:
     return {
         "ok": True,
         "kind": "diagnostic",
-        "message": "路由器网络自检已启动" if task.get("state") in {"queued", "running"} else "已取得路由器网络自检结果",
+        "message": ("路由器网络自检已启动，路由器执行约需十几秒；完成后用户可追问“路由器网络自检结果”查看明细"
+                    if task.get("state") in {"queued", "running"} else "已取得路由器网络自检结果"),
         "task": task,
     }
 
