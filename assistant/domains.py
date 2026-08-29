@@ -87,6 +87,28 @@ _SPECS: List[Dict[str, Any]] = [
         },
     ),
     _spec(
+        "agent.cleanup", "一键清理 Agent",
+        "清理路由器上 Agent 的全部备份和非必要临时日志，不影响配置与映射规则，经 APP 二次确认后执行。",
+        ["清理 agent", "一键清理路由器 Agent"],
+        "relay.write", "write", "always",
+        {
+            "type": "object",
+            "properties": {"router": {"type": "string", "maxLength": 64}},
+            "additionalProperties": False,
+        },
+    ),
+    _spec(
+        "agent.cleanup.status", "查询 Agent 清理结果",
+        "查询最近一次 Agent 一键清理任务的执行状态与释放空间。",
+        ["清理完成了吗", "上次 Agent 清理释放了多少空间"],
+        "relay.read", "read", "none",
+        {
+            "type": "object",
+            "properties": {"router": {"type": "string", "maxLength": 64}},
+            "additionalProperties": False,
+        },
+    ),
+    _spec(
         "router.status", "查询路由器状态",
         "查询路由器连接模式、在线设备数和数据更新时间。",
         ["路由器现在是什么模式", "路由器数据多久没更新了"],
@@ -390,6 +412,53 @@ def _agent_upgrade(executor, args, client_context) -> Dict[str, Any]:
             "message": "Rust Agent 更新指令已发送"}
 
 
+def _agent_cleanup(executor, args, client_context) -> Dict[str, Any]:
+    hub = executor.hub
+    router = hub.resolve_agent_router(hub.clean_saved_value(args.get("router")) or hub.primary_router_name()) or "router"
+    command = {
+        "id": secrets.token_hex(12), "router": router, "action": "cleanup", "state": "pending",
+        "createdAt": hub.now_str(), "updatedAt": hub.now_str(),
+        "message": "等待路由器清理 Agent 备份和临时日志（AI 助手下发）",
+        "result": {},
+    }
+    data = hub.load_json(hub.AGENT_UPDATE_COMMANDS_FILE, {"commands": []})
+    commands = data.get("commands", []) if isinstance(data, dict) else []
+    commands.append(command)
+    hub.save_json(hub.AGENT_UPDATE_COMMANDS_FILE, {"commands": commands[-100:]})
+    hub.notify_agent_commands_changed()
+    return {"ok": True, "commandId": command["id"], "router": router,
+            "message": "Agent 清理指令已发送，路由器将在领取后清理备份与非必要日志"}
+
+
+def _agent_cleanup_status(executor, args, client_context) -> Dict[str, Any]:
+    hub = executor.hub
+    router = hub.resolve_agent_router(hub.clean_saved_value(args.get("router")) or hub.primary_router_name()) or "router"
+    command_id = hub.clean_saved_value(args.get("commandId"))
+    lookup_by_id = getattr(hub, "agent_command_by_id", None)
+    lookup_latest = getattr(hub, "latest_agent_command", None)
+    if command_id and callable(lookup_by_id):
+        command = lookup_by_id(command_id, router, "cleanup")
+    elif callable(lookup_latest):
+        command = lookup_latest(router, "cleanup")
+    else:
+        command = None
+    if not isinstance(command, dict) or not command:
+        return {"ok": False, "state": "missing", "message": "还没有发送过 Agent 清理指令"}
+    result = command.get("result") if isinstance(command.get("result"), dict) else {}
+    cleaned = result.get("cleanedItems") if isinstance(result.get("cleanedItems"), list) else []
+    reclaimed = hub.clean_saved_value(result.get("reclaimedText")) or hub.to_int(result.get("reclaimedBytes"), 0)
+    errors = result.get("errors") if isinstance(result.get("errors"), list) else []
+    return {
+        "ok": True,
+        "state": str(command.get("state") or "pending"),
+        "message": str(command.get("message") or ""),
+        "cleanedItems": [str(item) for item in cleaned][:20],
+        "reclaimed": str(reclaimed),
+        "errors": [str(item) for item in errors][:10],
+        "updatedAt": str(command.get("updatedAt") or ""),
+    }
+
+
 def _router_status(executor, args, client_context) -> Dict[str, Any]:
     hub = executor.hub
     service = getattr(hub, "ROUTER_SERVICE", None)
@@ -633,9 +702,20 @@ def _network_self_check(executor, args, client_context) -> Dict[str, Any]:
         wireguard = wireguard_service.document() if wireguard_service is not None else {}
     except Exception:
         wireguard = {}
+    hub_info = status.get("hub") if isinstance(status.get("hub"), dict) else {}
+    vpn_addresses = status.get("vpnStunAddresses") if isinstance(status.get("vpnStunAddresses"), list) else []
     summary = {
         "router": router,
         "agent": presence,
+        "hub": {
+            "name": hub_info.get("name"),
+            "version": hub_info.get("version"),
+            "advertiseUrl": hub_info.get("advertiseUrl"),
+            "updatedAt": hub_info.get("updatedAt"),
+        },
+        "exitIpv4": router.get("exitIpv4"),
+        "exitIpv6": router.get("exitIpv6") or status.get("router", {}).get("exitIpv6") if isinstance(status.get("router"), dict) else router.get("exitIpv6"),
+        "vpnAddressCount": len(vpn_addresses),
         "portmapRules": len(portmaps or []) if portmap_loaded else None,
         "stunRules": len(stun_rules or []),
         "wireguardEnabled": bool((wireguard or {}).get("enabled")),
@@ -714,6 +794,8 @@ HANDLERS: Dict[str, Any] = {
     "relay.stun.rule.add": _stun_add,
     "relay.stun.rule.remove": _stun_remove,
     "relay.agent.upgrade": _agent_upgrade,
+    "agent.cleanup": _agent_cleanup,
+    "agent.cleanup.status": _agent_cleanup_status,
     "router.status": _router_status,
     "router.capabilities": _router_capabilities,
     "router.upnp.get": _router_upnp_get,
@@ -777,6 +859,19 @@ def _preview_agent_upgrade(executor, args, client_context) -> Dict[str, Any]:
         "executor": "hub",
         "title": "确认升级 LabRelay Agent",
         "summary": f"将 {router} 上的 LabRelay Agent 升级到 {target}",
+        "arguments": {"router": router},
+        "expiresInSeconds": 300,
+    }
+
+
+def _preview_agent_cleanup(executor, args, client_context) -> Dict[str, Any]:
+    hub = executor.hub
+    router = hub.resolve_agent_router(hub.clean_saved_value(args.get("router")) or hub.primary_router_name()) or "router"
+    return {
+        "toolId": "agent.cleanup",
+        "executor": "hub",
+        "title": "确认一键清理 Agent",
+        "summary": f"清理 {router} 上 Agent 的全部备份和非必要临时日志（不影响配置与映射规则）",
         "arguments": {"router": router},
         "expiresInSeconds": 300,
     }
@@ -887,6 +982,7 @@ PREVIEWS: Dict[str, Any] = {
     "relay.stun.rule.add": _preview_stun_add,
     "relay.stun.rule.remove": _preview_stun_remove,
     "relay.agent.upgrade": _preview_agent_upgrade,
+    "agent.cleanup": _preview_agent_cleanup,
     "router.portmap.create": _preview_portmap_create,
     "router.portmap.remove": _preview_portmap_remove,
     "router.portmap.toggle": _preview_portmap_toggle,

@@ -41,11 +41,32 @@ def fake_hub(tmp_path):
         except Exception:
             return default
 
+    commands_file = tmp_path / "agent-commands.json"
+    commands_file.write_text("{}", encoding="utf-8")
+
+    def save_json(path, value):
+        path.write_text(json.dumps(value, ensure_ascii=False), encoding="utf-8")
+
+    def latest_command(router, action):
+        rows = load_json(commands_file, {}).get("commands", [])
+        for row in reversed(rows if isinstance(rows, list) else []):
+            if isinstance(row, dict) and row.get("action") == action:
+                return row
+        return None
+
     task_calls = []
     runtime = SimpleNamespace(
         DEVICES_FILE=devices_file,
         PORTMAP_ROUTER_STATUS_FILE=portmap_status_file,
+        AGENT_UPDATE_COMMANDS_FILE=commands_file,
         load_json=load_json,
+        save_json=save_json,
+        clean_saved_value=lambda value: str(value or "").strip(),
+        primary_router_name=lambda: "router",
+        resolve_agent_router=lambda preferred: str(preferred or "router"),
+        notify_agent_commands_changed=lambda: None,
+        now_str=lambda: "2026-08-29 15:00:00",
+        latest_agent_command=latest_command,
         load_device_archive=lambda: {},
         normalize_ipv6_list=lambda value: value if isinstance(value, list) else [value],
         status_document=lambda: {"hub": {"name": "test"}},
@@ -278,7 +299,8 @@ def test_chat_executes_model_selected_read_tool_and_returns_final_answer(tmp_pat
 
 
 @pytest.mark.parametrize("message,tool_id,expected_call", [
-    ("NAT检测", "router.nat.diagnostic", "nat"),
+    ("路由NAT检测", "router.nat.diagnostic", "nat"),
+    ("路由器NAT诊断", "router.nat.diagnostic", "nat"),
     ("路由网络自检", "router.diagnostic", "diagnostic"),
 ])
 def test_diagnostic_intents_execute_router_core_without_provider_or_navigation(
@@ -739,6 +761,10 @@ def test_router_network_self_check_intent_maps_to_router_diagnostic(tmp_path, mo
     assert diagnostic_tool_intent("网络自检") == "network.self_check"
     assert diagnostic_tool_intent("综合网络自检") == "network.self_check"
     assert diagnostic_tool_intent("NAT诊断结果") == "router.nat.diagnostic"
+    assert diagnostic_tool_intent("NAT检测") == "navigate.tool_nat"
+    assert diagnostic_tool_intent("NAT诊断") == "navigate.tool_nat"
+    assert diagnostic_tool_intent("路由NAT检测") == "router.nat.diagnostic"
+    assert diagnostic_tool_intent("路由器NAT检测结果") == "router.nat.diagnostic"
     assert diagnostic_tool_intent("打开网络自检页面") is None
     assert diagnostic_tool_intent("查询设备列表") is None
 
@@ -760,7 +786,7 @@ def test_nat_forced_chat_polls_task_and_returns_readable_result(tmp_path, monkey
         snapshot=snapshot,
     )
     client = make_client(tmp_path, monkeypatch, hub_runtime=hub)
-    response = client.post("/api/ai/chat", json={"message": "NAT检测"})
+    response = client.post("/api/ai/chat", json={"message": "路由NAT检测"})
     assert response.status_code == 200
     content = response.json["message"]["content"]
     assert "NAT 类型：对称型 NAT" in content
@@ -806,9 +832,9 @@ def test_router_diagnostic_content_is_readable_chinese():
                 {"type": "lan", "item": "LAN Port", "status": "OK",
                  "list": [{"item": "LAN Port", "status": "OK"}]},
                 {"type": "port", "item": "Negotiation Speed", "status": "Error",
-                 "tips": "check port negotiation speed",
                  "list": [{"item": "Negotiation Speed", "status": "Error",
-                           "tips": "check internet connection status",
+                           "result": "Network port negotiation rate is abnormal; May cause slow access to the Internet; Problem interface: {port}",
+                           "tips": "Repair suggestion: ; Please try to change a network cable or check whether the network port rate of the intermediate device (switch/AP, etc.) is configured to 10M",
                            "advise": "check network cable",
                            "data": {"port": "LAN5/GAME"}}]},
             ],
@@ -819,8 +845,13 @@ def test_router_diagnostic_content_is_readable_chinese():
     assert "• 外网口连接：正常" in content
     assert "• 局域网连接：正常" in content
     assert "• 端口协商速率：异常（问题接口 LAN5/GAME）" in content
-    assert "请检查互联网连接状态" in content
-    assert "请检查对应接口的网线连接" in content
+    assert "现象：网络端口协商速率异常" in content
+    assert "现象：可能导致上网变慢" in content
+    assert "现象：问题接口：LAN5/GAME" in content
+    assert "提示：请尝试更换网线，或检查中间设备（交换机/AP 等）的网口速率是否被设置为 10M" in content
+    assert "建议：请检查对应接口的网线连接" in content
+    assert "Repair suggestion" not in content
+    assert "abnormal" not in content
 
 
 def test_nat_diagnostic_content_reports_running_and_failure():
@@ -837,14 +868,26 @@ def test_network_self_check_content_is_readable_without_raw_json():
 
     content = network_self_check_content({
         "summary": {
-            "router": {"name": "BE72", "onlineDeviceCount": 11, "exitIpv6": "2409::1", "routerStatus": "ok"},
-            "agent": {"online": True, "router": "BE72"},
+            "router": {"name": "BE72", "onlineDeviceCount": 11, "exitIpv4": "100.64.1.2",
+                       "exitIpv6": "2409::1", "routerStatus": "ok"},
+            "agent": {"agentOnline": True, "agentStateText": "Agent 在线", "agentVersion": "0.2.30",
+                      "agentArchitecture": "aarch64", "agentLastSeenAt": "2026-08-29 15:50:26", "router": "BE72"},
+            "hub": {"name": "labprobe", "version": "0.12.0", "advertiseUrl": "https://hub.example"},
+            "vpnAddressCount": 2,
             "portmapRules": 2, "stunRules": 1, "wireguardEnabled": True,
         },
         "hub": {"hub": {"name": "test"}},
     })
     assert "非路由器内置自检" in content
-    assert "BE72" in content and "11 台设备在线" in content
+    assert "名称：BE72（运行正常）" in content
+    assert "在线设备：11 台" in content
+    assert "出口 IPv4：100.64.1.2" in content
+    assert "Relay 扩展：Agent 在线" in content
+    assert "版本 0.2.30（aarch64）" in content
+    assert "最后上报 2026-08-29 15:50:26" in content
+    assert "Hub：labprobe v0.12.0" in content
+    assert "访问地址：https://hub.example" in content
+    assert "STUN 公网地址记录：2 条" in content
     assert "端口映射 2 条" in content
     assert "{" not in content
 
@@ -864,3 +907,53 @@ def test_conversation_delete_removes_messages_and_requires_auth(tmp_path, monkey
     rows = sqlite3.connect(tmp_path / "ai.db").execute(
         "SELECT COUNT(*) FROM messages WHERE conversation_id='delete-me'").fetchone()
     assert rows[0] == 0
+
+
+def test_plain_nat_intent_opens_app_tool_page_without_execution(tmp_path, monkeypatch):
+    hub = fake_hub(tmp_path)
+    client = make_client(tmp_path, monkeypatch, hub_runtime=hub)
+    response = client.post("/api/ai/chat", json={"message": "NAT检测"})
+    assert response.status_code == 200
+    assert response.json["clientActions"] == [{"type": "navigate", "route": "nat"}]
+    assert response.json["toolExecutions"] == []
+    assert hub.task_calls == []
+    assert "NAT 检测" in response.json["message"]["content"]
+    assert "路由NAT检测" in response.json["message"]["content"]
+
+
+def test_agent_cleanup_requires_confirmation_and_queues_command(tmp_path, monkeypatch):
+    hub = fake_hub(tmp_path)
+    client = make_client(tmp_path, monkeypatch, hub_runtime=hub)
+    denied = client.post("/api/ai/tools/execute", json={"toolId": "agent.cleanup", "arguments": {}})
+    assert denied.status_code == 409
+    prepared = client.post("/api/ai/tools/prepare", json={"toolId": "agent.cleanup", "arguments": {}})
+    assert prepared.status_code == 200
+    assert prepared.json["preview"]["executor"] == "hub"
+    assert "清理" in prepared.json["preview"]["title"]
+    confirmed = client.post("/api/ai/tools/confirm", json={"confirmationId": prepared.json["confirmationId"]})
+    assert confirmed.status_code == 200
+    assert "清理指令已发送" in confirmed.json["result"]["message"]
+    commands = json.loads((tmp_path / "agent-commands.json").read_text(encoding="utf-8"))["commands"]
+    assert commands and commands[-1]["action"] == "cleanup"
+
+    catalog_ids = [tool["id"] for tool in client.get("/api/ai/catalog").json["tools"]]
+    assert "agent.cleanup" in catalog_ids and "agent.cleanup.status" in catalog_ids
+
+
+def test_agent_cleanup_status_reports_latest_command(tmp_path, monkeypatch):
+    hub = fake_hub(tmp_path)
+    client = make_client(tmp_path, monkeypatch, hub_runtime=hub)
+    missing = client.post("/api/ai/tools/execute", json={
+        "toolId": "agent.cleanup.status", "arguments": {},
+    })
+    assert missing.status_code == 200
+    assert missing.json["result"]["state"] == "missing"
+    hub.save_json(hub.AGENT_UPDATE_COMMANDS_FILE, {"commands": [{
+        "id": "cmd-1", "router": "router", "action": "cleanup", "state": "succeeded",
+        "message": "清理完成", "result": {"cleanedItems": ["/etc/labprobe/backups/old"],
+                                          "reclaimedBytes": 2048, "reclaimedText": "2 KB"},
+    }]})
+    done = client.post("/api/ai/tools/execute", json={"toolId": "agent.cleanup.status", "arguments": {}})
+    assert done.status_code == 200
+    assert done.json["result"]["state"] == "succeeded"
+    assert done.json["result"]["reclaimed"] == "2 KB"

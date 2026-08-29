@@ -49,8 +49,11 @@ def diagnostic_tool_intent(text: str) -> str | None:
     normalized = "".join(str(text or "").lower().split())
     if any(word in normalized for word in ("打开", "进入", "跳转", "页面")):
         return None
-    if "nat" in normalized and any(word in normalized for word in ("检测", "诊断", "自检", "结果", "状态", "进度")):
-        return "router.nat.diagnostic"
+    if "nat" in normalized:
+        wants_result = any(word in normalized for word in ("结果", "状态", "进度"))
+        if "路由" in normalized or wants_result:
+            return "router.nat.diagnostic"
+        return "navigate.tool_nat"
     if "自检" in normalized:
         return "router.diagnostic" if "路由" in normalized else "network.self_check"
     return None
@@ -91,23 +94,84 @@ _DIAGNOSTIC_TITLE_ZH = (
 )
 
 _DIAGNOSTIC_TEXT_ZH = (
+    # 完整句子级翻译（dev_diag 实测字符串）
+    ("network port negotiation rate is abnormal", "网络端口协商速率异常"),
+    ("may cause slow access to the internet", "可能导致上网变慢"),
+    ("problem interface: {port}", "问题接口：{port}"),
+    ("problem interface:", "问题接口："),
+    ("repair suggestion:", "修复建议："),
+    ("please try to change a network cable or check whether the network port rate "
+     "of the intermediate device (switch/ap, etc.) is configured to 10m",
+     "请尝试更换网线，或检查中间设备（交换机/AP 等）的网口速率是否被设置为 10M"),
+    ("please check the external network port network cable", "请检查外网口网线连接是否正常"),
     ("check external network port network cable is ok", "请检查外网口网线连接是否正常"),
     ("external network port network cable is ok", "外网口网线连接正常"),
     ("check wan port network cable", "请检查 WAN 口网线连接"),
-    ("check internet connection status", "请检查互联网连接状态"),
-    ("check network cable", "请检查对应接口的网线连接"),
     ("network cable is unplugged", "网线未连接"),
     ("network cable is connected", "网线已连接"),
+    ("please check the network cable connection", "请检查网线连接是否正常"),
     ("link is normal", "链路正常"),
     ("network is normal", "网络状态正常"),
     ("internet access is normal", "互联网连接正常"),
     ("dns is normal", "DNS 解析正常"),
+    ("dns resolution is normal", "DNS 解析正常"),
     ("gateway is reachable", "网关可达"),
+    ("gateway connection is normal", "网关连接正常"),
+    ("check internet connection status", "请检查互联网连接状态"),
+    ("check dns configuration and resolution status", "请检查 DNS 配置和解析状态"),
+    ("check gateway configuration and connectivity", "请检查网关配置和连通性"),
     ("check port negotiation speed", "请检查端口协商速率"),
+    ("check the network cable connection of the corresponding interface", "请检查对应接口的网线连接"),
+    ("check network cable", "请检查对应接口的网线连接"),
+    ("negotiation speed", "协商速率"),
+    # 单词级兜底
     ("please check", "请检查"),
+    ("internet", "互联网"),
+    ("network cable", "网线"),
+    ("network port", "网口"),
+    ("negotiation", "协商"),
+    ("interface", "接口"),
+    ("gateway", "网关"),
     ("success", "正常"), ("failed", "失败"), ("failure", "失败"),
-    ("abnormal", "异常"), ("normal", "正常"),
+    ("abnormal", "异常"), ("normal", "正常"), ("error", "异常"),
 )
+
+def _diagnostic_apply_port(text: str, port: str) -> str:
+    return text.replace("{port}", port or "未知接口")
+
+
+def _diagnostic_segment_zh(raw: str, port: str) -> List[str]:
+    """Translate one diagnostic field into cleaned Chinese sentence segments."""
+    text = _diagnostic_apply_port(
+        str(raw or "").replace("<br>", "；").replace("\n", "；").replace(";", "；"),
+        port,
+    )
+    if not text.strip():
+        return []
+    if re.search(r"[A-Za-z]{2,}", text):
+        for old, new in _DIAGNOSTIC_TEXT_ZH:
+            text = re.sub(re.escape(old), new, text, flags=re.IGNORECASE)
+    segments: List[str] = []
+    for part in text.split("；"):
+        piece = part.strip(" ；,，")
+        if not piece:
+            continue
+        if len(piece) <= 12 and piece.endswith(("：", ":")):
+            continue
+        segments.append(re.sub(r"([：:])\s+", r"\1", piece))
+    return segments
+
+
+_ZH_STATUS_WORDS = {
+    "ok": "运行正常", "connected": "已连接", "syncing": "正在同步",
+    "sync": "正在同步", "reconnecting": "连接恢复中", "offline": "离线",
+    "online": "在线", "error": "异常", "failed": "异常", "": "",
+}
+
+
+def _zh_status(value: str) -> str:
+    text = str(value or "").strip()
+    return _ZH_STATUS_WORDS.get(text.lower()) or text
 
 
 def _first_text(source: Dict[str, Any], *keys: str) -> str:
@@ -136,19 +200,6 @@ def _diagnostic_title_zh(item_type: str, raw: str) -> str:
     return text or "网络状态检查"
 
 
-def _diagnostic_text_zh(raw: str) -> str:
-    text = str(raw or "").replace("<br>", "；").strip()
-    if not text or any(ch > "\x7f" for ch in text):
-        return text
-    for old, new in _DIAGNOSTIC_TEXT_ZH:
-        text = _replace_ci(text, old, new)
-    return text
-
-
-def _replace_ci(text: str, old: str, new: str) -> str:
-    return re.sub(re.escape(old), new, text, flags=re.IGNORECASE)
-
-
 def _diagnostic_status_ok(status: str) -> bool:
     return str(status or "").strip().lower() in {"ok", "success", "normal", "pass", "passed", "connected", "up", "good"}
 
@@ -156,41 +207,52 @@ def _diagnostic_status_ok(status: str) -> bool:
 def _diagnostic_rows(result: Dict[str, Any]) -> List[Dict[str, Any]]:
     groups = result.get("list") or result.get("List") or []
     rows: List[Dict[str, Any]] = []
+
+    def row_of(item: Dict[str, Any], group_type: str, port: str) -> Dict[str, Any]:
+        return {
+            "type": str(group_type or ""),
+            "title": _diagnostic_title_zh(str(group_type or ""), str(item.get("item") or "")),
+            "ok": _diagnostic_status_ok(str(item.get("status") or "")),
+            "status": str(item.get("status") or ""),
+            "phenomena": _diagnostic_segment_zh(item.get("result"), port),
+            "tips": _diagnostic_segment_zh(item.get("tips"), port),
+            "advise": _diagnostic_segment_zh(item.get("advise"), port),
+            "port": port,
+        }
+
     for group in groups if isinstance(groups, list) else []:
         if not isinstance(group, dict):
             continue
+        group_type = str(group.get("type") or "")
         children = group.get("list") or group.get("List") or []
         if isinstance(children, list) and children:
             for child in children:
                 if not isinstance(child, dict):
                     continue
                 child_data = child.get("data") if isinstance(child.get("data"), dict) else {}
-                rows.append({
-                    "type": str(group.get("type") or ""),
-                    "title": _diagnostic_title_zh(str(group.get("type") or ""), str(child.get("item") or "")),
-                    "ok": _diagnostic_status_ok(str(child.get("status") or "")),
-                    "status": str(child.get("status") or ""),
-                    "detail": "；".join(part for part in (
-                        _diagnostic_text_zh(str(child.get("result") or "")),
-                        _diagnostic_text_zh(str(child.get("tips") or "")),
-                        _diagnostic_text_zh(str(child.get("advise") or "")),
-                    ) if part),
-                    "port": str(child_data.get("port") or ""),
-                })
+                rows.append(row_of(child, group_type, str(child_data.get("port") or "")))
         else:
-            rows.append({
-                "type": str(group.get("type") or ""),
-                "title": _diagnostic_title_zh(str(group.get("type") or ""), str(group.get("item") or "")),
-                "ok": _diagnostic_status_ok(str(group.get("status") or "")),
-                "status": str(group.get("status") or ""),
-                "detail": "；".join(part for part in (
-                    _diagnostic_text_zh(str(group.get("result") or "")),
-                    _diagnostic_text_zh(str(group.get("tips") or "")),
-                    _diagnostic_text_zh(str(group.get("advise") or "")),
-                ) if part),
-                "port": "",
-            })
+            rows.append(row_of(group, group_type, ""))
     return rows
+
+
+def _diagnostic_item_lines(row: Dict[str, Any]) -> List[str]:
+    head = f"• {row['title']}：{'正常' if row['ok'] else '异常'}"
+    if row["port"]:
+        head += f"（问题接口 {row['port']}）"
+    lines = [head]
+    if not row["ok"]:
+        notes: List[tuple[str, List[str]]] = [
+            ("现象", row["phenomena"]), ("提示", row["tips"]), ("建议", row["advise"]),
+        ]
+        seen: set[str] = set()
+        for label, segments in notes:
+            for segment in segments:
+                if segment in seen:
+                    continue
+                seen.add(segment)
+                lines.append(f"　{label}：{segment}")
+    return lines
 
 
 def router_diagnostic_content(task: Dict[str, Any]) -> str:
@@ -211,15 +273,7 @@ def router_diagnostic_content(task: Dict[str, Any]) -> str:
     abnormal = [row for row in rows if not row["ok"]]
     lines = [f"路由器网络自检完成：共 {len(rows)} 项检查，{'全部通过' if not abnormal else f'{len(abnormal)} 项异常'}。"]
     for row in rows:
-        if row["ok"]:
-            lines.append(f"• {row['title']}：正常")
-            continue
-        head = f"• {row['title']}：异常"
-        if row["port"]:
-            head += f"（问题接口 {row['port']}）"
-        if row["detail"]:
-            head += f" — {row['detail']}"
-        lines.append(head)
+        lines.extend(_diagnostic_item_lines(row))
     return "\n".join(lines)
 
 
@@ -261,32 +315,71 @@ def network_self_check_content(result: Dict[str, Any]) -> str:
     summary = result.get("summary") if isinstance(result.get("summary"), dict) else {}
     router = summary.get("router") if isinstance(summary.get("router"), dict) else {}
     presence = summary.get("agent") if isinstance(summary.get("agent"), dict) else {}
+    hub_info = summary.get("hub") if isinstance(summary.get("hub"), dict) else {}
+
     lines = ["Hub 综合网络状态（非路由器内置自检）："]
+
+    router_lines: List[str] = []
     router_name = _first_text(router, "name")
-    online = _first_text(router, "onlineDeviceCount") or _first_text(router, "total")
-    status = _first_text(router, "routerStatus")
-    head = "• 路由器：" + (router_name or "未知")
+    status_text = _zh_status(_first_text(router, "routerStatus"))
+    head = "• 名称：" + (router_name or "未知")
+    if status_text:
+        head += f"（{status_text}）"
+    router_lines.append(head)
+    online = _first_text(router, "onlineDeviceCount")
     if online:
-        head += f"，{online} 台设备在线"
-    if status:
-        head += f"，状态 {status}"
-    exit_ipv6 = _first_text(router, "exitIpv6")
-    if exit_ipv6:
-        head += f"，出口 IPv6 {exit_ipv6}"
-    lines.append(head)
-    agent_state = _first_text(presence, "state") or ("在线" if presence.get("online") else "")
-    agent_line = "• Relay 扩展：" + (agent_state or "未知")
-    router_last = _first_text(presence, "router") or _first_text(presence, "lastSeenAt")
-    if router_last:
-        agent_line += f"（{router_last}）"
-    lines.append(agent_line)
-    counters = []
+        router_lines.append(f"• 在线设备：{online} 台")
+    for label, key in (("出口 IPv4", "exitIpv4"), ("出口 IPv6", "exitIpv6")):
+        value = _first_text(router, key) or str(summary.get(key) or "")
+        if value:
+            router_lines.append(f"• {label}：{value}")
+    if router_lines:
+        lines.append("")
+        lines.append("【路由器】")
+        lines.extend(router_lines)
+
+    agent_lines: List[str] = []
+    agent_state = _first_text(presence, "agentStateText") or (
+        "Agent 在线" if presence.get("agentOnline") else ""
+    )
+    if agent_state:
+        detail_bits = []
+        version = _first_text(presence, "agentVersion")
+        arch = _first_text(presence, "agentArchitecture")
+        if version:
+            detail_bits.append(f"版本 {version}" + (f"（{arch}）" if arch else ""))
+        last_seen = _first_text(presence, "agentLastSeenAt")
+        if last_seen:
+            detail_bits.append(f"最后上报 {last_seen}")
+        agent_lines.append("• Relay 扩展：" + agent_state + ("（" + "，".join(detail_bits) + "）" if detail_bits else ""))
+    hub_line = "• Hub：" + (str(hub_info.get("name") or "") or "labprobe-hub")
+    if hub_info.get("version"):
+        hub_line += f" v{hub_info['version']}"
+    if hub_info.get("updatedAt"):
+        hub_line += f"（数据更新 {hub_info['updatedAt']}）"
+    agent_lines.append(hub_line)
+    advertise = str(hub_info.get("advertiseUrl") or "")
+    if advertise:
+        agent_lines.append(f"• 访问地址：{advertise}")
+    vpn_count = summary.get("vpnAddressCount")
+    if isinstance(vpn_count, int):
+        agent_lines.append(f"• STUN 公网地址记录：{vpn_count} 条")
+    if agent_lines:
+        lines.append("")
+        lines.append("【Hub 与扩展】")
+        lines.extend(agent_lines)
+
+    counters: List[str] = []
     if summary.get("portmapRules") is not None:
         counters.append(f"端口映射 {summary.get('portmapRules')} 条")
     if summary.get("stunRules") is not None:
-        counters.append(f"STUN {summary.get('stunRules')} 条")
+        counters.append(f"STUN 规则 {summary.get('stunRules')} 条")
     counters.append("WireGuard " + ("已启用" if summary.get("wireguardEnabled") else "未启用"))
+    lines.append("")
+    lines.append("【功能状态】")
     lines.append("• " + " · ".join(counters))
+
+    lines.append("")
     lines.append('如需路由器内置自检（外网口/局域网/协商速率），请回复“路由器网络自检”。')
     return "\n".join(lines)
 
@@ -764,6 +857,20 @@ def create_ai_blueprint(*, check_app_token: Callable[[], bool], db_path, logger,
             (item["content"] for item in reversed(messages) if item["role"] == "user"), "",
         )
         forced_tool_id = diagnostic_tool_intent(latest_user_text)
+        if forced_tool_id == "navigate.tool_nat" and executor is not None:
+            content = (
+                "已打开工具箱的「NAT 检测」页面：在那里选择检测模式和 STUN 服务器即可开始检测。\n"
+                "如需我直接读取路由器原生的 NAT 类型与映射/过滤行为，请说「路由NAT检测」。"
+            )
+            store.add_message(conversation_id, "assistant", content)
+            return jsonify({
+                "conversationId": conversation_id,
+                "message": {"role": "assistant", "content": content},
+                "usage": {},
+                "usageKnown": False,
+                "toolExecutions": [],
+                "clientActions": [{"type": "navigate", "route": "nat"}],
+            })
         if forced_tool_id and executor is not None:
             if forced_tool_id == "network.self_check":
                 try:
@@ -926,7 +1033,9 @@ def create_ai_blueprint(*, check_app_token: Callable[[], bool], db_path, logger,
                         tool_payload = {"ok": False, "code": "TOOL_NOT_FOUND", "error": "不支持该工具"}
                     elif not tool_payload:
                         guarded_tool_id = diagnostic_tool_intent(latest_user_text)
-                        if tool_id == "app.navigate" and guarded_tool_id:
+                        if tool_id == "app.navigate" and guarded_tool_id in {
+                            "router.nat.diagnostic", "router.diagnostic", "network.self_check",
+                        }:
                             tool_id = guarded_tool_id
                             arguments = {}
                         spec = tool_spec(tool_id) or {"risk": "unknown"}
