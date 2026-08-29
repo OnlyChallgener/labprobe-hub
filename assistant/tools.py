@@ -234,7 +234,14 @@ class ToolExecutor:
 
     def execute(self, tool_id: str, arguments: Any, allow_write: bool = False,
                 client_context: Any = None) -> Dict[str, Any]:
-        spec, args = self.validate(tool_id, arguments)
+        pinned_wol = arguments if allow_write and tool_id == "device.wol" and isinstance(arguments, dict) else {}
+        validation_arguments = {"device": pinned_wol.get("device")} if pinned_wol else arguments
+        spec, args = self.validate(tool_id, validation_arguments)
+        if pinned_wol:
+            # Confirmation preview resolved and pinned this target. Do not
+            # resolve the mutable device inventory again during execution.
+            args["mac"] = str(pinned_wol.get("mac") or "").strip()
+            args["name"] = str(pinned_wol.get("name") or "").strip()
         if spec["risk"] == "write" and not allow_write:
             raise ToolError("该操作需要二次确认", "CONFIRMATION_REQUIRED", 409)
         handler = self._handlers.get(tool_id)

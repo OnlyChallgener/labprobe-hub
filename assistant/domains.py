@@ -94,6 +94,133 @@ _SPECS: List[Dict[str, Any]] = [
         {"type": "object", "properties": {}, "additionalProperties": False},
     ),
     _spec(
+        "router.capabilities", "查询路由器能力",
+        "查询 Router Core 当前是否已配置，以及路由器支持的状态、UPnP、防火墙、原生端口映射、DDNS 和诊断能力。",
+        ["路由器支持哪些功能", "查看路由器能力"],
+        "router.read", "read", "none",
+        {"type": "object", "properties": {}, "additionalProperties": False},
+    ),
+    _spec(
+        "router.upnp.get", "查询路由器 UPnP",
+        "直接读取 Router Core 的 UPnP 开关、WAN 接口和动态映射规则。",
+        ["查看路由器 UPnP 状态", "UPnP 开着吗"],
+        "router.read", "read", "none",
+        {"type": "object", "properties": {}, "additionalProperties": False},
+    ),
+    _spec(
+        "router.upnp.set", "设置路由器 UPnP",
+        "经二次确认后，通过 Router Core 启用或停用路由器 UPnP，并回读当前状态。",
+        ["关闭路由器 UPnP", "在 WAN1 开启 UPnP"],
+        "router.write", "write", "always",
+        {
+            "type": "object",
+            "properties": {
+                "enabled": {"type": "boolean"},
+                "wan": {"type": "string", "enum": ["WAN", "WAN1", "wan", "wan1"]},
+            },
+            "required": ["enabled", "wan"],
+            "additionalProperties": False,
+        },
+    ),
+    _spec(
+        "router.native_portmap.list", "查询路由器原生端口映射",
+        "直接读取 Router Core 的路由器原生 IPv4/NAT 端口映射；它与 LabRelay IPv6 PortMap 规则不同。",
+        ["查看路由器原生端口映射", "列出路由器 NAT 转发规则"],
+        "router.read", "read", "none",
+        {"type": "object", "properties": {}, "additionalProperties": False},
+    ),
+    _spec(
+        "router.native_portmap.create", "创建路由器原生端口映射",
+        "经二次确认后，通过 Router Core 创建一条路由器原生 IPv4/NAT 端口映射。",
+        ["把公网 TCP 8443 转发到 192.168.5.30:443"],
+        "router.write", "write", "always",
+        {
+            "type": "object",
+            "properties": {
+                "name": {"type": "string", "maxLength": 64},
+                "interface": {"type": "string", "enum": ["WAN", "WAN1", "wan", "wan1"]},
+                "proto": {"type": "string", "enum": ["tcp", "udp", "TCP", "UDP"]},
+                "extPort": {"type": "integer"},
+                "intIp": {"type": "string", "maxLength": 64},
+                "intPort": {"type": "integer"},
+                "enabled": {"type": "boolean"},
+            },
+            "required": ["name", "interface", "proto", "extPort", "intIp", "intPort"],
+            "additionalProperties": False,
+        },
+    ),
+    _spec(
+        "router.native_portmap.remove", "删除路由器原生端口映射",
+        "按名称删除一条路由器原生 IPv4/NAT 端口映射；确认卡会固定实际匹配的规则。",
+        ["删除路由器上的 NAS-HTTPS 原生映射"],
+        "router.write", "write", "always",
+        {
+            "type": "object",
+            "properties": {"rule": {"type": "string", "maxLength": 128}},
+            "required": ["rule"],
+            "additionalProperties": False,
+        },
+    ),
+    _spec(
+        "router.ddns.list", "查询路由器 DDNS",
+        "直接读取 Router Core 的路由器 DDNS 服务状态；密码、令牌等敏感字段不会返回给模型。",
+        ["查看路由器 DDNS", "路由器 DDNS 更新正常吗"],
+        "router.read", "read", "none",
+        {"type": "object", "properties": {}, "additionalProperties": False},
+    ),
+    _spec(
+        "router.ipv6.inspect", "查询路由器 IPv6",
+        "直接读取 Router Core 的 IPv6 状态、WAN/LAN 配置与 DHCPv6 客户端；不会修改 IPv6 配置。",
+        ["查看路由器 IPv6 状态和配置", "列出 DHCPv6 客户端"],
+        "router.read", "read", "none",
+        {"type": "object", "properties": {}, "additionalProperties": False},
+    ),
+    _spec(
+        "router.firewall.toggle", "启用或停用防火墙规则",
+        "按 UUID 或名称匹配防火墙规则，经二次确认后通过 Router Core 启用或停用，并回读结果。",
+        ["停用 Sun 防火墙规则", "启用指定 UUID 的防火墙规则"],
+        "router.write", "write", "always",
+        {
+            "type": "object",
+            "properties": {
+                "rule": {"type": "string", "maxLength": 128},
+                "enabled": {"type": "boolean"},
+            },
+            "required": ["rule", "enabled"],
+            "additionalProperties": False,
+        },
+    ),
+    _spec(
+        "router.nat.diagnostic", "执行路由器 NAT 检测",
+        "实际调用 Hub Router Core 在路由器上执行 NAT 检测，并返回任务进度或检测结果；这是检测操作，不会打开或跳转 APP 页面。",
+        ["NAT检测", "执行路由器NAT检测", "检测当前NAT类型"],
+        "router.read", "read", "none",
+        {
+            "type": "object",
+            "properties": {
+                "host": {"type": "string", "maxLength": 253},
+                "port": {"type": "integer"},
+                "interface": {"type": "string", "enum": ["wan", "wan1"]},
+                "mode": {"type": "string", "enum": ["classic", "5780"]},
+            },
+            "additionalProperties": False,
+        },
+    ),
+    _spec(
+        "router.diagnostic", "执行路由器网络自检",
+        "实际调用 Hub Router Core 在路由器上执行网络自检，并返回任务进度或自检结果；这是路由器自检，不会打开或跳转 APP 页面。",
+        ["路由网络自检", "路由器自检", "路由设置-网络自检"],
+        "router.read", "read", "none",
+        {"type": "object", "properties": {}, "additionalProperties": False},
+    ),
+    _spec(
+        "network.self_check", "执行 Hub 综合网络自检",
+        "采集 Hub、路由器、Agent、端口映射、STUN 与 WireGuard 的当前状态并汇总；这是综合状态检查，不会启动路由器内置自检，也不会跳转 APP 页面。",
+        ["网络自检", "检查一下当前网络状态"],
+        "network.read", "read", "none",
+        {"type": "object", "properties": {}, "additionalProperties": False},
+    ),
+    _spec(
         "router.portmap.create", "创建端口映射",
         "创建一条 IPv6 端口映射规则（监听端口 20000-20020），经 APP 二次确认后执行。",
         ["给 NAS 创建一条 20001 到 5001 的端口映射"],
@@ -142,8 +269,8 @@ _SPECS: List[Dict[str, Any]] = [
     ),
     _spec(
         "app.navigate", "打开 APP 页面",
-        "让 APP 跳转到指定页面。理解近似说法：IPv6 设置、网络自检、NAT 诊断、端口映射、DDNS、STUN、WireGuard、WOL 等，映射到最接近的页面。",
-        ["打开ipv6设置", "去网络自检", "看看NAT诊断", "打开端口映射"],
+        "仅当用户明确要求打开、进入或跳转页面时，让 APP 跳转到指定页面。网络自检、路由器自检和 NAT 检测属于实际检测操作，不使用本工具。",
+        ["打开ipv6设置页面", "进入端口映射页面"],
         "app.action", "read", "none",
         {
             "type": "object",
@@ -186,7 +313,11 @@ def _resolve_rule(rows: List[Dict[str, Any]], needle: str, kind: str) -> Dict[st
     if not query:
         raise ToolError(f"请提供{kind}规则 ID 或名称", "RULE_REQUIRED")
     def keys(row: Dict[str, Any]) -> set:
-        return {_normalize_rule_text(row.get("id")), _normalize_rule_text(row.get("name"))}
+        return {
+            _normalize_rule_text(row.get("id")),
+            _normalize_rule_text(row.get("uuid")),
+            _normalize_rule_text(row.get("name")),
+        }
     matches = [row for row in rows if query in keys(row)]
     if not matches:
         matches = [row for row in rows if query in _normalize_rule_text(row.get("name"))]
@@ -261,9 +392,259 @@ def _agent_upgrade(executor, args, client_context) -> Dict[str, Any]:
 
 def _router_status(executor, args, client_context) -> Dict[str, Any]:
     hub = executor.hub
+    service = getattr(hub, "ROUTER_SERVICE", None)
+    if service is not None and callable(getattr(service, "get_status", None)):
+        try:
+            return {"router": _router_data(service.get_status())}
+        except Exception as error:
+            raise _router_core_error(error, "ROUTER_STATUS_FAILED") from error
     document = hub.load_json(hub.STATE_FILE, {})
     router = document.get("router") if isinstance(document.get("router"), dict) else {}
     return {"router": router, "updatedAt": document.get("updatedAt")}
+
+
+def _router_core(executor):
+    return _require_service(executor, "ROUTER_SERVICE")
+
+
+def _router_core_error(error: Exception, fallback_code: str) -> ToolError:
+    return ToolError(
+        str(error or "").strip() or "路由器操作失败",
+        str(getattr(error, "code", "") or fallback_code),
+        int(getattr(error, "status_code", 0) or 502),
+    )
+
+
+def _router_data(value: Any) -> Any:
+    """Unwrap RouterService's public data envelope without changing it."""
+    if isinstance(value, dict) and "data" in value:
+        return value.get("data")
+    return value
+
+
+def _router_rows(value: Any, *keys: str) -> List[Dict[str, Any]]:
+    data = _router_data(value)
+    if isinstance(data, list):
+        return [dict(row) for row in data if isinstance(row, dict)]
+    if isinstance(data, dict):
+        for key in keys:
+            rows = data.get(key)
+            if isinstance(rows, list):
+                return [dict(row) for row in rows if isinstance(row, dict)]
+    return []
+
+
+def _required_bool(args: Dict[str, Any], key: str) -> bool:
+    value = args.get(key)
+    if not isinstance(value, bool):
+        raise ToolError(f"参数 {key} 必须是布尔值", "INVALID_ARGUMENTS")
+    return value
+
+
+def _required_port(args: Dict[str, Any], key: str) -> int:
+    value = args.get(key)
+    if isinstance(value, bool) or not isinstance(value, int) or not 1 <= value <= 65535:
+        raise ToolError(f"参数 {key} 必须是 1-65535 的端口号", "INVALID_ARGUMENTS")
+    return value
+
+
+def _router_capabilities(executor, args, client_context) -> Dict[str, Any]:
+    try:
+        return {"capabilities": _router_data(_router_core(executor).get_capabilities())}
+    except Exception as error:
+        raise _router_core_error(error, "ROUTER_CAPABILITIES_FAILED") from error
+
+
+def _router_upnp_get(executor, args, client_context) -> Dict[str, Any]:
+    try:
+        return {"upnp": _router_data(_router_core(executor).get_upnp(force=False))}
+    except Exception as error:
+        raise _router_core_error(error, "ROUTER_UPNP_READ_FAILED") from error
+
+
+def _router_upnp_set(executor, args, client_context) -> Dict[str, Any]:
+    enabled = _required_bool(args, "enabled")
+    try:
+        result = _router_core(executor).set_upnp(enabled, str(args["wan"]).upper())
+    except Exception as error:
+        raise _router_core_error(error, "ROUTER_UPNP_WRITE_FAILED") from error
+    return {"ok": True, "upnp": _router_data(result)}
+
+
+def _router_native_portmap_list(executor, args, client_context) -> Dict[str, Any]:
+    try:
+        result = _router_core(executor).get_port_mappings(force=False)
+    except Exception as error:
+        raise _router_core_error(error, "ROUTER_PORTMAP_READ_FAILED") from error
+    return {"rules": _router_rows(result, "rules", "list", "items")}
+
+
+def _native_portmap_payload(args: Dict[str, Any]) -> Dict[str, Any]:
+    enabled = args.get("enabled", True)
+    if not isinstance(enabled, bool):
+        raise ToolError("参数 enabled 必须是布尔值", "INVALID_ARGUMENTS")
+    return {
+        "name": str(args["name"]).strip(),
+        "interface": str(args["interface"]).upper(),
+        "proto": str(args["proto"]).lower(),
+        "extPort": _required_port(args, "extPort"),
+        "intIp": str(args["intIp"]).strip(),
+        "intPort": _required_port(args, "intPort"),
+        "enabled": enabled,
+    }
+
+
+def _router_native_portmap_create(executor, args, client_context) -> Dict[str, Any]:
+    rule = _native_portmap_payload(args)
+    try:
+        result = _router_core(executor).add_port_mapping(rule)
+    except Exception as error:
+        raise _router_core_error(error, "ROUTER_PORTMAP_CREATE_FAILED") from error
+    return {"ok": True, "rule": rule, "portMappings": _router_data(result)}
+
+
+def _native_portmap_rules(executor) -> List[Dict[str, Any]]:
+    try:
+        result = _router_core(executor).get_port_mappings(force=False)
+    except Exception as error:
+        raise _router_core_error(error, "ROUTER_PORTMAP_READ_FAILED") from error
+    return _router_rows(result, "rules", "list", "items")
+
+
+def _router_native_portmap_remove(executor, args, client_context) -> Dict[str, Any]:
+    target = _resolve_rule(_native_portmap_rules(executor), args["rule"], "路由器原生端口映射")
+    rule_name = str(target.get("name") or "").strip()
+    if not rule_name:
+        raise ToolError("原生端口映射缺少可删除的名称", "RULE_NAME_MISSING", 409)
+    try:
+        result = _router_core(executor).delete_port_mapping(rule_name)
+    except Exception as error:
+        raise _router_core_error(error, "ROUTER_PORTMAP_DELETE_FAILED") from error
+    return {"ok": True, "deleted": True, "name": rule_name, "portMappings": _router_data(result)}
+
+
+def _router_ddns_list(executor, args, client_context) -> Dict[str, Any]:
+    try:
+        result = _router_core(executor).get_ddns(force=False)
+    except Exception as error:
+        raise _router_core_error(error, "ROUTER_DDNS_READ_FAILED") from error
+    return {"services": _router_rows(result, "services", "list", "items")}
+
+
+def _router_ipv6_inspect(executor, args, client_context) -> Dict[str, Any]:
+    service = _router_core(executor)
+    try:
+        status = _router_data(service.get_ipv6_status())
+        config = _router_data(service.get_ipv6_config())
+        clients = _router_rows(service.get_dhcpv6_clients(), "clients", "list", "items")
+    except Exception as error:
+        raise _router_core_error(error, "ROUTER_IPV6_READ_FAILED") from error
+    return {"status": status, "config": config, "clients": clients}
+
+
+def _firewall_rules(executor) -> List[Dict[str, Any]]:
+    try:
+        result = _router_core(executor).get_firewall(force=False)
+    except Exception as error:
+        raise _router_core_error(error, "ROUTER_FIREWALL_READ_FAILED") from error
+    return _router_rows(result, "rules", "list", "items")
+
+
+def _router_firewall_list(executor, args, client_context) -> Dict[str, Any]:
+    try:
+        result = _router_core(executor).get_firewall(force=False)
+    except Exception as error:
+        raise _router_core_error(error, "ROUTER_FIREWALL_READ_FAILED") from error
+    data = _router_data(result)
+    return {"firewall": data, "rules": _router_rows(result, "rules", "list", "items")}
+
+
+def _router_firewall_toggle(executor, args, client_context) -> Dict[str, Any]:
+    target = _resolve_rule(_firewall_rules(executor), args["rule"], "防火墙")
+    uuid = str(target.get("uuid") or target.get("id") or "").strip()
+    if not uuid:
+        raise ToolError("防火墙规则缺少 UUID", "RULE_UUID_MISSING", 409)
+    enabled = _required_bool(args, "enabled")
+    try:
+        result = _router_core(executor).set_firewall_rule_enabled(uuid, enabled)
+    except Exception as error:
+        raise _router_core_error(error, "ROUTER_FIREWALL_WRITE_FAILED") from error
+    return {"ok": True, "uuid": uuid, "enabled": enabled, "firewall": _router_data(result)}
+
+
+def _router_task_error(error: Exception, fallback_code: str) -> ToolError:
+    message = str(error or "").strip() or "路由器检测任务启动失败"
+    return ToolError(
+        message,
+        str(getattr(error, "code", "") or fallback_code),
+        int(getattr(error, "status_code", 0) or 502),
+    )
+
+
+def _router_nat_diagnostic(executor, args, client_context) -> Dict[str, Any]:
+    manager = _require_service(executor, "ROUTER_TASK_MANAGER")
+    try:
+        task = manager.start_nat(dict(args))
+    except Exception as error:
+        raise _router_task_error(error, "NAT_DIAGNOSTIC_FAILED") from error
+    return {
+        "ok": True,
+        "kind": "nat",
+        "message": "路由器 NAT 检测已启动" if task.get("state") in {"queued", "running"} else "已取得路由器 NAT 检测结果",
+        "task": task,
+    }
+
+
+def _router_diagnostic(executor, args, client_context) -> Dict[str, Any]:
+    manager = _require_service(executor, "ROUTER_TASK_MANAGER")
+    try:
+        task = manager.start_diagnostic()
+    except Exception as error:
+        raise _router_task_error(error, "ROUTER_DIAGNOSTIC_FAILED") from error
+    return {
+        "ok": True,
+        "kind": "diagnostic",
+        "message": "路由器网络自检已启动" if task.get("state") in {"queued", "running"} else "已取得路由器网络自检结果",
+        "task": task,
+    }
+
+
+def _network_self_check(executor, args, client_context) -> Dict[str, Any]:
+    hub = executor.hub
+    status = hub.status_document() if callable(getattr(hub, "status_document", None)) else {}
+    state = hub.load_json(hub.STATE_FILE, {}) if hasattr(hub, "STATE_FILE") else {}
+    router = state.get("router") if isinstance(state, dict) and isinstance(state.get("router"), dict) else {}
+    presence = hub.agent_presence_snapshot() if callable(getattr(hub, "agent_presence_snapshot", None)) else {}
+    try:
+        portmap_document, portmap_loaded = hub._load_portmap_rules_document()
+        portmaps = portmap_document.get("rules") if isinstance(portmap_document, dict) else []
+    except Exception:
+        portmap_loaded, portmaps = False, []
+    stun_service = getattr(hub, "STUN_SERVICE", None)
+    try:
+        stun_document = stun_service.rules_snapshot() if stun_service is not None else {}
+        stun_rules = stun_document.get("rules") if isinstance(stun_document, dict) else []
+    except Exception:
+        stun_rules = []
+    wireguard_service = getattr(hub, "WIREGUARD_SERVICE", None)
+    try:
+        wireguard = wireguard_service.document() if wireguard_service is not None else {}
+    except Exception:
+        wireguard = {}
+    summary = {
+        "router": router,
+        "agent": presence,
+        "portmapRules": len(portmaps or []) if portmap_loaded else None,
+        "stunRules": len(stun_rules or []),
+        "wireguardEnabled": bool((wireguard or {}).get("enabled")),
+    }
+    return {
+        "ok": True,
+        "kind": "network",
+        "message": "Hub 综合网络状态已采集（非路由器内置自检）",
+        "summary": summary,
+        "hub": status,
+    }
 
 
 def _portmap_create(executor, args, client_context) -> Dict[str, Any]:
@@ -273,7 +654,7 @@ def _portmap_create(executor, args, client_context) -> Dict[str, Any]:
     hub._portmap_check_conflict(rows, rule)
     rows.append(rule)
     hub._save_portmap_rules(rows)
-    hub._queue_portmap_command("upsert", {"rule": rule})
+    hub._queue_portmap_command("upsert", {"rule": rule}, reactivate=True)
     hub.add_event({"type": "portmap_created", "title": f"端口映射已创建（AI）：{rule['name']}",
                    "name": rule["name"], "newValue": f"IPv6:{rule['listenPort']}"})
     return {"ok": True, "rule": _rule_view(rule, PORTMAP_VIEW_FIELDS)}
@@ -285,7 +666,7 @@ def _portmap_remove(executor, args, client_context) -> Dict[str, Any]:
     target = _resolve_rule(rows, args["rule"], "端口映射")
     rule_id = target.get("id")
     hub._save_portmap_rules([row for row in rows if row.get("id") != rule_id])
-    hub._queue_portmap_command("delete", {"id": rule_id})
+    hub._queue_portmap_command("delete", {"id": rule_id}, reactivate=True)
     hub.add_event({"type": "portmap_deleted", "title": f"端口映射已删除（AI）：{target.get('name')}",
                    "name": target.get("name"), "oldValue": str(target.get("listenPort"))})
     return {"ok": True, "deleted": True, "id": rule_id, "name": target.get("name")}
@@ -311,7 +692,11 @@ def _portmap_toggle(executor, args, client_context) -> Dict[str, Any]:
     rule["enabled"] = enabled
     rule["updatedAt"] = hub.now_str()
     hub._save_portmap_rules([rule if row.get("id") == rule_id else row for row in rows])
-    hub._queue_portmap_command("upsert" if enabled else "stop", {"rule": rule} if enabled else {"id": rule_id})
+    hub._queue_portmap_command(
+        "upsert" if enabled else "stop",
+        {"rule": rule} if enabled else {"id": rule_id},
+        reactivate=True,
+    )
     return {"ok": True, "rule": _rule_view(rule, PORTMAP_VIEW_FIELDS), "action": "start" if enabled else "stop"}
 
 
@@ -328,6 +713,19 @@ HANDLERS: Dict[str, Any] = {
     "relay.stun.rule.remove": _stun_remove,
     "relay.agent.upgrade": _agent_upgrade,
     "router.status": _router_status,
+    "router.capabilities": _router_capabilities,
+    "router.upnp.get": _router_upnp_get,
+    "router.upnp.set": _router_upnp_set,
+    "router.native_portmap.list": _router_native_portmap_list,
+    "router.native_portmap.create": _router_native_portmap_create,
+    "router.native_portmap.remove": _router_native_portmap_remove,
+    "router.ddns.list": _router_ddns_list,
+    "router.ipv6.inspect": _router_ipv6_inspect,
+    "router.firewall.toggle": _router_firewall_toggle,
+    "router.firewall.list": _router_firewall_list,
+    "router.nat.diagnostic": _router_nat_diagnostic,
+    "router.diagnostic": _router_diagnostic,
+    "network.self_check": _network_self_check,
     "router.portmap.create": _portmap_create,
     "router.portmap.remove": _portmap_remove,
     "router.portmap.toggle": _portmap_toggle,
@@ -423,6 +821,66 @@ def _preview_portmap_toggle(executor, args, client_context) -> Dict[str, Any]:
     }
 
 
+def _preview_router_upnp_set(executor, args, client_context) -> Dict[str, Any]:
+    enabled = _required_bool(args, "enabled")
+    wan = str(args["wan"]).upper()
+    return {
+        "toolId": "router.upnp.set",
+        "executor": "hub",
+        "title": f"确认{'启用' if enabled else '停用'}路由器 UPnP",
+        "summary": f"在 {wan} 上{'启用' if enabled else '停用'} UPnP",
+        "arguments": {"enabled": enabled, "wan": wan},
+        "expiresInSeconds": 300,
+    }
+
+
+def _preview_native_portmap_create(executor, args, client_context) -> Dict[str, Any]:
+    rule = _native_portmap_payload(args)
+    return {
+        "toolId": "router.native_portmap.create",
+        "executor": "hub",
+        "title": "确认创建路由器原生端口映射",
+        "summary": (
+            f"创建 {rule['proto'].upper()} {rule['interface']}:{rule['extPort']} → "
+            f"{rule['intIp']}:{rule['intPort']}（{rule['name']}）"
+        ),
+        "arguments": rule,
+        "expiresInSeconds": 300,
+    }
+
+
+def _preview_native_portmap_remove(executor, args, client_context) -> Dict[str, Any]:
+    target = _resolve_rule(_native_portmap_rules(executor), args["rule"], "路由器原生端口映射")
+    rule_name = str(target.get("name") or "").strip()
+    if not rule_name:
+        raise ToolError("原生端口映射缺少可删除的名称", "RULE_NAME_MISSING", 409)
+    return {
+        "toolId": "router.native_portmap.remove",
+        "executor": "hub",
+        "title": "确认删除路由器原生端口映射",
+        "summary": f"删除路由器原生端口映射：{rule_name}",
+        "arguments": {"rule": rule_name},
+        "expiresInSeconds": 300,
+    }
+
+
+def _preview_firewall_toggle(executor, args, client_context) -> Dict[str, Any]:
+    target = _resolve_rule(_firewall_rules(executor), args["rule"], "防火墙")
+    uuid = str(target.get("uuid") or target.get("id") or "").strip()
+    if not uuid:
+        raise ToolError("防火墙规则缺少 UUID", "RULE_UUID_MISSING", 409)
+    enabled = _required_bool(args, "enabled")
+    name = str(target.get("name") or uuid)
+    return {
+        "toolId": "router.firewall.toggle",
+        "executor": "hub",
+        "title": f"确认{'启用' if enabled else '停用'}防火墙规则",
+        "summary": f"{'启用' if enabled else '停用'}防火墙规则：{name}（{uuid}）",
+        "arguments": {"rule": uuid, "enabled": enabled},
+        "expiresInSeconds": 300,
+    }
+
+
 PREVIEWS: Dict[str, Any] = {
     "relay.stun.rule.add": _preview_stun_add,
     "relay.stun.rule.remove": _preview_stun_remove,
@@ -430,6 +888,10 @@ PREVIEWS: Dict[str, Any] = {
     "router.portmap.create": _preview_portmap_create,
     "router.portmap.remove": _preview_portmap_remove,
     "router.portmap.toggle": _preview_portmap_toggle,
+    "router.upnp.set": _preview_router_upnp_set,
+    "router.native_portmap.create": _preview_native_portmap_create,
+    "router.native_portmap.remove": _preview_native_portmap_remove,
+    "router.firewall.toggle": _preview_firewall_toggle,
 }
 
 

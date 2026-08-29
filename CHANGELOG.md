@@ -1,5 +1,15 @@
 # LabProbe 变更记录
 
+## 0.12.0 / LabRelay 0.2.30
+
+- **AI 助手多 API**：新增 `ai_provider_configs` 多配置 CRUD，按顺序自动 failover；流式响应先缓冲后切换，避免半截重复内容；腾讯混元默认地址 `https://tokenhub.tencentmaas.com/v1`。
+- **Token 额度与用量**：每配置/每模型额度、已用与剩余百分比；`/api/ai/usage` 返回 14 天北京时间日柱状数据（含输入/输出与缓存分段）与按配置累计用量。
+- **历史对话管理**：对话按北京时间自然日折叠展示，新增 `PATCH /api/ai/conversations/{id}` 重命名接口；消息总存储限额 8 MiB 自动治理。
+- **AI 工具扩展**：Router Core 只读能力（UPnP、原生端口映射、防火墙、DDNS、IPv6、NAT、自检）与需二次确认的写操作（UPnP 启停、映射增删、防火墙规则启停）；网络自检/路由自检/NAT 检测真实执行，不再误触发 APP 导航。
+- **时间语义统一**：Hub 展示时间、自然日与旧时间字符串转 epoch 固定 `Asia/Shanghai`；PortMap 规则继续使用 epoch 并带服务端时钟偏差保护。
+- **PortMap 命令治理**：`router`/主路由 alias 统一到 GET/ACK/reconciliation；命令重试 5 次后转 `failed` 并记录超时/错误，用户重新操作重置重试状态。
+- **Relay 0.2.30**：Agent 对带有效期规则的 PortMap 命令增加 Hub 服务端时钟偏差保护（>120 秒拒绝执行并回报 clock_skew）。
+
 ## 0.11.5
 
 - **STUN 规则可靠性**：保留自定义内网目标端口，切换传输协议发生同协议监听冲突时安全重分配监听端口，并正确解析字符串布尔值。

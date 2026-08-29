@@ -1,5 +1,6 @@
 from datetime import datetime, timedelta, timezone
 import json
+import sqlite3
 from types import SimpleNamespace
 
 import pytest
@@ -40,6 +41,7 @@ def fake_hub(tmp_path):
         except Exception:
             return default
 
+    task_calls = []
     runtime = SimpleNamespace(
         DEVICES_FILE=devices_file,
         PORTMAP_ROUTER_STATUS_FILE=portmap_status_file,
@@ -47,10 +49,21 @@ def fake_hub(tmp_path):
         load_device_archive=lambda: {},
         normalize_ipv6_list=lambda value: value if isinstance(value, list) else [value],
         status_document=lambda: {"hub": {"name": "test"}},
+        STATE_FILE=tmp_path / "state.json",
+        agent_presence_snapshot=lambda: {"online": True, "router": "BE72"},
+        ROUTER_TASK_MANAGER=SimpleNamespace(
+            start_nat=lambda payload: task_calls.append(("nat", dict(payload))) or {
+                "state": "succeeded", "stage": "finished", "result": {"nat_type": "symmetric"},
+            },
+            start_diagnostic=lambda: task_calls.append(("diagnostic", {})) or {
+                "state": "succeeded", "stage": "finished", "result": {"process": "100%"},
+            },
+        ),
         aggregate_daily=lambda day: {"date": day, "summary": {}},
         _load_portmap_rules_document=lambda: ({"rules": []}, True),
         send_wol=lambda mac: {"ok": True, "mac": mac, "sent": 3},
     )
+    runtime.task_calls = task_calls
     return runtime
 
 
@@ -161,6 +174,20 @@ def test_usage_summary_exposes_today_totals(tmp_path, monkeypatch):
     assert response.json["today_total_tokens"] == 0
 
 
+def test_daily_usage_exposes_real_input_and_output_totals_for_bar_chart(tmp_path, monkeypatch):
+    client = make_client(tmp_path, monkeypatch)
+    store = AIStore(tmp_path / "ai.db")
+    store.add_usage("chart", "deepseek", "model-chart", {
+        "prompt_tokens": 7, "completion_tokens": 3, "total_tokens": 10,
+        "cache_hit_tokens": 2, "cache_miss_tokens": 5,
+    })
+    daily = client.get("/api/ai/usage").json["daily"][-1]
+    assert daily["prompt_tokens"] == 7
+    assert daily["completion_tokens"] == 3
+    assert daily["cache_hit_tokens"] == 2
+    assert daily["cache_miss_tokens"] == 5
+
+
 def test_conversation_history_and_date_usage_are_persisted(tmp_path, monkeypatch):
     client = make_client(tmp_path, monkeypatch)
     from assistant.storage import AIStore
@@ -250,6 +277,33 @@ def test_chat_executes_model_selected_read_tool_and_returns_final_answer(tmp_pat
     assert response.json["toolExecutions"] == [{"status": "completed", "toolId": "device.ipv6"}]
 
 
+@pytest.mark.parametrize("message,tool_id,expected_call", [
+    ("NAT检测", "router.nat.diagnostic", "nat"),
+    ("路由网络自检", "router.diagnostic", "diagnostic"),
+])
+def test_diagnostic_intents_execute_router_core_without_provider_or_navigation(
+    tmp_path, monkeypatch, message, tool_id, expected_call,
+):
+    hub = fake_hub(tmp_path)
+    client = make_client(tmp_path, monkeypatch, hub_runtime=hub)
+    response = client.post("/api/ai/chat", json={"message": message})
+    assert response.status_code == 200
+    assert response.json["toolExecutions"] == [{"status": "completed", "toolId": tool_id}]
+    assert response.json["clientActions"] == []
+    assert hub.task_calls[0][0] == expected_call
+
+
+def test_generic_network_self_check_is_direct_and_does_not_start_router_diagnostic(tmp_path, monkeypatch):
+    hub = fake_hub(tmp_path)
+    client = make_client(tmp_path, monkeypatch, hub_runtime=hub)
+    response = client.post("/api/ai/chat", json={"message": "网络自检"})
+    assert response.status_code == 200
+    assert response.json["toolExecutions"] == [{"status": "completed", "toolId": "network.self_check"}]
+    assert response.json["clientActions"] == []
+    assert hub.task_calls == []
+    assert "非路由器内置自检" in response.json["message"]["content"]
+
+
 def test_app_context_is_sanitized_and_local_write_is_one_time_confirmed(tmp_path, monkeypatch):
     client = make_client(tmp_path, monkeypatch, hub_runtime=fake_hub(tmp_path))
     context = {
@@ -271,6 +325,14 @@ def test_app_context_is_sanitized_and_local_write_is_one_time_confirmed(tmp_path
     assert confirmed.status_code == 200
     assert confirmed.json["clientAction"]["arguments"]["favorite"] == "fav-1"
     assert client.post("/api/ai/tools/confirm", json={"confirmationId": confirmation_id}).status_code == 409
+    completed = client.post("/api/ai/tools/complete", json={
+        "confirmationId": confirmation_id, "ok": True, "message": "收藏已删除",
+    })
+    assert completed.status_code == 200
+    assert completed.json["result"] == {"ok": True, "message": "收藏已删除"}
+    assert client.post("/api/ai/tools/complete", json={
+        "confirmationId": confirmation_id, "ok": True,
+    }).status_code == 409
 
 
 def test_notification_inbox_deduplicates_watched_events_and_daily_summary(tmp_path):
@@ -300,7 +362,7 @@ def test_notification_inbox_deduplicates_watched_events_and_daily_summary(tmp_pa
     assert "30 Token" in rows[1]["content"]
 
 
-def test_prune_history_bounds_growth(tmp_path):
+def test_prune_history_preserves_unlimited_conversation_count_and_bounds_auxiliary_rows(tmp_path):
     store = AIStore(tmp_path / "ai.db")
     store.initialize()
     now = datetime.now(timezone.utc)
@@ -316,15 +378,14 @@ def test_prune_history_bounds_growth(tmp_path):
                 "INSERT INTO ai_tool_audit(request_id,tool_id,risk,status,arguments_json,created_at) VALUES(?,?,?,?,?,?)",
                 (f"r{index}", "status.get", "read", "ok", "{}", utc_now()),
             )
-    deleted = store.prune_history(idle_days=90, max_messages=10, max_audit_rows=5, max_notifications=5)
-    assert deleted["conversations"] == 1
+    store.prune_history(max_audit_rows=5, max_notifications=5)
     with store._connect() as conn:
-        assert conn.execute("SELECT COUNT(*) AS c FROM messages WHERE conversation_id='c-old'").fetchone()["c"] == 0
+        assert conn.execute("SELECT COUNT(*) AS c FROM messages WHERE conversation_id='c-old'").fetchone()["c"] == 1
         assert conn.execute("SELECT COUNT(*) AS c FROM messages WHERE conversation_id='c-new'").fetchone()["c"] == 1
         assert conn.execute("SELECT COUNT(*) AS c FROM ai_tool_audit").fetchone()["c"] == 5
     # Usage rows are the cumulative audit trail and are never pruned.
     store.add_usage("c-new", "deepseek", "deepseek-v4-flash", {"prompt_tokens": 1, "completion_tokens": 2, "total_tokens": 3})
-    store.prune_history(idle_days=90, max_messages=10, max_audit_rows=5, max_notifications=5)
+    store.prune_history(max_audit_rows=5, max_notifications=5)
     with store._connect() as conn:
         assert conn.execute("SELECT COUNT(*) AS c FROM ai_usage").fetchone()["c"] == 1
 
@@ -336,6 +397,63 @@ def test_prune_history_clears_expired_pending_confirmations(tmp_path):
     store.create_confirmation("expired-1", "device.wol", {"device": "ANS"}, {"toolId": "device.wol"}, past)
     deleted = store.prune_history()
     assert deleted["expired_confirmations"] == 1
+
+
+def test_conversation_storage_counts_utf8_bytes_and_prunes_oldest_whole_conversation(tmp_path):
+    store = AIStore(tmp_path / "ai.db")
+    store.initialize()
+    store.create_conversation("old", "旧")
+    store.add_message("old", "user", "你好")
+    store.create_conversation("current", "当前")
+    store.add_message("current", "user", "abcd")
+    assert store.conversation_storage()["bytes"] == 10
+    deleted = store.enforce_conversation_storage(limit_bytes=4, protected_conversation_id="current")
+    assert deleted["storage_conversations"] == 1
+    assert [row["id"] for row in store.list_conversations()] == ["current"]
+    assert store.conversation_storage()["bytes"] == 4
+
+
+def test_conversation_list_has_no_count_cap_and_null_title_has_safe_fallback(tmp_path, monkeypatch):
+    client = make_client(tmp_path, monkeypatch)
+    store = AIStore(tmp_path / "ai.db")
+    for index in range(75):
+        store.create_conversation(f"c-{index}", None)
+    rows = client.get("/api/ai/conversations").json["conversations"]
+    assert len(rows) == 75
+    assert all(row["title"] == "新对话" for row in rows)
+
+
+def test_incremental_chat_appends_one_turn_without_replaying_or_duplicating(tmp_path, monkeypatch):
+    client = make_client(tmp_path, monkeypatch)
+    assert client.put("/api/ai/config", json={"apiKey": "sk-test"}).status_code == 200
+
+    class FakeProvider:
+        calls = []
+
+        def __init__(self, *args, **kwargs):
+            pass
+
+        def chat(self, messages, tools=None):
+            from assistant.provider import ChatResult
+            self.__class__.calls.append(messages)
+            turn = sum(1 for item in messages if item.get("role") == "user")
+            return ChatResult(f"回复{turn}", {"total_tokens": 1}, {
+                "role": "assistant", "content": f"回复{turn}",
+            })
+
+    monkeypatch.setattr("assistant.api.OpenAICompatibleProvider", FakeProvider)
+    first = client.post("/api/ai/chat", json={"message": "第一问"})
+    conversation_id = first.json["conversationId"]
+    second = client.post("/api/ai/chat", json={"conversationId": conversation_id, "message": "第二问"})
+    assert second.status_code == 200
+    stored = client.get(f"/api/ai/conversations/{conversation_id}/messages").json["messages"]
+    assert [(item["role"], item["content"]) for item in stored] == [
+        ("user", "第一问"), ("assistant", "回复1"),
+        ("user", "第二问"), ("assistant", "回复2"),
+    ]
+    assert [item["content"] for item in FakeProvider.calls[-1] if item.get("role") != "system"] == [
+        "第一问", "回复1", "第二问",
+    ]
 
 
 def test_replace_messages_keeps_history_bounded_without_duplicates(tmp_path):
@@ -397,3 +515,215 @@ def test_conversation_title_comes_from_latest_message(tmp_path):
     store.create_conversation("t-1", "  帮我看看今天的设备流量变化  ")
     row = store.list_conversations()[0]
     assert row["title"] == "帮我看看今天的设备流量变化"
+
+
+def test_legacy_singleton_config_is_migrated_once(tmp_path, monkeypatch):
+    monkeypatch.setenv("LABPROBE_AI_MASTER_KEY", "test-master-key")
+    db_path = tmp_path / "legacy.db"
+    store = AIStore(db_path)
+    store.initialize()
+    ciphertext = encrypt_secret("sk-legacy")
+    with sqlite3.connect(db_path) as conn:
+        conn.execute("DELETE FROM ai_provider_configs")
+        conn.execute(
+            "INSERT INTO ai_config(id,provider,base_url,model,api_key_ciphertext,enabled,updated_at) "
+            "VALUES(1,'deepseek','https://legacy.example/v1','legacy-model',?,1,?)",
+            (ciphertext, utc_now()),
+        )
+        conn.execute(
+            "INSERT INTO ai_usage(conversation_id,provider,model,total_tokens,created_at) "
+            "VALUES('legacy-chat','deepseek','legacy-model',9,?)", (utc_now(),),
+        )
+    store.initialize()
+    configs = store.list_configs()
+    assert len(configs) == 1
+    assert configs[0]["model"] == "legacy-model"
+    with sqlite3.connect(db_path) as conn:
+        assert conn.execute("SELECT COUNT(*) FROM ai_config").fetchone()[0] == 0
+        assert conn.execute("SELECT config_id FROM ai_usage WHERE conversation_id='legacy-chat'").fetchone()[0] == configs[0]["id"]
+    store.initialize()
+    assert len(store.list_configs()) == 1
+
+
+def test_multi_config_crud_masks_keys_and_hunyuan_has_new_default(tmp_path, monkeypatch):
+    client = make_client(tmp_path, monkeypatch)
+    first = client.put("/api/ai/config", json={"apiKey": "sk-first", "name": "主模型"})
+    assert first.status_code == 200
+    second = client.post("/api/ai/config", json={
+        "apiKey": "sk-hunyuan", "name": "混元备用", "provider": "hunyuan",
+        "model": "hunyuan-turbos", "tokenQuota": 1_000_000,
+    })
+    assert second.status_code == 200
+    assert second.json["baseUrl"] == "https://tokenhub.tencentmaas.com/v1"
+    config_id = second.json["id"]
+    updated = client.put("/api/ai/config", json={"id": config_id, "name": "混元二号", "enabled": False})
+    assert updated.status_code == 200
+    assert updated.json["name"] == "混元二号"
+    assert updated.json["apiKeyStatus"] == "configured"
+    payload = client.get("/api/ai/config").json
+    assert len(payload["configs"]) == 2
+    assert "sk-first" not in json.dumps(payload)
+    assert "sk-hunyuan" not in json.dumps(payload)
+    assert payload["provider"] == "deepseek"  # phase-one fields still describe the primary config
+    assert client.delete(f"/api/ai/config/{config_id}").status_code == 204
+    assert len(client.get("/api/ai/config").json["configs"]) == 1
+
+
+def test_chat_fails_over_once_and_records_actual_config(tmp_path, monkeypatch):
+    client = make_client(tmp_path, monkeypatch)
+    first = client.put("/api/ai/config", json={
+        "apiKey": "sk-a", "name": "A", "baseUrl": "https://fail.example/v1",
+        "model": "model-a", "tokenQuota": 10,
+    }).json
+    second = client.post("/api/ai/config", json={
+        "apiKey": "sk-b", "name": "B", "baseUrl": "https://ok.example/v1",
+        "model": "model-b",
+    }).json
+    calls = []
+
+    class FakeProvider:
+        def __init__(self, base_url, api_key, model):
+            self.base_url, self.model = base_url, model
+
+        def chat(self, messages, tools=None):
+            calls.append(self.base_url)
+            if "fail.example" in self.base_url:
+                raise ProviderError("temporary provider failure", 429)
+            from assistant.provider import ChatResult
+            return ChatResult("备用配置成功", {"prompt_tokens": 3, "completion_tokens": 2, "total_tokens": 5})
+
+    monkeypatch.setattr("assistant.api.OpenAICompatibleProvider", FakeProvider)
+    response = client.post("/api/ai/chat", json={"message": "你好"})
+    assert response.status_code == 200
+    assert response.json["configId"] == second["id"]
+    assert response.json["provider"] == second["provider"]
+    assert response.json["model"] == "model-b"
+    assert calls == ["https://fail.example/v1", "https://ok.example/v1"]
+    usage = client.get("/api/ai/usage").json["config_usage"]
+    by_id = {item["config_id"]: item for item in usage}
+    assert by_id[first["id"]]["total_tokens"] == 0
+    assert by_id[first["id"]]["used_percent"] == 0.0
+    assert by_id[second["id"]]["total_tokens"] == 5
+    assert by_id[second["id"]]["quota_status"] == "unknown"
+
+
+def test_chat_skips_disabled_config_and_never_retries_exhausted_pool(tmp_path, monkeypatch):
+    client = make_client(tmp_path, monkeypatch)
+    client.put("/api/ai/config", json={
+        "apiKey": "sk-disabled", "baseUrl": "https://disabled.example/v1", "enabled": False,
+    })
+    client.post("/api/ai/config", json={
+        "apiKey": "sk-a", "baseUrl": "https://a.example/v1", "model": "a",
+    })
+    client.post("/api/ai/config", json={
+        "apiKey": "sk-b", "baseUrl": "https://b.example/v1", "model": "b",
+    })
+    calls = []
+
+    class FailingProvider:
+        def __init__(self, base_url, *_args):
+            self.base_url = base_url
+
+        def chat(self, messages, tools=None):
+            calls.append(self.base_url)
+            raise ProviderError("unavailable", 502)
+
+    monkeypatch.setattr("assistant.api.OpenAICompatibleProvider", FailingProvider)
+    response = client.post("/api/ai/chat", json={"message": "hello"})
+    assert response.status_code == 502
+    assert calls == ["https://a.example/v1", "https://b.example/v1"]
+
+
+def test_stream_chat_buffers_before_safe_failover(tmp_path, monkeypatch):
+    client = make_client(tmp_path, monkeypatch)
+    first = client.put("/api/ai/config", json={
+        "apiKey": "sk-a", "baseUrl": "https://a.example/v1", "model": "a",
+    }).json
+    second = client.post("/api/ai/config", json={
+        "apiKey": "sk-b", "baseUrl": "https://b.example/v1", "model": "b",
+    }).json
+    calls = []
+
+    class StreamProvider:
+        def __init__(self, base_url, *_args):
+            self.base_url = base_url
+
+        def stream(self, messages):
+            calls.append(self.base_url)
+            if "a.example" in self.base_url:
+                raise ProviderError("stream unavailable", 502)
+            yield {"choices": [{"delta": {"content": "备用流"}}]}
+            yield {"choices": [], "usage": {"total_tokens": 3}}
+
+    monkeypatch.setattr("assistant.api.OpenAICompatibleProvider", StreamProvider)
+    response = client.post("/api/ai/chat", json={"message": "hello", "stream": True})
+    assert response.status_code == 200
+    assert "备用流" in response.get_data(as_text=True)
+    assert calls == ["https://a.example/v1", "https://b.example/v1"]
+    usage = {item["config_id"]: item for item in client.get("/api/ai/usage").json["config_usage"]}
+    assert usage[first["id"]]["total_tokens"] == 0
+    assert usage[second["id"]]["total_tokens"] == 3
+
+
+def test_legacy_test_endpoint_fails_over_but_specific_test_stays_targeted(tmp_path, monkeypatch):
+    client = make_client(tmp_path, monkeypatch)
+    first = client.put("/api/ai/config", json={
+        "apiKey": "sk-a", "baseUrl": "https://a.example/v1", "model": "a",
+    }).json
+    client.post("/api/ai/config", json={
+        "apiKey": "sk-b", "baseUrl": "https://b.example/v1", "model": "b",
+    })
+    calls = []
+
+    class TestProvider:
+        def __init__(self, base_url, *_args):
+            self.base_url = base_url
+
+        def chat(self, messages):
+            calls.append(self.base_url)
+            if "a.example" in self.base_url:
+                raise ProviderError("auth rejected", 401)
+            from assistant.provider import ChatResult
+            return ChatResult("OK", {"total_tokens": 1})
+
+    monkeypatch.setattr("assistant.api.OpenAICompatibleProvider", TestProvider)
+    assert client.post("/api/ai/test").status_code == 200
+    assert calls == ["https://a.example/v1", "https://b.example/v1"]
+    calls.clear()
+    assert client.post(f"/api/ai/config/{first['id']}/test").status_code == 401
+    assert calls == ["https://a.example/v1"]
+
+
+def test_usage_reports_known_and_unknown_quota_for_multiple_models(tmp_path, monkeypatch):
+    client = make_client(tmp_path, monkeypatch)
+    known = client.put("/api/ai/config", json={
+        "apiKey": "sk-a", "name": "有限额", "model": "model-a", "tokenQuota": 100,
+    }).json
+    unknown = client.post("/api/ai/config", json={
+        "apiKey": "sk-b", "name": "无限额", "model": "model-b",
+    }).json
+    store = AIStore(tmp_path / "ai.db")
+    store.add_usage("c-a", "deepseek", "model-a", {"prompt_tokens": 20, "completion_tokens": 5, "total_tokens": 25}, config_id=known["id"])
+    store.add_usage("c-b", "deepseek", "model-b", {"prompt_tokens": 4, "completion_tokens": 6, "total_tokens": 10}, config_id=unknown["id"])
+    payload = client.get("/api/ai/usage").json
+    by_id = {item["config_id"]: item for item in payload["config_usage"]}
+    assert by_id[known["id"]]["used_percent"] == 25.0
+    assert by_id[known["id"]]["remaining_percent"] == 75.0
+    assert by_id[unknown["id"]]["quota_status"] == "unknown"
+    assert by_id[unknown["id"]]["used_percent"] is None
+    by_model = {item["model"]: item for item in payload["model_usage"]}
+    assert by_model["model-a"]["used_percent"] == 25.0
+    assert by_model["model-a"]["remaining_percent"] == 75.0
+    assert by_model["model-b"]["quota_status"] == "unknown"
+
+
+def test_conversation_title_can_be_renamed_with_validation(tmp_path, monkeypatch):
+    client = make_client(tmp_path, monkeypatch)
+    store = AIStore(tmp_path / "ai.db")
+    store.create_conversation("rename-me", "旧标题")
+    response = client.patch("/api/ai/conversations/rename-me", json={"title": "  新标题  "})
+    assert response.status_code == 200
+    assert response.json["conversation"]["title"] == "新标题"
+    assert client.patch("/api/ai/conversations/rename-me", json={"title": " "}).status_code == 400
+    assert client.patch("/api/ai/conversations/rename-me", json={"title": "x" * 65}).status_code == 400
+    assert client.patch("/api/ai/conversations/missing", json={"title": "名字"}).status_code == 404

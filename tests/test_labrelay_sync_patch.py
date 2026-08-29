@@ -23,6 +23,11 @@ class _Hub(SimpleNamespace):
     def primary_router_name(self):
         return "router"
 
+    def _canonical_portmap_router(self, value=""):
+        primary = self.primary_router_name()
+        candidate = self.clean_saved_value(value) or primary or "router"
+        return primary if candidate.lower() in {"router", primary.lower()} else candidate
+
     def check_hook_token(self):
         return True
 

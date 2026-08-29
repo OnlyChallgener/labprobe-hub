@@ -30,9 +30,7 @@ def install_labrelay_sync_patch(hub: Any) -> None:
         return max(0, hub.to_int(value, 0))
 
     def router_name(value: Any = "") -> str:
-        # A configured router identity is canonical.  This prevents old agent
-        # configs named router/BE72/BE72Pro from splitting one router's status.
-        return clean(hub.primary_router_name()) or clean(value) or "router"
+        return hub._canonical_portmap_router(value)
 
     def statuses() -> Dict[str, Any]:
         value = hub.load_json(hub.AGENT_STATUS_FILE, {})
@@ -48,7 +46,7 @@ def install_labrelay_sync_patch(hub: Any) -> None:
         if not isinstance(heartbeat, dict):
             heartbeat = {}
         runtime = runtime_document()
-        same_router = clean(runtime.get("router")) == router
+        same_router = router_name(runtime.get("router")) == router
         heartbeat_seen = number(heartbeat.get("lastSeenEpoch"))
         runtime_seen = number(runtime.get("receivedEpoch")) if same_router else 0
         seen = max(heartbeat_seen, runtime_seen)
@@ -99,7 +97,7 @@ def install_labrelay_sync_patch(hub: Any) -> None:
 
     def decorated_rules(rules: List[Dict[str, Any]], router: str) -> tuple[List[Dict[str, Any]], int]:
         document = runtime_document()
-        same_router = clean(document.get("router")) == router
+        same_router = router_name(document.get("router")) == router
         runtime = hub._portmap_runtime_map(document) if same_router else {}
         runtime_revision = number(document.get("runtimeRevision")) if same_router else 0
         agent = presence(router)

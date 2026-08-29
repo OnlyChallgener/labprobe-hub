@@ -91,6 +91,22 @@ fn now_epoch() -> u64 {
         .as_secs()
 }
 
+const MAX_PORTMAP_CLOCK_SKEW_SECONDS: u64 = 120;
+
+fn epoch_distance(left: u64, right: u64) -> u64 {
+    left.max(right) - left.min(right)
+}
+
+fn command_has_timed_rule(command: &Value) -> bool {
+    command
+        .get("payload")
+        .and_then(|value| value.get("rule"))
+        .and_then(|value| value.get("expiresAt"))
+        .and_then(Value::as_u64)
+        .map(|value| value > 0)
+        .unwrap_or(false)
+}
+
 fn arg_value(args: &[String], key: &str) -> Option<String> {
     args.iter()
         .position(|x| x == key)
@@ -1476,6 +1492,13 @@ async fn sync_portmaps(
         &format!("/api/router/portmaps/commands?router={}&limit=20", router),
     )
     .await?;
+    let local_epoch = now_epoch();
+    let server_epoch = root
+        .get("serverEpoch")
+        .or_else(|| root.get("serverTime"))
+        .and_then(Value::as_u64)
+        .unwrap_or(local_epoch);
+    let clock_skew_seconds = epoch_distance(local_epoch, server_epoch);
     let commands = root
         .get("commands")
         .and_then(Value::as_array)
@@ -1496,8 +1519,24 @@ async fn sync_portmaps(
                 }
                 _ => json!({"action":"invalid"}),
             };
-            let result = ctl_request(Path::new(&config.relay_socket), &local)
-                .unwrap_or_else(|e| json!({"ok":false,"error":e.to_string()}));
+            let result = if command_has_timed_rule(&command)
+                && clock_skew_seconds > MAX_PORTMAP_CLOCK_SKEW_SECONDS
+            {
+                json!({
+                    "ok": false,
+                    "errorCode": "clock_skew",
+                    "error": format!(
+                        "router clock differs from Hub by {} seconds; timed rule was not applied",
+                        clock_skew_seconds
+                    ),
+                    "clockSkewSeconds": clock_skew_seconds,
+                    "serverEpoch": server_epoch,
+                    "routerEpoch": local_epoch
+                })
+            } else {
+                ctl_request(Path::new(&config.relay_socket), &local)
+                    .unwrap_or_else(|e| json!({"ok":false,"error":e.to_string()}))
+            };
             acks.push(json!({"id":id,"ok":result.get("ok").and_then(Value::as_bool).unwrap_or(false),"result":result}));
         }
         post_json(

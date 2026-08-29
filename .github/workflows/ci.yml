@@ -58,7 +58,7 @@ jobs:
       - name: Verify release versions
         run: |
           set -e
-          grep -q 'HUB_VERSION = "0.11.5"' hub_entry.py
+          grep -q 'HUB_VERSION = "0.12.0"' hub_entry.py
           grep -q 'create_router_blueprint_v1' hub_entry.py
           grep -q 'create_ai_blueprint' hub_entry.py
           grep -q 'install_hub0934_fixes(hub)' hub_entry.py
@@ -73,7 +73,7 @@ jobs:
           grep -q '/api/realtime/ws' hub_realtime_ws.py
           test ! -e assistant/wechat.py
           ! git grep -qi -E 'wechat|clawbot|openclaw' -- '*.py' '*.md' '*.env*' 'Dockerfile'
-          grep -q 'version = "0.2.29"' labrelay/Cargo.toml
+          grep -q 'version = "0.2.30"' labrelay/Cargo.toml
           sh -n agent/install.sh
           sh -n scripts/labprobe-install.sh
 
@@ -85,6 +85,6 @@ jobs:
 
       - name: Build Hub Docker image
         run: |
-          docker build --pull=false -t labprobe-hub:0.11.5 .
-          docker run --rm --entrypoint python labprobe-hub:0.11.5 -c \
-            'import hub_entry, assistant, router_core, hub0934_fixes, hub0935_sync_fix, labrelay_sync_patch; print("Hub 0.11.5 imports OK")'
+          docker build --pull=false -t labprobe-hub:0.12.0 .
+          docker run --rm --entrypoint python labprobe-hub:0.12.0 -c \
+            'import hub_entry, assistant, router_core, hub0934_fixes, hub0935_sync_fix, labrelay_sync_patch; print("Hub 0.12.0 imports OK")'

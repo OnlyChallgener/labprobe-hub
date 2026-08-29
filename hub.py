@@ -13,6 +13,7 @@ import platform
 import sys
 from logging.handlers import TimedRotatingFileHandler
 from datetime import datetime, date
+from zoneinfo import ZoneInfo
 from pathlib import Path
 from typing import Any, Dict, List, Optional, Tuple
 
@@ -23,7 +24,8 @@ import paho.mqtt.client as mqtt
 from flask import Flask, request, jsonify, g
 from labprobe_storage import SQLiteStore
 
-APP_VERSION = "0.11.2"
+BEIJING_TZ = ZoneInfo("Asia/Shanghai")
+APP_VERSION = "0.12.0"
 PORT = int(os.environ.get("PORT", "58443"))
 BASE_DIR = Path(os.environ.get("LABPROBE_BASE_DIR", ".")).resolve()
 CONFIG_DIR = Path(os.environ.get("CONFIG_DIR", str(BASE_DIR / "config"))).resolve()
@@ -178,7 +180,7 @@ class MqttRevisionPublisher:
     def _timestamp() -> str:
         # This publisher starts while the module is still loading, so avoid
         # depending on helpers declared later in the file from callback threads.
-        return datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+        return datetime.now(BEIJING_TZ).strftime("%Y-%m-%d %H:%M:%S")
 
     def __init__(self):
         self.enabled = bool(MQTT_PUBLIC_URL and MQTT_INTERNAL_HOST and MQTT_USERNAME and MQTT_PASSWORD)
@@ -386,11 +388,11 @@ def unlock_request_data(_error=None):
 
 
 def now_str() -> str:
-    return datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+    return datetime.now(BEIJING_TZ).strftime("%Y-%m-%d %H:%M:%S")
 
 
 def today_str() -> str:
-    return date.today().isoformat()
+    return datetime.now(BEIJING_TZ).date().isoformat()
 
 
 def time_to_epoch(v: Any) -> float:
@@ -399,7 +401,7 @@ def time_to_epoch(v: Any) -> float:
     text = str(v).strip()
     for fmt in ["%Y-%m-%d %H:%M:%S", "%Y-%m-%dT%H:%M:%S"]:
         try:
-            return datetime.strptime(text[:19], fmt).timestamp()
+            return datetime.strptime(text[:19], fmt).replace(tzinfo=BEIJING_TZ).timestamp()
         except Exception:
             pass
     return 0.0
@@ -848,7 +850,9 @@ def today_online_seconds_from_item(item: Dict[str, Any], now: Optional[datetime]
     leave both empty, so their real daily duration is maintained separately by
     update_daily_online_durations().
     """
-    now = now or datetime.now()
+    now = now or datetime.now(BEIJING_TZ).replace(tzinfo=None)
+    if now.tzinfo is not None:
+        now = now.astimezone(BEIJING_TZ).replace(tzinfo=None)
     midnight = datetime.combine(now.date(), datetime.min.time())
     seconds_since_midnight = max(0, int((now - midnight).total_seconds()))
 
@@ -871,9 +875,11 @@ def update_daily_online_durations(devices: List[Dict[str, Any]], now: Optional[d
     onlinetime/activeTime remains a useful lower-bound seed; wired devices are
     tracked entirely by Hub snapshots.
     """
-    now = now or datetime.now()
+    now = now or datetime.now(BEIJING_TZ).replace(tzinfo=None)
+    if now.tzinfo is not None:
+        now = now.astimezone(BEIJING_TZ).replace(tzinfo=None)
     day = now.date().isoformat()
-    now_epoch = int(now.timestamp())
+    now_epoch = int(now.replace(tzinfo=BEIJING_TZ).timestamp())
     state = load_json(DAILY_ONLINE_FILE, {})
     if not isinstance(state, dict) or state.get("date") != day:
         state = {"date": day, "devices": {}, "updatedAt": now_str()}
@@ -3558,6 +3564,22 @@ def _portmap_router_name() -> str:
     )
 
 
+def _canonical_portmap_router(value: Any = "") -> str:
+    """Return the shared canonical identity for PortMap command/state traffic.
+
+    Legacy agents use the literal ``router`` while Hub stores the configured
+    primary name (for example ``BE72``).  Only those two aliases collapse; a
+    genuinely different router name remains distinct.
+    """
+    canonical = clean_saved_value(primary_router_name()) or _portmap_router_name()
+    candidate = clean_saved_value(value) or canonical or "router"
+    if candidate.casefold() == "router" or (
+        canonical and candidate.casefold() == canonical.casefold()
+    ):
+        return canonical or "router"
+    return candidate
+
+
 def _portmap_rule_id(value: Any = None) -> str:
     raw = re.sub(r"[^a-zA-Z0-9_-]+", "-", str(value or "").strip()).strip("-").lower()
     return raw[:48] or f"pm-{int(time.time())}-{secrets.token_hex(3)}"
@@ -3594,7 +3616,10 @@ def _portmap_time_epoch(value: Any) -> Optional[int]:
     if not raw:
         return None
     try:
-        return int(datetime.strptime(raw, "%Y-%m-%d %H:%M:%S").timestamp())
+        local = datetime.strptime(raw, "%Y-%m-%d %H:%M:%S").replace(
+            tzinfo=ZoneInfo("Asia/Shanghai")
+        )
+        return int(local.timestamp())
     except Exception:
         return None
 
@@ -3682,7 +3707,10 @@ def _clean_portmap_rule(payload: Dict[str, Any], existing: Optional[Dict[str, An
 
     max_connections = max(1, min(256, to_int(src.get("maxConnections"), 32) or 32))
     idle_timeout = max(30, min(3600, to_int(src.get("idleTimeoutSec"), 300) or 300))
-    expires_at = _portmap_epoch(src.get("expiresAt"))
+    raw_expires_at = src.get("expiresAt")
+    expires_at = _portmap_epoch(raw_expires_at)
+    if raw_expires_at not in [None, "", 0, "0"] and expires_at is None:
+        raise ValueError("expiresAt 必须是 Unix Epoch 秒、毫秒或 null")
     lease_seconds = _portmap_lease_seconds(src, old, expires_at)
     if expires_at is None:
         lease_seconds = 0
@@ -3771,24 +3799,55 @@ def _portmap_command_rule_id(action: str, payload: Dict[str, Any]) -> str:
     return clean_saved_value(payload.get("id"))
 
 
-def _queue_portmap_command(action: str, payload: Dict[str, Any], router: Optional[str] = None) -> Dict[str, Any]:
+def _reset_portmap_command_delivery(command: Dict[str, Any], payload: Dict[str, Any], now_epoch: int) -> None:
+    command["payload"] = payload
+    command["status"] = "pending"
+    command["attempts"] = 0
+    command["updatedAt"] = now_str()
+    command["updatedEpoch"] = now_epoch
+    for key in (
+        "deliveredAt", "deliveredEpoch", "finishedAt", "finishedEpoch",
+        "retryAt", "retryEpoch", "retryState", "timeout", "error",
+        "lastError", "result",
+    ):
+        command.pop(key, None)
+
+
+def _queue_portmap_command(
+    action: str,
+    payload: Dict[str, Any],
+    router: Optional[str] = None,
+    *,
+    reactivate: bool = False,
+) -> Dict[str, Any]:
     data = load_json(PORTMAP_COMMANDS_FILE, {"commands": []})
     commands = data.get("commands", []) if isinstance(data, dict) else []
     now_epoch = int(time.time())
     commands = [c for c in commands if isinstance(c, dict) and not (
         c.get("status") in ["done", "failed"] and now_epoch - to_int(c.get("finishedEpoch"), now_epoch) > 86400
     )][-500:]
-    target_router = router or _portmap_router_name()
+    target_router = _canonical_portmap_router(router)
     rule_id = _portmap_command_rule_id(action, payload)
     for existing in reversed(commands):
-        if existing.get("router") != target_router or existing.get("status") not in ["pending", "delivered"]:
+        if _canonical_portmap_router(existing.get("router")) != target_router:
             continue
         if existing.get("action") == action and _portmap_command_rule_id(action, existing.get("payload") or {}) == rule_id:
-            existing["payload"] = payload
-            existing["status"] = "pending"
-            existing["updatedAt"] = now_str()
-            save_json(PORTMAP_COMMANDS_FILE, {"commands": commands})
-            return existing
+            status = clean_saved_value(existing.get("status"))
+            if status in {"pending", "delivered"}:
+                if reactivate:
+                    _reset_portmap_command_delivery(existing, payload, now_epoch)
+                elif existing.get("payload") != payload:
+                    existing["payload"] = payload
+                    existing["updatedAt"] = now_str()
+                    existing["updatedEpoch"] = now_epoch
+                save_json(PORTMAP_COMMANDS_FILE, {"commands": commands})
+                return existing
+            if not reactivate and status in {"done", "failed"} and existing.get("payload") == payload:
+                # Reconciliation must not turn a terminal delivery into an
+                # endless sequence of fresh commands. A user action explicitly
+                # opts into a new command lifecycle with a new id below.
+                return existing
+            break
     command = {
         "id": f"cmd-{int(time.time() * 1000)}-{secrets.token_hex(3)}",
         "router": target_router,
@@ -3810,7 +3869,7 @@ def _portmap_command_sync_states(router: str) -> Dict[str, str]:
     commands = data.get("commands", []) if isinstance(data, dict) else []
     states: Dict[str, str] = {}
     for command in reversed(commands if isinstance(commands, list) else []):
-        if not isinstance(command, dict) or command.get("router") != router:
+        if not isinstance(command, dict) or _canonical_portmap_router(command.get("router")) != _canonical_portmap_router(router):
             continue
         rule_id = _portmap_command_rule_id(clean_saved_value(command.get("action")), command.get("payload") or {})
         if not rule_id or rule_id in states:
@@ -3912,7 +3971,7 @@ def api_portmaps():
         _portmap_check_conflict(rows, rule)
         rows.append(rule)
         _save_portmap_rules(rows)
-        _queue_portmap_command("upsert", {"rule": rule})
+        _queue_portmap_command("upsert", {"rule": rule}, reactivate=True)
         add_event({"type": "portmap_created", "title": f"端口映射已创建：{rule['name']}", "name": rule["name"], "newValue": f"IPv6:{rule['listenPort']}"})
         return jsonify({"ok": True, "rule": rule}), 201
     except Exception as e:
@@ -3929,7 +3988,7 @@ def api_portmap_item(rule_id: str):
         return jsonify({"ok": False, "error": "rule not found"}), 404
     if request.method == "DELETE":
         _save_portmap_rules([x for x in rows if x.get("id") != rule_id])
-        _queue_portmap_command("delete", {"id": rule_id})
+        _queue_portmap_command("delete", {"id": rule_id}, reactivate=True)
         add_event({"type": "portmap_deleted", "title": f"端口映射已删除：{old.get('name')}", "name": old.get("name"), "oldValue": str(old.get("listenPort"))})
         return jsonify({"ok": True, "deleted": True, "id": rule_id})
     try:
@@ -3939,7 +3998,7 @@ def api_portmap_item(rule_id: str):
         _portmap_check_conflict(rows, rule)
         rows = [rule if x.get("id") == rule_id else x for x in rows]
         _save_portmap_rules(rows)
-        _queue_portmap_command("upsert", {"rule": rule})
+        _queue_portmap_command("upsert", {"rule": rule}, reactivate=True)
         return jsonify({"ok": True, "rule": rule})
     except Exception as e:
         return jsonify({"ok": False, "error": str(e)}), 400
@@ -3971,7 +4030,11 @@ def api_portmap_action(rule_id: str, action: str):
     rule["updatedAt"] = now_str()
     rows = [rule if x.get("id") == rule_id else x for x in rows]
     _save_portmap_rules(rows)
-    _queue_portmap_command("upsert" if action == "start" else "stop", {"rule": rule} if action == "start" else {"id": rule_id})
+    _queue_portmap_command(
+        "upsert" if action == "start" else "stop",
+        {"rule": rule} if action == "start" else {"id": rule_id},
+        reactivate=True,
+    )
     return jsonify({"ok": True, "rule": rule, "action": action})
 
 
@@ -3990,7 +4053,7 @@ def api_portmap_history(rule_id: str):
 def api_router_portmap_commands():
     if not check_hook_token():
         return jsonify({"ok": False, "error": "bad hook token"}), 401
-    router = clean_saved_value(request.args.get("router")) or _portmap_router_name()
+    router = _canonical_portmap_router(request.args.get("router"))
     limit = max(1, min(50, to_int(request.args.get("limit"), 20) or 20))
     data = load_json(PORTMAP_COMMANDS_FILE, {"commands": []})
     commands = data.get("commands", []) if isinstance(data, dict) else []
@@ -3998,9 +4061,24 @@ def api_router_portmap_commands():
     selected = []
     changed = False
     for command in commands:
-        if not isinstance(command, dict) or command.get("router") != router:
+        if not isinstance(command, dict) or _canonical_portmap_router(command.get("router")) != router:
             continue
-        retry_due = command.get("status") == "delivered" and now_epoch - to_int(command.get("deliveredEpoch"), 0) >= 15 and to_int(command.get("attempts"), 0) < 5
+        attempts = to_int(command.get("attempts"), 0)
+        delivery_age = now_epoch - to_int(command.get("deliveredEpoch"), 0)
+        retry_due = command.get("status") == "delivered" and delivery_age >= 15 and attempts < 5
+        if command.get("status") == "delivered" and delivery_age >= 15 and attempts >= 5:
+            error = "delivery timeout after 5 attempts"
+            command.update({
+                "status": "failed",
+                "finishedAt": now_str(),
+                "finishedEpoch": now_epoch,
+                "retryState": "exhausted",
+                "timeout": True,
+                "error": error,
+                "result": {"ok": False, "errorCode": "delivery_timeout", "error": error},
+            })
+            changed = True
+            continue
         if command.get("status") == "pending" or retry_due:
             command["status"] = "delivered"
             command["deliveredAt"] = now_str()
@@ -4012,7 +4090,7 @@ def api_router_portmap_commands():
                 break
     if changed:
         save_json(PORTMAP_COMMANDS_FILE, {"commands": commands})
-    return jsonify({"ok": True, "commands": selected, "time": now_str()})
+    return jsonify({"ok": True, "commands": selected, "time": now_str(), "serverEpoch": now_epoch})
 
 
 @app.route("/api/router/portmaps/ack", methods=["POST"])
@@ -4020,19 +4098,30 @@ def api_router_portmap_ack():
     if not check_hook_token():
         return jsonify({"ok": False, "error": "bad hook token"}), 401
     payload = request.get_json(silent=True) or {}
+    router = _canonical_portmap_router(request.args.get("router") or payload.get("router"))
     acks = payload.get("acks", []) if isinstance(payload.get("acks"), list) else []
     data = load_json(PORTMAP_COMMANDS_FILE, {"commands": []})
     commands = data.get("commands", []) if isinstance(data, dict) else []
     ack_map = {clean_saved_value(x.get("id")): x for x in acks if isinstance(x, dict)}
     changed = 0
     for command in commands:
-        ack = ack_map.get(clean_saved_value(command.get("id")))
-        if not ack:
+        if not isinstance(command, dict) or _canonical_portmap_router(command.get("router")) != router:
             continue
-        command["status"] = "done" if bool(ack.get("ok")) else "failed"
+        ack = ack_map.get(clean_saved_value(command.get("id")))
+        if not ack or clean_saved_value(command.get("status")) not in {"pending", "delivered"}:
+            continue
+        ok = bool(ack.get("ok"))
+        command["status"] = "done" if ok else "failed"
         command["result"] = ack.get("result")
         command["finishedAt"] = now_str()
         command["finishedEpoch"] = int(time.time())
+        command["retryState"] = "completed" if ok else "agent_failed"
+        if ok:
+            command.pop("error", None)
+            command.pop("timeout", None)
+        else:
+            result = ack.get("result") if isinstance(ack.get("result"), dict) else {}
+            command["error"] = clean_saved_value(ack.get("error") or result.get("error")) or "agent reported failure"
         changed += 1
     if changed:
         save_json(PORTMAP_COMMANDS_FILE, {"commands": commands})
@@ -4044,7 +4133,7 @@ def api_router_portmap_status():
     if not check_hook_token():
         return jsonify({"ok": False, "error": "bad hook token"}), 401
     payload = request.get_json(silent=True) or {}
-    router = clean_saved_value(request.args.get("router")) or _portmap_router_name()
+    router = _canonical_portmap_router(request.args.get("router"))
     record = {
         "router": router,
         "receivedAt": now_str(),
@@ -4078,7 +4167,7 @@ def api_router_portmap_status():
     else:
         LOGGER.warning("Port-map rules document unavailable; skip destructive router reconciliation")
 
-    return jsonify({"ok": True, "receivedAt": record["receivedAt"]})
+    return jsonify({"ok": True, "receivedAt": record["receivedAt"], "serverEpoch": record["receivedEpoch"]})
 
 
 @app.route("/api/status", methods=["GET"])
@@ -4463,7 +4552,7 @@ def aggregate_daily(day: str) -> Dict[str, Any]:
 
 def recent_dates(days: int = 7) -> List[str]:
     from datetime import timedelta
-    today = date.today()
+    today = datetime.now(BEIJING_TZ).date()
     return [(today - timedelta(days=i)).isoformat() for i in range(days)]
 
 
