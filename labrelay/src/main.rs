@@ -454,7 +454,7 @@ impl Manager {
         let target_task = target.clone();
         let rule_task = rule.clone();
         let lan_if = self.lan_if.clone();
-        let mut join = match rule.transport_protocol.as_str() {
+        let join = match rule.transport_protocol.as_str() {
             // Lucky's direct TCP path deliberately does not listen/proxy on
             // this port.  The router's native port mapping delivers inbound
             // traffic straight to the selected LAN service, while this socket
@@ -533,24 +533,12 @@ impl Manager {
             },
             _ => unreachable!("validate_rule normalizes transportProtocol"),
         };
-        let mut startup_state = "running";
-        if rule.kind == "stun" {
-            if let Err(error) = confirm_stun_startup(&shared, Duration::from_secs(30)).await {
-                let current = shared.snapshot().await;
-                if current.state == "expired" || join.is_finished() {
-                    let _ = cancel_tx.send(true);
-                    if timeout(Duration::from_secs(3), &mut join).await.is_err() {
-                        join.abort();
-                        let _ = join.await;
-                    }
-                    let message = format!("STUN 运行时启动失败：{error:#}");
-                    self.set_cached_state(&rule, "error", &message).await;
-                    return Err(anyhow!(message));
-                }
-                mark_stun_startup_retrying(&shared, &error).await;
-                startup_state = "mapping";
-            }
-        }
+        // Socket/listener creation above is the apply-time boundary: invalid
+        // configuration, an occupied port, or a bind failure still rejects the
+        // command immediately. DNS, remote connect and STUN Binding failures
+        // are transient runtime work and must never hold the Agent's single
+        // command/status loop for the old 30-second confirmation window.
+        let startup_state = if rule.kind == "stun" { "mapping" } else { "running" };
         self.runtimes.lock().await.insert(
             id.to_string(),
             RuntimeHandle {
@@ -861,46 +849,6 @@ async fn mark_stun_transient_failure(shared: &Arc<RuntimeShared>, message: Strin
         base.state = "mapping".to_string();
     }
     base.last_error = message;
-}
-
-async fn mark_stun_startup_retrying(shared: &Arc<RuntimeShared>, error: &anyhow::Error) {
-    let last_error = {
-        let current = shared.snapshot().await;
-        if current.last_error.trim().is_empty() {
-            error.to_string()
-        } else {
-            current.last_error
-        }
-    };
-    mark_stun_transient_failure(
-        shared,
-        format!("首次 STUN 绑定暂未确认，正在后台重试；最后错误：{last_error}"),
-    )
-    .await;
-}
-
-async fn confirm_stun_startup(shared: &Arc<RuntimeShared>, wait: Duration) -> Result<()> {
-    let mut last_error = String::new();
-    let confirmation = timeout(wait, async {
-        loop {
-            let current = shared.snapshot().await;
-            if current.state == "mapped" && !current.public_endpoint.is_empty() {
-                return;
-            }
-            if !current.last_error.is_empty() {
-                last_error = current.last_error;
-            }
-            sleep(Duration::from_millis(100)).await;
-        }
-    })
-    .await;
-    if confirmation.is_ok() {
-        return Ok(());
-    }
-    if last_error.is_empty() {
-        bail!("首次 STUN 绑定确认超时");
-    }
-    bail!("首次 STUN 绑定确认超时；最后错误：{last_error}")
 }
 
 async fn resolve_stun_server(value: &str) -> Result<SocketAddr> {
@@ -1933,13 +1881,10 @@ async fn unix_server_fixed(manager: Manager, socket_path: PathBuf) -> Result<()>
 }
 
 fn ctl_read_timeout(request: &Value) -> Duration {
-    let is_stun_upsert = request.get("action").and_then(Value::as_str) == Some("upsert")
-        && request
-            .get("rule")
-            .and_then(|rule| rule.get("kind"))
-            .and_then(Value::as_str)
-            == Some("stun");
-    Duration::from_secs(if is_stun_upsert { 70 } else { 8 })
+    let _ = request;
+    // All local control operations are bounded equally. STUN startup now
+    // returns after local apply and performs remote confirmation in runtime.
+    Duration::from_secs(8)
 }
 
 pub(crate) fn ctl_request(socket_path: &Path, request: &Value) -> Result<Value> {
@@ -2523,61 +2468,6 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn stun_startup_confirmation_allows_a_transient_error_to_recover() {
-        let rule = Rule {
-            id: "stun-transient".into(),
-            name: "STUN transient".into(),
-            kind: "stun".into(),
-            ..Rule::default()
-        };
-        let mut snapshot = RuntimeSnapshot::stopped(&rule);
-        snapshot.state = "mapping".into();
-        snapshot.public_endpoint = "198.51.100.8:20001".into();
-        snapshot.public_ip = "198.51.100.8".into();
-        snapshot.public_port = 20001;
-        snapshot.mapping_updated_at = Some(1);
-        snapshot.last_error = "解析 STUN 服务器失败".into();
-        let shared = Arc::new(RuntimeShared::new(snapshot));
-        let updater = shared.clone();
-        let mapping = tokio::spawn(async move {
-            sleep(Duration::from_millis(25)).await;
-            mark_stun_mapping(&updater, "203.0.113.9:20001".parse().unwrap()).await;
-        });
-
-        confirm_stun_startup(&shared, Duration::from_millis(500))
-            .await
-            .unwrap();
-        mapping.await.unwrap();
-        let current = shared.snapshot().await;
-        assert_eq!(current.state, "mapped");
-        assert_eq!(current.public_endpoint, "203.0.113.9:20001");
-        assert!(current.last_error.is_empty());
-    }
-
-    #[tokio::test]
-    async fn stun_startup_confirmation_timeout_keeps_the_last_real_error() {
-        let rule = Rule {
-            id: "stun-timeout".into(),
-            name: "STUN timeout".into(),
-            kind: "stun".into(),
-            ..Rule::default()
-        };
-        let mut snapshot = RuntimeSnapshot::stopped(&rule);
-        snapshot.state = "mapping".into();
-        snapshot.last_error = "STUN TCP 连接失败".into();
-        let shared = Arc::new(RuntimeShared::new(snapshot));
-
-        let error = confirm_stun_startup(&shared, Duration::from_millis(20))
-            .await
-            .unwrap_err();
-
-        assert_eq!(
-            error.to_string(),
-            "首次 STUN 绑定确认超时；最后错误：STUN TCP 连接失败"
-        );
-    }
-
-    #[tokio::test]
     async fn one_transient_stun_failure_keeps_a_recent_mapping_ready() {
         let rule = Rule {
             id: "stun-history".into(),
@@ -2630,34 +2520,6 @@ mod tests {
         assert_eq!(current.last_error, "STUN TCP 连接失败");
     }
 
-    #[tokio::test]
-    async fn startup_timeout_stays_mapping_and_announces_background_retry() {
-        let rule = Rule {
-            id: "stun-background-retry".into(),
-            name: "STUN background retry".into(),
-            kind: "stun".into(),
-            ..Rule::default()
-        };
-        let mut snapshot = RuntimeSnapshot::stopped(&rule);
-        snapshot.state = "mapping".into();
-        snapshot.public_endpoint = "198.51.100.8:20001".into();
-        snapshot.last_error = "STUN TCP 连接失败".into();
-        let shared = Arc::new(RuntimeShared::new(snapshot));
-        let error = confirm_stun_startup(&shared, Duration::from_millis(20))
-            .await
-            .unwrap_err();
-
-        mark_stun_startup_retrying(&shared, &error).await;
-
-        let current = shared.snapshot().await;
-        assert_eq!(current.state, "mapping");
-        assert_eq!(current.public_endpoint, "198.51.100.8:20001");
-        assert_eq!(
-            current.last_error,
-            "首次 STUN 绑定暂未确认，正在后台重试；最后错误：STUN TCP 连接失败"
-        );
-    }
-
     #[test]
     fn tcp_stun_fast_retries_are_bounded_before_slow_recovery_probes() {
         assert_eq!(STUN_TCP_KEEPALIVE_INTERVAL, Duration::from_secs(10));
@@ -2671,10 +2533,10 @@ mod tests {
     }
 
     #[test]
-    fn only_stun_upsert_extends_the_local_control_timeout() {
+    fn stun_upsert_uses_the_same_bounded_local_control_timeout() {
         assert_eq!(
             ctl_read_timeout(&json!({"action": "upsert", "rule": {"kind": "stun"}})),
-            Duration::from_secs(70)
+            Duration::from_secs(8)
         );
         assert_eq!(
             ctl_read_timeout(&json!({"action": "upsert", "rule": {"kind": "portmap"}})),
@@ -2684,6 +2546,63 @@ mod tests {
             ctl_read_timeout(&json!({"action": "status", "scope": "stun"})),
             Duration::from_secs(8)
         );
+    }
+
+    #[tokio::test]
+    async fn stun_upsert_returns_before_remote_binding_confirmation() {
+        let root = std::env::temp_dir().join(format!(
+            "labrelay-stun-nonblocking-{}-{}",
+            std::process::id(),
+            now_epoch()
+        ));
+        fs::create_dir_all(&root).unwrap();
+        let port_probe = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let listen_port = port_probe.local_addr().unwrap().port();
+        drop(port_probe);
+        let manager = Manager {
+            rules: Arc::new(RwLock::new(HashMap::new())),
+            runtimes: Arc::new(Mutex::new(HashMap::new())),
+            operation_lock: Arc::new(Mutex::new(())),
+            last_status: Arc::new(RwLock::new(HashMap::new())),
+            config_path: root.join("config.json"),
+            state_path: root.join("state.json"),
+            port_min: listen_port,
+            port_max: listen_port,
+            lan_if: "lo".into(),
+        };
+        let rule = Rule {
+            id: "stun-nonblocking".into(),
+            name: "STUN nonblocking".into(),
+            enabled: true,
+            kind: "stun".into(),
+            mode: "stun".into(),
+            listen_port,
+            target_mode: "ipv4".into(),
+            target_ipv4: "127.0.0.1".into(),
+            target_port: 443,
+            transport_protocol: "TCP".into(),
+            forward_mode: "router_native".into(),
+            stun_server: "203.0.113.1:3478".into(),
+            ..Rule::default()
+        };
+
+        timeout(Duration::from_secs(1), manager.upsert(rule))
+            .await
+            .expect("STUN upsert must not wait for remote Binding")
+            .unwrap();
+        let runtime = manager
+            .status_value(Some("stun"))
+            .await
+            .get("rules")
+            .and_then(Value::as_array)
+            .and_then(|rows| rows.first())
+            .and_then(|row| row.get("runtime"))
+            .cloned()
+            .unwrap();
+        let state = runtime.get("state").and_then(Value::as_str);
+        assert!(state == Some("starting") || state == Some("mapping"));
+        manager.stop_runtime("stun-nonblocking", false).await;
+        fs::remove_dir_all(&root).unwrap();
     }
 
     #[tokio::test]

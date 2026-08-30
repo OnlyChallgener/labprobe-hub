@@ -561,3 +561,11 @@ def test_wireguard_lan_does_not_adopt_same_name_unowned_rule(tmp_path):
     result = service.ensure_firewall(rule)
     assert result["state"] == "manual_change"
     assert [row["uuid"] for row in client.rules] == ["manual-1"]
+
+
+def test_relay_stun_startup_does_not_block_the_agent_control_loop():
+    source = (Path(__file__).parents[1] / "labrelay" / "src" / "main.rs").read_text(encoding="utf-8")
+
+    assert "confirm_stun_startup(&shared, Duration::from_secs(30))" not in source
+    assert "Duration::from_secs(if is_stun_upsert { 70 } else { 8 })" not in source
+    assert 'let startup_state = if rule.kind == "stun" { "mapping" } else { "running" };' in source
