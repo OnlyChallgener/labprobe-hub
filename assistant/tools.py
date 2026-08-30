@@ -6,6 +6,7 @@ import json
 import re
 from datetime import date
 from typing import Any, Dict, Iterable, List
+from urllib.parse import urlsplit, urlunsplit
 
 from .catalog import tool_spec
 
@@ -23,6 +24,28 @@ _DEVICE_FIELDS = (
     "ipv6", "ipv6List", "online", "lastSeenAt", "onlineSince", "offlineAt",
     "connectType", "band", "rssi", "ssid",
 )
+_CLIENT_CONTEXT_LIMIT_BYTES = 16 * 1024
+
+
+def _safe_favorite_url(value: Any) -> str:
+    """Keep a usable address while removing userinfo, query and fragment."""
+    raw = str(value or "").strip()
+    if not raw:
+        return ""
+    try:
+        parsed = urlsplit(raw)
+        if not parsed.scheme or not parsed.hostname:
+            return raw.split("?", 1)[0].split("#", 1)[0][:2048]
+        host = parsed.hostname
+        if ":" in host and not host.startswith("["):
+            host = f"[{host}]"
+        try:
+            port = f":{parsed.port}" if parsed.port is not None else ""
+        except ValueError:
+            port = ""
+        return urlunsplit((parsed.scheme, host + port, parsed.path, "", ""))[:2048]
+    except (TypeError, ValueError):
+        return raw.split("?", 1)[0].split("#", 1)[0][:2048]
 
 
 def _sanitized(value: Any) -> Any:
@@ -105,20 +128,29 @@ class ToolExecutor:
             return {"settings": {}, "favorites": []}
         settings = client_context.get("settings") if isinstance(client_context.get("settings"), dict) else {}
         favorites = client_context.get("favorites") if isinstance(client_context.get("favorites"), list) else []
-        safe_settings = {
-            key: settings.get(key)
-            for key in ("privacyMode", "favoriteNetworkMode", "routerDisplayName")
-            if settings.get(key) is not None
-        }
-        safe_favorites = []
+        safe_settings: Dict[str, Any] = {}
+        if isinstance(settings.get("privacyMode"), bool):
+            safe_settings["privacyMode"] = settings["privacyMode"]
+        if settings.get("favoriteNetworkMode") is not None:
+            safe_settings["favoriteNetworkMode"] = str(settings["favoriteNetworkMode"])[:32]
+        if settings.get("routerDisplayName") is not None:
+            safe_settings["routerDisplayName"] = str(settings["routerDisplayName"])[:256]
+        safe_favorites: List[Dict[str, Any]] = []
         for item in favorites[:100]:
             if not isinstance(item, dict):
                 continue
-            safe_favorites.append({
-                key: item.get(key)
-                for key in ("id", "title", "description", "localUrl", "remoteUrl", "serviceType")
-                if item.get(key) not in (None, "")
-            })
+            favorite: Dict[str, Any] = {}
+            for key, limit in (("id", 256), ("title", 256), ("description", 512), ("serviceType", 128)):
+                if item.get(key) not in (None, ""):
+                    favorite[key] = str(item[key])[:limit]
+            for key in ("localUrl", "remoteUrl"):
+                safe_url = _safe_favorite_url(item.get(key))
+                if safe_url:
+                    favorite[key] = safe_url
+            candidate = {"settings": safe_settings, "favorites": [*safe_favorites, favorite]}
+            if len(json.dumps(candidate, ensure_ascii=False).encode("utf-8")) > _CLIENT_CONTEXT_LIMIT_BYTES:
+                break
+            safe_favorites.append(favorite)
         return {"settings": safe_settings, "favorites": safe_favorites}
 
     def _device_documents(self) -> List[Dict[str, Any]]:

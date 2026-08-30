@@ -103,7 +103,7 @@ Hub 使用两个必须自行设置的独立令牌：
 
 ## AI 助手
 
-AI API Key 由 Hub 加密托管，APP 不保存原文。首次配置时若没有单独设置 `LABPROBE_AI_MASTER_KEY`，Hub 会基于必填的 `APP_TOKEN` 安全派生凭证加密密钥，因此不会再因缺少额外环境变量拒绝 DeepSeek 配置。DeepSeek 默认使用官方兼容地址 `https://api.deepseek.com` 与模型 `deepseek-v4-flash`。`GET /api/ai/usage` 同时返回今日、累计和最近单次任务 Token 明细；每次对话任务记录模型、输入、输出、总 Token 以及成功/失败状态。
+AI API Key 由 Hub 加密托管，APP 不保存原文。首次配置时若没有单独设置 `LABPROBE_AI_MASTER_KEY`，Hub 会基于必填的 `APP_TOKEN` 安全派生凭证加密密钥，因此不会再因缺少额外环境变量拒绝 DeepSeek 配置。轮换 `APP_TOKEN` 时先把旧值临时放入 `APP_TOKEN_PREVIOUS`；Hub 在读取或使用 AI 配置时会自动用新 Token 重加密，确认配置显示可用后即可移除旧值并重启。DeepSeek 默认使用官方兼容地址 `https://api.deepseek.com` 与模型 `deepseek-v4-flash`。`GET /api/ai/usage` 同时返回今日、累计和最近单次任务 Token 明细；每次对话任务记录模型、输入、输出、总 Token 以及成功/失败状态。
 
 AI 对话、工具确认、每日记录和 Token 统计均由 Hub 提供。APP 不保存 API Key 原文，涉及路由器写入的指令仍需在 APP 内二次确认。
 

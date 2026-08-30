@@ -5,9 +5,13 @@ from __future__ import annotations
 import json
 import sqlite3
 import time
+from contextlib import contextmanager
 from datetime import datetime, timezone
 from pathlib import Path
-from typing import Any, Dict, List, Optional
+from typing import Any, Dict, Iterator, List, Optional
+
+
+_UNSET = object()
 
 
 def utc_now() -> str:
@@ -36,12 +40,16 @@ class AIStore:
         self.db_path = Path(db_path)
         self._next_prune_monotonic = time.monotonic() + self.PRUNE_INTERVAL_SEC
 
-    def _connect(self) -> sqlite3.Connection:
+    @contextmanager
+    def _connect(self) -> Iterator[sqlite3.Connection]:
         conn = sqlite3.connect(str(self.db_path), timeout=15, isolation_level=None)
-        conn.row_factory = sqlite3.Row
-        conn.execute("PRAGMA foreign_keys=ON")
-        conn.execute("PRAGMA busy_timeout=15000")
-        return conn
+        try:
+            conn.row_factory = sqlite3.Row
+            conn.execute("PRAGMA foreign_keys=ON")
+            conn.execute("PRAGMA busy_timeout=15000")
+            yield conn
+        finally:
+            conn.close()
 
     def initialize(self) -> None:
         with self._connect() as conn:
@@ -338,6 +346,26 @@ class AIStore:
             ).rowcount
         return self.get_config(config_id) if updated else None
 
+    def migrate_config_ciphertext(self, config_id: int, old_ciphertext: str,
+                                  new_ciphertext: str) -> bool:
+        """Persist a rotated-key ciphertext only if it has not changed meanwhile."""
+        with self._connect() as conn:
+            return bool(conn.execute(
+                "UPDATE ai_provider_configs SET api_key_ciphertext=?,updated_at=? "
+                "WHERE id=? AND api_key_ciphertext=?",
+                (new_ciphertext, utc_now(), int(config_id), old_ciphertext),
+            ).rowcount)
+
+    def migrate_config_base_url(self, config_id: int, old_base_url: str,
+                                new_base_url: str) -> bool:
+        """Canonicalize a legacy provider URL with a compare-and-swap update."""
+        with self._connect() as conn:
+            return bool(conn.execute(
+                "UPDATE ai_provider_configs SET base_url=?,updated_at=? "
+                "WHERE id=? AND base_url=?",
+                (new_base_url, utc_now(), int(config_id), old_base_url),
+            ).rowcount)
+
     def save_config(self, provider: str, base_url: str, model: str, ciphertext: str, enabled: bool,
                     model_quota_tokens: Optional[int] = None, name: Optional[str] = None) -> None:
         """Compatibility wrapper for phase-one callers of the singleton store API."""
@@ -478,7 +506,7 @@ class AIStore:
         with self._connect() as conn:
             rows = conn.execute(
                 "SELECT date(datetime(created_at, '+8 hours')) AS day,"
-                " COUNT(*) AS requests,"
+                " SUM(CASE WHEN status<>'adjusted' THEN 1 ELSE 0 END) AS requests,"
                 " COALESCE(SUM(prompt_tokens),0) AS prompt_tokens,"
                 " COALESCE(SUM(completion_tokens),0) AS completion_tokens,"
                 " COALESCE(SUM(total_tokens),0) AS total_tokens,"
@@ -511,11 +539,11 @@ class AIStore:
 
     def usage_summary(self) -> Dict[str, int]:
         with self._connect() as conn:
-            row = conn.execute("SELECT COUNT(*) AS requests, COALESCE(SUM(prompt_tokens),0) AS prompt_tokens, "
+            row = conn.execute("SELECT COALESCE(SUM(CASE WHEN status<>'adjusted' THEN 1 ELSE 0 END),0) AS requests, COALESCE(SUM(prompt_tokens),0) AS prompt_tokens, "
                                "COALESCE(SUM(completion_tokens),0) AS completion_tokens, "
                                "COALESCE(SUM(total_tokens),0) AS total_tokens FROM ai_usage").fetchone()
             today = conn.execute(
-                "SELECT COUNT(*) AS requests, COALESCE(SUM(total_tokens),0) AS total_tokens "
+                "SELECT COALESCE(SUM(CASE WHEN status<>'adjusted' THEN 1 ELSE 0 END),0) AS requests, COALESCE(SUM(total_tokens),0) AS total_tokens "
                 "FROM ai_usage WHERE date(datetime(created_at, '+8 hours')) = date('now', '+8 hours')"
             ).fetchone()
         result = dict(row)
@@ -622,7 +650,8 @@ class AIStore:
         )
         with self._connect() as conn:
             rows = conn.execute(
-                f"SELECT {fields} FROM ai_usage ORDER BY id DESC LIMIT ?", (bounded_limit,)
+                f"SELECT {fields} FROM ai_usage WHERE status<>'adjusted' ORDER BY id DESC LIMIT ?",
+                (bounded_limit,),
             ).fetchall()
         return [dict(row) for row in rows]
 
@@ -631,11 +660,11 @@ class AIStore:
         safe_day = str(day or "").strip()
         with self._connect() as conn:
             row = conn.execute(
-                "SELECT COUNT(*) AS requests, "
+                "SELECT COALESCE(SUM(CASE WHEN status<>'adjusted' THEN 1 ELSE 0 END),0) AS requests, "
                 "COALESCE(SUM(prompt_tokens),0) AS prompt_tokens, "
                 "COALESCE(SUM(completion_tokens),0) AS completion_tokens, "
                 "COALESCE(SUM(total_tokens),0) AS total_tokens, "
-                "COALESCE(SUM(CASE WHEN usage_known=0 THEN 1 ELSE 0 END),0) AS unknown_usage_requests "
+                "COALESCE(SUM(CASE WHEN usage_known=0 AND status<>'adjusted' THEN 1 ELSE 0 END),0) AS unknown_usage_requests "
                 "FROM ai_usage WHERE date(datetime(created_at, '+8 hours')) = ?",
                 (safe_day,),
             ).fetchone()
@@ -690,13 +719,16 @@ class AIStore:
         return result
 
     def finish_confirmation(self, confirmation_id: str, status: str,
-                            result: Optional[Dict[str, Any]] = None) -> None:
+                            result: Optional[Dict[str, Any]] = None) -> bool:
+        if status not in {"completed", "failed"}:
+            raise ValueError("invalid confirmation status")
         result_json = json.dumps(result, ensure_ascii=False)[:32000] if result is not None else None
         with self._connect() as conn:
-            conn.execute(
-                "UPDATE ai_tool_confirmations SET status=?, result_json=? WHERE id=?",
+            return bool(conn.execute(
+                "UPDATE ai_tool_confirmations SET status=?, result_json=? "
+                "WHERE id=? AND status='executing'",
                 (status, result_json, confirmation_id),
-            )
+            ).rowcount)
 
     def complete_client_confirmation(self, confirmation_id: str, status: str,
                                      result: Optional[Dict[str, Any]] = None) -> Optional[Dict[str, Any]]:
@@ -730,6 +762,68 @@ class AIStore:
         result_row["preview"] = preview
         return result_row
 
+    @staticmethod
+    def _confirmation_view(row: sqlite3.Row) -> Dict[str, Any]:
+        item = dict(row)
+        item["arguments"] = json.loads(item.pop("arguments_json") or "{}")
+        item["preview"] = json.loads(item.pop("preview_json") or "{}")
+        raw_result = item.pop("result_json", None)
+        try:
+            item["result"] = json.loads(raw_result) if raw_result else None
+        except (TypeError, ValueError):
+            item["result"] = None
+        item["expired"] = (
+            str(item.get("status") or "") in {"pending", "executing"}
+            and str(item.get("expires_at") or "") < utc_now()
+        )
+        return item
+
+    def get_confirmation(self, confirmation_id: str) -> Optional[Dict[str, Any]]:
+        with self._connect() as conn:
+            row = conn.execute(
+                "SELECT * FROM ai_tool_confirmations WHERE id=?", (str(confirmation_id),),
+            ).fetchone()
+        return self._confirmation_view(row) if row is not None else None
+
+    def pending_confirmation_for_conversation(self, conversation_id: str) -> Optional[Dict[str, Any]]:
+        """Return the newest unexpired recoverable confirmation for a chat."""
+        now = utc_now()
+        with self._connect() as conn:
+            row = conn.execute(
+                "SELECT * FROM ai_tool_confirmations WHERE conversation_id=? "
+                "AND status IN ('pending','executing') AND expires_at>=? "
+                "ORDER BY created_at DESC,id DESC LIMIT 1",
+                (str(conversation_id), now),
+            ).fetchone()
+        return self._confirmation_view(row) if row is not None else None
+
+    def cancel_confirmation(self, confirmation_id: str) -> Optional[Dict[str, Any]]:
+        """Atomically cancel an unclaimed confirmation.
+
+        Once executing, the side effect may already have started and cannot be
+        truthfully reported as cancelled.
+        """
+        with self._connect() as conn:
+            conn.execute("BEGIN IMMEDIATE")
+            row = conn.execute(
+                "SELECT * FROM ai_tool_confirmations WHERE id=? AND status='pending' AND expires_at>=?",
+                (str(confirmation_id), utc_now()),
+            ).fetchone()
+            if row is None:
+                conn.execute("ROLLBACK")
+                return None
+            changed = conn.execute(
+                "UPDATE ai_tool_confirmations SET status='cancelled',result_json=? "
+                "WHERE id=? AND status='pending'",
+                (json.dumps({"ok": False, "message": "用户已取消"}, ensure_ascii=False),
+                 str(confirmation_id)),
+            ).rowcount
+            if changed != 1:
+                conn.execute("ROLLBACK")
+                return None
+            conn.execute("COMMIT")
+        return self.get_confirmation(confirmation_id)
+
     def list_recent_confirmations(self, limit: int = 10) -> list[Dict[str, Any]]:
         """Recent confirmation cards with an explicit expired flag, for the
         assistant to verify whether historical confirmation requests ever ran."""
@@ -756,10 +850,44 @@ class AIStore:
         if not clean_id:
             return False
         with self._connect() as conn:
-            deleted = conn.execute(
-                "DELETE FROM messages WHERE id=? AND conversation_id=?",
-                (int(message_id), clean_id),
-            ).rowcount
+            conn.execute("BEGIN IMMEDIATE")
+            try:
+                removed = conn.execute(
+                    "SELECT role,content FROM messages WHERE id=? AND conversation_id=?",
+                    (int(message_id), clean_id),
+                ).fetchone()
+                conversation = conn.execute(
+                    "SELECT title,created_at FROM conversations WHERE id=?", (clean_id,),
+                ).fetchone()
+                deleted = conn.execute(
+                    "DELETE FROM messages WHERE id=? AND conversation_id=?",
+                    (int(message_id), clean_id),
+                ).rowcount
+                if deleted and conversation is not None:
+                    latest = conn.execute(
+                        "SELECT created_at FROM messages WHERE conversation_id=? ORDER BY id DESC LIMIT 1",
+                        (clean_id,),
+                    ).fetchone()
+                    title = str(conversation["title"] or "").strip()
+                    removed_was_title = bool(
+                        removed is not None and removed["role"] == "user"
+                        and title == str(removed["content"] or "").strip()[:32]
+                    )
+                    if removed_was_title or latest is None:
+                        first_user = conn.execute(
+                            "SELECT content FROM messages WHERE conversation_id=? AND role='user' "
+                            "ORDER BY id ASC LIMIT 1", (clean_id,),
+                        ).fetchone()
+                        title = str(first_user["content"] or "").strip()[:32] if first_user else "新对话"
+                    updated_at = latest["created_at"] if latest else conversation["created_at"]
+                    conn.execute(
+                        "UPDATE conversations SET title=?,updated_at=? WHERE id=?",
+                        (title or "新对话", updated_at, clean_id),
+                    )
+                conn.execute("COMMIT")
+            except Exception:
+                conn.execute("ROLLBACK")
+                raise
         if deleted:
             self.enforce_conversation_storage(protected_conversation_id=clean_id)
         return bool(deleted)
@@ -809,29 +937,45 @@ class AIStore:
         with self._connect() as conn:
             return bool(conn.execute("DELETE FROM ai_usage WHERE id=?", (int(usage_id),)).rowcount)
 
-    def record_usage_adjustment(self, config_id: int, target_total: int) -> Optional[Dict[str, Any]]:
+    def record_usage_adjustment(self, config_id: int, target_total: int,
+                                model_quota_tokens: Any = _UNSET) -> Optional[Dict[str, Any]]:
         """把某配置的累计用量调整为手动输入值。
 
         以一条带符号的调整行实现：历史记录保留，各处 SUM 统计自然生效。
         """
-        row = self.get_config(int(config_id))
-        if row is None:
-            return None
         with self._connect() as conn:
-            current = conn.execute(
-                "SELECT COALESCE(SUM(total_tokens),0) AS total FROM ai_usage WHERE config_id=?",
-                (int(config_id),),
-            ).fetchone()
-        delta = int(target_total) - int(current["total"] or 0)
-        now = utc_now()
-        with self._connect() as conn:
-            cursor = conn.execute(
-                """INSERT INTO ai_usage(conversation_id,provider,model,prompt_tokens,completion_tokens,
-                   total_tokens,status,usage_known,usage_json,cache_hit_tokens,cache_miss_tokens,created_at,config_id)
-                   VALUES(NULL,?,?,0,0,?,'adjusted',0,NULL,0,0,?,?)""",
-                (row["provider"], row["model"], delta, now, int(config_id)),
-            )
-            return {"id": int(cursor.lastrowid), "delta": delta, "target": int(target_total)}
+            conn.execute("BEGIN IMMEDIATE")
+            try:
+                row = conn.execute(
+                    "SELECT * FROM ai_provider_configs WHERE id=?", (int(config_id),),
+                ).fetchone()
+                if row is None:
+                    conn.execute("ROLLBACK")
+                    return None
+                current = conn.execute(
+                    "SELECT COALESCE(SUM(total_tokens),0) AS total FROM ai_usage WHERE config_id=?",
+                    (int(config_id),),
+                ).fetchone()
+                delta = int(target_total) - int(current["total"] or 0)
+                adjustment_id = None
+                if delta:
+                    cursor = conn.execute(
+                        """INSERT INTO ai_usage(conversation_id,provider,model,prompt_tokens,completion_tokens,
+                           total_tokens,status,usage_known,usage_json,cache_hit_tokens,cache_miss_tokens,created_at,config_id)
+                           VALUES(NULL,?,?,0,0,?,'adjusted',0,NULL,0,0,?,?)""",
+                        (row["provider"], row["model"], delta, utc_now(), int(config_id)),
+                    )
+                    adjustment_id = int(cursor.lastrowid)
+                if model_quota_tokens is not _UNSET:
+                    conn.execute(
+                        "UPDATE ai_provider_configs SET model_quota_tokens=?,updated_at=? WHERE id=?",
+                        (model_quota_tokens, utc_now(), int(config_id)),
+                    )
+                conn.execute("COMMIT")
+            except Exception:
+                conn.execute("ROLLBACK")
+                raise
+        return {"id": adjustment_id, "delta": delta, "target": int(target_total)}
 
     def add_notification(self, kind: str, title: str, content: str, dedupe_key: str,
                          payload: Optional[Dict[str, Any]] = None) -> Optional[int]:

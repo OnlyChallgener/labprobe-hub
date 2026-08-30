@@ -2,6 +2,8 @@
 
 from __future__ import annotations
 
+import hashlib
+import json
 import threading
 import time
 from datetime import datetime, timedelta, timezone
@@ -144,6 +146,10 @@ class AssistantNotificationService:
                        else router_diagnostic_content(task)).strip()[:600]
             suffix = {"failed": "失败", "timed_out": "超时"}.get(state, "完成")
             identity = str(task.get("taskId") or task.get("finishedAt") or task.get("updatedAt") or "")
+            if not identity:
+                identity = hashlib.sha256(
+                    json.dumps(task, ensure_ascii=False, sort_keys=True, default=str).encode("utf-8")
+                ).hexdigest()[:16]
             self.store.add_notification(
                 "task", f"{label}{suffix}", content,
                 f"task:{kind}:{identity}:{state}", {"task": task},

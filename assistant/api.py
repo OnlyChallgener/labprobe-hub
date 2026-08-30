@@ -3,7 +3,9 @@
 from __future__ import annotations
 
 import json
+import queue
 import re
+import threading
 import time
 import uuid
 from datetime import datetime, timedelta, timezone
@@ -14,7 +16,7 @@ from flask import Blueprint, Response, jsonify, request, stream_with_context
 
 from .provider import OpenAICompatibleProvider, ProviderError, usage_from_chunk, \
     accumulate_tool_call_fragment, tool_calls_from_accumulated
-from .security import MasterKeyUnavailable, decrypt_secret, encrypt_secret, mask_secret
+from .security import MasterKeyUnavailable, decrypt_secret_with_migration, encrypt_secret
 from .storage import AIStore, usage_known
 from .catalog import catalog, provider_tools, tool_id_from_function, tool_spec
 from .domains import register_builtin
@@ -467,18 +469,118 @@ def create_ai_blueprint(*, check_app_token: Callable[[], bool], db_path, logger,
             return jsonify({"error": "unauthorized"}), 401
         return None
 
+    def sse_response(events) -> Response:
+        response = Response(stream_with_context(events), content_type="text/event-stream")
+        response.headers["Cache-Control"] = "no-cache, no-transform"
+        response.headers["X-Accel-Buffering"] = "no"
+        response.headers["Connection"] = "keep-alive"
+        return response
+
+    def keepalive_items(items, interval: float = 10.0):
+        """Consume a possibly-blocking provider iterator without starving SSE."""
+        channel: queue.Queue = queue.Queue(maxsize=8)
+        stop = threading.Event()
+        sentinel = object()
+
+        def publish(kind: str, value: Any) -> bool:
+            while not stop.is_set():
+                try:
+                    channel.put((kind, value), timeout=0.1)
+                    return True
+                except queue.Full:
+                    continue
+            return False
+
+        def pump() -> None:
+            try:
+                for item in items:
+                    if not publish("item", item):
+                        return
+            except BaseException as exc:
+                publish("error", exc)
+            finally:
+                publish("end", sentinel)
+
+        threading.Thread(target=pump, name="labprobe-ai-provider-stream", daemon=True).start()
+        try:
+            while True:
+                try:
+                    kind, value = channel.get(timeout=interval)
+                except queue.Empty:
+                    yield None
+                    continue
+                if kind == "item":
+                    yield value
+                elif kind == "error":
+                    raise value
+                else:
+                    return
+        finally:
+            stop.set()
+            close = getattr(items, "close", None)
+            if callable(close):
+                try:
+                    close()
+                except (RuntimeError, ValueError):
+                    pass
+
+    def base_url_view(value: Any) -> str:
+        """Never reflect legacy URL credentials or query secrets to clients."""
+        raw = str(value or "")
+        parsed = urlparse(raw)
+        if not parsed.hostname:
+            return ""
+        host = parsed.hostname
+        if ":" in host and not host.startswith("["):
+            host = f"[{host}]"
+        try:
+            port = f":{parsed.port}" if parsed.port is not None else ""
+        except ValueError:
+            port = ""
+        return parsed._replace(netloc=host + port, query="", fragment="").geturl()
+
+    def canonicalize_config_base_url(row: Dict[str, Any]) -> str:
+        old_url = str(row.get("base_url") or "")
+        safe_url = base_url_view(old_url).rstrip("/")
+        parsed = urlparse(safe_url)
+        local_http = parsed.scheme == "http" and parsed.hostname in {"localhost", "127.0.0.1", "::1"}
+        if not safe_url or ((parsed.scheme != "https" and not local_http) or not parsed.netloc):
+            raise ValueError("stored AI provider base URL is invalid")
+        if safe_url != old_url:
+            store.migrate_config_base_url(int(row["id"]), old_url, safe_url)
+            row["base_url"] = safe_url
+        return safe_url
+
+    def decrypt_config_secret(row: Dict[str, Any]) -> str:
+        canonicalize_config_base_url(row)
+        ciphertext = row.get("api_key_ciphertext")
+        plaintext, replacement = decrypt_secret_with_migration(ciphertext)
+        if replacement:
+            store.migrate_config_ciphertext(int(row["id"]), str(ciphertext), replacement)
+            row["api_key_ciphertext"] = replacement
+        return plaintext
+
     def config_view(row):
-        key_configured = bool(row and row["api_key_ciphertext"])
+        key_status = "not_configured"
+        if row and row.get("api_key_ciphertext"):
+            try:
+                decrypt_config_secret(row)
+                key_status = "configured"
+            except MasterKeyUnavailable:
+                key_status = "unavailable"
+            except ValueError:
+                key_status = "invalid"
         return {"id": int(row["id"]) if row else None,
                 "name": row["name"] if row else "DeepSeek",
-                "configured": bool(row), "provider": row["provider"] if row else "deepseek",
-                "baseUrl": row["base_url"] if row else DEFAULT_BASE_URL,
+                "configured": bool(row and key_status == "configured"),
+                "provider": row["provider"] if row else "deepseek",
+                "baseUrl": base_url_view(row["base_url"]) if row else DEFAULT_BASE_URL,
                 "model": row["model"] if row else DEFAULT_MODEL,
                 "enabled": bool(row["enabled"]) if row else False,
                 "tokenQuota": row["model_quota_tokens"] if row else None,
                 "modelQuotaTokens": row["model_quota_tokens"] if row else None,
-                "apiKey": mask_secret(row["api_key_ciphertext"]) if row else None,
-                "apiKeyStatus": "configured" if key_configured else "not_configured"}
+                "apiKey": "configured" if key_status == "configured" else None,
+                "apiKeyStatus": key_status}
 
     def configs_response():
         rows = store.list_configs()
@@ -519,6 +621,11 @@ def create_ai_blueprint(*, check_app_token: Callable[[], bool], db_path, logger,
                 return jsonify({"error": "id must be an integer"}), 400
             if config_id is not None and current is None:
                 return jsonify({"error": "AI configuration was not found"}), 404
+            if current is not None:
+                try:
+                    canonicalize_config_base_url(current)
+                except ValueError as exc:
+                    return jsonify({"error": str(exc)}), 409
         provider = str(body.get("provider") or (current["provider"] if current else "deepseek")).strip().lower()
         if not provider or len(provider) > 64:
             return jsonify({"error": "provider is invalid"}), 400
@@ -535,8 +642,16 @@ def create_ai_blueprint(*, check_app_token: Callable[[], bool], db_path, logger,
         local_http = parsed.scheme == "http" and parsed.hostname in {"localhost", "127.0.0.1", "::1"}
         if (parsed.scheme != "https" and not local_http) or not parsed.netloc:
             return jsonify({"error": "baseUrl is invalid"}), 400
+        if parsed.username is not None or parsed.password is not None or parsed.query or parsed.fragment:
+            return jsonify({"error": "baseUrl must not contain credentials, a query, or a fragment"}), 400
         api_key = body.get("apiKey")
         if current and (api_key is None or str(api_key).strip() in {"", "configured"}):
+            try:
+                decrypt_config_secret(current)
+            except MasterKeyUnavailable as exc:
+                return jsonify({"error": str(exc)}), 503
+            except ValueError as exc:
+                return jsonify({"error": str(exc)}), 409
             ciphertext = current["api_key_ciphertext"]
         elif isinstance(api_key, str) and api_key.strip():
             try:
@@ -633,10 +748,19 @@ def create_ai_blueprint(*, check_app_token: Callable[[], bool], db_path, logger,
             return jsonify({"error": "configId and totalTokens must be integers"}), 400
         if target < 0:
             return jsonify({"error": "totalTokens must be >= 0"}), 400
-        result = store.record_usage_adjustment(config_id, target)
+        quota_supplied = "tokenQuota" in body or "modelQuotaTokens" in body
+        try:
+            quota = parse_quota(body) if quota_supplied else None
+        except ValueError as exc:
+            return jsonify({"error": str(exc)}), 400
+        result = (
+            store.record_usage_adjustment(config_id, target, quota)
+            if quota_supplied else store.record_usage_adjustment(config_id, target)
+        )
         if result is None:
             return jsonify({"error": "AI configuration was not found"}), 404
-        return jsonify({"ok": True, **result})
+        saved = store.get_config(config_id)
+        return jsonify({"ok": True, **result, "adjustment": result, "config": config_view(saved)})
 
     @bp.delete("/usage/<int:usage_id>")
     def delete_usage_record(usage_id: int):
@@ -768,7 +892,7 @@ def create_ai_blueprint(*, check_app_token: Callable[[], bool], db_path, logger,
                     yield ": ping\n\n"
                 time.sleep(2)
 
-        return Response(stream_with_context(generate()), content_type="text/event-stream")
+        return sse_response(generate())
 
     def require_executor():
         if executor is None:
@@ -885,6 +1009,73 @@ def create_ai_blueprint(*, check_app_token: Callable[[], bool], db_path, logger,
                                      f"{tool_display_name(pending['tool_id'])}执行失败：操作执行失败")
             return jsonify(failure), 500
 
+    def confirmation_view(item: Dict[str, Any]) -> Dict[str, Any]:
+        return {
+            "confirmationId": item["id"],
+            "conversationId": item.get("conversation_id"),
+            "toolId": item.get("tool_id"),
+            "status": item.get("status"),
+            "expiresAt": item.get("expires_at"),
+            "createdAt": item.get("created_at"),
+            "confirmedAt": item.get("confirmed_at"),
+            "expired": bool(item.get("expired")),
+            "preview": item.get("preview") or {},
+            "result": item.get("result"),
+        }
+
+    @bp.post("/tools/cancel")
+    def cancel_tool():
+        denial = authorized()
+        if denial:
+            return denial
+        body = request.get_json(silent=True) or {}
+        confirmation_id = str(body.get("confirmationId") or "").strip()
+        if not confirmation_id:
+            return jsonify({"error": "confirmationId is required"}), 400
+        cancelled = store.cancel_confirmation(confirmation_id)
+        if cancelled is None:
+            current = store.get_confirmation(confirmation_id)
+            if current is None:
+                return jsonify({"error": "确认不存在", "code": "CONFIRMATION_NOT_FOUND"}), 404
+            return jsonify({
+                "error": "确认已执行、已取消或已过期", "code": "CONFIRMATION_INVALID",
+                "confirmation": confirmation_view(current),
+            }), 409
+        store.add_tool_audit(
+            confirmation_id, cancelled["tool_id"], "write", "cancelled",
+            cancelled.get("arguments") or {}, {"ok": False, "message": "用户已取消"},
+        )
+        record_confirmation_note(
+            store, cancelled,
+            f"用户已取消{tool_display_name(cancelled['tool_id'])}，操作未执行",
+        )
+        return jsonify({"ok": True, "confirmation": confirmation_view(cancelled)})
+
+    @bp.get("/conversations/<conversation_id>/confirmations")
+    @bp.get("/conversations/<conversation_id>/pending-confirmation")
+    def pending_confirmation(conversation_id: str):
+        denial = authorized()
+        if denial:
+            return denial
+        pending = store.pending_confirmation_for_conversation(conversation_id)
+        return jsonify({
+            "conversationId": conversation_id,
+            "confirmation": confirmation_view(pending) if pending is not None else None,
+        })
+
+    @bp.get("/tools/confirmations/<confirmation_id>")
+    def confirmation_status(confirmation_id: str):
+        denial = authorized()
+        if denial:
+            return denial
+        item = store.get_confirmation(confirmation_id)
+        if item is None:
+            return jsonify({"error": "确认不存在", "code": "CONFIRMATION_NOT_FOUND"}), 404
+        view = confirmation_view(item)
+        # Keep the nested shape used by the APP and mirror lifecycle fields at
+        # top level for simple status polling clients.
+        return jsonify({**view, "confirmation": view})
+
     @bp.post("/tools/complete")
     def complete_client_tool():
         denial = authorized()
@@ -936,7 +1127,7 @@ def create_ai_blueprint(*, check_app_token: Callable[[], bool], db_path, logger,
         last_status = 502
         for row in rows:
             try:
-                key = decrypt_secret(row["api_key_ciphertext"])
+                key = decrypt_config_secret(row)
                 result = OpenAICompatibleProvider(row["base_url"], key, row["model"]).chat(
                     [{"role": "user", "content": "Reply with OK."}]
                 )
@@ -1009,6 +1200,11 @@ def create_ai_blueprint(*, check_app_token: Callable[[], bool], db_path, logger,
         else:
             # Compatibility for older APP builds that still send a bounded transcript.
             store.replace_messages(conversation_id, messages)
+            stored_messages = store.get_messages(conversation_id, limit=MAX_MESSAGES)
+            user_message_id = next(
+                (int(item["id"]) for item in reversed(stored_messages) if item["role"] == "user"),
+                None,
+            )
         latest_user_text = next(
             (item["content"] for item in reversed(messages) if item["role"] == "user"), "",
         )
@@ -1019,8 +1215,30 @@ def create_ai_blueprint(*, check_app_token: Callable[[], bool], db_path, logger,
 
         def sse_done(payload: Dict[str, Any]) -> Response:
             def emit():
+                yield ": connected\n\n"
                 yield stream_event({"type": "done", **payload})
-            return Response(stream_with_context(emit()), content_type="text/event-stream")
+            return sse_response(emit())
+
+        def failure_payload(error: Any) -> Dict[str, Any]:
+            detail = " ".join(str(error or "请求失败").split())[:500]
+            content = "〔请求失败〕" + detail
+            message_id = store.add_message(conversation_id, "assistant", content)
+            return {
+                "error": detail,
+                "conversationId": conversation_id,
+                "userMessageId": user_message_id,
+                "messageId": message_id,
+                "message": {"role": "assistant", "content": content},
+            }
+
+        def post_persist_failure(error: Any, status_code: int):
+            payload = failure_payload(error)
+            if wants_stream:
+                def emit():
+                    yield ": connected\n\n"
+                    yield stream_event({"type": "error", **payload})
+                return sse_response(emit())
+            return jsonify(payload), status_code
 
         forced_tool_id = diagnostic_tool_intent(latest_user_text)
         if forced_tool_id == "navigate.tool_nat" and executor is not None:
@@ -1045,7 +1263,9 @@ def create_ai_blueprint(*, check_app_token: Callable[[], bool], db_path, logger,
                 try:
                     tool_result = executor.execute(forced_tool_id, {})
                 except ToolError as exc:
-                    return tool_error_response(exc)
+                    return post_persist_failure(exc, exc.status_code)
+                except Exception:
+                    return post_persist_failure("工具执行失败", 500)
                 content = network_self_check_content(tool_result)
             else:
                 task_kind = "nat" if forced_tool_id == "router.nat.diagnostic" else "diagnostic"
@@ -1060,7 +1280,9 @@ def create_ai_blueprint(*, check_app_token: Callable[[], bool], db_path, logger,
                     try:
                         tool_result = executor.execute(forced_tool_id, {})
                     except ToolError as exc:
-                        return tool_error_response(exc)
+                        return post_persist_failure(exc, exc.status_code)
+                    except Exception:
+                        return post_persist_failure("工具执行失败", 500)
                     started = tool_result.get("task") if isinstance(tool_result.get("task"), dict) else None
                     task = _wait_router_task(hub_runtime, task_kind, 40.0) or started
                 content = nat_diagnostic_content(task) if task_kind == "nat" else router_diagnostic_content(task or {})
@@ -1080,7 +1302,7 @@ def create_ai_blueprint(*, check_app_token: Callable[[], bool], db_path, logger,
         # 模型名与真实原因返回给 APP 提醒用户切换，而不是悄悄换下一个继续烧。
         config_rows = store.list_configs(enabled_only=True)[:1]
         if not config_rows:
-            return jsonify({"error": "AI provider is not configured"}), 409
+            return post_persist_failure("AI provider is not configured", 409)
         internal_messages: List[Dict[str, Any]] = list(messages)
         if not internal_messages or internal_messages[0].get("role") != "system":
             internal_messages.insert(0, {"role": "system", "content": TOOL_SYSTEM_PROMPT})
@@ -1118,7 +1340,7 @@ def create_ai_blueprint(*, check_app_token: Callable[[], bool], db_path, logger,
                         raise model_unavailable_error()
                     active_row = config_rows[config_index]
                     try:
-                        key = decrypt_secret(active_row["api_key_ciphertext"])
+                        key = decrypt_config_secret(active_row)
                     except (MasterKeyUnavailable, ValueError) as exc:
                         store.add_usage(conversation_id, active_row["provider"], active_row["model"], {},
                                         status="failed", config_id=active_row["id"], error=str(exc))
@@ -1258,6 +1480,7 @@ def create_ai_blueprint(*, check_app_token: Callable[[], bool], db_path, logger,
                 executions: List[Dict[str, Any]] = []
                 client_actions: List[Dict[str, Any]] = []
                 pending_writes: List[Dict[str, Any]] = []
+                yield ": connected\n\n"
                 try:
                     for _ in range(4):
                         content_parts: List[str] = []
@@ -1266,7 +1489,14 @@ def create_ai_blueprint(*, check_app_token: Callable[[], bool], db_path, logger,
                         while True:
                             row, provider = next_provider()
                             try:
-                                for chunk in provider.stream(internal_messages, tools=provider_tools() if executor is not None else None):
+                                provider_items = provider.stream(
+                                    internal_messages,
+                                    tools=provider_tools() if executor is not None else None,
+                                )
+                                for chunk in keepalive_items(provider_items):
+                                    if chunk is None:
+                                        yield ": ping\n\n"
+                                        continue
                                     merge_usage(round_usage, usage_from_chunk(chunk) or {})
                                     choices = chunk.get("choices") if isinstance(chunk.get("choices"), list) else []
                                     for choice in choices:
@@ -1279,6 +1509,8 @@ def create_ai_blueprint(*, check_app_token: Callable[[], bool], db_path, logger,
                                         accumulate_tool_call_fragment(tool_acc, delta.get("tool_calls"))
                                 break
                             except ProviderError as exc:
+                                merge_usage(accumulated_usage, round_usage)
+                                round_usage.clear()
                                 fail_active_provider(exc)
                                 if content_parts:
                                     # Partial text of the failed attempt is already on the
@@ -1340,12 +1572,18 @@ def create_ai_blueprint(*, check_app_token: Callable[[], bool], db_path, logger,
                         store.add_usage(conversation_id, active_row["provider"], active_row["model"],
                                         accumulated_usage, status="failed", config_id=active_row["id"],
                                         error=str(exc))
-                    yield stream_event({
-                        "type": "error", "error": str(exc),
-                        "conversationId": conversation_id,
-                        "userMessageId": user_message_id,
-                    })
-            return Response(stream_with_context(generate()), content_type="text/event-stream")
+                    yield stream_event({"type": "error", **failure_payload(exc)})
+                except Exception:
+                    if active_row is not None:
+                        store.add_usage(
+                            conversation_id, active_row["provider"], active_row["model"],
+                            accumulated_usage, status="failed", config_id=active_row["id"],
+                            error="unexpected provider stream failure",
+                        )
+                    if logger is not None:
+                        logger.exception("ai: unexpected provider stream failure")
+                    yield stream_event({"type": "error", **failure_payload("AI provider stream failed unexpectedly")})
+            return sse_response(generate())
         executions: List[Dict[str, Any]] = []
         client_actions: List[Dict[str, Any]] = []
         pending_writes: List[Dict[str, Any]] = []
@@ -1393,6 +1631,16 @@ def create_ai_blueprint(*, check_app_token: Callable[[], bool], db_path, logger,
             if active_row is not None:
                 store.add_usage(conversation_id, active_row["provider"], active_row["model"],
                                 accumulated_usage, status="failed", config_id=active_row["id"])
-            return jsonify({"error": str(exc)}), exc.status_code
+            return jsonify(failure_payload(exc)), exc.status_code
+        except Exception:
+            if active_row is not None:
+                store.add_usage(
+                    conversation_id, active_row["provider"], active_row["model"],
+                    accumulated_usage, status="failed", config_id=active_row["id"],
+                    error="unexpected provider failure",
+                )
+            if logger is not None:
+                logger.exception("ai: unexpected provider failure")
+            return jsonify(failure_payload("AI provider failed unexpectedly")), 502
 
     return bp
