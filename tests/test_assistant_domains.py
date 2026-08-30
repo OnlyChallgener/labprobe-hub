@@ -477,6 +477,17 @@ def test_firewall_rule_create_outbound_clears_inbound_interface():
     assert payload["inIface"] == "" and payload["outIface"] == "lan"
 
 
+def test_firewall_rule_create_matches_app_dual_and_non_port_protocols():
+    hub, executor = make_executor()
+    executor.execute("router.firewall.rule.create", {
+        "ruleName": "Ping", "ipVersion": "dual", "proto": "icmp",
+        "srcPort": "123", "destPort": "456",
+    }, allow_write=True)
+    _, payload = hub.ROUTER_SERVICE.calls[-1]
+    assert payload["ipVersion"] == "dual" and payload["proto"] == "icmp"
+    assert payload["srcPort"] == "" and payload["destPort"] == ""
+
+
 def test_firewall_rule_update_pins_uuid_and_merges_existing_fields():
     hub, executor = make_executor()
     preview = executor.preview("router.firewall.rule.update", {"rule": "Sun", "destPort": "2186,9001"})
@@ -489,6 +500,26 @@ def test_firewall_rule_update_pins_uuid_and_merges_existing_fields():
     assert payload["destPort"] == "2186,9001"
     assert payload["ruleName"] == "Sun"
     assert "uuid" not in payload
+
+
+def test_firewall_rule_update_can_clear_fields_and_submits_full_whitelist():
+    hub, executor = make_executor()
+    hub.ROUTER_SERVICE.firewall["rules"][0].update({
+        "ruleName": "Sun", "direction": "forward", "ipVersion": "ipv4", "proto": "tcp",
+        "srcIP": "192.168.1.2", "destIP": "10.0.0.1", "srcPort": "1000",
+        "destPort": "2000", "target": "ACCEPT", "enable": "1",
+        "ipv6SuffixSrc": "", "ipv6SuffixDest": "", "inIface": "wan", "outIface": "lan",
+    })
+    executor.execute("router.firewall.rule.update", {
+        "rule": "fw-sun", "srcIP": "", "destIP": "", "proto": "any",
+    }, allow_write=True)
+    _, _, payload = hub.ROUTER_SERVICE.calls[-1]
+    assert payload["srcIP"] == "" and payload["destIP"] == ""
+    assert payload["proto"] == "any" and payload["srcPort"] == "" and payload["destPort"] == ""
+    assert set(payload) == {
+        "ruleName", "direction", "ipVersion", "proto", "srcIP", "destIP", "srcPort", "destPort",
+        "target", "enable", "ipv6SuffixSrc", "ipv6SuffixDest", "inIface", "outIface",
+    }
 
 
 def test_firewall_rule_remove_resolves_by_name():
@@ -508,3 +539,41 @@ def test_stun_and_portmap_write_results_carry_readable_messages():
     assert "已新增 STUN 穿透规则" in added["message"]
     removed = executor.execute("relay.stun.rule.remove", {"rule": added["rule"]["name"]}, allow_write=True)
     assert "已删除 STUN 穿透规则" in removed["message"]
+
+
+def test_firmware_check_formats_chinese_digest():
+    hub, executor = make_executor()
+    snapshot = {
+        "kind": "beta", "state": "succeeded", "stageText": "版本检测完成",
+        "result": {
+            "cur": "EW_3.0(1)B11P279",
+            "new": {
+                "totalCount": 1, "msg": "发现新版本",
+                "firmwareList": [{"version": "EW_3.0(1)B11P280", "size": 20480000,
+                                  "releaseNotes": "修复 2.5G 口协商问题", "downloadUrl": "https://fw/280"}],
+            },
+            "checkedAt": 1,
+        },
+    }
+    hub.ROUTER_TASK_MANAGER = SimpleNamespace(
+        start_beta=lambda: {"kind": "beta", "state": "queued"},
+        snapshot=lambda kind: snapshot,
+    )
+    result = executor.execute("router.firmware.check", {}, allow_write=False)
+    assert result["ok"] is True
+    content = result["content"]
+    assert "EW_3.0(1)B11P279" in content
+    assert "1 个可更新版本" in content
+    assert "EW_3.0(1)B11P280" in content
+    assert "修复 2.5G 口协商问题" in content
+    assert "19.5 MB" in content
+    assert "firmwareList" not in content and "{" not in content
+    status = executor.execute("router.firmware.status", {})
+    assert "最近一次" in status["message"]
+
+
+def test_firmware_status_without_snapshot_prompts_check():
+    hub, executor = make_executor()
+    hub.ROUTER_TASK_MANAGER.snapshot = lambda kind: {"kind": "beta", "state": "idle"}
+    result = executor.execute("router.firmware.status", {})
+    assert "还没有检测过" in result["message"] and "content" in result

@@ -15,7 +15,7 @@ from flask import Blueprint, Response, jsonify, request, stream_with_context
 from .provider import OpenAICompatibleProvider, ProviderError, usage_from_chunk, \
     accumulate_tool_call_fragment, tool_calls_from_accumulated
 from .security import MasterKeyUnavailable, decrypt_secret, encrypt_secret, mask_secret
-from .storage import AIStore
+from .storage import AIStore, usage_known
 from .catalog import catalog, provider_tools, tool_id_from_function, tool_spec
 from .domains import register_builtin
 from .extend import drain_pending
@@ -28,15 +28,20 @@ TENCENT_HUNYUAN_BASE_URL = "https://tokenhub.tencentmaas.com/v1"
 MAX_MESSAGES = 80
 MAX_MESSAGE_CHARS = 32_000
 MAX_REQUEST_CHARS = 80_000
+MAX_REPLAY_CHARS = 24_000
 TOOL_SYSTEM_PROMPT = (
     "你是极客网探 Hub 助手，可以查看和控制整个网络：设备、事件、Agent/Relay、STUN 穿透、"
     "WireGuard、路由器端口映射、IPv6、每日记录、防火墙（转发/入站/出站规则的查询、启停、"
-    "新建、修改、删除），以及让 APP 跳转页面或刷新数据。"
+    "新建、修改、删除）、路由器 Beta 固件（版本查询与检测更新），以及让 APP 跳转页面或刷新数据。"
     "涉及查询时必须调用工具，不得猜测。只读工具可以直接调用；写入操作（新增/删除/启停端口映射、"
     "穿透规则或防火墙规则，升级 Agent）只能生成确认请求，在对话中出现对应的〔操作记录〕之前"
     "绝不能声称操作已经完成。"
-    "确认后的执行结果会以〔操作记录〕消息出现在对话中；判断之前的写操作是否已执行，"
-    "以〔操作记录〕或状态查询工具（如 agent.cleanup.status）为准，不得无视记录要求用户重新确认。"
+    "用户问「路由器固件 / Beta 固件」时调用 router.firmware.status 或 router.firmware.check，"
+    "不要把 Agent 版本当固件版本回答；固件检测结果用 content 字段的中文内容组织回复，不要输出 JSON。"
+    "确认后的执行结果会以〔操作记录〕消息出现在对话中；对话里没有〔操作记录〕的历史确认请求"
+    "一律视为已过期、从未执行。用户提起这类旧请求时，先用 assistant.confirmations.list 或对应"
+    "状态工具（agent.cleanup.status、stun.rules.list、router.portmap.list 等）核实实际状态再如实"
+    "告知，禁止凭对话记忆声称“仍在等待确认”。"
     "用户说‘网络自检’时调用 network.self_check；说‘路由网络自检/路由器自检’时调用 router.diagnostic；"
     "说‘NAT检测’时调用 router.nat.diagnostic。检测和自检绝不能调用 app.navigate，只有明确要求打开/进入/跳转页面时才允许导航。"
     "回答使用简洁中文。"
@@ -440,6 +445,10 @@ def create_ai_blueprint(*, check_app_token: Callable[[], bool], db_path, logger,
     store = AIStore(db_path)
     store.initialize()
     executor = ToolExecutor(hub_runtime) if hub_runtime is not None else None
+    if hub_runtime is not None:
+        # Capability domains read lifecycle data (confirmations) through the
+        # same runtime stash the executor uses.
+        setattr(hub_runtime, "ASSISTANT_AI_STORE", store)
     if executor is not None:
         # Feature modules attach tool handlers via the hub runtime during
         # hub_entry install, before the first chat request arrives. Buffered
@@ -623,6 +632,15 @@ def create_ai_blueprint(*, check_app_token: Callable[[], bool], db_path, logger,
             return denial
         messages = store.get_messages(conversation_id, limit=MAX_MESSAGES)
         return jsonify({"conversationId": conversation_id, "messages": messages})
+
+    @bp.delete("/conversations/<conversation_id>/messages/<int:message_id>")
+    def delete_conversation_message(conversation_id: str, message_id: int):
+        denial = authorized()
+        if denial:
+            return denial
+        if not store.delete_message(conversation_id, message_id):
+            return jsonify({"error": "message was not found"}), 404
+        return jsonify({"ok": True, "deleted": message_id})
 
     @bp.patch("/conversations/<conversation_id>")
     def rename_conversation(conversation_id: str):
@@ -911,15 +929,29 @@ def create_ai_blueprint(*, check_app_token: Callable[[], bool], db_path, logger,
             messages.append({"role": item["role"], "content": item["content"]})
         if total_chars > MAX_REQUEST_CHARS:
             return jsonify({"error": "messages exceed the request size limit"}), 413
+        if incremental and len(messages[0]["content"]) > MAX_REPLAY_CHARS:
+            return jsonify({"error": "message exceeds the replay budget"}), 413
         conversation_id = str(body.get("conversationId") or uuid.uuid4())
         first_user_message = next((item["content"] for item in messages if item["role"] == "user"), None)
         store.create_conversation(conversation_id, title=first_user_message)
+        user_message_id: int | None = None
         if incremental:
-            store.add_message(conversation_id, "user", messages[0]["content"])
+            user_message_id = store.add_message(conversation_id, "user", messages[0]["content"])
             messages = [
                 {"role": item["role"], "content": item["content"]}
                 for item in store.get_messages(conversation_id, limit=MAX_MESSAGES)
             ]
+            # Strictly cap replay. The current incremental user message has
+            # already passed the per-message validation above, so discard whole
+            # oldest messages until the transcript is within budget.
+            replay_chars = sum(len(item["content"]) for item in messages)
+            while len(messages) > 1 and replay_chars > MAX_REPLAY_CHARS:
+                replay_chars -= len(messages[0]["content"])
+                messages.pop(0)
+            # Do not begin a replay with a detached assistant response.
+            while len(messages) > 1 and messages[0]["role"] != "user":
+                replay_chars -= len(messages[0]["content"])
+                messages.pop(0)
         else:
             # Compatibility for older APP builds that still send a bounded transcript.
             store.replace_messages(conversation_id, messages)
@@ -942,10 +974,12 @@ def create_ai_blueprint(*, check_app_token: Callable[[], bool], db_path, logger,
                 "已打开工具箱页的「NAT 检测」。\n"
                 "如需我直接读取路由器原生的 NAT 类型与映射/过滤行为，请说「路由NAT检测」。"
             )
-            store.add_message(conversation_id, "assistant", content)
+            message_id = store.add_message(conversation_id, "assistant", content)
             payload = {
                 "conversationId": conversation_id,
                 "message": {"role": "assistant", "content": content},
+                "messageId": message_id,
+                "userMessageId": user_message_id,
                 "usage": {},
                 "usageKnown": False,
                 "toolExecutions": [],
@@ -976,10 +1010,12 @@ def create_ai_blueprint(*, check_app_token: Callable[[], bool], db_path, logger,
                     started = tool_result.get("task") if isinstance(tool_result.get("task"), dict) else None
                     task = _wait_router_task(hub_runtime, task_kind, 40.0) or started
                 content = nat_diagnostic_content(task) if task_kind == "nat" else router_diagnostic_content(task or {})
-            store.add_message(conversation_id, "assistant", content)
+            message_id = store.add_message(conversation_id, "assistant", content)
             payload = {
                 "conversationId": conversation_id,
                 "message": {"role": "assistant", "content": content},
+                "messageId": message_id,
+                "userMessageId": user_message_id,
                 "usage": {},
                 "usageKnown": False,
                 "toolExecutions": [{"toolId": forced_tool_id, "status": "completed"}],
@@ -1012,7 +1048,7 @@ def create_ai_blueprint(*, check_app_token: Callable[[], bool], db_path, logger,
                         raise ProviderError(str(exc), 503) from exc
                     except ValueError as exc:
                         store.add_usage(conversation_id, active_row["provider"], active_row["model"], {},
-                                        status="failed", config_id=active_row["id"])
+                                        status="failed", config_id=active_row["id"], error=str(exc))
                         active_row = None
                         last_provider_error = ProviderError(str(exc), 503)
                         continue
@@ -1027,7 +1063,7 @@ def create_ai_blueprint(*, check_app_token: Callable[[], bool], db_path, logger,
             if active_row is not None:
                 store.add_usage(
                     conversation_id, active_row["provider"], active_row["model"], accumulated_usage,
-                    status="failed", config_id=active_row["id"],
+                    status="failed", config_id=active_row["id"], error=str(exc),
                 )
             accumulated_usage = {}
             active_row = None
@@ -1124,14 +1160,16 @@ def create_ai_blueprint(*, check_app_token: Callable[[], bool], db_path, logger,
             for item in pending_writes:
                 store.add_tool_audit(confirmation_id, item["toolId"], "write", "confirmation_required", item["arguments"], item["preview"])
             content = "需要你的确认：" + str(preview.get("summary") or preview.get("title") or confirm_tool_id)
-            store.add_message(conversation_id, "assistant", content)
+            message_id = store.add_message(conversation_id, "assistant", content)
             store.add_usage(conversation_id, active_row["provider"], active_row["model"],
                             usage_snapshot, config_id=active_row["id"])
             return {
                 "conversationId": conversation_id,
                 "message": {"role": "assistant", "content": content},
+                "messageId": message_id,
+                "userMessageId": user_message_id,
                 "usage": usage_snapshot,
-                "usageKnown": bool(usage_snapshot),
+                "usageKnown": usage_known(usage_snapshot),
                 "configId": active_row["id"],
                 "provider": active_row["provider"],
                 "model": active_row["model"],
@@ -1201,7 +1239,7 @@ def create_ai_blueprint(*, check_app_token: Callable[[], bool], db_path, logger,
                         content_text = "".join(content_parts)
                         if not content_text:
                             raise ProviderError("AI provider returned an empty response")
-                        store.add_message(conversation_id, "assistant", content_text)
+                        message_id = store.add_message(conversation_id, "assistant", content_text)
                         if not accumulated_usage and logger is not None:
                             logger.warning("ai: provider returned no usage tokens (model=%s)", active_row["model"])
                         store.add_usage(conversation_id, active_row["provider"], active_row["model"],
@@ -1210,8 +1248,10 @@ def create_ai_blueprint(*, check_app_token: Callable[[], bool], db_path, logger,
                             "type": "done",
                             "conversationId": conversation_id,
                             "message": {"role": "assistant", "content": content_text},
+                            "messageId": message_id,
+                            "userMessageId": user_message_id,
                             "usage": accumulated_usage,
-                            "usageKnown": bool(accumulated_usage),
+                            "usageKnown": usage_known(accumulated_usage),
                             "configId": active_row["id"],
                             "provider": active_row["provider"],
                             "model": active_row["model"],
@@ -1223,8 +1263,13 @@ def create_ai_blueprint(*, check_app_token: Callable[[], bool], db_path, logger,
                 except ProviderError as exc:
                     if active_row is not None:
                         store.add_usage(conversation_id, active_row["provider"], active_row["model"],
-                                        accumulated_usage, status="failed", config_id=active_row["id"])
-                    yield stream_event({"type": "error", "error": str(exc)})
+                                        accumulated_usage, status="failed", config_id=active_row["id"],
+                                        error=str(exc))
+                    yield stream_event({
+                        "type": "error", "error": str(exc),
+                        "conversationId": conversation_id,
+                        "userMessageId": user_message_id,
+                    })
             return Response(stream_with_context(generate()), content_type="text/event-stream")
         executions: List[Dict[str, Any]] = []
         client_actions: List[Dict[str, Any]] = []
@@ -1238,7 +1283,7 @@ def create_ai_blueprint(*, check_app_token: Callable[[], bool], db_path, logger,
                 if not isinstance(tool_calls, list) or not tool_calls:
                     if not result.content:
                         raise ProviderError("AI provider returned an empty response")
-                    store.add_message(conversation_id, "assistant", result.content)
+                    message_id = store.add_message(conversation_id, "assistant", result.content)
                     if not accumulated_usage and logger is not None:
                         logger.warning("ai: provider returned no usage tokens (model=%s)", active_row["model"])
                     store.add_usage(conversation_id, active_row["provider"], active_row["model"],
@@ -1246,8 +1291,10 @@ def create_ai_blueprint(*, check_app_token: Callable[[], bool], db_path, logger,
                     return jsonify({
                         "conversationId": conversation_id,
                         "message": {"role": "assistant", "content": result.content},
+                        "messageId": message_id,
+                        "userMessageId": user_message_id,
                         "usage": accumulated_usage,
-                        "usageKnown": bool(accumulated_usage),
+                        "usageKnown": usage_known(accumulated_usage),
                         "configId": active_row["id"],
                         "provider": active_row["provider"],
                         "model": active_row["model"],

@@ -17,6 +17,7 @@ ones and stay visible in the APP. Future domains register the same way via
 
 from __future__ import annotations
 
+import json
 import secrets
 import time
 from typing import Any, Dict, List
@@ -221,20 +222,20 @@ _SPECS: List[Dict[str, Any]] = [
         {
             "type": "object",
             "properties": {
-                "ruleName": {"type": "string", "maxLength": 64},
+                "ruleName": {"type": "string", "maxLength": 24},
                 "direction": {"type": "string", "enum": ["forward", "inbound", "outbound"]},
-                "ipVersion": {"type": "string", "enum": ["ipv4", "ipv6"]},
-                "proto": {"type": "string", "enum": ["tcp", "udp"]},
-                "srcIP": {"type": "string", "maxLength": 64},
-                "destIP": {"type": "string", "maxLength": 64},
-                "srcPort": {"type": "string", "maxLength": 128},
-                "destPort": {"type": "string", "maxLength": 128},
+                "ipVersion": {"type": "string", "enum": ["ipv4", "ipv6", "dual"]},
+                "proto": {"type": "string", "enum": ["tcp", "udp", "icmp", "any"]},
+                "srcIP": {"type": "string", "maxLength": 80},
+                "destIP": {"type": "string", "maxLength": 80},
+                "srcPort": {"type": "string", "maxLength": 96},
+                "destPort": {"type": "string", "maxLength": 96},
                 "target": {"type": "string", "enum": ["ACCEPT", "DROP"]},
                 "enabled": {"type": "boolean"},
-                "ipv6SuffixSrc": {"type": "string", "maxLength": 64},
-                "ipv6SuffixDest": {"type": "string", "maxLength": 64},
-                "inIface": {"type": "string", "enum": ["wan", "wan1", "lan"]},
-                "outIface": {"type": "string", "enum": ["lan", "wan", "wan1"]},
+                "ipv6SuffixSrc": {"type": "string", "maxLength": 80},
+                "ipv6SuffixDest": {"type": "string", "maxLength": 80},
+                "inIface": {"type": "string", "enum": ["wan", "lan"]},
+                "outIface": {"type": "string", "enum": ["lan", "wan"]},
             },
             "required": ["ruleName"],
             "additionalProperties": False,
@@ -249,20 +250,20 @@ _SPECS: List[Dict[str, Any]] = [
             "type": "object",
             "properties": {
                 "rule": {"type": "string", "maxLength": 128},
-                "ruleName": {"type": "string", "maxLength": 64},
+                "ruleName": {"type": "string", "maxLength": 24},
                 "direction": {"type": "string", "enum": ["forward", "inbound", "outbound"]},
-                "ipVersion": {"type": "string", "enum": ["ipv4", "ipv6"]},
-                "proto": {"type": "string", "enum": ["tcp", "udp"]},
-                "srcIP": {"type": "string", "maxLength": 64},
-                "destIP": {"type": "string", "maxLength": 64},
-                "srcPort": {"type": "string", "maxLength": 128},
-                "destPort": {"type": "string", "maxLength": 128},
+                "ipVersion": {"type": "string", "enum": ["ipv4", "ipv6", "dual"]},
+                "proto": {"type": "string", "enum": ["tcp", "udp", "icmp", "any"]},
+                "srcIP": {"type": "string", "maxLength": 80},
+                "destIP": {"type": "string", "maxLength": 80},
+                "srcPort": {"type": "string", "maxLength": 96},
+                "destPort": {"type": "string", "maxLength": 96},
                 "target": {"type": "string", "enum": ["ACCEPT", "DROP"]},
                 "enabled": {"type": "boolean"},
-                "ipv6SuffixSrc": {"type": "string", "maxLength": 64},
-                "ipv6SuffixDest": {"type": "string", "maxLength": 64},
-                "inIface": {"type": "string", "enum": ["wan", "wan1", "lan"]},
-                "outIface": {"type": "string", "enum": ["lan", "wan", "wan1"]},
+                "ipv6SuffixSrc": {"type": "string", "maxLength": 80},
+                "ipv6SuffixDest": {"type": "string", "maxLength": 80},
+                "inIface": {"type": "string", "enum": ["wan", "lan"]},
+                "outIface": {"type": "string", "enum": ["lan", "wan"]},
             },
             "required": ["rule"],
             "additionalProperties": False,
@@ -279,6 +280,34 @@ _SPECS: List[Dict[str, Any]] = [
             "required": ["rule"],
             "additionalProperties": False,
         },
+    ),
+    _spec(
+        "assistant.confirmations.list", "查询确认单状态",
+        "查询最近的工具确认单及其真实状态（等待确认/已执行成功/执行失败/已过期未执行），"
+        "用于核实历史确认请求是否真的执行过，而不是凭对话记忆断言。",
+        ["之前让我确认的操作做了吗", "有哪些确认单还没处理"],
+        "assistant.read", "read", "none",
+        {
+            "type": "object",
+            "properties": {"limit": {"type": "integer", "minimum": 1, "maximum": 20}},
+            "additionalProperties": False,
+        },
+    ),
+    _spec(
+        "router.firmware.status", "查询固件版本快照",
+        "查询最近一次路由器 Beta 固件检测结果（当前版本、可用版本与更新内容），不会发起新检测。"
+        "用户问路由器固件/Beta 固件版本时使用本工具，不要回答 Agent 版本。",
+        ["路由器固件是什么版本", "Beta 固件有更新吗"],
+        "router.read", "read", "none",
+        {"type": "object", "properties": {}, "additionalProperties": False},
+    ),
+    _spec(
+        "router.firmware.check", "检测路由器固件更新",
+        "实际向路由器发起一次 Beta 固件版本检测（约十几秒），返回当前版本、是否有更新与中文更新内容；"
+        "这是检测操作，不会升级固件，也不会跳转 APP 页面。",
+        ["检测固件更新", "路由器有新固件吗"],
+        "router.read", "read", "none",
+        {"type": "object", "properties": {}, "additionalProperties": False},
     ),
     _spec(
         "router.nat.diagnostic", "执行路由器 NAT 检测",
@@ -737,7 +766,7 @@ def _firewall_rule_payload(args: Dict[str, Any], base: Dict[str, Any] | None = N
     """
     rule = dict(base or {})
     for key in _FIREWALL_TEXT_FIELDS:
-        if args.get(key) not in (None, ""):
+        if key in args and args.get(key) is not None:
             rule[key] = str(args[key]).strip()
     for key, default in _FIREWALL_ENUM_FIELDS:
         if args.get(key) not in (None, ""):
@@ -754,6 +783,10 @@ def _firewall_rule_payload(args: Dict[str, Any], base: Dict[str, Any] | None = N
         rule["inIface"] = ""
     elif direction == "inbound" and args.get("outIface") in (None, ""):
         rule["outIface"] = ""
+    if str(rule.get("proto") or "tcp").lower() not in {"tcp", "udp"}:
+        # APP clears hidden port inputs when switching to ICMP/any.
+        rule["srcPort"] = ""
+        rule["destPort"] = ""
     if base is None:
         rule["enable"] = "0" if args.get("enabled") is False else "1"
     elif args.get("enabled") is not None:
@@ -793,12 +826,17 @@ def _router_firewall_rule_create(executor, args, client_context) -> Dict[str, An
 def _router_firewall_rule_update(executor, args, client_context) -> Dict[str, Any]:
     target = _resolve_rule(_firewall_rules(executor), args["rule"], "防火墙")
     uuid_value = _firewall_rule_uuid(target)
-    base = {key: target.get(key) for key in _FIREWALL_MERGE_FIELDS
-            if target.get(key) not in (None, "")}
-    if "ruleName" not in base:
-        fallback_name = target.get("ruleName") or target.get("name")
-        if fallback_name:
-            base["ruleName"] = str(fallback_name)
+    # Router Core update follows the APP's full-editor submission contract.
+    # Keep the whitelist, but include legal empty fields instead of silently
+    # changing a clear operation into a partial update.
+    base = {key: str(target.get(key) or "") for key in _FIREWALL_TEXT_FIELDS}
+    for key, default in _FIREWALL_ENUM_FIELDS:
+        base[key] = str(target.get(key) or default)
+    for key in ("inIface", "outIface"):
+        base[key] = str(target.get(key) if target.get(key) is not None else _FIREWALL_CREATE_DEFAULTS[key])
+    fallback_name = target.get("ruleName") or target.get("name")
+    if fallback_name:
+        base["ruleName"] = str(fallback_name)
     existing_enable = target.get("enable", target.get("enabled"))
     rule = _firewall_rule_payload(dict(args), base=base)
     if "enable" not in rule and existing_enable is not None:
@@ -861,6 +899,153 @@ def _router_diagnostic(executor, args, client_context) -> Dict[str, Any]:
         "message": ("路由器网络自检已启动，路由器执行约需十几秒；完成后用户可追问“路由器网络自检结果”查看明细"
                     if task.get("state") in {"queued", "running"} else "已取得路由器网络自检结果"),
         "task": task,
+    }
+
+
+def _wait_task_snapshot(manager: Any, kind: str, timeout_seconds: float = 40.0) -> Dict[str, Any] | None:
+    """Poll a router task to its terminal state inside the request window."""
+    deadline = time.monotonic() + max(0.0, float(timeout_seconds))
+    last: Dict[str, Any] | None = None
+    while True:
+        try:
+            snapshot = manager.snapshot(kind)
+        except Exception:
+            snapshot = None
+        if isinstance(snapshot, dict):
+            last = snapshot
+            if str(snapshot.get("state") or "") not in {"", "idle", "queued", "running"}:
+                return last
+        if time.monotonic() >= deadline:
+            return last
+        time.sleep(1.5)
+
+
+def _beta_releases(result: Dict[str, Any]) -> List[Dict[str, Any]]:
+    next_data = result.get("new") if isinstance(result.get("new"), dict) else {}
+    raw = next_data.get("firmwareList")
+    if isinstance(raw, str):
+        try:
+            raw = json.loads(raw)
+        except ValueError:
+            raw = None
+    items: List[Any] = []
+    if isinstance(raw, list):
+        items = raw
+    elif isinstance(raw, dict):
+        items = [
+            {**value, "version": str(key)} if isinstance(value, dict) else {"version": str(key)}
+            for key, value in raw.items()
+        ]
+    releases: List[Dict[str, Any]] = []
+    for item in items:
+        if isinstance(item, str):
+            releases.append({"version": item.strip(), "notes": [], "size": 0, "downloadUrl": ""})
+            continue
+        if not isinstance(item, dict):
+            continue
+        version = str(item.get("version") or item.get("versionCode") or "").strip()
+        if not version:
+            continue
+        notes_value = item.get("releaseNotes") or item.get("release_notes") or item.get("notes")
+        if isinstance(notes_value, list):
+            notes = [str(note).strip() for note in notes_value if str(note).strip()]
+        elif isinstance(notes_value, str) and notes_value.strip():
+            notes = [line.strip() for line in notes_value.splitlines() if line.strip()]
+        else:
+            notes = []
+        try:
+            size = int(item.get("size") or item.get("sizeBytes") or 0)
+        except (TypeError, ValueError):
+            size = 0
+        releases.append({
+            "version": version,
+            "notes": notes,
+            "size": size,
+            "downloadUrl": str(item.get("downloadUrl") or "").strip(),
+        })
+    return releases
+
+
+def _firmware_size_text(size: int) -> str:
+    if size <= 0:
+        return ""
+    value = float(size)
+    for unit in ("B", "KB", "MB", "GB"):
+        if value < 1024 or unit == "GB":
+            return f"{int(value)} B" if unit == "B" else f"{value:.1f} {unit}"
+        value /= 1024
+    return ""
+
+
+def firmware_check_content(task: Dict[str, Any]) -> str:
+    """Format a beta-check task snapshot into readable Chinese (never JSON)."""
+    state = str(task.get("state") or "")
+    result = task.get("result") if isinstance(task.get("result"), dict) else {}
+    if state in {"", "idle", "queued", "running"}:
+        return "路由器 Beta 固件检测进行中。完成后回复「固件检测结果」，我会把版本与更新内容整理给你。"
+    if state == "timed_out":
+        return "路由器 Beta 固件检测超时：路由器长时间未返回版本信息，可稍后重试。"
+    if state == "failed":
+        return "路由器 Beta 固件检测失败：" + str(task.get("message") or "未知错误")
+    current = str(result.get("cur") or "").strip() or "未知"
+    releases = _beta_releases(result)
+    next_data = result.get("new") if isinstance(result.get("new"), dict) else {}
+    message = str(next_data.get("msg") or task.get("message") or "").strip()
+    lines = ["路由器 Beta 固件检测结果：", f"• 当前版本：{current}"]
+    if not releases:
+        lines.append("• 检测结果：已是最新版本" + (f"（{message}）" if message else ""))
+    else:
+        lines.append(f"• 发现 {len(releases)} 个可更新版本：")
+        for index, release in enumerate(releases, start=1):
+            head = f"{index}. {release['version']}"
+            size_text = _firmware_size_text(int(release.get("size") or 0))
+            if size_text:
+                head += f"（{size_text}）"
+            lines.append(head)
+            for note in release.get("notes") or []:
+                lines.append(f"   更新内容：{note}")
+            download = str(release.get("downloadUrl") or "")
+            if download:
+                lines.append(f"   下载地址：{download}")
+    if message and releases:
+        lines.append(f"• 路由器备注：{message}")
+    lines.append("固件升级会重启路由器并短暂断网。升级请到 APP「路由设置 → Beta 在线升级」页面按提示手动进行，我目前只能检测、不能替你执行升级。")
+    return "\n".join(lines)
+
+
+def _router_firmware_status(executor, args, client_context) -> Dict[str, Any]:
+    manager = _require_service(executor, "ROUTER_TASK_MANAGER")
+    try:
+        snapshot = manager.snapshot("beta")
+    except Exception as error:
+        raise _router_task_error(error, "ROUTER_FIRMWARE_STATUS_FAILED") from error
+    task = snapshot if isinstance(snapshot, dict) else {}
+    has_snapshot = bool(task.get("result")) or str(task.get("state") or "") not in {"", "idle"}
+    return {
+        "ok": True,
+        "kind": "beta",
+        "message": ("还没有检测过路由器 Beta 固件版本；说「检测固件更新」可以现在查一次"
+                    if not has_snapshot else "这是最近一次 Beta 固件检测结果。"),
+        "content": firmware_check_content(task),
+        "task": task,
+    }
+
+
+def _router_firmware_check(executor, args, client_context) -> Dict[str, Any]:
+    manager = _require_service(executor, "ROUTER_TASK_MANAGER")
+    try:
+        task = manager.start_beta()
+    except Exception as error:
+        raise _router_task_error(error, "ROUTER_FIRMWARE_CHECK_FAILED") from error
+    snapshot = _wait_task_snapshot(manager, "beta", 40.0) or task
+    state = str((snapshot or {}).get("state") or "")
+    return {
+        "ok": True,
+        "kind": "beta",
+        "message": ("路由器 Beta 固件检测已启动，通常十几秒内完成；完成后回复「固件检测结果」查看明细"
+                    if state in {"", "idle", "queued", "running"} else "路由器 Beta 固件检测完成。"),
+        "content": firmware_check_content(snapshot or {}),
+        "task": snapshot,
     }
 
 
@@ -970,6 +1155,51 @@ def _portmap_toggle(executor, args, client_context) -> Dict[str, Any]:
             "message": f"已{'启用' if enabled else '停用'}端口映射：{target.get('name')}"}
 
 
+def _assistant_confirmations_list(executor, args, client_context) -> Dict[str, Any]:
+    store = getattr(executor.hub, "ASSISTANT_AI_STORE", None)
+    if store is None:
+        raise ToolError("确认单存储未就绪", "SERVICE_UNAVAILABLE", 503)
+    try:
+        limit = int(args.get("limit") or 10)
+    except (TypeError, ValueError):
+        limit = 10
+    items: List[Dict[str, Any]] = []
+    for row in store.list_recent_confirmations(limit=limit):
+        spec = catalog.tool_spec(str(row.get("tool_id") or ""))
+        status = str(row.get("status") or "")
+        if row.get("expired"):
+            state = "已过期未执行"
+        elif status == "pending":
+            state = "等待确认"
+        elif status == "executing":
+            state = "执行中"
+        elif status == "completed":
+            state = "已确认执行成功"
+        elif status == "failed":
+            state = "已确认但执行失败"
+        else:
+            state = status or "未知"
+        item: Dict[str, Any] = {
+            "id": str(row.get("id") or "")[:8],
+            "tool": spec["name"] if spec else str(row.get("tool_id") or ""),
+            "state": state,
+            "createdAt": str(row.get("created_at") or ""),
+            "expiresAt": str(row.get("expires_at") or ""),
+        }
+        raw_result = row.get("result_json")
+        if raw_result:
+            try:
+                parsed = json.loads(raw_result)
+                message = parsed.get("message") if isinstance(parsed, dict) else ""
+                if message:
+                    item["result"] = str(message)[:160]
+            except ValueError:
+                pass
+        items.append(item)
+    return {"ok": True, "confirmations": items,
+            "message": (f"最近 {len(items)} 条确认单" if items else "没有任何确认单记录")}
+
+
 def _app_navigate(executor, args, client_context) -> Dict[str, Any]:
     return {"clientAction": {"type": "navigate", "route": args["route"]}}
 
@@ -979,6 +1209,7 @@ def _app_refresh(executor, args, client_context) -> Dict[str, Any]:
 
 
 HANDLERS: Dict[str, Any] = {
+    "assistant.confirmations.list": _assistant_confirmations_list,
     "relay.stun.rule.add": _stun_add,
     "relay.stun.rule.remove": _stun_remove,
     "relay.agent.upgrade": _agent_upgrade,
@@ -1000,6 +1231,8 @@ HANDLERS: Dict[str, Any] = {
     "router.firewall.list": _router_firewall_list,
     "router.nat.diagnostic": _router_nat_diagnostic,
     "router.diagnostic": _router_diagnostic,
+    "router.firmware.status": _router_firmware_status,
+    "router.firmware.check": _router_firmware_check,
     "network.self_check": _network_self_check,
     "router.portmap.create": _portmap_create,
     "router.portmap.remove": _portmap_remove,

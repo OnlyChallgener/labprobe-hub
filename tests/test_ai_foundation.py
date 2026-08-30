@@ -377,6 +377,7 @@ def test_notification_inbox_deduplicates_watched_events_and_daily_summary(tmp_pa
     event = {"id": 7, "type": "device_online", "name": "ANS", "mac": "AA:BB:CC:DD:EE:02", "createdAt": "2026-08-23 21:00:00"}
     service.publish_event(event)
     service.publish_event(event)
+    service.publish_event({**event, "id": 8, "type": "device_offline"})
     service.publish_daily("2026-08-23")
     service.publish_daily("2026-08-23")
     rows = store.list_notifications()
@@ -476,6 +477,40 @@ def test_incremental_chat_appends_one_turn_without_replaying_or_duplicating(tmp_
     assert [item["content"] for item in FakeProvider.calls[-1] if item.get("role") != "system"] == [
         "第一问", "回复1", "第二问",
     ]
+
+
+def test_incremental_chat_replay_is_strictly_bounded_and_starts_with_user(tmp_path, monkeypatch):
+    client = make_client(tmp_path, monkeypatch)
+    assert client.put("/api/ai/config", json={"apiKey": "sk-test"}).status_code == 200
+    store = AIStore(tmp_path / "ai.db")
+    store.create_conversation("bounded", "bounded")
+    for role, marker in (("user", "u1"), ("assistant", "a1"), ("user", "u2"), ("assistant", "a2")):
+        store.add_message("bounded", role, marker + ("x" * 8998))
+
+    class CapturingProvider:
+        calls = []
+
+        def __init__(self, *args, **kwargs):
+            pass
+
+        def chat(self, messages, tools=None):
+            from assistant.provider import ChatResult
+            self.__class__.calls.append(messages)
+            return ChatResult("ok", {"total_tokens": 1}, {"role": "assistant", "content": "ok"})
+
+    monkeypatch.setattr("assistant.api.OpenAICompatibleProvider", CapturingProvider)
+    response = client.post("/api/ai/chat", json={"conversationId": "bounded", "message": "current"})
+    assert response.status_code == 200
+    replay = [item for item in CapturingProvider.calls[-1] if item.get("role") != "system"]
+    assert sum(len(item["content"]) for item in replay) <= 24_000
+    assert replay[0]["role"] == "user" and replay[-1]["content"] == "current"
+
+
+def test_incremental_chat_rejects_a_message_larger_than_replay_budget(tmp_path, monkeypatch):
+    client = make_client(tmp_path, monkeypatch)
+    response = client.post("/api/ai/chat", json={"message": "x" * 24_001})
+    assert response.status_code == 413
+    assert "replay budget" in response.json["error"]
 
 
 def test_replace_messages_keeps_history_bounded_without_duplicates(tmp_path):
@@ -693,6 +728,27 @@ def test_stream_chat_fails_over_and_signals_reset(tmp_path, monkeypatch):
     usage = {item["config_id"]: item for item in client.get("/api/ai/usage").json["config_usage"]}
     assert usage[first["id"]]["total_tokens"] == 0
     assert usage[second["id"]]["total_tokens"] == 3
+
+
+def test_stream_error_carries_stored_user_message_identity(tmp_path, monkeypatch):
+    client = make_client(tmp_path, monkeypatch)
+    assert client.put("/api/ai/config", json={"apiKey": "sk-test"}).status_code == 200
+
+    class FailingStreamProvider:
+        def __init__(self, *args, **kwargs):
+            pass
+
+        def stream(self, messages, tools=None):
+            raise ProviderError("rate limit exceeded", 429)
+            yield  # pragma: no cover
+
+    monkeypatch.setattr("assistant.api.OpenAICompatibleProvider", FailingStreamProvider)
+    response = client.post("/api/ai/chat", json={"message": "hello", "stream": True})
+    events = [json.loads(line[len("data: "):]) for line in response.get_data(as_text=True).splitlines()
+              if line.startswith("data: ")]
+    error = events[-1]
+    assert error["type"] == "error" and error["conversationId"]
+    assert error["userMessageId"] > 0 and "rate limit exceeded" in error["error"]
 
 
 def test_legacy_test_endpoint_fails_over_but_specific_test_stays_targeted(tmp_path, monkeypatch):
@@ -1114,6 +1170,18 @@ def test_orphaned_usage_config_ids_are_reattributed(tmp_path):
     assert all(row["config_id"] is None for row in rows)
 
 
+def test_usage_backfill_prefers_first_position_for_duplicate_provider_model(tmp_path):
+    store = AIStore(tmp_path / "ai.db")
+    store.initialize()
+    first = store.create_config("first", "deepseek", "https://one", "same", "v1:a", True, None)
+    second = store.create_config("second", "deepseek", "https://two", "same", "v1:b", True, None)
+    store.add_usage("c", "deepseek", "same", {"total_tokens": 77})
+    store.initialize()
+    totals = {row["config_id"]: row["total_tokens"] for row in store.usage_by_config()}
+    assert totals[first["id"]] == 77
+    assert totals[second["id"]] == 0
+
+
 def test_notifications_stream_emits_inbox_rows(tmp_path, monkeypatch):
     client = make_client(tmp_path, monkeypatch)
     store = AIStore(tmp_path / "ai.db")
@@ -1148,3 +1216,37 @@ def test_task_completion_publishes_notification_once(tmp_path, monkeypatch):
     task_rows = [row for row in rows if row["kind"] == "task"]
     assert len(task_rows) == 1
     assert "NAT 检测完成" in task_rows[0]["title"]
+
+
+def test_usage_known_requires_positive_tokens():
+    from assistant.storage import usage_known
+
+    assert usage_known({}) is False
+    assert usage_known({"prompt_tokens": 0, "completion_tokens": 0, "total_tokens": 0}) is False
+    assert usage_known({"prompt_tokens": 12, "completion_tokens": 0, "total_tokens": 12}) is True
+
+
+def test_single_message_delete_keeps_usage_intact(tmp_path, monkeypatch):
+    client = make_client(tmp_path, monkeypatch)
+    store = AIStore(tmp_path / "ai.db")
+    store.initialize()
+    store.add_usage("conv-1", "hy3", "hy3", {"total_tokens": 500})
+    store.create_conversation("conv-1", title="t")
+    kept_id = store.add_message("conv-1", "user", "保留")
+    gone_id = store.add_message("conv-1", "assistant", "待删除")
+    assert client.delete(f"/api/ai/conversations/conv-1/messages/{gone_id}").status_code == 200
+    assert client.delete(f"/api/ai/conversations/conv-1/messages/{gone_id}").status_code == 404
+    rows = client.get("/api/ai/conversations/conv-1/messages").json["messages"]
+    assert [row["id"] for row in rows] == [kept_id]
+    assert store.usage_summary()["total_tokens"] == 500
+
+
+def test_confirmations_list_reports_lifecycle(tmp_path, monkeypatch):
+    hub_runtime = fake_hub(tmp_path)
+    client = make_client(tmp_path, monkeypatch, hub_runtime=hub_runtime)
+    store = hub_runtime.ASSISTANT_AI_STORE
+    store.create_conversation("conv-x", title="t")
+    store.create_confirmation("conf-1", "agent.cleanup", {}, {"executor": "hub"}, "2000-01-01T00:00:00+00:00",
+                              conversation_id="conv-x")
+    rows = store.list_recent_confirmations(limit=5)
+    assert rows[0]["expired"] is True

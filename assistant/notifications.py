@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import threading
+import time
 from datetime import datetime, timedelta, timezone
 from typing import Any, Dict
 
@@ -24,6 +25,7 @@ class AssistantNotificationService:
         self.logger = logger
         self.stop_event = threading.Event()
         self._task_states: Dict[str, str] = {}
+        self._recent_device_events: Dict[str, float] = {}
         self.thread = threading.Thread(target=self._run, name="assistant-notifications", daemon=True)
 
     def _is_watched(self, event: Dict[str, Any]) -> bool:
@@ -44,6 +46,14 @@ class AssistantNotificationService:
             return
         if not self._is_watched(event):
             return
+        # 抖动保护：同一设备 120 秒内只投递第一次状态变化，避免
+        # online/offline 快速交替时连续刷屏。
+        identity = self.hub.norm_mac(event.get("mac")) or str(event.get("name") or "").strip().lower()
+        now_ts = time.monotonic()
+        previous_ts = self._recent_device_events.get(identity)
+        if previous_ts is not None and now_ts - previous_ts < 120:
+            return
+        self._recent_device_events[identity] = now_ts
         online = event.get("type") == "device_online"
         name = str(event.get("name") or event.get("mac") or "关注设备")
         at = str(event.get("createdAt") or event.get("time") or self.hub.now_str())

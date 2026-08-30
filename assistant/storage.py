@@ -14,6 +14,15 @@ def utc_now() -> str:
     return datetime.now(timezone.utc).isoformat(timespec="seconds")
 
 
+def usage_known(usage: Dict[str, Any]) -> bool:
+    """A usage frame counts as known only when it reports positive tokens;
+    some providers stream all-zero frames which would fake the usage page."""
+    return any(
+        isinstance(value, (int, float)) and not isinstance(value, bool) and value > 0
+        for value in usage.values()
+    )
+
+
 class AIStore:
     # Bounded growth for chat history, audit rows and notifications. Usage rows
     # are never pruned: they are the cumulative token audit trail and ~100
@@ -176,9 +185,10 @@ class AIStore:
             ).fetchall()
             if not configs:
                 return
-            by_pair = {(row["provider"], row["model"]): int(row["id"]) for row in configs}
+            by_pair: Dict[tuple[str, str], int] = {}
             by_model: Dict[str, int] = {}
             for row in configs:
+                by_pair.setdefault((str(row["provider"]), str(row["model"])), int(row["id"]))
                 by_model.setdefault(str(row["model"]), int(row["id"]))
             unattributed = conn.execute(
                 "SELECT provider, model FROM ai_usage WHERE config_id IS NULL GROUP BY provider, model"
@@ -408,18 +418,20 @@ class AIStore:
     def get_messages(self, conversation_id: str, limit: int = 40) -> list[Dict[str, Any]]:
         with self._connect() as conn:
             rows = conn.execute(
-                "SELECT role, content, created_at FROM messages "
+                "SELECT id, role, content, created_at FROM messages "
                 "WHERE conversation_id=? ORDER BY id DESC LIMIT ?",
                 (conversation_id, int(limit)),
             ).fetchall()
         return [dict(row) for row in reversed(rows)]
 
-    def add_message(self, conversation_id: str, role: str, content: str) -> None:
+    def add_message(self, conversation_id: str, role: str, content: str) -> int:
         with self._connect() as conn:
-            conn.execute("INSERT INTO messages(conversation_id,role,content,created_at) VALUES(?,?,?,?)",
-                         (conversation_id, role, content, utc_now()))
+            cursor = conn.execute("INSERT INTO messages(conversation_id,role,content,created_at) VALUES(?,?,?,?)",
+                                  (conversation_id, role, content, utc_now()))
+            message_id = int(cursor.lastrowid)
             conn.execute("UPDATE conversations SET updated_at=? WHERE id=?", (utc_now(), conversation_id))
         self.enforce_conversation_storage(protected_conversation_id=conversation_id)
+        return message_id
 
     def replace_messages(self, conversation_id: str, messages: List[Dict[str, str]]) -> None:
         """Make stored history match exactly what the client sent.
@@ -444,13 +456,17 @@ class AIStore:
         self.enforce_conversation_storage(protected_conversation_id=conversation_id)
 
     def add_usage(self, conversation_id: str, provider: str, model: str, usage: Dict[str, Any],
-                  status: str = "completed", config_id: Optional[int] = None) -> None:
+                  status: str = "completed", config_id: Optional[int] = None,
+                  error: Optional[str] = None) -> None:
+        payload = dict(usage) if usage else {}
+        if error:
+            payload["error"] = str(error)[:300]
         with self._connect() as conn:
             conn.execute("""INSERT INTO ai_usage(conversation_id,provider,model,prompt_tokens,completion_tokens,total_tokens,status,usage_known,usage_json,cache_hit_tokens,cache_miss_tokens,created_at,config_id)
                 VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?)""", (conversation_id, provider, model,
                 int(usage.get("prompt_tokens") or 0), int(usage.get("completion_tokens") or 0),
-                int(usage.get("total_tokens") or 0), status, int(bool(usage)),
-                json.dumps(usage, separators=(",", ":")) if usage else None,
+                int(usage.get("total_tokens") or 0), status, int(usage_known(usage)),
+                json.dumps(payload, separators=(",", ":"), ensure_ascii=False) if payload else None,
                 int(usage.get("cache_hit_tokens") or 0), int(usage.get("cache_miss_tokens") or 0),
                 utc_now(), config_id))
         self._maybe_prune()
@@ -713,6 +729,40 @@ class AIStore:
         result_row["arguments"] = json.loads(result_row.pop("arguments_json"))
         result_row["preview"] = preview
         return result_row
+
+    def list_recent_confirmations(self, limit: int = 10) -> list[Dict[str, Any]]:
+        """Recent confirmation cards with an explicit expired flag, for the
+        assistant to verify whether historical confirmation requests ever ran."""
+        bounded = max(1, min(int(limit), 20))
+        with self._connect() as conn:
+            rows = conn.execute(
+                "SELECT id, tool_id, status, expires_at, created_at, confirmed_at, result_json "
+                "FROM ai_tool_confirmations ORDER BY created_at DESC, id DESC LIMIT ?",
+                (bounded,),
+            ).fetchall()
+        now = utc_now()
+        result: List[Dict[str, Any]] = []
+        for row in rows:
+            item = dict(row)
+            item["expired"] = (
+                str(item.get("status") or "") in ("pending", "executing")
+                and str(item.get("expires_at") or "") < now
+            )
+            result.append(item)
+        return result
+
+    def delete_message(self, conversation_id: str, message_id: int) -> bool:
+        clean_id = str(conversation_id or "").strip()
+        if not clean_id:
+            return False
+        with self._connect() as conn:
+            deleted = conn.execute(
+                "DELETE FROM messages WHERE id=? AND conversation_id=?",
+                (int(message_id), clean_id),
+            ).rowcount
+        if deleted:
+            self.enforce_conversation_storage(protected_conversation_id=clean_id)
+        return bool(deleted)
 
     def add_notification(self, kind: str, title: str, content: str, dedupe_key: str,
                          payload: Optional[Dict[str, Any]] = None) -> Optional[int]:

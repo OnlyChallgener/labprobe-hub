@@ -86,6 +86,32 @@ class ChatProvider(Protocol):
     def stream(self, messages: List[Dict[str, Any]]) -> Iterator[Dict[str, Any]]: ...
 
 
+def _provider_detail(response) -> str:
+    """Extract a short, key-safe snippet of an upstream error response.
+
+    Without this the actual vendor complaint (unsupported stream+tools,
+    rate limit, quota) is discarded and provider failures are undebuggable.
+    """
+    try:
+        body = (response.text or "").strip()
+    except Exception:
+        return ""
+    body = body.replace("\n", " ")
+    try:
+        parsed = json.loads(body)
+        if isinstance(parsed, dict):
+            message = parsed.get("error") or parsed.get("message") or ""
+            if isinstance(message, dict):
+                message = message.get("message") or ""
+            if message:
+                return str(message)[:200]
+    except (ValueError, AttributeError):
+        pass
+    if body.lower().startswith(("<!doctype", "<html")):
+        return ""
+    return body[:200]
+
+
 class OpenAICompatibleProvider:
     def __init__(self, base_url: str, api_key: str, model: str, session: Any = requests):
         self.base_url = base_url.rstrip("/")
@@ -107,11 +133,14 @@ class OpenAICompatibleProvider:
                 headers={"Authorization": "Bearer " + self.api_key, "Content-Type": "application/json"},
                 timeout=(5, 90), stream=stream)
         except requests.RequestException as exc:
-            raise ProviderError("AI provider is unavailable") from exc
+            raise ProviderError(f"AI provider is unavailable: {str(exc)[:150]}") from exc
         if not response.ok:
             status_code = response.status_code if response.status_code < 500 else 502
+            detail = _provider_detail(response)
             response.close()
-            raise ProviderError("AI provider rejected the request", status_code)
+            message = "AI provider rejected the request" if not detail else \
+                f"AI provider HTTP {response.status_code}: {detail}"
+            raise ProviderError(message, status_code)
         return response
 
     def chat(self, messages: List[Dict[str, Any]],
@@ -139,6 +168,6 @@ class OpenAICompatibleProvider:
                 if chunk is not None:
                     yield chunk
         except requests.RequestException as exc:
-            raise ProviderError("AI provider stream was interrupted") from exc
+            raise ProviderError(f"AI provider stream was interrupted: {str(exc)[:150]}") from exc
         finally:
             response.close()

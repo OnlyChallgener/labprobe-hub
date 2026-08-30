@@ -2,6 +2,11 @@
 
 ## 0.12.0 / LabRelay 0.2.30
 
+- **上游错误可见**：Provider 报错时提取上游响应摘要（限流/配额/不支持 stream+tools 等真实原因），进入聊天气泡、SSE error 事件与 `ai_usage` 失败记录，不再只显示“AI provider rejected the request”。
+- **确认单可核实**：新增 `assistant.confirmations.list` 只读工具（等待/成功/失败/已过期）；提示词硬规则——无〔操作记录〕的历史确认请求一律视为已过期，必须先核实实际状态，杜绝“仍在等待确认”式叨叨。
+- **路由器 Beta 固件工具**：新增 `router.firmware.status/check`，检测结果以中文排版返回（当前版本、可用版本、更新内容、大小、下载地址）；不输出 JSON，不把 Agent 版本当固件版本。
+- **单条消息删除**：`DELETE /api/ai/conversations/{id}/messages/{id}`；chat 响应携带 `messageId/userMessageId`；删除不影响已记录的 Token 用量。
+- **回放预算**：每轮对话回放上限 24k 字符（此前随历史无限增长，单轮输入 15-23k Token）；全零 usage 帧按“模型未上报”处理；设备上下线 120 秒抖动降噪。
 - **确认结果回传会话**：工具确认的执行结果以〔操作记录〕写入对话转录，APP 增量模式下模型不再对已完成的操作重复要求确认（此前会导致重复下发 Agent 清理/升级指令）；批量确认与 APP 本机执行结果同样回传。
 - **写操作结果可读**：STUN/端口映射/原生映射/UPnP/防火墙等写工具返回人话 `message`，APP 确认执行后显示具体改动而非统一“操作已完成”。
 - **用量归属修复**：删除并重建 API 配置遗留的孤儿 usage 记录，在启动时与删除配置时按 provider+model 重新归因；模型分布与配置额度两张卡对齐，额度余量不再偏乐观。
