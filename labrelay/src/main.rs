@@ -30,9 +30,11 @@ const DEFAULT_PID: &str = "/tmp/labrelay.pid";
 const DEFAULT_UDP_STUN_SERVER: &str = "stun.cloudflare.com:3478";
 const DEFAULT_TCP_STUN_SERVER: &str = "stunserver2025.stunprotocol.org:3478";
 const LEGACY_TCP_STUN_SERVER: &str = DEFAULT_UDP_STUN_SERVER;
-const STUN_FAST_RETRY_LIMIT: u32 = 6;
+const STUN_TCP_KEEPALIVE_INTERVAL: Duration = Duration::from_secs(10);
+const STUN_MAPPING_FAILURE_GRACE: Duration = Duration::from_secs(90);
+const STUN_FAST_RETRY_LIMIT: u32 = 12;
 const STUN_FAST_RETRY_DELAY: Duration = Duration::from_secs(5);
-const STUN_RECOVERY_PROBE_DELAY: Duration = Duration::from_secs(30);
+const STUN_RECOVERY_PROBE_DELAY: Duration = Duration::from_secs(15);
 
 fn default_true() -> bool {
     true
@@ -847,9 +849,15 @@ async fn mark_stun_mapping(shared: &Arc<RuntimeShared>, endpoint: SocketAddr) {
 
 async fn mark_stun_transient_failure(shared: &Arc<RuntimeShared>, message: String) {
     let mut base = shared.base.write().await;
-    if base.state != "expired" && base.state != "stopped" {
-        // Keep the last known endpoint as history, but `mapping` makes it
-        // explicitly non-ready until a fresh Binding response arrives.
+    let mapping_is_recent = base.state == "mapped"
+        && !base.public_endpoint.is_empty()
+        && base.mapping_updated_at.is_some_and(|updated_at| {
+            now_epoch().saturating_sub(updated_at) <= STUN_MAPPING_FAILURE_GRACE.as_secs()
+        });
+    if !mapping_is_recent && base.state != "expired" && base.state != "stopped" {
+        // One failed probe does not invalidate a recently confirmed mapping.
+        // Only downgrade after the recovery window has elapsed, which keeps
+        // transient carrier/NAT resets from making the APP card oscillate.
         base.state = "mapping".to_string();
     }
     base.last_error = message;
@@ -958,7 +966,17 @@ async fn run_tcp_stun_keepalive(
                 None => prepare_tcp_stun_socket(rule.listen_port)?,
             };
             let mut stream = connect_prepared_tcp_stun(socket, server).await?;
-            let mut tick = tokio::time::interval(Duration::from_secs(20));
+            // RFC 8489 recommends an abortive close before reopening an idle
+            // TCP STUN flow that has failed.  Linger zero prevents the old
+            // four-tuple from trapping the fixed local channel port in
+            // TIME_WAIT and blocking all later recovery attempts.
+            stream
+                .set_zero_linger()
+                .context("设置 STUN TCP 快速重连失败")?;
+            stream
+                .set_nodelay(true)
+                .context("设置 STUN TCP 低延迟模式失败")?;
+            let mut tick = tokio::time::interval(STUN_TCP_KEEPALIVE_INTERVAL);
             tick.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
             loop {
                 tokio::select! {
@@ -992,7 +1010,7 @@ async fn run_tcp_stun_keepalive(
         }.await;
         if let Err(error) = result {
             consecutive_failures = consecutive_failures.saturating_add(1);
-            mark_stun_transient_failure(&shared, error.to_string()).await;
+            mark_stun_transient_failure(&shared, format!("{error:#}")).await;
         }
         let retry_delay = stun_retry_delay(consecutive_failures);
         tokio::select! {
@@ -2560,7 +2578,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn transient_stun_failure_keeps_history_but_marks_endpoint_not_ready() {
+    async fn one_transient_stun_failure_keeps_a_recent_mapping_ready() {
         let rule = Rule {
             id: "stun-history".into(),
             name: "STUN history".into(),
@@ -2572,18 +2590,44 @@ mod tests {
         snapshot.public_endpoint = "198.51.100.8:20001".into();
         snapshot.public_ip = "198.51.100.8".into();
         snapshot.public_port = 20001;
-        snapshot.mapping_updated_at = Some(123);
+        snapshot.mapping_updated_at = Some(now_epoch());
         let shared = Arc::new(RuntimeShared::new(snapshot));
 
         mark_stun_transient_failure(&shared, "STUN TCP 响应超时".into()).await;
 
         let current = shared.snapshot().await;
-        assert_eq!(current.state, "mapping");
+        assert_eq!(current.state, "mapped");
         assert_eq!(current.public_endpoint, "198.51.100.8:20001");
         assert_eq!(current.public_ip, "198.51.100.8");
         assert_eq!(current.public_port, 20001);
-        assert_eq!(current.mapping_updated_at, Some(123));
+        assert!(current.mapping_updated_at.is_some());
         assert_eq!(current.last_error, "STUN TCP 响应超时");
+    }
+
+    #[tokio::test]
+    async fn repeated_stun_failure_downgrades_a_stale_mapping() {
+        let rule = Rule {
+            id: "stun-stale".into(),
+            name: "STUN stale".into(),
+            kind: "stun".into(),
+            ..Rule::default()
+        };
+        let mut snapshot = RuntimeSnapshot::stopped(&rule);
+        snapshot.state = "mapped".into();
+        snapshot.public_endpoint = "198.51.100.8:20001".into();
+        snapshot.public_ip = "198.51.100.8".into();
+        snapshot.public_port = 20001;
+        snapshot.mapping_updated_at = Some(
+            now_epoch().saturating_sub(STUN_MAPPING_FAILURE_GRACE.as_secs() + 1),
+        );
+        let shared = Arc::new(RuntimeShared::new(snapshot));
+
+        mark_stun_transient_failure(&shared, "STUN TCP 连接失败".into()).await;
+
+        let current = shared.snapshot().await;
+        assert_eq!(current.state, "mapping");
+        assert_eq!(current.public_endpoint, "198.51.100.8:20001");
+        assert_eq!(current.last_error, "STUN TCP 连接失败");
     }
 
     #[tokio::test]
@@ -2616,11 +2660,13 @@ mod tests {
 
     #[test]
     fn tcp_stun_fast_retries_are_bounded_before_slow_recovery_probes() {
+        assert_eq!(STUN_TCP_KEEPALIVE_INTERVAL, Duration::from_secs(10));
+        assert_eq!(STUN_MAPPING_FAILURE_GRACE, Duration::from_secs(90));
         assert_eq!(stun_retry_delay(1), Duration::from_secs(5));
         assert_eq!(stun_retry_delay(STUN_FAST_RETRY_LIMIT), Duration::from_secs(5));
         assert_eq!(
             stun_retry_delay(STUN_FAST_RETRY_LIMIT + 1),
-            Duration::from_secs(30)
+            Duration::from_secs(15)
         );
     }
 
