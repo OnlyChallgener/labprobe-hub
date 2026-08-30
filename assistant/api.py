@@ -703,9 +703,15 @@ def create_ai_blueprint(*, check_app_token: Callable[[], bool], db_path, logger,
         def generate():
             cursor = after
             last_heartbeat = time.monotonic()
+            started = last_heartbeat
             yield ": connected\n\n"
-            while True:
-                for row in store.list_notifications(after_id=cursor, limit=50):
+            # 长流有寿命上限：到期正常关闭，APP 会带退避重连。
+            while time.monotonic() - started < 240:
+                try:
+                    rows = store.list_notifications(after_id=cursor, limit=50)
+                except Exception:
+                    rows = []
+                for row in rows:
                     cursor = int(row["id"])
                     yield "data: " + json.dumps({"type": "notification", "notification": row},
                                                 ensure_ascii=False, separators=(",", ":")) + "\n\n"
@@ -1022,7 +1028,9 @@ def create_ai_blueprint(*, check_app_token: Callable[[], bool], db_path, logger,
                 "clientActions": [],
             }
             return sse_done(payload) if wants_stream else jsonify(payload)
-        config_rows = store.list_configs(enabled_only=True)
+        # 停用自动切换（产品决定）：对话只使用第一个启用的配置；不可用时把
+        # 模型名与真实原因返回给 APP 提醒用户切换，而不是悄悄换下一个继续烧。
+        config_rows = store.list_configs(enabled_only=True)[:1]
         if not config_rows:
             return jsonify({"error": "AI provider is not configured"}), 409
         internal_messages: List[Dict[str, Any]] = list(messages)
@@ -1033,22 +1041,40 @@ def create_ai_blueprint(*, check_app_token: Callable[[], bool], db_path, logger,
         active_row: Dict[str, Any] | None = None
         active_provider: Any = None
         last_provider_error: ProviderError | None = None
+        last_failed_model: str | None = None
+
+        def config_model_label(row: Dict[str, Any]) -> str:
+            model = str(row.get("model") or "当前模型")
+            display_name = str(row.get("name") or row.get("provider") or "").strip()
+            if not display_name or display_name == model:
+                return model
+            return f"{model}（{display_name}）"
+
+        def model_unavailable_error() -> ProviderError:
+            if last_provider_error is None:
+                return ProviderError("AI provider is unavailable")
+            detail = str(last_provider_error)
+            status = last_provider_error.status_code
+            model = last_failed_model or "当前模型"
+            return ProviderError(
+                f"模型 {model} 不可用：{detail}。自动切换已停用，请在 AI 设置中更换模型或修复后重试",
+                status,
+            )
 
         def next_provider():
-            nonlocal config_index, active_row, active_provider, last_provider_error
+            nonlocal config_index, active_row, active_provider, last_provider_error, last_failed_model
             while True:
                 if active_provider is None:
                     config_index += 1
                     if config_index >= len(config_rows):
-                        raise last_provider_error or ProviderError("AI provider is unavailable")
+                        raise model_unavailable_error()
                     active_row = config_rows[config_index]
                     try:
                         key = decrypt_secret(active_row["api_key_ciphertext"])
-                    except MasterKeyUnavailable as exc:
-                        raise ProviderError(str(exc), 503) from exc
-                    except ValueError as exc:
+                    except (MasterKeyUnavailable, ValueError) as exc:
                         store.add_usage(conversation_id, active_row["provider"], active_row["model"], {},
                                         status="failed", config_id=active_row["id"], error=str(exc))
+                        last_failed_model = config_model_label(active_row)
                         active_row = None
                         last_provider_error = ProviderError(str(exc), 503)
                         continue
@@ -1058,9 +1084,10 @@ def create_ai_blueprint(*, check_app_token: Callable[[], bool], db_path, logger,
                 return active_row, active_provider
 
         def fail_active_provider(exc: ProviderError) -> None:
-            nonlocal accumulated_usage, active_row, active_provider, last_provider_error
+            nonlocal accumulated_usage, active_row, active_provider, last_provider_error, last_failed_model
             last_provider_error = exc
             if active_row is not None:
+                last_failed_model = config_model_label(active_row)
                 store.add_usage(
                     conversation_id, active_row["provider"], active_row["model"], accumulated_usage,
                     status="failed", config_id=active_row["id"], error=str(exc),

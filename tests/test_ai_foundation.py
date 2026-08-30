@@ -626,16 +626,16 @@ def test_multi_config_crud_masks_keys_and_hunyuan_has_new_default(tmp_path, monk
     assert len(client.get("/api/ai/config").json["configs"]) == 1
 
 
-def test_chat_fails_over_once_and_records_actual_config(tmp_path, monkeypatch):
+def test_chat_stays_on_primary_config_and_reports_model_failure(tmp_path, monkeypatch):
     client = make_client(tmp_path, monkeypatch)
-    first = client.put("/api/ai/config", json={
+    client.put("/api/ai/config", json={
         "apiKey": "sk-a", "name": "A", "baseUrl": "https://fail.example/v1",
         "model": "model-a", "tokenQuota": 10,
-    }).json
-    second = client.post("/api/ai/config", json={
+    })
+    client.post("/api/ai/config", json={
         "apiKey": "sk-b", "name": "B", "baseUrl": "https://ok.example/v1",
         "model": "model-b",
-    }).json
+    })
     calls = []
 
     class FakeProvider:
@@ -644,27 +644,22 @@ def test_chat_fails_over_once_and_records_actual_config(tmp_path, monkeypatch):
 
         def chat(self, messages, tools=None):
             calls.append(self.base_url)
-            if "fail.example" in self.base_url:
-                raise ProviderError("temporary provider failure", 429)
-            from assistant.provider import ChatResult
-            return ChatResult("备用配置成功", {"prompt_tokens": 3, "completion_tokens": 2, "total_tokens": 5})
+            raise ProviderError("temporary provider failure", 429)
 
     monkeypatch.setattr("assistant.api.OpenAICompatibleProvider", FakeProvider)
     response = client.post("/api/ai/chat", json={"message": "你好"})
-    assert response.status_code == 200
-    assert response.json["configId"] == second["id"]
-    assert response.json["provider"] == second["provider"]
-    assert response.json["model"] == "model-b"
-    assert calls == ["https://fail.example/v1", "https://ok.example/v1"]
+    assert response.status_code == 429
+    assert calls == ["https://fail.example/v1"]
+    error_text = response.json["error"]
+    assert "模型 model-a（A）" in error_text and "temporary provider failure" in error_text
+    assert "自动切换已停用" in error_text
     usage = client.get("/api/ai/usage").json["config_usage"]
-    by_id = {item["config_id"]: item for item in usage}
-    assert by_id[first["id"]]["total_tokens"] == 0
-    assert by_id[first["id"]]["used_percent"] == 0.0
-    assert by_id[second["id"]]["total_tokens"] == 5
-    assert by_id[second["id"]]["quota_status"] == "unknown"
+    by_name = {item["name"]: item for item in usage}
+    assert by_name["A"]["total_tokens"] == 0
+    assert by_name["B"]["total_tokens"] == 0
 
 
-def test_chat_skips_disabled_config_and_never_retries_exhausted_pool(tmp_path, monkeypatch):
+def test_chat_uses_first_enabled_config_and_never_auto_switches(tmp_path, monkeypatch):
     client = make_client(tmp_path, monkeypatch)
     client.put("/api/ai/config", json={
         "apiKey": "sk-disabled", "baseUrl": "https://disabled.example/v1", "enabled": False,
@@ -688,17 +683,20 @@ def test_chat_skips_disabled_config_and_never_retries_exhausted_pool(tmp_path, m
     monkeypatch.setattr("assistant.api.OpenAICompatibleProvider", FailingProvider)
     response = client.post("/api/ai/chat", json={"message": "hello"})
     assert response.status_code == 502
-    assert calls == ["https://a.example/v1", "https://b.example/v1"]
+    # 停用自动切换：只尝试第一个启用的配置，失败时把模型名与原因带回给 APP。
+    assert calls == ["https://a.example/v1"]
+    error_text = response.json["error"]
+    assert "模型 a" in error_text and "不可用" in error_text and "自动切换已停用" in error_text
 
 
-def test_stream_chat_fails_over_and_signals_reset(tmp_path, monkeypatch):
+def test_stream_chat_reports_model_failure_without_failover(tmp_path, monkeypatch):
     client = make_client(tmp_path, monkeypatch)
     first = client.put("/api/ai/config", json={
         "apiKey": "sk-a", "baseUrl": "https://a.example/v1", "model": "a",
     }).json
-    second = client.post("/api/ai/config", json={
+    client.post("/api/ai/config", json={
         "apiKey": "sk-b", "baseUrl": "https://b.example/v1", "model": "b",
-    }).json
+    })
     calls = []
 
     class StreamProvider:
@@ -707,27 +705,22 @@ def test_stream_chat_fails_over_and_signals_reset(tmp_path, monkeypatch):
 
         def stream(self, messages, tools=None):
             calls.append(self.base_url)
-            if "a.example" in self.base_url:
-                yield {"choices": [{"delta": {"content": "残句"}}]}
-                raise ProviderError("stream unavailable", 502)
-            yield {"choices": [{"delta": {"content": "备用流"}}]}
-            yield {"choices": [], "usage": {"total_tokens": 3}}
+            yield {"choices": [{"delta": {"content": "残句"}}]}
+            raise ProviderError("stream unavailable", 502)
 
     monkeypatch.setattr("assistant.api.OpenAICompatibleProvider", StreamProvider)
     response = client.post("/api/ai/chat", json={"message": "hello", "stream": True})
     assert response.status_code == 200
     body = response.get_data(as_text=True)
-    assert "备用流" in body
     events = [json.loads(line[len("data: "):]) for line in body.splitlines() if line.startswith("data: ")]
     kinds = [event["type"] for event in events]
-    assert "reset" in kinds, kinds
-    assert kinds.index("reset") < kinds.index("delta") + 1 or kinds[0] == "delta"
-    done = events[-1]
-    assert done["type"] == "done" and done["message"]["content"] == "备用流"
-    assert calls == ["https://a.example/v1", "https://b.example/v1"]
+    assert "reset" in kinds and "delta" in kinds
+    last = events[-1]
+    assert last["type"] == "error" and "模型 a" in last["error"] and "不可用" in last["error"]
+    # 不自动切换：第二个配置从未被调用。
+    assert calls == ["https://a.example/v1"]
     usage = {item["config_id"]: item for item in client.get("/api/ai/usage").json["config_usage"]}
     assert usage[first["id"]]["total_tokens"] == 0
-    assert usage[second["id"]]["total_tokens"] == 3
 
 
 def test_stream_error_carries_stored_user_message_identity(tmp_path, monkeypatch):
@@ -735,20 +728,48 @@ def test_stream_error_carries_stored_user_message_identity(tmp_path, monkeypatch
     assert client.put("/api/ai/config", json={"apiKey": "sk-test"}).status_code == 200
 
     class FailingStreamProvider:
-        def __init__(self, *args, **kwargs):
+        def __init__(self, *_args):
             pass
 
         def stream(self, messages, tools=None):
             raise ProviderError("rate limit exceeded", 429)
-            yield  # pragma: no cover
+            yield  # pragma: no cover - keeps this method a generator
 
     monkeypatch.setattr("assistant.api.OpenAICompatibleProvider", FailingStreamProvider)
     response = client.post("/api/ai/chat", json={"message": "hello", "stream": True})
-    events = [json.loads(line[len("data: "):]) for line in response.get_data(as_text=True).splitlines()
-              if line.startswith("data: ")]
+    assert response.status_code == 200
+    events = [
+        json.loads(line[len("data: "):])
+        for line in response.get_data(as_text=True).splitlines()
+        if line.startswith("data: ")
+    ]
     error = events[-1]
-    assert error["type"] == "error" and error["conversationId"]
-    assert error["userMessageId"] > 0 and "rate limit exceeded" in error["error"]
+    assert error["type"] == "error"
+    assert error["conversationId"]
+    assert error["userMessageId"] > 0
+    assert "rate limit exceeded" in error["error"]
+
+
+def test_master_key_failure_reports_config_name_and_records_usage(tmp_path, monkeypatch):
+    client = make_client(tmp_path, monkeypatch)
+    assert client.put("/api/ai/config", json={
+        "apiKey": "sk-test", "name": "混元", "provider": "hunyuan", "model": "hy3",
+    }).status_code == 200
+    monkeypatch.delenv("LABPROBE_AI_MASTER_KEY", raising=False)
+    monkeypatch.delenv("APP_TOKEN", raising=False)
+
+    response = client.post("/api/ai/chat", json={"message": "hello"})
+    assert response.status_code == 503
+    assert "模型 hy3（混元）" in response.json["error"]
+    assert "自动切换已停用" in response.json["error"]
+
+    store = AIStore(tmp_path / "ai.db")
+    with store._connect() as conn:
+        row = conn.execute(
+            "SELECT status, usage_json FROM ai_usage ORDER BY id DESC LIMIT 1"
+        ).fetchone()
+    assert row["status"] == "failed"
+    assert "Hub 缺少可用于加密 API Key 的 APP_TOKEN" in row["usage_json"]
 
 
 def test_legacy_test_endpoint_fails_over_but_specific_test_stays_targeted(tmp_path, monkeypatch):

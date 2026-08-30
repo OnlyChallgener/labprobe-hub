@@ -4623,7 +4623,9 @@ def command_line() -> int:
         LOGGER.warning("configuration: %s", warning)
     for error in report["errors"]:
         LOGGER.error("configuration: %s", error)
-    app.run(host="0.0.0.0", port=PORT)
+    # Flask 3 enables threaded serving by default. Keep it explicit because
+    # notification SSE and slow router diagnostics require concurrent requests.
+    app.run(host="0.0.0.0", port=PORT, threaded=True)
     return 0
 
 
