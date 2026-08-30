@@ -40,6 +40,8 @@ TOOL_SYSTEM_PROMPT = (
     "绝不能声称操作已经完成。"
     "用户问「路由器固件 / Beta 固件」时调用 router.firmware.status 或 router.firmware.check，"
     "不要把 Agent 版本当固件版本回答；固件检测结果用 content 字段的中文内容组织回复，不要输出 JSON。"
+    "用户说‘今天/昨天/每日记录’时调用 daily.summary；相对日期不要按模型或设备本地时钟猜测，"
+    "省略 date 让工具按 Hub 的北京时间解析，并在回复中使用工具返回的 date。"
     "确认后的执行结果会以〔操作记录〕消息出现在对话中；对话里没有〔操作记录〕的历史确认请求"
     "一律视为已过期、从未执行。用户提起这类旧请求时，先用 assistant.confirmations.list 或对应"
     "状态工具（agent.cleanup.status、stun.rules.list、router.portmap.list 等）核实实际状态再如实"
@@ -546,6 +548,11 @@ def create_ai_blueprint(*, check_app_token: Callable[[], bool], db_path, logger,
         local_http = parsed.scheme == "http" and parsed.hostname in {"localhost", "127.0.0.1", "::1"}
         if not safe_url or ((parsed.scheme != "https" and not local_http) or not parsed.netloc):
             raise ValueError("stored AI provider base URL is invalid")
+        # Tencent's legacy OpenAI-compatible Hunyuan endpoint is being
+        # migrated to TokenHub. Existing configurations are moved lazily on
+        # first read/use so users do not have to re-enter their API key.
+        if parsed.hostname == "api.hunyuan.cloud.tencent.com":
+            safe_url = TENCENT_HUNYUAN_BASE_URL
         if safe_url != old_url:
             store.migrate_config_base_url(int(row["id"]), old_url, safe_url)
             row["base_url"] = safe_url
@@ -579,6 +586,8 @@ def create_ai_blueprint(*, check_app_token: Callable[[], bool], db_path, logger,
                 "enabled": bool(row["enabled"]) if row else False,
                 "tokenQuota": row["model_quota_tokens"] if row else None,
                 "modelQuotaTokens": row["model_quota_tokens"] if row else None,
+                "manualTotalTokens": row.get("manual_total_tokens") if row else None,
+                "manualCalibratedAt": row.get("manual_calibrated_at") if row else None,
                 "apiKey": "configured" if key_status == "configured" else None,
                 "apiKeyStatus": key_status}
 
@@ -1484,6 +1493,7 @@ def create_ai_blueprint(*, check_app_token: Callable[[], bool], db_path, logger,
                 try:
                     for _ in range(4):
                         content_parts: List[str] = []
+                        reasoning_parts: List[str] = []
                         tool_acc: Dict[str, Dict[str, str]] = {}
                         round_usage: Dict[str, int] = {}
                         while True:
@@ -1506,27 +1516,40 @@ def create_ai_blueprint(*, check_app_token: Callable[[], bool], db_path, logger,
                                         if text:
                                             content_parts.append(str(text))
                                             yield stream_event({"type": "delta", "content": str(text)})
+                                        reasoning = delta.get("reasoning_content")
+                                        if reasoning:
+                                            reasoning_parts.append(str(reasoning))
                                         accumulate_tool_call_fragment(tool_acc, delta.get("tool_calls"))
                                 break
                             except ProviderError as exc:
                                 merge_usage(accumulated_usage, round_usage)
                                 round_usage.clear()
                                 fail_active_provider(exc)
-                                if content_parts:
-                                    # Partial text of the failed attempt is already on the
-                                    # wire; tell the client to clear it before the retry.
+                                if content_parts or reasoning_parts or tool_acc:
+                                    # Partial text/reasoning/tool fragments of the failed
+                                    # attempt are already in memory or on the wire; tell
+                                    # the client to clear them before the retry and never
+                                    # combine stale tool-call fragments with a new stream.
                                     content_parts.clear()
+                                    reasoning_parts.clear()
                                     tool_acc.clear()
                                     round_usage.clear()
                                     yield stream_event({"type": "reset"})
                         merge_usage(accumulated_usage, round_usage)
                         tool_calls = tool_calls_from_accumulated(tool_acc)
                         if tool_calls:
-                            internal_messages.append({
+                            assistant_tool_message = {
                                 "role": "assistant",
                                 "content": "".join(content_parts) or None,
                                 "tool_calls": tool_calls,
-                            })
+                            }
+                            # TokenHub (and other interleaved-thinking APIs) require
+                            # the reasoning trace to be echoed with the assistant
+                            # tool-call message on the next round. Dropping it makes
+                            # otherwise valid tool calls fail with HTTP 400.
+                            if reasoning_parts:
+                                assistant_tool_message["reasoning_content"] = "".join(reasoning_parts)
+                            internal_messages.append(assistant_tool_message)
                             for call in tool_calls[:4]:
                                 call_id, tool_id, tool_payload = process_tool_call(call, executions, client_actions, pending_writes)
                                 if tool_payload is None:

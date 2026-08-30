@@ -396,15 +396,8 @@ def today_str() -> str:
 
 
 def time_to_epoch(v: Any) -> float:
-    if not v:
-        return 0.0
-    text = str(v).strip()
-    for fmt in ["%Y-%m-%d %H:%M:%S", "%Y-%m-%dT%H:%M:%S"]:
-        try:
-            return datetime.strptime(text[:19], fmt).replace(tzinfo=BEIJING_TZ).timestamp()
-        except Exception:
-            pass
-    return 0.0
+    parsed = parse_time_safe(v)
+    return parsed.replace(tzinfo=BEIJING_TZ).timestamp() if parsed else 0.0
 
 
 def load_json(path: Path, default: Any) -> Any:
@@ -1350,11 +1343,13 @@ def parse_time_safe(v: Any) -> Optional[datetime]:
     if not v:
         return None
     text = str(v).strip()
-    for fmt in ["%Y-%m-%d %H:%M:%S", "%Y-%m-%dT%H:%M:%S"]:
-        try:
-            return datetime.strptime(text[:19], fmt)
-        except Exception:
-            pass
+    try:
+        parsed = datetime.fromisoformat(text.replace("Z", "+00:00"))
+        if parsed.tzinfo is None:
+            parsed = parsed.replace(tzinfo=BEIJING_TZ)
+        return parsed.astimezone(BEIJING_TZ).replace(tzinfo=None)
+    except (TypeError, ValueError):
+        pass
     return None
 
 
@@ -2290,7 +2285,9 @@ def api_router_push():
     payload = request.get_json(silent=True) or {}
     typ = str(payload.get("type") or "snapshot").strip()
     ts = payload.get("ts")
-    event_time = datetime.fromtimestamp(float(ts)).strftime("%Y-%m-%d %H:%M:%S") if ts else now_str()
+    # Router timestamps are epoch seconds; always render them in the same
+    # Beijing calendar used by /api/daily and the assistant tool.
+    event_time = datetime.fromtimestamp(float(ts), tz=BEIJING_TZ).strftime("%Y-%m-%d %H:%M:%S") if ts else now_str()
 
     if typ == "snapshot":
         state = load_json(STATE_FILE, {})
@@ -4427,8 +4424,25 @@ def normalize_device_events_for_daily(events: List[Dict[str, Any]]) -> List[Dict
         kept.append(e)
     return kept
 
+def event_beijing_day(value: Any) -> str:
+    """Normalize an event timestamp to the Hub's Beijing calendar date."""
+    text = str(value or "").strip()
+    if not text:
+        return ""
+    try:
+        parsed = datetime.fromisoformat(text.replace("Z", "+00:00"))
+        if parsed.tzinfo is None:
+            parsed = parsed.replace(tzinfo=BEIJING_TZ)
+        return parsed.astimezone(BEIJING_TZ).date().isoformat()
+    except (TypeError, ValueError):
+        return text[:10]
+
+
 def aggregate_daily(day: str) -> Dict[str, Any]:
-    events = normalize_device_events_for_daily([e for e in load_json(EVENTS_FILE, []) if not e.get("deleted") and event_timestamp(e).startswith(day)])
+    events = normalize_device_events_for_daily([
+        e for e in load_json(EVENTS_FILE, [])
+        if not e.get("deleted") and event_beijing_day(event_timestamp(e)) == str(day)
+    ])
     devices: Dict[str, Dict[str, Any]] = {}
     vpn_items: List[Dict[str, Any]] = []
     network_items: List[Dict[str, Any]] = []

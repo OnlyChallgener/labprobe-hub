@@ -4,7 +4,7 @@ from __future__ import annotations
 
 import json
 import re
-from datetime import date
+from datetime import datetime, timedelta, timezone
 from typing import Any, Dict, Iterable, List
 from urllib.parse import urlsplit, urlunsplit
 
@@ -291,7 +291,15 @@ class ToolExecutor:
             view = self._device_view(device)
             return {"device": view, "ipv6List": view.get("ipv6List") or []}
         if tool_id == "daily.summary":
-            day = args.get("date") or date.today().isoformat()
+            day = args.get("date")
+            if not day:
+                # `date.today()` follows the host's local timezone (and on
+                # some Hub installs was several hours/days behind Beijing).
+                # The Hub owns the canonical calendar used by /api/daily.
+                today = getattr(self.hub, "today_str", None)
+                day = today() if callable(today) else datetime.now(
+                    timezone(timedelta(hours=8))
+                ).date().isoformat()
             return {"daily": _sanitized(self.hub.aggregate_daily(day))}
         if tool_id == "router.portmap.list":
             document, loaded = self.hub._load_portmap_rules_document()

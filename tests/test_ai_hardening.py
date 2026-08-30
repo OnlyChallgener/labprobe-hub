@@ -149,6 +149,75 @@ def test_stream_failure_records_usage_received_before_disconnect(tmp_path, monke
     assert usage["status"] == "failed" and usage["total_tokens"] == 7
 
 
+def test_stream_tool_round_echoes_tokenhub_reasoning_content(tmp_path, monkeypatch):
+    client = make_client(tmp_path, monkeypatch, hub_runtime=SimpleNamespace())
+    assert client.put("/api/ai/config", json={"apiKey": "sk"}).status_code == 200
+    provider_messages = []
+
+    class NoopExecutor:
+        def __init__(self, hub):
+            pass
+
+        def register_handler(self, *args, **kwargs):
+            pass
+
+        def register_preview(self, *args, **kwargs):
+            pass
+
+        def execute(self, tool_id, arguments, **kwargs):
+            return {"checked": True}
+
+    class ThinkingToolProvider:
+        def __init__(self, *args, **kwargs):
+            self.round = 0
+
+        def stream(self, messages, tools=None):
+            provider_messages.append(json.loads(json.dumps(messages)))
+            self.round += 1
+            if self.round == 1:
+                yield {"choices": [{"delta": {
+                    "reasoning_content": "先检查网络，",
+                    "tool_calls": [{"index": 0, "id": "call-1", "type": "function",
+                                     "function": {"name": "network.self_check", "arguments": "{}"}}],
+                }}]}
+            else:
+                yield {"choices": [{"delta": {"content": "检查完成"}}]}
+
+    monkeypatch.setattr("assistant.api.ToolExecutor", NoopExecutor)
+    monkeypatch.setattr("assistant.api.OpenAICompatibleProvider", ThinkingToolProvider)
+    response = client.post("/api/ai/chat", json={"message": "请检查", "stream": True})
+    assert response.status_code == 200
+    events = _sse_events(response)
+    assert events[-1]["type"] == "done"
+    assert len(provider_messages) == 2
+    assistant_tool = next(item for item in provider_messages[1] if item.get("role") == "assistant")
+    assert assistant_tool["reasoning_content"] == "先检查网络，"
+
+
+def test_daily_summary_uses_hub_beijing_today_instead_of_process_timezone():
+    requested = []
+
+    class DailyHub:
+        def today_str(self):
+            return "2026-08-30"
+
+        def aggregate_daily(self, day):
+            requested.append(day)
+            return {"date": day, "summary": {}}
+
+    result = ToolExecutor(DailyHub()).execute("daily.summary", {})
+    assert requested == ["2026-08-30"]
+    assert result["daily"]["date"] == "2026-08-30"
+
+
+def test_daily_event_date_normalizes_utc_midnight_to_beijing_day():
+    from hub import event_beijing_day, time_to_epoch
+
+    assert event_beijing_day("2026-08-29T16:30:00Z") == "2026-08-30"
+    assert event_beijing_day("2026-08-30 00:30:00") == "2026-08-30"
+    assert time_to_epoch("2026-08-29T16:30:00Z") == time_to_epoch("2026-08-30 00:30:00")
+
+
 def test_post_persist_chat_failure_keeps_identity_and_assistant_record(tmp_path, monkeypatch):
     client = make_client(tmp_path, monkeypatch)
     response = client.post("/api/ai/chat", json={"message": "hello"})
@@ -274,6 +343,29 @@ def test_legacy_secret_base_url_is_migrated_before_provider_use(tmp_path, monkey
     assert updated.status_code == 200 and updated.json["model"] == "m2"
 
 
+def test_legacy_hunyuan_endpoint_migrates_to_tokenhub_before_provider_use(tmp_path, monkeypatch):
+    client = make_client(tmp_path, monkeypatch)
+    store = AIStore(tmp_path / "ai.db")
+    row = store.create_config(
+        "混元", "hunyuan", "https://api.hunyuan.cloud.tencent.com/v1", "deepseek-v4-flash-202605",
+        encrypt_secret("sk"), True,
+    )
+    outbound = []
+
+    class CapturingProvider:
+        def __init__(self, base_url, *_args):
+            outbound.append(base_url)
+
+        def chat(self, messages, **_kwargs):
+            return ChatResult("OK", {"total_tokens": 1})
+
+    monkeypatch.setattr("assistant.api.OpenAICompatibleProvider", CapturingProvider)
+    response = client.post(f"/api/ai/config/{row['id']}/test")
+    assert response.status_code == 200
+    assert outbound == ["https://tokenhub.tencentmaas.com/v1"]
+    assert store.get_config(row["id"])["base_url"] == "https://tokenhub.tencentmaas.com/v1"
+
+
 def test_confirmation_cancel_and_recovery_endpoints_persist_cancel_note(tmp_path, monkeypatch):
     client = make_client(tmp_path, monkeypatch)
     store = AIStore(tmp_path / "ai.db")
@@ -314,6 +406,29 @@ def test_usage_calibration_and_quota_are_atomic_and_not_counted_as_tasks(tmp_pat
     }).json
     assert same["adjustment"]["id"] is None and same["adjustment"]["delta"] == 0
     assert same["config"]["tokenQuota"] is None
+
+
+def test_manual_calibration_is_independent_from_conversation_deletion_and_future_tasks(tmp_path):
+    store = AIStore(tmp_path / "ai.db")
+    store.initialize()
+    config = store.create_config("c", "p", "https://api.example", "m", "v1:x", True)
+    store.create_conversation("old", "old")
+    store.add_usage("old", "p", "m", {"total_tokens": 10}, config_id=config["id"])
+    calibrated = store.record_usage_adjustment(config["id"], 100)
+    assert calibrated["delta"] == 90
+    assert store.delete_conversation("old")
+    assert store.usage_by_config()[0]["total_tokens"] == 100
+    from datetime import datetime, timedelta, timezone
+    today = datetime.now(timezone.utc).astimezone(timezone(timedelta(hours=8))).date().isoformat()
+    assert store.usage_for_date(today)["total_tokens"] == 100
+    store.add_usage("new", "p", "m", {"total_tokens": 7}, config_id=config["id"])
+    assert store.usage_by_config()[0]["total_tokens"] == 107
+    calibrated_day = store.usage_daily()[-1]
+    assert calibrated_day["total_tokens"] == 107
+    assert calibrated_day["models"]["m"] == 107
+    assert store.record_usage_adjustment(config["id"], 100)["delta"] == -7
+    assert store.usage_by_config()[0]["total_tokens"] == 100
+    assert [row["total_tokens"] for row in store.list_usage()] == [7, 10]
 
 
 def test_concurrent_same_target_calibration_creates_only_one_adjustment(tmp_path):

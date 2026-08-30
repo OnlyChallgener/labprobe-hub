@@ -6,7 +6,7 @@ import json
 import sqlite3
 import time
 from contextlib import contextmanager
-from datetime import datetime, timezone
+from datetime import datetime, timedelta, timezone
 from pathlib import Path
 from typing import Any, Dict, Iterator, List, Optional
 
@@ -135,6 +135,15 @@ class AIStore:
             config_columns = {row["name"] for row in conn.execute("PRAGMA table_info(ai_config)")}
             if "enabled" not in config_columns:
                 conn.execute("ALTER TABLE ai_config ADD COLUMN enabled INTEGER NOT NULL DEFAULT 1")
+            provider_config_columns = {
+                row["name"] for row in conn.execute("PRAGMA table_info(ai_provider_configs)")
+            }
+            if "manual_total_tokens" not in provider_config_columns:
+                conn.execute("ALTER TABLE ai_provider_configs ADD COLUMN manual_total_tokens INTEGER")
+            if "manual_calibrated_at" not in provider_config_columns:
+                conn.execute("ALTER TABLE ai_provider_configs ADD COLUMN manual_calibrated_at TEXT")
+            if "manual_usage_floor_id" not in provider_config_columns:
+                conn.execute("ALTER TABLE ai_provider_configs ADD COLUMN manual_usage_floor_id INTEGER")
             confirmation_columns = {
                 row["name"] for row in conn.execute("PRAGMA table_info(ai_tool_confirmations)")
             }
@@ -499,56 +508,171 @@ class AIStore:
                 utc_now(), config_id))
         self._maybe_prune()
 
+    @staticmethod
+    def _effective_config_total(config: sqlite3.Row | Dict[str, Any], usage_rows: List[sqlite3.Row]) -> int:
+        """Return the displayed total for one config.
+
+        A manual calibration is a durable baseline, not a signed usage row.
+        Only task rows created after the calibration floor are added to it;
+        task history remains intact and deleting a conversation cannot alter
+        the calibrated baseline.
+        """
+        config_id = int(config["id"])
+        baseline = config.get("manual_total_tokens") if isinstance(config, dict) else config["manual_total_tokens"]
+        scoped = [row for row in usage_rows if int(row["config_id"] or 0) == config_id]
+        if baseline is None:
+            return sum(int(row["total_tokens"] or 0) for row in scoped)
+        floor = int((config.get("manual_usage_floor_id") if isinstance(config, dict) else config["manual_usage_floor_id"]) or 0)
+        return int(baseline) + sum(
+            int(row["total_tokens"] or 0)
+            for row in scoped
+            if str(row["status"] or "") != "adjusted" and int(row["id"]) > floor
+        )
+
+    @staticmethod
+    def _effective_rows_for_config(config: sqlite3.Row | Dict[str, Any], usage_rows: List[sqlite3.Row]) -> List[sqlite3.Row]:
+        config_id = int(config["id"])
+        scoped = [row for row in usage_rows if int(row["config_id"] or 0) == config_id]
+        baseline = config.get("manual_total_tokens") if isinstance(config, dict) else config["manual_total_tokens"]
+        if baseline is None:
+            return scoped
+        floor = int((config.get("manual_usage_floor_id") if isinstance(config, dict) else config["manual_usage_floor_id"]) or 0)
+        return [row for row in scoped if str(row["status"] or "") != "adjusted" and int(row["id"]) > floor]
+
+    def _usage_context(self) -> tuple[List[Dict[str, Any]], List[Dict[str, Any]]]:
+        with self._connect() as conn:
+            configs = [dict(row) for row in conn.execute(
+                "SELECT * FROM ai_provider_configs ORDER BY position ASC,id ASC"
+            ).fetchall()]
+            usage_rows = [dict(row) for row in conn.execute("SELECT * FROM ai_usage").fetchall()]
+        return configs, usage_rows
+
     def usage_daily(self, days: int = 14) -> List[Dict[str, Any]]:
         """Per-Beijing-day token totals for the usage trend chart (oldest first)."""
         bounded = max(1, min(int(days), 60))
-        window = (f'-{bounded} days',)
-        with self._connect() as conn:
-            rows = conn.execute(
-                "SELECT date(datetime(created_at, '+8 hours')) AS day,"
-                " SUM(CASE WHEN status<>'adjusted' THEN 1 ELSE 0 END) AS requests,"
-                " COALESCE(SUM(prompt_tokens),0) AS prompt_tokens,"
-                " COALESCE(SUM(completion_tokens),0) AS completion_tokens,"
-                " COALESCE(SUM(total_tokens),0) AS total_tokens,"
-                " COALESCE(SUM(cache_hit_tokens),0) AS cache_hit_tokens,"
-                " COALESCE(SUM(cache_miss_tokens),0) AS cache_miss_tokens"
-                " FROM ai_usage"
-                " WHERE created_at >= datetime('now', ?, '-8 hours')"
-                " GROUP BY day ORDER BY day", window,
-            ).fetchall()
-            models = conn.execute(
-                "SELECT date(datetime(created_at, '+8 hours')) AS day, model,"
-                " COALESCE(SUM(total_tokens),0) AS total_tokens"
-                " FROM ai_usage"
-                " WHERE created_at >= datetime('now', ?, '-8 hours')"
-                " GROUP BY day, model", window,
-            ).fetchall()
+        configs, usage_rows = self._usage_context()
+        cutoff = datetime.now(timezone.utc).timestamp() - bounded * 86400
+        beijing = timezone(timedelta(hours=8))
+        def day_for(value: Any) -> str:
+            try:
+                parsed = datetime.fromisoformat(str(value).replace("Z", "+00:00"))
+                if parsed.tzinfo is None:
+                    parsed = parsed.replace(tzinfo=timezone.utc)
+                return parsed.astimezone(beijing).date().isoformat()
+            except (TypeError, ValueError):
+                return str(value or "")[:10]
+        def in_window(row: Dict[str, Any]) -> bool:
+            try:
+                parsed = datetime.fromisoformat(str(row["created_at"]).replace("Z", "+00:00"))
+                if parsed.tzinfo is None:
+                    parsed = parsed.replace(tzinfo=timezone.utc)
+                return parsed.timestamp() >= cutoff
+            except (TypeError, ValueError):
+                return False
+        result: Dict[str, Dict[str, Any]] = {}
         model_map: Dict[str, Dict[str, int]] = {}
-        for row in models:
-            model_map.setdefault(row["day"], {})[row["model"]] = int(row["total_tokens"])
-        return [{
-            "date": row["day"],
-            "requests": int(row["requests"]),
-            "prompt_tokens": int(row["prompt_tokens"]),
-            "completion_tokens": int(row["completion_tokens"]),
-            "total_tokens": int(row["total_tokens"]),
-            "cache_hit_tokens": int(row["cache_hit_tokens"]),
-            "cache_miss_tokens": int(row["cache_miss_tokens"]),
-            "models": model_map.get(row["day"], {}),
-        } for row in rows]
+        for row in usage_rows:
+            if not in_window(row):
+                continue
+            day = day_for(row["created_at"])
+            item = result.setdefault(day, {"date": day, "requests": 0, "prompt_tokens": 0,
+                                           "completion_tokens": 0, "total_tokens": 0,
+                                           "cache_hit_tokens": 0, "cache_miss_tokens": 0})
+            if str(row.get("status") or "") != "adjusted":
+                item["requests"] += 1
+            item["prompt_tokens"] += int(row.get("prompt_tokens") or 0)
+            item["completion_tokens"] += int(row.get("completion_tokens") or 0)
+            item["total_tokens"] += int(row.get("total_tokens") or 0)
+            item["cache_hit_tokens"] += int(row.get("cache_hit_tokens") or 0)
+            item["cache_miss_tokens"] += int(row.get("cache_miss_tokens") or 0)
+            model_map.setdefault(day, {})[row["model"]] = (
+                model_map.setdefault(day, {}).get(row["model"], 0) + int(row.get("total_tokens") or 0)
+            )
+        # Replace calibrated configs' historical totals with the baseline and
+        # post-calibration task rows, then put the baseline on its calibration
+        # day so the 14-day chart reconciles with the headline total.
+        for config in configs:
+            baseline = config.get("manual_total_tokens")
+            if baseline is None:
+                continue
+            floor = int(config.get("manual_usage_floor_id") or 0)
+            calibrated_day = day_for(config.get("manual_calibrated_at"))
+            if calibrated_day and calibrated_day not in result:
+                result[calibrated_day] = {"date": calibrated_day, "requests": 0, "prompt_tokens": 0,
+                                          "completion_tokens": 0, "total_tokens": 0,
+                                          "cache_hit_tokens": 0, "cache_miss_tokens": 0}
+            if calibrated_day in result:
+                result[calibrated_day]["total_tokens"] += int(baseline)
+                model_map.setdefault(calibrated_day, {})[config["model"]] = (
+                    model_map.setdefault(calibrated_day, {}).get(config["model"], 0) + int(baseline)
+                )
+            # Historical rows before the floor are still task records and
+            # count toward request metrics, but their tokens are represented by
+            # the manually entered baseline instead of being double-counted.
+            for row in usage_rows:
+                if int(row.get("config_id") or 0) != int(config["id"]) or int(row["id"]) > floor or not in_window(row):
+                    continue
+                day = day_for(row["created_at"])
+                if day in result:
+                    result[day]["total_tokens"] -= int(row.get("total_tokens") or 0)
+                    model_map.setdefault(day, {})[row["model"]] = (
+                        model_map.setdefault(day, {}).get(row["model"], 0) - int(row.get("total_tokens") or 0)
+                    )
+        for day, item in result.items():
+            item["models"] = model_map.get(day, {})
+        return [result[day] for day in sorted(result)]
 
     def usage_summary(self) -> Dict[str, int]:
-        with self._connect() as conn:
-            row = conn.execute("SELECT COALESCE(SUM(CASE WHEN status<>'adjusted' THEN 1 ELSE 0 END),0) AS requests, COALESCE(SUM(prompt_tokens),0) AS prompt_tokens, "
-                               "COALESCE(SUM(completion_tokens),0) AS completion_tokens, "
-                               "COALESCE(SUM(total_tokens),0) AS total_tokens FROM ai_usage").fetchone()
-            today = conn.execute(
-                "SELECT COALESCE(SUM(CASE WHEN status<>'adjusted' THEN 1 ELSE 0 END),0) AS requests, COALESCE(SUM(total_tokens),0) AS total_tokens "
-                "FROM ai_usage WHERE date(datetime(created_at, '+8 hours')) = date('now', '+8 hours')"
-            ).fetchone()
-        result = dict(row)
-        result["today_requests"] = int(today["requests"] or 0)
-        result["today_total_tokens"] = int(today["total_tokens"] or 0)
+        configs, usage_rows = self._usage_context()
+        config_ids = {int(config["id"]) for config in configs}
+        result = {"requests": 0, "prompt_tokens": 0, "completion_tokens": 0, "total_tokens": 0}
+        today = {"requests": 0, "total_tokens": 0}
+        beijing = timezone(timedelta(hours=8))
+        today_key = datetime.now(timezone.utc).astimezone(beijing).date().isoformat()
+        def row_day(value: Any) -> str:
+            try:
+                parsed = datetime.fromisoformat(str(value or "").replace("Z", "+00:00"))
+                if parsed.tzinfo is None:
+                    parsed = parsed.replace(tzinfo=timezone.utc)
+                return parsed.astimezone(beijing).date().isoformat()
+            except (TypeError, ValueError):
+                return str(value or "")[:10]
+        for row in usage_rows:
+            if str(row.get("status") or "") != "adjusted":
+                result["requests"] += 1
+                if row_day(row.get("created_at")) == today_key:
+                    today["requests"] += 1
+            result["prompt_tokens"] += int(row.get("prompt_tokens") or 0)
+            result["completion_tokens"] += int(row.get("completion_tokens") or 0)
+        for config in configs:
+            config_rows = [row for row in usage_rows if int(row.get("config_id") or 0) == int(config["id"])]
+            result["total_tokens"] += self._effective_config_total(config, config_rows)
+        result["total_tokens"] += sum(
+            int(row.get("total_tokens") or 0) for row in usage_rows
+            if not row.get("config_id") or int(row.get("config_id")) not in config_ids
+        )
+        today["total_tokens"] = 0
+        for config in configs:
+            config_rows = [row for row in usage_rows if int(row.get("config_id") or 0) == int(config["id"])]
+            if config.get("manual_total_tokens") is None:
+                today["total_tokens"] += sum(
+                    int(row.get("total_tokens") or 0) for row in config_rows if row_day(row.get("created_at")) == today_key
+                )
+            else:
+                if str(config.get("manual_calibrated_at") or "") and row_day(config.get("manual_calibrated_at")) == today_key:
+                    today["total_tokens"] += int(config.get("manual_total_tokens") or 0)
+                floor = int(config.get("manual_usage_floor_id") or 0)
+                today["total_tokens"] += sum(
+                    int(row.get("total_tokens") or 0) for row in config_rows
+                    if int(row["id"]) > floor and str(row.get("status") or "") != "adjusted" and row_day(row.get("created_at")) == today_key
+                )
+        today["total_tokens"] += sum(
+            int(row.get("total_tokens") or 0) for row in usage_rows
+            if (not row.get("config_id") or int(row.get("config_id")) not in config_ids)
+            and row_day(row.get("created_at")) == today_key
+        )
+        result["today_requests"] = today["requests"]
+        result["today_total_tokens"] = today["total_tokens"]
         return result
 
     @staticmethod
@@ -569,55 +693,53 @@ class AIStore:
 
     def usage_by_config(self) -> List[Dict[str, Any]]:
         """Cumulative token usage for every configured API record."""
-        with self._connect() as conn:
-            rows = conn.execute(
-                "SELECT c.id AS config_id,c.name,c.provider,c.model,c.model_quota_tokens,"
-                "COALESCE(SUM(u.prompt_tokens),0) AS prompt_tokens,"
-                "COALESCE(SUM(u.completion_tokens),0) AS completion_tokens,"
-                "COALESCE(SUM(u.total_tokens),0) AS total_tokens "
-                "FROM ai_provider_configs c LEFT JOIN ai_usage u ON u.config_id=c.id "
-                "GROUP BY c.id,c.name,c.provider,c.model,c.model_quota_tokens "
-                "ORDER BY c.position ASC,c.id ASC"
-            ).fetchall()
+        configs, usage_rows = self._usage_context()
         result: List[Dict[str, Any]] = []
-        for row in rows:
+        for row in configs:
+            config_rows = [usage for usage in usage_rows if int(usage.get("config_id") or 0) == int(row["id"])]
             item = {
-                "config_id": int(row["config_id"]), "name": row["name"],
+                "config_id": int(row["id"]), "name": row["name"],
                 "provider": row["provider"], "model": row["model"],
-                "prompt_tokens": int(row["prompt_tokens"] or 0),
-                "completion_tokens": int(row["completion_tokens"] or 0),
-                "total_tokens": int(row["total_tokens"] or 0),
+                "prompt_tokens": sum(int(usage.get("prompt_tokens") or 0) for usage in config_rows),
+                "completion_tokens": sum(int(usage.get("completion_tokens") or 0) for usage in config_rows),
+                "total_tokens": self._effective_config_total(row, config_rows),
             }
-            item.update(self._quota_view(item["total_tokens"], row["model_quota_tokens"]))
+            item.update(self._quota_view(item["total_tokens"], row.get("model_quota_tokens")))
             result.append(item)
         return result
 
     def usage_by_model(self) -> List[Dict[str, Any]]:
         """Cumulative usage grouped by provider/model across API records."""
-        with self._connect() as conn:
-            usage_rows = conn.execute(
-                "SELECT provider,model,COALESCE(SUM(prompt_tokens),0) AS prompt_tokens,"
-                "COALESCE(SUM(completion_tokens),0) AS completion_tokens,"
-                "COALESCE(SUM(total_tokens),0) AS total_tokens "
-                "FROM ai_usage GROUP BY provider,model ORDER BY total_tokens DESC,provider,model"
-            ).fetchall()
-            config_rows = conn.execute(
-                "SELECT provider,model,model_quota_tokens FROM ai_provider_configs"
-            ).fetchall()
-        usage = {(row["provider"], row["model"]): row for row in usage_rows}
-        configs: Dict[tuple[str, str], List[Optional[int]]] = {}
-        for row in config_rows:
-            configs.setdefault((row["provider"], row["model"]), []).append(row["model_quota_tokens"])
+        configs, usage_rows = self._usage_context()
+        usage: Dict[tuple[str, str], Dict[str, int]] = {}
+        for row in usage_rows:
+            key = (row["provider"], row["model"])
+            item = usage.setdefault(key, {"prompt_tokens": 0, "completion_tokens": 0, "total_tokens": 0})
+            item["prompt_tokens"] += int(row.get("prompt_tokens") or 0)
+            item["completion_tokens"] += int(row.get("completion_tokens") or 0)
+        for config in configs:
+            key = (config["provider"], config["model"])
+            config_rows = [row for row in usage_rows if int(row.get("config_id") or 0) == int(config["id"])]
+            usage.setdefault(key, {"prompt_tokens": 0, "completion_tokens": 0, "total_tokens": 0})["total_tokens"] += self._effective_config_total(config, config_rows)
+        configured_ids = {int(config["id"]) for config in configs}
+        for row in usage_rows:
+            if row.get("config_id") and int(row["config_id"]) in configured_ids:
+                continue
+            key = (row["provider"], row["model"])
+            usage.setdefault(key, {"prompt_tokens": 0, "completion_tokens": 0, "total_tokens": 0})["total_tokens"] += int(row.get("total_tokens") or 0)
+        config_quotas: Dict[tuple[str, str], List[Optional[int]]] = {}
+        for row in configs:
+            config_quotas.setdefault((row["provider"], row["model"]), []).append(row.get("model_quota_tokens"))
         result: List[Dict[str, Any]] = []
-        for provider, model in sorted(set(usage) | set(configs)):
+        for provider, model in sorted(set(usage) | set(config_quotas)):
             row = usage.get((provider, model))
-            total_tokens = int(row["total_tokens"] or 0) if row else 0
-            quotas = configs.get((provider, model), [])
+            total_tokens = int(row.get("total_tokens") or 0) if row else 0
+            quotas = config_quotas.get((provider, model), [])
             quota = sum(int(value) for value in quotas) if quotas and all(value is not None for value in quotas) else None
             item = {
                 "provider": provider, "model": model,
-                "prompt_tokens": int(row["prompt_tokens"] or 0) if row else 0,
-                "completion_tokens": int(row["completion_tokens"] or 0) if row else 0,
+                "prompt_tokens": int(row.get("prompt_tokens") or 0) if row else 0,
+                "completion_tokens": int(row.get("completion_tokens") or 0) if row else 0,
                 "total_tokens": total_tokens,
             }
             item.update(self._quota_view(total_tokens, quota))
@@ -658,19 +780,54 @@ class AIStore:
     def usage_for_date(self, day: str) -> Dict[str, int]:
         """Return usage for an Asia/Shanghai calendar date without exposing secrets."""
         safe_day = str(day or "").strip()
-        with self._connect() as conn:
-            row = conn.execute(
-                "SELECT COALESCE(SUM(CASE WHEN status<>'adjusted' THEN 1 ELSE 0 END),0) AS requests, "
-                "COALESCE(SUM(prompt_tokens),0) AS prompt_tokens, "
-                "COALESCE(SUM(completion_tokens),0) AS completion_tokens, "
-                "COALESCE(SUM(total_tokens),0) AS total_tokens, "
-                "COALESCE(SUM(CASE WHEN usage_known=0 AND status<>'adjusted' THEN 1 ELSE 0 END),0) AS unknown_usage_requests "
-                "FROM ai_usage WHERE date(datetime(created_at, '+8 hours')) = ?",
-                (safe_day,),
-            ).fetchone()
-        return {key: int(row[key] or 0) for key in (
-            "requests", "prompt_tokens", "completion_tokens", "total_tokens", "unknown_usage_requests"
-        )}
+        configs, usage_rows = self._usage_context()
+        config_ids = {int(config["id"]) for config in configs}
+        result = {"requests": 0, "prompt_tokens": 0, "completion_tokens": 0,
+                  "total_tokens": 0, "unknown_usage_requests": 0}
+        beijing = timezone(timedelta(hours=8))
+        def row_day(value: Any) -> str:
+            try:
+                parsed = datetime.fromisoformat(str(value or "").replace("Z", "+00:00"))
+                if parsed.tzinfo is None:
+                    parsed = parsed.replace(tzinfo=timezone.utc)
+                return parsed.astimezone(beijing).date().isoformat()
+            except (TypeError, ValueError):
+                return str(value or "")[:10]
+        for row in usage_rows:
+            if row_day(row.get("created_at")) != safe_day:
+                continue
+            if str(row.get("status") or "") != "adjusted":
+                result["requests"] += 1
+                if not int(row.get("usage_known") or 0):
+                    result["unknown_usage_requests"] += 1
+            result["prompt_tokens"] += int(row.get("prompt_tokens") or 0)
+            result["completion_tokens"] += int(row.get("completion_tokens") or 0)
+        for config in configs:
+            if config.get("manual_total_tokens") is None or row_day(config.get("manual_calibrated_at")) != safe_day:
+                continue
+            floor = int(config.get("manual_usage_floor_id") or 0)
+            # The calibration baseline is attributed to its own date.
+            result["total_tokens"] += int(config["manual_total_tokens"] or 0)
+            for row in usage_rows:
+                if int(row.get("config_id") or 0) != int(config["id"]) or int(row["id"]) <= floor:
+                    continue
+                if str(row.get("status") or "") != "adjusted" and row_day(row.get("created_at")) == safe_day:
+                    result["total_tokens"] += int(row.get("total_tokens") or 0)
+        result["total_tokens"] += sum(
+            int(row.get("total_tokens") or 0) for row in usage_rows
+            if row_day(row.get("created_at")) == safe_day and (
+                not row.get("config_id") or int(row.get("config_id")) not in config_ids
+            ) and str(row.get("status") or "") != "adjusted"
+        )
+        # Uncalibrated configured rows use their recorded totals; calibrated
+        # rows before the floor are deliberately replaced by the baseline.
+        for config in configs:
+            if config.get("manual_total_tokens") is not None:
+                continue
+            for row in usage_rows:
+                if int(row.get("config_id") or 0) == int(config["id"]) and row_day(row.get("created_at")) == safe_day:
+                    result["total_tokens"] += int(row.get("total_tokens") or 0)
+        return result
 
     def add_tool_audit(self, request_id: str, tool_id: str, risk: str, status: str,
                        arguments: Dict[str, Any], result: Optional[Dict[str, Any]] = None) -> None:
@@ -941,7 +1098,8 @@ class AIStore:
                                 model_quota_tokens: Any = _UNSET) -> Optional[Dict[str, Any]]:
         """把某配置的累计用量调整为手动输入值。
 
-        以一条带符号的调整行实现：历史记录保留，各处 SUM 统计自然生效。
+        把平台后台读到的累计值保存为独立基准。任务用量行不被改写，
+        后续任务从校准时的最后一行继续累加，删除对话也不会改变基准。
         """
         with self._connect() as conn:
             conn.execute("BEGIN IMMEDIATE")
@@ -952,24 +1110,34 @@ class AIStore:
                 if row is None:
                     conn.execute("ROLLBACK")
                     return None
-                current = conn.execute(
-                    "SELECT COALESCE(SUM(total_tokens),0) AS total FROM ai_usage WHERE config_id=?",
+                usage_rows = conn.execute(
+                    "SELECT * FROM ai_usage WHERE config_id=?", (int(config_id),)
+                ).fetchall()
+                current = self._effective_config_total(row, usage_rows)
+                delta = int(target_total) - int(current)
+                floor = conn.execute(
+                    "SELECT COALESCE(MAX(id),0) AS id FROM ai_usage WHERE config_id=?",
                     (int(config_id),),
-                ).fetchone()
-                delta = int(target_total) - int(current["total"] or 0)
-                adjustment_id = None
-                if delta:
-                    cursor = conn.execute(
-                        """INSERT INTO ai_usage(conversation_id,provider,model,prompt_tokens,completion_tokens,
-                           total_tokens,status,usage_known,usage_json,cache_hit_tokens,cache_miss_tokens,created_at,config_id)
-                           VALUES(NULL,?,?,0,0,?,'adjusted',0,NULL,0,0,?,?)""",
-                        (row["provider"], row["model"], delta, utc_now(), int(config_id)),
-                    )
-                    adjustment_id = int(cursor.lastrowid)
+                ).fetchone()["id"]
+                prior_target = row["manual_total_tokens"]
+                # Re-calibrate even when the user enters the same baseline
+                # value after new tasks have accumulated; otherwise the old
+                # floor would keep those tasks added on top of the requested
+                # target. Concurrent identical submissions still converge to
+                # one update because the second read sees current == target.
+                changed = prior_target is None or int(current) != int(target_total)
+                adjustment_id = int(config_id) if changed else None
                 if model_quota_tokens is not _UNSET:
                     conn.execute(
-                        "UPDATE ai_provider_configs SET model_quota_tokens=?,updated_at=? WHERE id=?",
-                        (model_quota_tokens, utc_now(), int(config_id)),
+                        "UPDATE ai_provider_configs SET model_quota_tokens=?,manual_total_tokens=?,"
+                        "manual_calibrated_at=?,manual_usage_floor_id=?,updated_at=? WHERE id=?",
+                        (model_quota_tokens, int(target_total), utc_now(), int(floor), utc_now(), int(config_id)),
+                    )
+                elif changed:
+                    conn.execute(
+                        "UPDATE ai_provider_configs SET manual_total_tokens=?,manual_calibrated_at=?,"
+                        "manual_usage_floor_id=?,updated_at=? WHERE id=?",
+                        (int(target_total), utc_now(), int(floor), utc_now(), int(config_id)),
                     )
                 conn.execute("COMMIT")
             except Exception:

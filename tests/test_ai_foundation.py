@@ -205,6 +205,7 @@ def test_daily_usage_exposes_real_input_and_output_totals_for_bar_chart(tmp_path
     daily = client.get("/api/ai/usage").json["daily"][-1]
     assert daily["prompt_tokens"] == 7
     assert daily["completion_tokens"] == 3
+    assert daily["total_tokens"] == 10
     assert daily["cache_hit_tokens"] == 2
     assert daily["cache_miss_tokens"] == 5
 
