@@ -30,6 +30,9 @@ const DEFAULT_PID: &str = "/tmp/labrelay.pid";
 const DEFAULT_UDP_STUN_SERVER: &str = "stun.cloudflare.com:3478";
 const DEFAULT_TCP_STUN_SERVER: &str = "stunserver2025.stunprotocol.org:3478";
 const LEGACY_TCP_STUN_SERVER: &str = DEFAULT_UDP_STUN_SERVER;
+const STUN_FAST_RETRY_LIMIT: u32 = 6;
+const STUN_FAST_RETRY_DELAY: Duration = Duration::from_secs(5);
+const STUN_RECOVERY_PROBE_DELAY: Duration = Duration::from_secs(30);
 
 fn default_true() -> bool {
     true
@@ -424,32 +427,19 @@ impl Manager {
             expires_at: rule.expires_at,
             last_resolved_at: None,
             last_error: String::new(),
-            public_endpoint: if rule.kind == "stun" {
-                String::new()
-            } else {
-                previous
-                    .as_ref()
-                    .map(|x| x.public_endpoint.clone())
-                    .unwrap_or_default()
-            },
-            public_ip: if rule.kind == "stun" {
-                String::new()
-            } else {
-                previous
-                    .as_ref()
-                    .map(|x| x.public_ip.clone())
-                    .unwrap_or_default()
-            },
-            public_port: if rule.kind == "stun" {
-                0
-            } else {
-                previous.as_ref().map(|x| x.public_port).unwrap_or(0)
-            },
-            mapping_updated_at: if rule.kind == "stun" {
-                None
-            } else {
-                previous.as_ref().and_then(|x| x.mapping_updated_at)
-            },
+            // A previous STUN endpoint is useful as history while the new
+            // binding is being confirmed.  The state remains `mapping`, so
+            // API consumers must not treat this address as newly ready.
+            public_endpoint: previous
+                .as_ref()
+                .map(|x| x.public_endpoint.clone())
+                .unwrap_or_default(),
+            public_ip: previous
+                .as_ref()
+                .map(|x| x.public_ip.clone())
+                .unwrap_or_default(),
+            public_port: previous.as_ref().map(|x| x.public_port).unwrap_or(0),
+            mapping_updated_at: previous.as_ref().and_then(|x| x.mapping_updated_at),
         };
         let shared = Arc::new(RuntimeShared::new(snapshot));
         let target = Arc::new(RwLock::new(
@@ -469,8 +459,25 @@ impl Manager {
             // keeps that same channel port alive at the upstream NAT and
             // observes its current public endpoint.
             "TCP" if rule.kind == "stun" && rule.forward_mode == "router_native" => {
+                // Binding the local channel port is an apply-time requirement,
+                // not a transient STUN failure.  Do it before spawning so an
+                // occupied/invalid port still fails the upsert atomically.
+                let initial_socket = match prepare_tcp_stun_socket(rule.listen_port) {
+                    Ok(socket) => socket,
+                    Err(error) => {
+                        self.set_cached_state(&rule, "error", &error.to_string())
+                            .await;
+                        return Err(error);
+                    }
+                };
                 tokio::spawn(async move {
-                    run_tcp_stun_keepalive(rule_task, shared_task, cancel_rx).await;
+                    run_tcp_stun_keepalive(
+                        rule_task,
+                        shared_task,
+                        cancel_rx,
+                        Some(initial_socket),
+                    )
+                    .await;
                 })
             }
             "TCP" => match if rule.kind == "stun" {
@@ -524,16 +531,22 @@ impl Manager {
             },
             _ => unreachable!("validate_rule normalizes transportProtocol"),
         };
+        let mut startup_state = "running";
         if rule.kind == "stun" {
             if let Err(error) = confirm_stun_startup(&shared, Duration::from_secs(30)).await {
-                let _ = cancel_tx.send(true);
-                if timeout(Duration::from_secs(3), &mut join).await.is_err() {
-                    join.abort();
-                    let _ = join.await;
+                let current = shared.snapshot().await;
+                if current.state == "expired" || join.is_finished() {
+                    let _ = cancel_tx.send(true);
+                    if timeout(Duration::from_secs(3), &mut join).await.is_err() {
+                        join.abort();
+                        let _ = join.await;
+                    }
+                    let message = format!("STUN 运行时启动失败：{error:#}");
+                    self.set_cached_state(&rule, "error", &message).await;
+                    return Err(anyhow!(message));
                 }
-                let message = format!("confirm first STUN binding: {error:#}");
-                self.set_cached_state(&rule, "error", &message).await;
-                return Err(anyhow!(message));
+                mark_stun_startup_retrying(&shared, &error).await;
+                startup_state = "mapping";
             }
         }
         self.runtimes.lock().await.insert(
@@ -544,7 +557,7 @@ impl Manager {
                 shared,
             },
         );
-        Ok(json!({"ok": true, "id": id, "state": "running"}))
+        Ok(json!({"ok": true, "id": id, "state": startup_state}))
     }
 
     async fn ensure_port_available(&self, rule: &Rule) -> Result<()> {
@@ -791,11 +804,11 @@ fn parse_stun_mapped_address(message: &[u8]) -> Result<SocketAddr> {
         || u16::from_be_bytes([message[0], message[1]]) != 0x0101
         || u32::from_be_bytes([message[4], message[5], message[6], message[7]]) != STUN_MAGIC_COOKIE
     {
-        bail!("invalid STUN binding response");
+        bail!("STUN 绑定响应无效");
     }
     let body_len = u16::from_be_bytes([message[2], message[3]]) as usize;
     if message.len() < 20 + body_len {
-        bail!("truncated STUN binding response");
+        bail!("STUN 绑定响应不完整");
     }
     let mut offset = 20usize;
     while offset + 4 <= 20 + body_len {
@@ -803,7 +816,7 @@ fn parse_stun_mapped_address(message: &[u8]) -> Result<SocketAddr> {
         let len = u16::from_be_bytes([message[offset + 2], message[offset + 3]]) as usize;
         let value = offset + 4;
         if value + len > message.len() {
-            bail!("truncated STUN attribute");
+            bail!("STUN 响应属性不完整");
         }
         if matches!(kind, 0x0001 | 0x0020) && len >= 8 && message[value + 1] == 0x01 {
             let mut port = u16::from_be_bytes([message[value + 2], message[value + 3]]);
@@ -819,7 +832,7 @@ fn parse_stun_mapped_address(message: &[u8]) -> Result<SocketAddr> {
         }
         offset = value + ((len + 3) & !3);
     }
-    bail!("STUN response has no IPv4 mapped address")
+    bail!("STUN 响应未包含 IPv4 映射地址")
 }
 
 async fn mark_stun_mapping(shared: &Arc<RuntimeShared>, endpoint: SocketAddr) {
@@ -830,6 +843,32 @@ async fn mark_stun_mapping(shared: &Arc<RuntimeShared>, endpoint: SocketAddr) {
     base.public_port = endpoint.port();
     base.mapping_updated_at = Some(now_epoch());
     base.last_error.clear();
+}
+
+async fn mark_stun_transient_failure(shared: &Arc<RuntimeShared>, message: String) {
+    let mut base = shared.base.write().await;
+    if base.state != "expired" && base.state != "stopped" {
+        // Keep the last known endpoint as history, but `mapping` makes it
+        // explicitly non-ready until a fresh Binding response arrives.
+        base.state = "mapping".to_string();
+    }
+    base.last_error = message;
+}
+
+async fn mark_stun_startup_retrying(shared: &Arc<RuntimeShared>, error: &anyhow::Error) {
+    let last_error = {
+        let current = shared.snapshot().await;
+        if current.last_error.trim().is_empty() {
+            error.to_string()
+        } else {
+            current.last_error
+        }
+    };
+    mark_stun_transient_failure(
+        shared,
+        format!("首次 STUN 绑定暂未确认，正在后台重试；最后错误：{last_error}"),
+    )
+    .await;
 }
 
 async fn confirm_stun_startup(shared: &Arc<RuntimeShared>, wait: Duration) -> Result<()> {
@@ -851,48 +890,74 @@ async fn confirm_stun_startup(shared: &Arc<RuntimeShared>, wait: Duration) -> Re
         return Ok(());
     }
     if last_error.is_empty() {
-        bail!("STUN startup confirmation timed out");
+        bail!("首次 STUN 绑定确认超时");
     }
-    bail!("STUN startup confirmation timed out; last error: {last_error}")
+    bail!("首次 STUN 绑定确认超时；最后错误：{last_error}")
 }
 
 async fn resolve_stun_server(value: &str) -> Result<SocketAddr> {
     tokio::net::lookup_host(value)
         .await
-        .context("resolve STUN server")?
+        .context("解析 STUN 服务器失败")?
         .find(SocketAddr::is_ipv4)
-        .ok_or_else(|| anyhow!("STUN server has no IPv4 address"))
+        .ok_or_else(|| anyhow!("STUN 服务器没有可用的 IPv4 地址"))
 }
 
-async fn connect_tcp_stun(local_port: u16, server: SocketAddr) -> Result<TcpStream> {
+fn prepare_tcp_stun_socket(local_port: u16) -> Result<TcpSocket> {
     // TcpSocket owns the nonblocking connect state and lets Tokio handle
     // EINPROGRESS/EALREADY consistently on musl/BusyBox routers.  The old
     // socket2 + writable()/SO_ERROR sequence could surface raw errno 115
     // after the initial connect had already been accepted as pending.
-    let socket = TcpSocket::new_v4()?;
-    socket.set_reuseaddr(true)?;
+    let socket = TcpSocket::new_v4().context("创建 STUN TCP 套接字失败")?;
+    socket
+        .set_reuseaddr(true)
+        .context("设置 STUN TCP 套接字失败")?;
     socket.bind(SocketAddr::V4(SocketAddrV4::new(
         Ipv4Addr::UNSPECIFIED,
         local_port,
-    )))?;
+    )))
+    .with_context(|| format!("绑定 STUN TCP 本地端口 {local_port} 失败"))?;
+    Ok(socket)
+}
+
+async fn connect_prepared_tcp_stun(socket: TcpSocket, server: SocketAddr) -> Result<TcpStream> {
     timeout(Duration::from_secs(8), socket.connect(server))
         .await
-        .context("STUN TCP connect timeout")?
-        .context("STUN TCP connect")
+        .context("STUN TCP 连接超时")?
+        .context("STUN TCP 连接失败")
+}
+
+#[cfg(test)]
+async fn connect_tcp_stun(local_port: u16, server: SocketAddr) -> Result<TcpStream> {
+    connect_prepared_tcp_stun(prepare_tcp_stun_socket(local_port)?, server).await
+}
+
+fn stun_retry_delay(consecutive_failures: u32) -> Duration {
+    if consecutive_failures <= STUN_FAST_RETRY_LIMIT {
+        STUN_FAST_RETRY_DELAY
+    } else {
+        STUN_RECOVERY_PROBE_DELAY
+    }
 }
 
 async fn run_tcp_stun_keepalive(
     rule: Rule,
     shared: Arc<RuntimeShared>,
     mut cancel: watch::Receiver<bool>,
+    mut initial_socket: Option<TcpSocket>,
 ) {
+    let mut consecutive_failures = 0u32;
     loop {
         if *cancel.borrow() {
             return;
         }
         let result: Result<()> = async {
             let server = resolve_stun_server(&rule.stun_server).await?;
-            let mut stream = connect_tcp_stun(rule.listen_port, server).await?;
+            let socket = match initial_socket.take() {
+                Some(socket) => socket,
+                None => prepare_tcp_stun_socket(rule.listen_port)?,
+            };
+            let mut stream = connect_prepared_tcp_stun(socket, server).await?;
             let mut tick = tokio::time::interval(Duration::from_secs(20));
             tick.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
             loop {
@@ -902,31 +967,37 @@ async fn run_tcp_stun_keepalive(
                     }
                     _ = tick.tick() => {
                         let request = stun_binding_request();
-                        stream.write_all(&request).await?;
+                        stream
+                            .write_all(&request)
+                            .await
+                            .context("发送 STUN TCP 绑定请求失败")?;
                         let mut header = [0u8; 20];
                         timeout(Duration::from_secs(8), stream.read_exact(&mut header))
-                            .await.context("STUN TCP response timeout")??;
+                            .await
+                            .context("STUN TCP 响应超时")?
+                            .context("读取 STUN TCP 响应失败")?;
                         let length = u16::from_be_bytes([header[2], header[3]]) as usize;
                         let mut message = Vec::with_capacity(20 + length);
                         message.extend_from_slice(&header);
                         message.resize(20 + length, 0);
                         timeout(Duration::from_secs(8), stream.read_exact(&mut message[20..]))
-                            .await.context("STUN TCP body timeout")??;
+                            .await
+                            .context("STUN TCP 响应内容超时")?
+                            .context("读取 STUN TCP 响应内容失败")?;
                         mark_stun_mapping(&shared, parse_stun_mapped_address(&message)?).await;
+                        consecutive_failures = 0;
                     }
                 }
             }
         }.await;
         if let Err(error) = result {
-            let mut base = shared.base.write().await;
-            if base.public_endpoint.is_empty() {
-                base.state = "mapping".to_string();
-            }
-            base.last_error = error.to_string();
+            consecutive_failures = consecutive_failures.saturating_add(1);
+            mark_stun_transient_failure(&shared, error.to_string()).await;
         }
+        let retry_delay = stun_retry_delay(consecutive_failures);
         tokio::select! {
             _ = cancel.changed() => if *cancel.borrow() { return; },
-            _ = sleep(Duration::from_secs(5)) => {}
+            _ = sleep(retry_delay) => {}
         }
     }
 }
@@ -944,6 +1015,7 @@ async fn run_tcp_listener(
             rule.clone(),
             shared.clone(),
             cancel.clone(),
+            None,
         )))
     } else {
         None
@@ -2442,7 +2514,11 @@ mod tests {
         };
         let mut snapshot = RuntimeSnapshot::stopped(&rule);
         snapshot.state = "mapping".into();
-        snapshot.last_error = "temporary DNS failure".into();
+        snapshot.public_endpoint = "198.51.100.8:20001".into();
+        snapshot.public_ip = "198.51.100.8".into();
+        snapshot.public_port = 20001;
+        snapshot.mapping_updated_at = Some(1);
+        snapshot.last_error = "解析 STUN 服务器失败".into();
         let shared = Arc::new(RuntimeShared::new(snapshot));
         let updater = shared.clone();
         let mapping = tokio::spawn(async move {
@@ -2454,7 +2530,10 @@ mod tests {
             .await
             .unwrap();
         mapping.await.unwrap();
-        assert_eq!(shared.snapshot().await.state, "mapped");
+        let current = shared.snapshot().await;
+        assert_eq!(current.state, "mapped");
+        assert_eq!(current.public_endpoint, "203.0.113.9:20001");
+        assert!(current.last_error.is_empty());
     }
 
     #[tokio::test]
@@ -2467,7 +2546,7 @@ mod tests {
         };
         let mut snapshot = RuntimeSnapshot::stopped(&rule);
         snapshot.state = "mapping".into();
-        snapshot.last_error = "STUN UDP receive failed: network unreachable".into();
+        snapshot.last_error = "STUN TCP 连接失败".into();
         let shared = Arc::new(RuntimeShared::new(snapshot));
 
         let error = confirm_stun_startup(&shared, Duration::from_millis(20))
@@ -2476,7 +2555,72 @@ mod tests {
 
         assert_eq!(
             error.to_string(),
-            "STUN startup confirmation timed out; last error: STUN UDP receive failed: network unreachable"
+            "首次 STUN 绑定确认超时；最后错误：STUN TCP 连接失败"
+        );
+    }
+
+    #[tokio::test]
+    async fn transient_stun_failure_keeps_history_but_marks_endpoint_not_ready() {
+        let rule = Rule {
+            id: "stun-history".into(),
+            name: "STUN history".into(),
+            kind: "stun".into(),
+            ..Rule::default()
+        };
+        let mut snapshot = RuntimeSnapshot::stopped(&rule);
+        snapshot.state = "mapped".into();
+        snapshot.public_endpoint = "198.51.100.8:20001".into();
+        snapshot.public_ip = "198.51.100.8".into();
+        snapshot.public_port = 20001;
+        snapshot.mapping_updated_at = Some(123);
+        let shared = Arc::new(RuntimeShared::new(snapshot));
+
+        mark_stun_transient_failure(&shared, "STUN TCP 响应超时".into()).await;
+
+        let current = shared.snapshot().await;
+        assert_eq!(current.state, "mapping");
+        assert_eq!(current.public_endpoint, "198.51.100.8:20001");
+        assert_eq!(current.public_ip, "198.51.100.8");
+        assert_eq!(current.public_port, 20001);
+        assert_eq!(current.mapping_updated_at, Some(123));
+        assert_eq!(current.last_error, "STUN TCP 响应超时");
+    }
+
+    #[tokio::test]
+    async fn startup_timeout_stays_mapping_and_announces_background_retry() {
+        let rule = Rule {
+            id: "stun-background-retry".into(),
+            name: "STUN background retry".into(),
+            kind: "stun".into(),
+            ..Rule::default()
+        };
+        let mut snapshot = RuntimeSnapshot::stopped(&rule);
+        snapshot.state = "mapping".into();
+        snapshot.public_endpoint = "198.51.100.8:20001".into();
+        snapshot.last_error = "STUN TCP 连接失败".into();
+        let shared = Arc::new(RuntimeShared::new(snapshot));
+        let error = confirm_stun_startup(&shared, Duration::from_millis(20))
+            .await
+            .unwrap_err();
+
+        mark_stun_startup_retrying(&shared, &error).await;
+
+        let current = shared.snapshot().await;
+        assert_eq!(current.state, "mapping");
+        assert_eq!(current.public_endpoint, "198.51.100.8:20001");
+        assert_eq!(
+            current.last_error,
+            "首次 STUN 绑定暂未确认，正在后台重试；最后错误：STUN TCP 连接失败"
+        );
+    }
+
+    #[test]
+    fn tcp_stun_fast_retries_are_bounded_before_slow_recovery_probes() {
+        assert_eq!(stun_retry_delay(1), Duration::from_secs(5));
+        assert_eq!(stun_retry_delay(STUN_FAST_RETRY_LIMIT), Duration::from_secs(5));
+        assert_eq!(
+            stun_retry_delay(STUN_FAST_RETRY_LIMIT + 1),
+            Duration::from_secs(30)
         );
     }
 
