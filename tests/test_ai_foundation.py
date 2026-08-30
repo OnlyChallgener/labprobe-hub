@@ -1271,3 +1271,36 @@ def test_confirmations_list_reports_lifecycle(tmp_path, monkeypatch):
                               conversation_id="conv-x")
     rows = store.list_recent_confirmations(limit=5)
     assert rows[0]["expired"] is True
+
+
+def test_stream_tolerates_gateway_noise_and_multiline_data():
+    from assistant.provider import OpenAICompatibleProvider
+
+    class FakeResponse:
+        ok = True
+        text = ""
+
+        def iter_lines(self, decode_unicode=True):
+            yield ": keep-alive"
+            yield "data:"
+            yield 'data: not-a-json-frame'
+            yield 'data: {"choices":[{"delta":{"content":"你"}}]}'
+            yield ""
+            yield 'data: {"choices":[{"delta":{"content":"好"}}],'
+            yield ' "usage":{"total_tokens": 2}}'
+            yield ""
+            yield "data: [DONE]"
+
+        def close(self):
+            pass
+
+    class FakeSession:
+        def post(self, *args, **kwargs):
+            return FakeResponse()
+
+    provider = OpenAICompatibleProvider("https://gw.example", "k", "m", session=FakeSession())
+    chunks = list(provider.stream([{"role": "user", "content": "hi"}]))
+    texts = [c["choices"][0]["delta"]["content"] for c in chunks if c.get("choices")]
+    assert texts == ["你", "好"]
+    assert any(c.get("usage", {}).get("total_tokens") == 2 for c in chunks)
+    assert any(c.get("done") for c in chunks)

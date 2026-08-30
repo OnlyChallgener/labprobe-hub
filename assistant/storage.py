@@ -764,6 +764,75 @@ class AIStore:
             self.enforce_conversation_storage(protected_conversation_id=clean_id)
         return bool(deleted)
 
+    def promote_config(self, config_id: int) -> Optional[Dict[str, Any]]:
+        """Move a config to the front of the enabled order (chat uses #1)."""
+        target = int(config_id)
+        with self._connect() as conn:
+            rows = conn.execute(
+                "SELECT id FROM ai_provider_configs ORDER BY position ASC, id ASC"
+            ).fetchall()
+            ids = [int(row["id"]) for row in rows]
+            if target not in ids:
+                return None
+            ids.remove(target)
+            ids.insert(0, target)
+            for index, row_id in enumerate(ids):
+                conn.execute(
+                    "UPDATE ai_provider_configs SET position=?, updated_at=? WHERE id=?",
+                    (index, utc_now(), row_id),
+                )
+        return self.get_config(target)
+
+    def move_config(self, config_id: int, direction: str) -> bool:
+        """Swap a config with its upper/lower neighbor in the enabled order."""
+        target = int(config_id)
+        with self._connect() as conn:
+            rows = conn.execute(
+                "SELECT id FROM ai_provider_configs ORDER BY position ASC, id ASC"
+            ).fetchall()
+            ids = [int(row["id"]) for row in rows]
+            if target not in ids:
+                return False
+            index = ids.index(target)
+            swap = index - 1 if direction == "up" else index + 1
+            if not 0 <= swap < len(ids):
+                return True  # already at the edge
+            ids[index], ids[swap] = ids[swap], ids[index]
+            for position, row_id in enumerate(ids):
+                conn.execute(
+                    "UPDATE ai_provider_configs SET position=?, updated_at=? WHERE id=?",
+                    (position, utc_now(), row_id),
+                )
+        return True
+
+    def delete_usage_record(self, usage_id: int) -> bool:
+        with self._connect() as conn:
+            return bool(conn.execute("DELETE FROM ai_usage WHERE id=?", (int(usage_id),)).rowcount)
+
+    def record_usage_adjustment(self, config_id: int, target_total: int) -> Optional[Dict[str, Any]]:
+        """把某配置的累计用量调整为手动输入值。
+
+        以一条带符号的调整行实现：历史记录保留，各处 SUM 统计自然生效。
+        """
+        row = self.get_config(int(config_id))
+        if row is None:
+            return None
+        with self._connect() as conn:
+            current = conn.execute(
+                "SELECT COALESCE(SUM(total_tokens),0) AS total FROM ai_usage WHERE config_id=?",
+                (int(config_id),),
+            ).fetchone()
+        delta = int(target_total) - int(current["total"] or 0)
+        now = utc_now()
+        with self._connect() as conn:
+            cursor = conn.execute(
+                """INSERT INTO ai_usage(conversation_id,provider,model,prompt_tokens,completion_tokens,
+                   total_tokens,status,usage_known,usage_json,cache_hit_tokens,cache_miss_tokens,created_at,config_id)
+                   VALUES(NULL,?,?,0,0,?,'adjusted',0,NULL,0,0,?,?)""",
+                (row["provider"], row["model"], delta, now, int(config_id)),
+            )
+            return {"id": int(cursor.lastrowid), "delta": delta, "target": int(target_total)}
+
     def add_notification(self, kind: str, title: str, content: str, dedupe_key: str,
                          payload: Optional[Dict[str, Any]] = None) -> Optional[int]:
         with self._connect() as conn:

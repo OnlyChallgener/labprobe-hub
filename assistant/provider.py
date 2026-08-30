@@ -160,13 +160,153 @@ class OpenAICompatibleProvider:
         finally:
             response.close()
 
+    def stream(self, messages: List[Dict[str, Any]]) -> Iterator[Dict[str, Any]]: ...
+
+
+def _provider_detail(response) -> str:
+    """Extract a short, key-safe snippet of an upstream error response.
+
+    Without this the actual vendor complaint (unsupported stream+tools,
+    rate limit, quota) is discarded and provider failures are undebuggable.
+    """
+    try:
+        body = (response.text or "").strip()
+    except Exception:
+        return ""
+    body = body.replace("\n", " ")
+    try:
+        parsed = json.loads(body)
+        if isinstance(parsed, dict):
+            message = parsed.get("error") or parsed.get("message") or ""
+            if isinstance(message, dict):
+                message = message.get("message") or ""
+            if message:
+                return str(message)[:200]
+    except (ValueError, AttributeError):
+        pass
+    if body.lower().startswith(("<!doctype", "<html")):
+        return ""
+    return body[:200]
+
+
+class OpenAICompatibleProvider:
+    def __init__(self, base_url: str, api_key: str, model: str, session: Any = requests):
+        self.base_url = base_url.rstrip("/")
+        self.api_key = api_key
+        self.model = model
+        self.session = session
+
+    def _request(self, messages: List[Dict[str, Any]], stream: bool,
+                 tools: Optional[List[Dict[str, Any]]] = None):
+        payload: Dict[str, Any] = {"model": self.model, "messages": messages, "stream": stream}
+        if tools:
+            payload["tools"] = tools
+            payload["tool_choice"] = "auto"
+        if stream:
+            payload["stream_options"] = {"include_usage": True}
+        try:
+            endpoint = self.base_url if self.base_url.endswith("/chat/completions") else self.base_url + "/chat/completions"
+            response = self.session.post(endpoint, json=payload,
+                headers={"Authorization": "Bearer " + self.api_key, "Content-Type": "application/json"},
+                timeout=(5, 90), stream=stream)
+        except requests.RequestException as exc:
+            raise ProviderError(f"AI provider is unavailable: {str(exc)[:150]}") from exc
+        if not response.ok:
+            status_code = response.status_code if response.status_code < 500 else 502
+            detail = _provider_detail(response)
+            response.close()
+            message = "AI provider rejected the request" if not detail else \
+                f"AI provider HTTP {response.status_code}: {detail}"
+            raise ProviderError(message, status_code)
+        return response
+
+    def chat(self, messages: List[Dict[str, Any]],
+             tools: Optional[List[Dict[str, Any]]] = None) -> ChatResult:
+        response = self._request(messages, False, tools)
+        try:
+            body = response.json()
+            choice = body["choices"][0]["message"]
+            message = {
+                key: choice[key]
+                for key in ("role", "content", "reasoning_content", "tool_calls")
+                if key in choice
+            }
+            return ChatResult(str(choice.get("content") or ""), usage_from_chunk(body) or {}, message)
+        except (KeyError, IndexError, ValueError, TypeError) as exc:
+            raise ProviderError("AI provider returned an invalid response") from exc
+        finally:
+            response.close()
+
+    @staticmethod
+    def _parse_data_event(data: str) -> Optional[Dict[str, Any]]:
+        """Parse one accumulated SSE data payload, tolerating gateway noise.
+
+        Vendor gateways emit bare `data:` keep-alives, comments and the odd
+        malformed frame; any of those must skip the frame, not kill the
+        whole stream ("provider returned invalid SSE JSON").
+        """
+        if not data:
+            return None
+        if data == "[DONE]":
+            return {"done": True}
+        try:
+            return json.loads(data)
+        except json.JSONDecodeError:
+            return None
+
     def stream(self, messages: List[Dict[str, Any]], tools: Optional[List[Dict[str, Any]]] = None) -> Iterator[Dict[str, Any]]:
         response = self._request(messages, True, tools)
         try:
+            # 容错解析：完整 JSON 帧逐行即出；单行解析失败的按 SSE 规范累积、
+            # 空行时合并重试；心跳/注释/垃圾帧一律跳过而不是打断整条流。
+            pending: List[str] = []
+
+            def flush() -> Optional[Dict[str, Any]]:
+                if not pending:
+                    return None
+                joined = "\n".join(pending)
+                pending.clear()
+                if not joined or joined == "[DONE]":
+                    return {"done": True} if joined == "[DONE]" else None
+                try:
+                    return json.loads(joined)
+                except json.JSONDecodeError:
+                    return None
+
             for raw in response.iter_lines(decode_unicode=True):
-                chunk = parse_sse_line(raw)
+                if not raw:
+                    event = flush()
+                    if event is not None:
+                        yield event
+                    continue
+                line = raw.strip()
+                if not line or line.startswith(":"):
+                    continue
+                if not line.startswith("data:"):
+                    # 已经在跨行帧中间时，无前缀行按续行处理；否则忽略。
+                    if pending:
+                        pending.append(line)
+                    continue
+                payload = line[5:].strip()
+                if not payload:
+                    continue
+                if payload == "[DONE]":
+                    pending.clear()
+                    yield {"done": True}
+                    continue
+                chunk = None
+                try:
+                    chunk = json.loads(payload)
+                except json.JSONDecodeError:
+                    chunk = None
                 if chunk is not None:
+                    pending.clear()
                     yield chunk
+                    continue
+                pending.append(payload)
+            event = flush()
+            if event is not None:
+                yield event
         except requests.RequestException as exc:
             raise ProviderError(f"AI provider stream was interrupted: {str(exc)[:150]}") from exc
         finally:

@@ -599,6 +599,54 @@ def create_ai_blueprint(*, check_app_token: Callable[[], bool], db_path, logger,
             return jsonify({"error": "AI configuration was not found"}), 404
         return "", 204
 
+    @bp.post("/config/<int:config_id>/promote")
+    def promote_config(config_id: int):
+        denial = authorized()
+        if denial:
+            return denial
+        row = store.promote_config(config_id)
+        if row is None:
+            return jsonify({"error": "AI configuration was not found"}), 404
+        return jsonify(config_view(row))
+
+    @bp.post("/config/<int:config_id>/move")
+    def move_config(config_id: int):
+        denial = authorized()
+        if denial:
+            return denial
+        body = request.get_json(silent=True) or {}
+        direction = "up" if str(body.get("direction") or "").lower() == "up" else "down"
+        if not store.move_config(config_id, direction):
+            return jsonify({"error": "AI configuration was not found"}), 404
+        return jsonify({"ok": True})
+
+    @bp.post("/usage/adjust")
+    def adjust_usage():
+        denial = authorized()
+        if denial:
+            return denial
+        body = request.get_json(silent=True) or {}
+        try:
+            config_id = int(body.get("configId"))
+            target = int(body.get("totalTokens"))
+        except (TypeError, ValueError):
+            return jsonify({"error": "configId and totalTokens must be integers"}), 400
+        if target < 0:
+            return jsonify({"error": "totalTokens must be >= 0"}), 400
+        result = store.record_usage_adjustment(config_id, target)
+        if result is None:
+            return jsonify({"error": "AI configuration was not found"}), 404
+        return jsonify({"ok": True, **result})
+
+    @bp.delete("/usage/<int:usage_id>")
+    def delete_usage_record(usage_id: int):
+        denial = authorized()
+        if denial:
+            return denial
+        if not store.delete_usage_record(usage_id):
+            return jsonify({"error": "usage record was not found"}), 404
+        return jsonify({"ok": True, "deleted": usage_id})
+
     @bp.get("/usage")
     def get_usage():
         denial = authorized()

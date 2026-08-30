@@ -58,15 +58,40 @@ class AssistantNotificationService:
         name = str(event.get("name") or event.get("mac") or "关注设备")
         at = str(event.get("createdAt") or event.get("time") or self.hub.now_str())
         address = str(event.get("ip") or event.get("lastIp") or "").strip()
-        title = f"{name}{'上线' if online else '离线'}"
-        details = [at]
+
+        def _int(value):
+            try:
+                return int(str(value).replace(" dBm", "").strip())
+            except (TypeError, ValueError):
+                return 0
+
+        lines = [f"{name} {'已上线' if online else '已离线'}"]
         if address:
-            details.append(address)
-        if not online and event.get("onlineDurationText"):
-            details.append("本次在线 " + str(event["onlineDurationText"]))
+            lines.append(f"IP:{address}")
+        details: list = []
+        rssi = _int(event.get("rssi"))
+        if rssi:
+            details.append(f"信号 {rssi} dBm")
+        band = str(event.get("band") or "").strip()
+        if band:
+            details.append(f"频段 {band}")
+        ssid = str(event.get("ssid") or "").strip()
+        if ssid:
+            details.append(f"SSID {ssid}")
+        connect = str(event.get("connectType") or "").strip()
+        if connect:
+            details.append(f"连接 {connect}")
+        if details:
+            lines.append(" · ".join(details))
+        if not online:
+            duration = str(event.get("onlineDurationText") or "").strip()
+            if duration:
+                lines.append(f"本次在线 {duration}")
+        lines.append(f"时间 {at}")
+        title = f"{name}{'上线' if online else '离线'}"
         event_id = event.get("id") or f"{event.get('type')}:{event.get('mac')}:{at}"
         notification_id = self.store.add_notification(
-            "device", title, title + " · " + " · ".join(details),
+            "device", title, chr(10).join(lines),
             f"event:{event_id}", {"event": event},
         )
 
