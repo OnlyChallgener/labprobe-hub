@@ -58,7 +58,7 @@ jobs:
       - name: Verify release versions
         run: |
           set -e
-          grep -q 'HUB_VERSION = "0.12.1"' hub_entry.py
+          grep -q 'HUB_VERSION = "0.12.2"' hub_entry.py
           grep -q 'create_router_blueprint_v1' hub_entry.py
           grep -q 'create_ai_blueprint' hub_entry.py
           grep -q 'install_hub0934_fixes(hub)' hub_entry.py
@@ -85,6 +85,6 @@ jobs:
 
       - name: Build Hub Docker image
         run: |
-          docker build --pull=false -t labprobe-hub:0.12.1 .
-          docker run --rm --entrypoint python labprobe-hub:0.12.1 -c \
-            'import hub_entry, assistant, router_core, hub0934_fixes, hub0935_sync_fix, labrelay_sync_patch; print("Hub 0.12.1 imports OK")'
+          docker build --pull=false -t labprobe-hub:0.12.2 .
+          docker run --rm --entrypoint python labprobe-hub:0.12.2 -c \
+            'import hub_entry, assistant, router_core, hub0934_fixes, hub0935_sync_fix, labrelay_sync_patch; print("Hub 0.12.2 imports OK")'

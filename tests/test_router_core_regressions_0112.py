@@ -193,6 +193,39 @@ def test_manifest_refresh_queues_the_resolved_github_fallback_urls(monkeypatch):
     assert saved
 
 
+def test_explicit_agent_update_check_returns_before_manifest_network_io(monkeypatch):
+    calls = []
+    deferred = []
+
+    class DeferredThread:
+        def __init__(self, target, **_kwargs):
+            self.target = target
+            deferred.append(self)
+
+        def start(self):
+            return None
+
+    monkeypatch.setattr(followup_stability_patch.threading, "Thread", DeferredThread)
+    monkeypatch.setattr(hub, "check_app_token", lambda: True)
+    monkeypatch.setattr(
+        hub,
+        "agent_release_manifest",
+        lambda force=False: calls.append(force) or {"version": "0.2.32"},
+    )
+
+    with hub.app.test_request_context("/api/agent/update/check", method="POST"):
+        response, status = hub.app.view_functions["api_agent_update_check"]()
+
+    assert status == 202
+    assert response.get_json()["state"] == "checking"
+    assert calls == []
+    assert len(deferred) == 1
+
+    deferred[0].target()
+    assert calls == [True]
+    assert followup_stability_patch._manifest_refresh_active() is False
+
+
 def test_app_managed_router_config_overrides_compose_after_save(monkeypatch, tmp_path):
     monkeypatch.setenv("APP_TOKEN", "config-key")
     monkeypatch.setenv("ROUTER_EWEB_URL", "http://192.168.5.1")
