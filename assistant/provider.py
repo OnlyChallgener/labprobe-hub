@@ -44,21 +44,72 @@ def usage_from_chunk(chunk: Any) -> Optional[Dict[str, int]]:
     if not isinstance(usage, dict):
         return None
     values: Dict[str, int] = {}
-    for key in ("prompt_tokens", "completion_tokens", "total_tokens"):
-        try:
-            if usage.get(key) is not None:
-                values[key] = int(usage[key])
-        except (TypeError, ValueError):
-            continue
-    hit = usage.get("prompt_cache_hit_tokens", usage.get("cache_read_input_tokens"))
-    miss = usage.get("prompt_cache_miss_tokens", usage.get("cache_creation_input_tokens"))
-    try:
-        if hit is not None:
-            values["cache_hit_tokens"] = int(hit)
-        if miss is not None:
-            values["cache_miss_tokens"] = int(miss)
-    except (TypeError, ValueError):
-        pass
+
+    def first_int(*candidates: Any) -> Optional[int]:
+        for candidate in candidates:
+            if candidate is None or isinstance(candidate, bool):
+                continue
+            try:
+                return max(0, int(candidate))
+            except (TypeError, ValueError):
+                continue
+        return None
+
+    anthropic_read = first_int(usage.get("cache_read_input_tokens"))
+    anthropic_creation = first_int(usage.get("cache_creation_input_tokens"))
+    anthropic_cache_usage = anthropic_read is not None or anthropic_creation is not None
+    prompt = first_int(usage.get("prompt_tokens"))
+    if prompt is None and anthropic_cache_usage:
+        # Anthropic reports uncached input, cache writes and cache reads as
+        # separate billing buckets. Their complete logical prompt is the sum.
+        uncached_input = first_int(usage.get("input_tokens")) or 0
+        prompt = uncached_input + int(anthropic_read or 0) + int(anthropic_creation or 0)
+    elif prompt is None:
+        prompt = first_int(usage.get("input_tokens"))
+    completion = first_int(usage.get("completion_tokens"), usage.get("output_tokens"))
+    total = first_int(usage.get("total_tokens"))
+    if prompt is not None:
+        values["prompt_tokens"] = prompt
+    if completion is not None:
+        values["completion_tokens"] = completion
+    if total is not None:
+        values["total_tokens"] = total
+    elif prompt is not None or completion is not None:
+        values["total_tokens"] = int(prompt or 0) + int(completion or 0)
+
+    prompt_details = usage.get("prompt_tokens_details")
+    prompt_details = prompt_details if isinstance(prompt_details, dict) else {}
+    input_details = usage.get("input_tokens_details")
+    input_details = input_details if isinstance(input_details, dict) else {}
+    if anthropic_cache_usage and usage.get("prompt_cache_hit_tokens") is None:
+        explicit_hit = int(anthropic_read or 0)
+        explicit_miss = (
+            (first_int(usage.get("input_tokens")) or 0)
+            + int(anthropic_creation or 0)
+        )
+    else:
+        explicit_hit = first_int(
+            usage.get("prompt_cache_hit_tokens"),
+            prompt_details.get("cached_tokens"),
+            input_details.get("cached_tokens"),
+        )
+        explicit_miss = first_int(usage.get("prompt_cache_miss_tokens"))
+    if explicit_hit is not None or explicit_miss is not None:
+        hit = int(explicit_hit or 0)
+        miss = int(explicit_miss or 0)
+        # OpenAI's nested cached_tokens is a complete split against prompt
+        # tokens; several OpenAI-compatible providers instead expose only a
+        # partial hit/miss pair. Preserve the reported coverage so the APP can
+        # distinguish "not cached" from "provider did not report it".
+        nested_cached = (
+            prompt_details.get("cached_tokens") is not None
+            or input_details.get("cached_tokens") is not None
+        )
+        if nested_cached and explicit_miss is None and prompt is not None:
+            miss = max(0, prompt - hit)
+        values["cache_hit_tokens"] = hit
+        values["cache_miss_tokens"] = miss
+        values["cache_reported_input_tokens"] = hit + miss
     return values or None
 
 
@@ -241,11 +292,22 @@ class OpenAICompatibleProvider:
             return self._validated_event(value)
 
         try:
-            for raw in response.iter_lines(decode_unicode=True):
+            # SSE and JSON are UTF-8 on the wire.  Do not let ``requests``
+            # choose ISO-8859-1 for ``text/event-stream`` responses which omit
+            # an explicit charset (Tencent TokenHub currently does this), or
+            # valid Chinese text is irreversibly turned into mojibake before it
+            # reaches the Hub transcript.
+            for raw in response.iter_lines(decode_unicode=False):
                 if raw is None:
                     continue
-                if not isinstance(raw, str):
-                    raw = raw.decode("utf-8", errors="replace")
+                if isinstance(raw, bytes):
+                    try:
+                        raw = raw.decode("utf-8")
+                    except UnicodeDecodeError as exc:
+                        raise ProviderError("AI provider returned non-UTF-8 SSE data") from exc
+                elif not isinstance(raw, str):
+                    raw = str(raw)
+                raw = raw.lstrip("\ufeff")
                 if not raw:
                     event = decode_pending()
                     if event is not None:

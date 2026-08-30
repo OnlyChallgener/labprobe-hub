@@ -8,7 +8,7 @@ from __future__ import annotations
 
 from typing import Any, Dict, List
 
-CATALOG_REVISION = "2026-08-29.2"
+CATALOG_REVISION = "2026-08-30.1"
 
 _TOOLS: List[Dict[str, Any]] = [
     {
@@ -228,6 +228,22 @@ _TOOLS: List[Dict[str, Any]] = [
         "confirmation": "none",
         "scope": "router.read",
         "inputSchema": {"type": "object", "properties": {}, "additionalProperties": False},
+    },
+    {
+        "id": "wireguard.server.toggle",
+        "version": "1",
+        "name": "启停 WireGuard 服务端",
+        "description": "启用或停用路由器 Agent 上的 WireGuard 网关；停用后所有 DDNS/STUN WireGuard 客户端都会断开。",
+        "examples": ["关闭 WireGuard", "停用 WireGuard 网关", "重新启用 WireGuard 服务端"],
+        "risk": "write",
+        "confirmation": "always",
+        "scope": "router.write",
+        "inputSchema": {
+            "type": "object",
+            "properties": {"enabled": {"type": "boolean"}},
+            "required": ["enabled"],
+            "additionalProperties": False,
+        },
     },
 ]
 

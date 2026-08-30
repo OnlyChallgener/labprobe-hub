@@ -208,6 +208,25 @@ def test_daily_usage_exposes_real_input_and_output_totals_for_bar_chart(tmp_path
     assert daily["total_tokens"] == 10
     assert daily["cache_hit_tokens"] == 2
     assert daily["cache_miss_tokens"] == 5
+    assert daily["cache_reported_input_tokens"] == 7
+
+
+def test_daily_cache_coverage_keeps_unreported_provider_input_out_of_hit_rate(tmp_path, monkeypatch):
+    client = make_client(tmp_path, monkeypatch)
+    store = AIStore(tmp_path / "ai.db")
+    store.add_usage("reported", "deepseek", "cache-model", {
+        "prompt_tokens": 50, "completion_tokens": 1, "total_tokens": 51,
+        "cache_hit_tokens": 20, "cache_miss_tokens": 30,
+    })
+    store.add_usage("unreported", "gateway", "opaque-model", {
+        "prompt_tokens": 200, "completion_tokens": 2, "total_tokens": 202,
+    })
+    daily = client.get("/api/ai/usage").json["daily"][-1]
+    assert daily["prompt_tokens"] == 250
+    assert daily["cache_hit_tokens"] == 20
+    assert daily["cache_reported_input_tokens"] == 50
+    # The correct displayed rate is 20/50=40% with 50/250 coverage;
+    # treating the opaque provider as a miss would incorrectly show 8%.
 
 
 def test_conversation_history_and_date_usage_are_persisted(tmp_path, monkeypatch):
@@ -1139,7 +1158,12 @@ def test_stream_chat_runs_tool_loop_and_emits_typed_events(tmp_path, monkeypatch
     done = events[-1]
     assert done["type"] == "done"
     assert done["message"]["content"] == "Mate60 的IPv6 是 240e::60。"
-    assert done["usage"]["total_tokens"] == 8
+    # A tool task is two billable provider requests: the tool-selection round
+    # (7) plus the final-answer round (8). Repeated usage frames inside either
+    # round are snapshots, but distinct rounds must be added.
+    assert done["usage"]["prompt_tokens"] == 10
+    assert done["usage"]["completion_tokens"] == 5
+    assert done["usage"]["total_tokens"] == 15
     assert done["usageKnown"] is True
     assert done["toolExecutions"] == [{"toolId": "device.ipv6", "status": "completed"}]
 

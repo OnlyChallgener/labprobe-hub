@@ -73,6 +73,50 @@ def test_wireguard_status_redacts_private_key_material(tmp_path):
     assert result["wireguard"]["server"]["endpoint"] == "hub:51820"
 
 
+def test_wireguard_server_toggle_is_revision_pinned_and_requires_confirmation(tmp_path):
+    hub = make_hub(tmp_path)
+    document = {
+        "revision": 7,
+        "server": {
+            "interfaceName": "labwg0", "address": "10.77.0.1/24",
+            "listenPort": 51820, "mtu": 1420, "enabled": True,
+            "peers": [], "endpointProfiles": [],
+        },
+    }
+    calls = []
+
+    def put(payload, expected_revision):
+        calls.append((dict(payload), expected_revision))
+        assert expected_revision == document["revision"]
+        document["revision"] += 1
+        document["server"] = dict(payload)
+        return dict(document)
+
+    hub.WIREGUARD_SERVICE = SimpleNamespace(document=lambda: dict(document), put=put)
+    executor = ToolExecutor(hub)
+    with pytest.raises(ToolError, match="二次确认"):
+        executor.execute("wireguard.server.toggle", {"enabled": False})
+
+    preview = executor.preview("wireguard.server.toggle", {"enabled": False})
+    assert preview["arguments"] == {"enabled": False, "expectedRevision": 7}
+    assert "所有 WireGuard 客户端将断开" in preview["summary"]
+    result = executor.execute("wireguard.server.toggle", preview["arguments"], allow_write=True)
+    assert result["enabled"] is False and result["revision"] == 8
+    assert calls == [({**document["server"], "enabled": False}, 7)]
+
+
+def test_wireguard_toggle_rejects_unconfigured_gateway_and_non_boolean_value(tmp_path):
+    hub = make_hub(tmp_path)
+    hub.WIREGUARD_SERVICE = SimpleNamespace(document=lambda: {"revision": 0, "server": None})
+    executor = ToolExecutor(hub)
+    with pytest.raises(ToolError) as missing:
+        executor.preview("wireguard.server.toggle", {"enabled": False})
+    assert missing.value.code == "WIREGUARD_NOT_CONFIGURED"
+    with pytest.raises(ToolError) as invalid:
+        executor.preview("wireguard.server.toggle", {"enabled": "false"})
+    assert invalid.value.code == "INVALID_ARGUMENTS"
+
+
 def test_missing_service_returns_503(tmp_path):
     hub = make_hub(tmp_path)
     hub.WIREGUARD_SERVICE = None

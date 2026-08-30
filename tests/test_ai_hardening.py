@@ -7,7 +7,7 @@ from types import SimpleNamespace
 import pytest
 from flask import Flask
 
-from assistant.api import create_ai_blueprint
+from assistant.api import create_ai_blueprint, merge_usage, update_usage_snapshot
 from assistant.provider import ChatResult, OpenAICompatibleProvider, ProviderError, parse_sse_line, usage_from_chunk
 from assistant.security import decrypt_secret, encrypt_secret
 from assistant.storage import AIStore
@@ -67,6 +67,64 @@ def test_provider_normalizes_error_events_and_rejects_scalars_cleanly():
         list(provider_for(["event: error", 'data: {"message":"gateway rejected"}']).stream([]))
 
 
+def test_provider_normalizes_provider_specific_cache_usage_without_inventing_missing_data():
+    openai = usage_from_chunk({"usage": {
+        "input_tokens": 10, "output_tokens": 2,
+        "input_tokens_details": {"cached_tokens": 4},
+    }})
+    assert openai == {
+        "prompt_tokens": 10, "completion_tokens": 2, "total_tokens": 12,
+        "cache_hit_tokens": 4, "cache_miss_tokens": 6,
+        "cache_reported_input_tokens": 10,
+    }
+
+    deepseek_partial = usage_from_chunk({"usage": {
+        "prompt_tokens": 20_000, "completion_tokens": 100,
+        "prompt_cache_hit_tokens": 0, "prompt_cache_miss_tokens": 174,
+    }})
+    assert deepseek_partial["total_tokens"] == 20_100
+    assert deepseek_partial["cache_reported_input_tokens"] == 174
+
+    no_cache_detail = usage_from_chunk({"usage": {
+        "prompt_tokens": 8, "completion_tokens": 2, "total_tokens": 10,
+    }})
+    assert "cache_reported_input_tokens" not in no_cache_detail
+
+    anthropic = usage_from_chunk({"usage": {
+        "input_tokens": 3, "cache_creation_input_tokens": 5,
+        "cache_read_input_tokens": 12, "output_tokens": 2,
+    }})
+    assert anthropic == {
+        "prompt_tokens": 20, "completion_tokens": 2, "total_tokens": 22,
+        "cache_hit_tokens": 12, "cache_miss_tokens": 8,
+        "cache_reported_input_tokens": 20,
+    }
+
+
+def test_stream_usage_frames_are_latest_snapshots_while_tool_rounds_are_additive():
+    first_round = {}
+    snapshot = {
+        "prompt_tokens": 20, "completion_tokens": 3, "total_tokens": 23,
+        "cache_hit_tokens": 5, "cache_miss_tokens": 15,
+        "cache_reported_input_tokens": 20,
+    }
+    update_usage_snapshot(first_round, snapshot)
+    update_usage_snapshot(first_round, snapshot)
+    assert first_round == snapshot
+
+    second_round = {}
+    update_usage_snapshot(second_round, {
+        "prompt_tokens": 8, "completion_tokens": 2, "total_tokens": 10,
+    })
+    task = {}
+    merge_usage(task, first_round)
+    merge_usage(task, second_round)
+    assert task["prompt_tokens"] == 28
+    assert task["completion_tokens"] == 5
+    assert task["total_tokens"] == 33
+    assert task["cache_reported_input_tokens"] == 20
+
+
 def test_provider_skips_bad_frame_when_a_later_frame_is_valid_and_reports_empty_stream():
     chunks = list(provider_for([
         "data: not-json", "",
@@ -75,6 +133,20 @@ def test_provider_skips_bad_frame_when_a_later_frame_is_valid_and_reports_empty_
     assert chunks[0]["choices"][0]["delta"]["content"] == "ok"
     with pytest.raises(ProviderError, match="empty SSE stream"):
         list(provider_for([": ping", "data:"]).stream([]))
+
+
+def test_provider_decodes_tokenhub_sse_bytes_as_utf8_without_charset():
+    content = "当前防火墙规则共 3 条"
+    line = ("data: " + json.dumps({
+        "choices": [{"delta": {"content": content}}],
+    }, ensure_ascii=False)).encode("utf-8")
+    chunks = list(provider_for([line, b"data: [DONE]"]).stream([]))
+    assert chunks[0]["choices"][0]["delta"]["content"] == content
+
+
+def test_provider_rejects_non_utf8_sse_instead_of_saving_replacement_text():
+    with pytest.raises(ProviderError, match="non-UTF-8 SSE"):
+        list(provider_for([b"data: {\"message\":\"\xff\"}"]).stream([]))
 
 
 def test_chat_stream_starts_with_handshake_and_proxy_safe_headers(tmp_path, monkeypatch):
@@ -389,7 +461,9 @@ def test_usage_calibration_and_quota_are_atomic_and_not_counted_as_tasks(tmp_pat
     client = make_client(tmp_path, monkeypatch)
     config = client.put("/api/ai/config", json={"apiKey": "sk", "tokenQuota": 1000}).json
     store = AIStore(tmp_path / "ai.db")
-    store.add_usage("c", "deepseek", config["model"], {"total_tokens": 10}, config_id=config["id"])
+    store.add_usage("c", "deepseek", config["model"], {
+        "prompt_tokens": 7, "completion_tokens": 3, "total_tokens": 10,
+    }, config_id=config["id"])
     response = client.post("/api/ai/usage/adjust", json={
         "configId": config["id"], "totalTokens": 40, "tokenQuota": 2000,
     })
@@ -399,6 +473,10 @@ def test_usage_calibration_and_quota_are_atomic_and_not_counted_as_tasks(tmp_pat
     usage = client.get("/api/ai/usage").json
     assert usage["requests"] == 1 and usage["total_tokens"] == 40
     assert usage["today_requests"] == 1 and usage["daily"][-1]["requests"] == 1
+    assert usage["today_total_tokens"] == 10
+    assert usage["daily"][-1]["total_tokens"] == 10
+    assert usage["daily"][-1]["prompt_tokens"] == 7
+    assert usage["daily"][-1]["completion_tokens"] == 3
     assert all(row["status"] != "adjusted" for row in usage["recent"])
 
     same = client.post("/api/ai/usage/adjust", json={
@@ -406,6 +484,57 @@ def test_usage_calibration_and_quota_are_atomic_and_not_counted_as_tasks(tmp_pat
     }).json
     assert same["adjustment"]["id"] is None and same["adjustment"]["delta"] == 0
     assert same["config"]["tokenQuota"] is None
+
+
+def test_delete_quota_record_preserves_provider_config_key_and_task_history(tmp_path, monkeypatch):
+    client = make_client(tmp_path, monkeypatch)
+    config = client.put("/api/ai/config", json={
+        "name": "腾讯混元", "provider": "hunyuan", "apiKey": "tokenhub-secret",
+        "baseUrl": "https://tokenhub.tencentmaas.com/v1",
+        "model": "deepseek-v4-flash-202605", "tokenQuota": 1_000_000,
+    }).json
+    store = AIStore(tmp_path / "ai.db")
+    store.add_usage("task-1", "hunyuan", config["model"], {"total_tokens": 12}, config_id=config["id"])
+    assert client.post("/api/ai/usage/adjust", json={
+        "configId": config["id"], "totalTokens": 1_000_000, "tokenQuota": 1_000_000,
+    }).status_code == 200
+
+    deleted = client.delete(f"/api/ai/usage/config/{config['id']}")
+    assert deleted.status_code == 200
+    assert deleted.json["providerConfigPreserved"] is True
+    assert deleted.json["taskUsagePreserved"] is True
+    configs = client.get("/api/ai/config").json["configs"]
+    kept = next(row for row in configs if row["id"] == config["id"])
+    assert kept["apiKey"] == "configured"
+    assert kept["baseUrl"] == "https://tokenhub.tencentmaas.com/v1"
+    usage = client.get("/api/ai/usage").json
+    assert usage["config_usage"] == []
+    assert [row["total_tokens"] for row in usage["recent"]] == [12]
+
+    restored = client.post("/api/ai/usage/adjust", json={
+        "configId": config["id"], "totalTokens": 25, "tokenQuota": 500,
+    })
+    assert restored.status_code == 200
+    assert client.get("/api/ai/usage").json["config_usage"][0]["total_tokens"] == 25
+
+
+def test_switching_model_clears_old_calibration_without_losing_old_task_usage(tmp_path):
+    store = AIStore(tmp_path / "ai.db")
+    store.initialize()
+    config = store.create_config("腾讯混元", "hunyuan", "https://tokenhub.tencentmaas.com/v1", "hy3", "v1:key", True, 100)
+    store.add_usage("old", "hunyuan", "hy3", {"total_tokens": 10}, config_id=config["id"])
+    store.record_usage_adjustment(config["id"], 100, 100)
+    switched = store.update_config(
+        config["id"], name=config["name"], provider=config["provider"],
+        base_url=config["base_url"], model="deepseek-v4-flash", ciphertext=config["api_key_ciphertext"],
+        enabled=True, model_quota_tokens=None, position=config["position"],
+    )
+    assert switched["manual_total_tokens"] is None
+    assert store.usage_by_config()[0]["model"] == "deepseek-v4-flash"
+    assert store.usage_by_config()[0]["total_tokens"] == 0
+    assert store.usage_summary()["total_tokens"] == 10
+    by_model = {row["model"]: row["total_tokens"] for row in store.usage_by_model()}
+    assert by_model["hy3"] == 10
 
 
 def test_manual_calibration_is_independent_from_conversation_deletion_and_future_tasks(tmp_path):
@@ -420,12 +549,12 @@ def test_manual_calibration_is_independent_from_conversation_deletion_and_future
     assert store.usage_by_config()[0]["total_tokens"] == 100
     from datetime import datetime, timedelta, timezone
     today = datetime.now(timezone.utc).astimezone(timezone(timedelta(hours=8))).date().isoformat()
-    assert store.usage_for_date(today)["total_tokens"] == 100
+    assert store.usage_for_date(today)["total_tokens"] == 10
     store.add_usage("new", "p", "m", {"total_tokens": 7}, config_id=config["id"])
     assert store.usage_by_config()[0]["total_tokens"] == 107
     calibrated_day = store.usage_daily()[-1]
-    assert calibrated_day["total_tokens"] == 107
-    assert calibrated_day["models"]["m"] == 107
+    assert calibrated_day["total_tokens"] == 17
+    assert calibrated_day["models"]["m"] == 17
     assert store.record_usage_adjustment(config["id"], 100)["delta"] == -7
     assert store.usage_by_config()[0]["total_tokens"] == 100
     assert [row["total_tokens"] for row in store.list_usage()] == [7, 10]

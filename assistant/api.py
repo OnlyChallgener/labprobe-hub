@@ -36,7 +36,7 @@ TOOL_SYSTEM_PROMPT = (
     "WireGuard、路由器端口映射、IPv6、每日记录、防火墙（转发/入站/出站规则的查询、启停、"
     "新建、修改、删除）、路由器 Beta 固件（版本查询与检测更新），以及让 APP 跳转页面或刷新数据。"
     "涉及查询时必须调用工具，不得猜测。只读工具可以直接调用；写入操作（新增/删除/启停端口映射、"
-    "穿透规则或防火墙规则，升级 Agent）只能生成确认请求，在对话中出现对应的〔操作记录〕之前"
+    "穿透规则、防火墙规则或 WireGuard 网关，升级 Agent）只能生成确认请求，在对话中出现对应的〔操作记录〕之前"
     "绝不能声称操作已经完成。"
     "用户问「路由器固件 / Beta 固件」时调用 router.firmware.status 或 router.firmware.check，"
     "不要把 Agent 版本当固件版本回答；固件检测结果用 content 字段的中文内容组织回复，不要输出 JSON。"
@@ -53,10 +53,29 @@ TOOL_SYSTEM_PROMPT = (
 
 
 def merge_usage(total: Dict[str, int], usage: Dict[str, int]) -> Dict[str, int]:
-    for key in ("prompt_tokens", "completion_tokens", "total_tokens"):
+    for key in (
+        "prompt_tokens", "completion_tokens", "total_tokens",
+        "cache_hit_tokens", "cache_miss_tokens", "cache_reported_input_tokens",
+    ):
         if key in usage:
             total[key] = int(total.get(key) or 0) + int(usage.get(key) or 0)
     return total
+
+
+def update_usage_snapshot(current: Dict[str, int], usage: Dict[str, int]) -> Dict[str, int]:
+    """Keep the latest cumulative usage snapshot for one provider request.
+
+    OpenAI-compatible streaming usage frames are cumulative snapshots, not
+    deltas. Summing repeated frames can multiply a single task's tokens. Tool
+    rounds are still added together later with ``merge_usage``.
+    """
+    for key in (
+        "prompt_tokens", "completion_tokens", "total_tokens",
+        "cache_hit_tokens", "cache_miss_tokens", "cache_reported_input_tokens",
+    ):
+        if key in usage:
+            current[key] = int(usage[key])
+    return current
 
 
 def diagnostic_tool_intent(text: str) -> str | None:
@@ -779,6 +798,21 @@ def create_ai_blueprint(*, check_app_token: Callable[[], bool], db_path, logger,
         if not store.delete_usage_record(usage_id):
             return jsonify({"error": "usage record was not found"}), 404
         return jsonify({"ok": True, "deleted": usage_id})
+
+    @bp.delete("/usage/config/<int:config_id>")
+    def delete_config_usage_record(config_id: int):
+        """Remove one quota/calibration card, never the provider config."""
+        denial = authorized()
+        if denial:
+            return denial
+        if not store.delete_config_usage_record(config_id):
+            return jsonify({"error": "AI configuration was not found"}), 404
+        return jsonify({
+            "ok": True,
+            "configId": config_id,
+            "providerConfigPreserved": True,
+            "taskUsagePreserved": True,
+        })
 
     @bp.get("/usage")
     def get_usage():
@@ -1507,7 +1541,7 @@ def create_ai_blueprint(*, check_app_token: Callable[[], bool], db_path, logger,
                                     if chunk is None:
                                         yield ": ping\n\n"
                                         continue
-                                    merge_usage(round_usage, usage_from_chunk(chunk) or {})
+                                    update_usage_snapshot(round_usage, usage_from_chunk(chunk) or {})
                                     choices = chunk.get("choices") if isinstance(chunk.get("choices"), list) else []
                                     for choice in choices:
                                         delta = choice.get("delta") if isinstance(choice, dict) else {}

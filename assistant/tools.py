@@ -119,6 +119,8 @@ class ToolExecutor:
                     raise ToolError(f"参数 {name} 格式错误", "INVALID_ARGUMENTS")
                 if rule.get("enum") and value not in rule["enum"]:
                     raise ToolError(f"参数 {name} 不在允许范围", "INVALID_ARGUMENTS")
+            elif rule.get("type") == "boolean" and not isinstance(value, bool):
+                raise ToolError(f"参数 {name} 必须是布尔值", "INVALID_ARGUMENTS")
             clean[name] = value
         return spec, clean
 
@@ -262,18 +264,46 @@ class ToolExecutor:
                 "arguments": clean_args,
                 "expiresInSeconds": 300,
             }
+        if tool_id == "wireguard.server.toggle":
+            service = getattr(self.hub, "WIREGUARD_SERVICE", None)
+            if service is None:
+                raise ToolError("WireGuard 服务未启用", "SERVICE_UNAVAILABLE", 503)
+            document = service.document()
+            server = document.get("server") if isinstance(document, dict) else None
+            if not isinstance(server, dict):
+                raise ToolError("WireGuard 网关尚未配置", "WIREGUARD_NOT_CONFIGURED", 409)
+            enabled = bool(args["enabled"])
+            current = bool(server.get("enabled", True))
+            action = "启用" if enabled else "停用"
+            impact = "恢复路由器 WireGuard 网关" if enabled else "所有 WireGuard 客户端将断开，DDNS/STUN 入口都会停止使用"
+            return {
+                "toolId": tool_id,
+                "title": f"确认{action} WireGuard",
+                "summary": f"当前网关已{'启用' if current else '停用'}；确认后将{action}。{impact}。",
+                # Pin the desired-document revision so a stale confirmation
+                # can never overwrite edits made from the APP in the meantime.
+                "arguments": {"enabled": enabled, "expectedRevision": int(document.get("revision") or 0)},
+                "expiresInSeconds": 300,
+            }
         raise ToolError("该写入指令尚未开放", "TOOL_NOT_IMPLEMENTED", 501)
 
     def execute(self, tool_id: str, arguments: Any, allow_write: bool = False,
                 client_context: Any = None) -> Dict[str, Any]:
         pinned_wol = arguments if allow_write and tool_id == "device.wol" and isinstance(arguments, dict) else {}
-        validation_arguments = {"device": pinned_wol.get("device")} if pinned_wol else arguments
+        pinned_wireguard = arguments if allow_write and tool_id == "wireguard.server.toggle" and isinstance(arguments, dict) else {}
+        validation_arguments = (
+            {"device": pinned_wol.get("device")} if pinned_wol
+            else {"enabled": pinned_wireguard.get("enabled")} if pinned_wireguard
+            else arguments
+        )
         spec, args = self.validate(tool_id, validation_arguments)
         if pinned_wol:
             # Confirmation preview resolved and pinned this target. Do not
             # resolve the mutable device inventory again during execution.
             args["mac"] = str(pinned_wol.get("mac") or "").strip()
             args["name"] = str(pinned_wol.get("name") or "").strip()
+        if pinned_wireguard and pinned_wireguard.get("expectedRevision") is not None:
+            args["expectedRevision"] = int(pinned_wireguard.get("expectedRevision") or 0)
         if spec["risk"] == "write" and not allow_write:
             raise ToolError("该操作需要二次确认", "CONFIRMATION_REQUIRED", 409)
         handler = self._handlers.get(tool_id)
@@ -341,6 +371,29 @@ class ToolExecutor:
             if service is None:
                 raise ToolError("WireGuard 服务未启用", "SERVICE_UNAVAILABLE", 503)
             return {"wireguard": _sanitized(service.document())}
+        if tool_id == "wireguard.server.toggle":
+            service = getattr(self.hub, "WIREGUARD_SERVICE", None)
+            if service is None:
+                raise ToolError("WireGuard 服务未启用", "SERVICE_UNAVAILABLE", 503)
+            document = service.document()
+            server = document.get("server") if isinstance(document, dict) else None
+            if not isinstance(server, dict):
+                raise ToolError("WireGuard 网关尚未配置", "WIREGUARD_NOT_CONFIGURED", 409)
+            expected = args.get("expectedRevision")
+            try:
+                saved = service.put(
+                    {**server, "enabled": bool(args["enabled"])},
+                    int(expected) if expected is not None else int(document.get("revision") or 0),
+                )
+            except RuntimeError as exc:
+                raise ToolError(f"WireGuard 配置已变化，请重新确认：{exc}", "REVISION_CONFLICT", 409) from exc
+            except ValueError as exc:
+                raise ToolError(str(exc), "INVALID_WIREGUARD_CONFIG", 400) from exc
+            return {
+                "enabled": bool((saved.get("server") or {}).get("enabled", False)),
+                "revision": saved.get("revision"),
+                "message": f"WireGuard 网关已{'启用' if args['enabled'] else '停用'}，正在下发到路由器 Agent",
+            }
         if tool_id == "app.settings.get":
             return {"settings": self._client_context(client_context)["settings"]}
         if tool_id == "app.favorite.list":
