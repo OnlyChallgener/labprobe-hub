@@ -253,7 +253,7 @@ start_service() {
   # Keep the Relay process FD ceiling above the TCP test scale. Runtime guards
   # still reserve 20% and stop earlier on conntrack, memory, source-port or CPU
   # pressure, so raising RLIMIT_NOFILE does not bypass resource protection.
-  procd_set_param limits nofile=131072 131072
+  procd_set_param limits nofile="131072 131072"
   procd_close_instance
 }
 EOF
