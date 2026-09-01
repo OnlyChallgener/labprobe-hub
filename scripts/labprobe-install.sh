@@ -220,7 +220,7 @@ start_service() {
   procd_set_param respawn 3600 5 5
   procd_set_param stdout 1
   procd_set_param stderr 1
-  procd_set_param limits nofile=131072 131072
+  procd_set_param limits nofile="131072 131072"
   procd_close_instance
 
   procd_open_instance agent
@@ -275,6 +275,30 @@ wait_for_relay() {
     sleep 1
     attempt=$((attempt + 1))
   done
+  return 1
+}
+
+verify_relay_nofile() {
+  for pid in $(pidof labrelay 2>/dev/null); do
+    [ -r "/proc/$pid/cmdline" ] || continue
+    cmdline="$(tr '\000' ' ' < "/proc/$pid/cmdline" 2>/dev/null)"
+    case "$cmdline" in
+      *" labrelay daemon "*|*"/labrelay daemon "*)
+        soft="$(awk '/Max open files/ {print $4; exit}' "/proc/$pid/limits" 2>/dev/null)"
+        hard="$(awk '/Max open files/ {print $5; exit}' "/proc/$pid/limits" 2>/dev/null)"
+        case "$soft:$hard" in
+          *[!0-9:]*|:*) return 1 ;;
+        esac
+        if [ "$soft" -ge 65536 ] && [ "$hard" -ge 65536 ]; then
+          say "Relay FD 上限已生效：soft=$soft hard=$hard"
+          return 0
+        fi
+        say "Relay FD 上限未生效：soft=$soft hard=$hard"
+        return 1
+        ;;
+    esac
+  done
+  say "未找到 Relay daemon 进程，无法校验 FD 上限"
   return 1
 }
 
@@ -351,6 +375,8 @@ INSTALL_STAGE="启动 Relay 与 Agent 服务"
 "$INIT_SCRIPT" start >/tmp/labprobe/service-start.log 2>&1 || { show_stage_log /tmp/labprobe/service-start.log; rollback; }
 INSTALL_STAGE="等待 Relay 控制套接字"
 wait_for_relay || { show_stage_log /tmp/labprobe/service-start.log; rollback; }
+INSTALL_STAGE="校验 Relay FD 上限"
+verify_relay_nofile || { show_stage_log /tmp/labprobe/service-start.log; rollback; }
 INSTALL_STAGE="校验 Hub 连通性"
 wait_for_hub || { show_stage_log /tmp/labprobe/install-test.log; rollback; }
 if [ "$0" != "$INSTALL_DIR/labprobe-install.sh" ]; then
