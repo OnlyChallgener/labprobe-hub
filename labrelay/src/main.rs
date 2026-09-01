@@ -68,6 +68,7 @@ struct Rule {
     enabled: bool,
     mode: String,
     listen_port: u16,
+    target_type: String,
     target_mode: String,
     target_ipv4: String,
     target_ipv6: String,
@@ -97,6 +98,7 @@ impl Default for Rule {
             enabled: false,
             mode: "6to4".to_string(),
             listen_port: 0,
+            target_type: "manual".to_string(),
             target_mode: "ipv4".to_string(),
             target_ipv4: String::new(),
             target_ipv6: String::new(),
@@ -1521,11 +1523,18 @@ async fn update_target_status(
         base.last_error.clear();
     } else {
         base.state = "waiting_target".to_string();
-        base.last_error = error.unwrap_or_else(|| "target unavailable".to_string());
+        base.last_error = error.unwrap_or_else(|| "目标当前不可用".to_string());
     }
 }
 
 async fn resolve_rule_target(rule: &Rule, lan_if: &str) -> Result<IpAddr> {
+    if rule.target_type == "router_self" {
+        return Ok(if rule.mode == "6to6" {
+            IpAddr::V6(Ipv6Addr::LOCALHOST)
+        } else {
+            IpAddr::V4(Ipv4Addr::LOCALHOST)
+        });
+    }
     match rule.mode.as_str() {
         "6to4" | "stun" => {
             let ip = IpAddr::V4(Ipv4Addr::from_str(&rule.target_ipv4)?);
@@ -1738,6 +1747,10 @@ fn normalize_rule(rule: &mut Rule) {
     rule.id = rule.id.trim().to_ascii_lowercase();
     rule.name = rule.name.trim().to_string();
     rule.mode = rule.mode.trim().to_ascii_lowercase();
+    rule.target_type = rule.target_type.trim().to_ascii_lowercase();
+    if rule.target_type.is_empty() {
+        rule.target_type = "manual".to_string();
+    }
     rule.target_mode = rule.target_mode.trim().to_ascii_lowercase();
     rule.target_ipv4 = rule.target_ipv4.trim().to_string();
     rule.target_ipv6 = strip_brackets(&rule.target_ipv6).to_string();
@@ -1747,10 +1760,30 @@ fn normalize_rule(rule: &mut Rule) {
     rule.service_type = rule.service_type.trim().to_string();
     rule.forward_mode = rule.forward_mode.trim().to_ascii_lowercase();
     rule.stun_server = rule.stun_server.trim().to_string();
+    if rule.target_type == "router_self" && rule.kind != "stun" {
+        if rule.mode == "6to6" {
+            rule.target_mode = "ipv6_full".to_string();
+            rule.target_ipv4.clear();
+            rule.target_ipv6 = Ipv6Addr::LOCALHOST.to_string();
+            rule.target_ipv6_suffix.clear();
+            rule.target_mac.clear();
+        } else {
+            rule.target_mode = "ipv4".to_string();
+            rule.target_ipv4 = Ipv4Addr::LOCALHOST.to_string();
+            rule.target_ipv6.clear();
+            rule.target_ipv6_suffix.clear();
+            rule.target_mac.clear();
+        }
+    }
     if rule.kind == "stun" {
         rule.mode = "stun".to_string();
         rule.target_mode = "ipv4".to_string();
-        rule.forward_mode = "router_native".to_string();
+        rule.forward_mode = if rule.target_type == "router_self" {
+            rule.target_ipv4 = Ipv4Addr::LOCALHOST.to_string();
+            "relay_proxy".to_string()
+        } else {
+            "router_native".to_string()
+        };
         if rule.stun_server.is_empty()
             || (rule.transport_protocol == "TCP" && rule.stun_server == LEGACY_TCP_STUN_SERVER)
         {
@@ -1775,6 +1808,9 @@ fn validate_rule(rule: &Rule, port_min: u16, port_max: u16) -> Result<()> {
     }
     if rule.name.is_empty() || rule.name.len() > 64 {
         bail!("规则名称无效");
+    }
+    if !matches!(rule.target_type.as_str(), "router_self" | "device" | "manual") {
+        bail!("目标类型只能是路由器本机、内网设备或手动目标");
     }
     if !rule.target_mac.is_empty() {
         let parts: Vec<&str> = rule.target_mac.split(':').collect();
@@ -1814,7 +1850,7 @@ fn validate_rule(rule: &Rule, port_min: u16, port_max: u16) -> Result<()> {
             "ipv6_full" => {
                 let ip = Ipv6Addr::from_str(strip_brackets(&rule.target_ipv6))
                     .context("目标 IPv6 地址无效")?;
-                if ip.is_loopback()
+                if (ip.is_loopback() && rule.target_type != "router_self")
                     || ip.is_unspecified()
                     || ip.is_multicast()
                     || ip.is_unicast_link_local()
@@ -2744,7 +2780,7 @@ mod tests {
 
         let error = manager.upsert(replacement).await.unwrap_err();
 
-        assert!(format!("{error:#}").contains("persist new rule"));
+        assert!(format!("{error:#}").contains("保存新规则失败"));
         assert_eq!(
             manager.rules.read().await.get("stun-persist").unwrap().name,
             "Previous"

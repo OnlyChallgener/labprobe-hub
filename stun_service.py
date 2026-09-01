@@ -52,6 +52,7 @@ STUN_RUNTIME_FIELDS = (
     "kind",
     "mode",
     "listenPort",
+    "targetType",
     "targetMode",
     "targetIpv4",
     "targetPort",
@@ -66,6 +67,7 @@ STUN_RUNTIME_FIELDS = (
 STUN_NATIVE_MAPPING_FIELDS = (
     "enabled",
     "listenPort",
+    "targetType",
     "targetIpv4",
     "targetPort",
     "transportProtocol",
@@ -175,7 +177,21 @@ class StunService:
             rule = dict(raw)
             if _text(rule.get("kind")).lower() == "stun":
                 protocol = _text(rule.get("transportProtocol")).upper() or "TCP"
-                forward_mode = "router_native"
+                target_type = _text(rule.get("targetType")).lower()
+                if not target_type:
+                    target_ip = _text(rule.get("targetIpv4"))
+                    try:
+                        target_type = "router_self" if target_ip and ipaddress.ip_address(target_ip).is_loopback else "manual"
+                    except ValueError:
+                        target_type = "manual"
+                    rule["targetType"] = target_type
+                    rule["updatedAt"] = _now_text()
+                    changed = True
+                forward_mode = "relay_proxy" if target_type == "router_self" else "router_native"
+                if target_type == "router_self" and _text(rule.get("targetIpv4")) != "127.0.0.1":
+                    rule["targetIpv4"] = "127.0.0.1"
+                    rule["updatedAt"] = _now_text()
+                    changed = True
                 if _text(rule.get("forwardMode")) != forward_mode:
                     rule["forwardMode"] = forward_mode
                     rule["updatedAt"] = _now_text()
@@ -228,7 +244,16 @@ class StunService:
             raise ValueError(f"{service} 不支持 {protocol} 穿透")
         old_protocol = _text(old.get("transportProtocol")).upper()
         stun_server = _text(old.get("stunServer")) if old and protocol == old_protocol else ""
-        target_ip = _text(payload.get("targetIpv4") or old.get("targetIpv4"))
+        target_type = _text(payload.get("targetType") or old.get("targetType")).lower()
+        if not target_type:
+            old_target = _text(payload.get("targetIpv4") or old.get("targetIpv4"))
+            try:
+                target_type = "router_self" if old_target and ipaddress.ip_address(old_target).is_loopback else "manual"
+            except ValueError:
+                target_type = "manual"
+        if target_type not in {"router_self", "device", "manual"}:
+            raise ValueError("目标类型只能是路由器本机、内网设备或手动目标")
+        target_ip = "127.0.0.1" if target_type == "router_self" else _text(payload.get("targetIpv4") or old.get("targetIpv4"))
         try:
             address = ipaddress.ip_address(target_ip)
         except ValueError as error:
@@ -244,7 +269,8 @@ class StunService:
         listen = _int(old.get("listenPort")) if old else 0
         if not listen or listen in self._used_ports(protocol, rule_id):
             listen = self._allocated_port(protocol, rule_id)
-        generated_name = f"{service} · {target_ip}:{target_port}"
+        generated_target = "路由器本机" if target_type == "router_self" else target_ip
+        generated_name = f"{service} · {generated_target}:{target_port}"
         name = (_text(payload.get("name")) or generated_name) if "name" in payload else (_text(old.get("name")) or generated_name)
         if len(name) > 64:
             raise ValueError("名称不能超过 64 个字符")
@@ -255,6 +281,7 @@ class StunService:
             "enabled": _bool(payload.get("enabled"), _bool(old.get("enabled"), True)),
             "mode": "stun",
             "listenPort": listen,
+            "targetType": target_type,
             "targetMode": "ipv4",
             "targetIpv4": target_ip,
             "targetPort": target_port,
@@ -263,7 +290,7 @@ class StunService:
             # The router owns forwarding while the STUN client only keeps the
             # public NAT mapping alive.  This is Lucky's direct mode and
             # works for either selected transport on current Lucky releases.
-            "forwardMode": "router_native",
+            "forwardMode": "relay_proxy" if target_type == "router_self" else "router_native",
             "stunServer": stun_server or _stun_server(protocol),
             "maxConnections": max(1, min(256, _int(payload.get("maxConnections"), _int(old.get("maxConnections"), 32)) or 32)),
             "idleTimeoutSec": max(30, min(3600, _int(payload.get("idleTimeoutSec"), _int(old.get("idleTimeoutSec"), 300)) or 300)),
@@ -415,7 +442,7 @@ class StunService:
 
     @staticmethod
     def _is_native_forward(rule: Dict[str, Any]) -> bool:
-        return _text(rule.get("forwardMode")) == "router_native"
+        return _text(rule.get("targetType")) != "router_self" and _text(rule.get("forwardMode")) == "router_native"
 
     def _expected_native_mapping(self, rule: Dict[str, Any]) -> Dict[str, Any]:
         return {
@@ -589,11 +616,12 @@ class StunService:
 
     def ensure_firewall(self, rule: Dict[str, Any]) -> Dict[str, Any]:
         expected = self._expected_firewall(rule)
+        owner = "labprobe-wireguard" if _text(rule.get("firewallMode")).lower() == "wireguard_lan_forward" else "labprobe-stun"
         bindings = self._firewall_bindings()
         binding = bindings.get(rule["id"], {})
         current = self.client.firewall(True)
         existing = self._find_firewall(current, _text(binding.get("uuid")))
-        if not existing and _text(rule.get("firewallMode")).lower() == "wireguard_lan_forward":
+        if not existing:
             # A same-name rule without our persisted fingerprint is not ours
             # to adopt.  Refuse a duplicate so a manual/operator rule remains
             # authoritative and cleanup can never target it accidentally.
@@ -606,13 +634,16 @@ class StunService:
                 None,
             )
             if same_name:
-                return {"state": "manual_change", "message": "检测到同名但不属于 WireGuard 的防火墙规则，未接管"}
+                result = {"owner": owner, "state": "manual_change", "message": "检测到同名但不属于 LabProbe 的防火墙规则，未接管"}
+                bindings[rule["id"]] = result
+                self._save_firewall_bindings(bindings)
+                return result
         if existing:
             if binding.get("fingerprint") and binding["fingerprint"] != _rule_fingerprint(existing):
                 return {"state": "manual_change", "message": "已检测到防火墙规则被手动修改"}
             if not self._firewall_matches(existing, expected):
                 return {"state": "verify_failed", "message": "防火墙规则回读与穿透规则不一致"}
-            bindings[rule["id"]] = {"uuid": _text(existing.get("uuid")), "fingerprint": _rule_fingerprint(existing)}
+            bindings[rule["id"]] = {"owner": owner, "uuid": _text(existing.get("uuid")), "fingerprint": _rule_fingerprint(existing)}
             self._save_firewall_bindings(bindings)
             return {"state": "ready", "uuid": _text(existing.get("uuid")), "fingerprint": _rule_fingerprint(existing)}
         if _int(current.get("maxLen"), 20) and len(current.get("list", [])) >= _int(current.get("maxLen"), 20):
@@ -626,7 +657,7 @@ class StunService:
         created = next((dict(row) for row in verified.get("list", []) if isinstance(row, dict) and self._firewall_matches(row, expected)), None)
         if not created or not _text(created.get("uuid")):
             return {"state": "verify_failed", "message": "防火墙规则创建后未能确认"}
-        bindings[rule["id"]] = {"uuid": _text(created.get("uuid")), "fingerprint": _rule_fingerprint(created)}
+        bindings[rule["id"]] = {"owner": owner, "uuid": _text(created.get("uuid")), "fingerprint": _rule_fingerprint(created)}
         self._save_firewall_bindings(bindings)
         return {"state": "ready", "uuid": _text(created.get("uuid")), "fingerprint": _rule_fingerprint(created)}
 
@@ -637,6 +668,10 @@ class StunService:
             return
         current = self.client.firewall(True)
         row = self._find_firewall(current, _text(binding.get("uuid")))
+        if row and binding.get("fingerprint") != _rule_fingerprint(row):
+            bindings[rule_id] = {**binding, "state": "manual_change", "message": "防火墙规则已被手动修改；为避免误删，未移除"}
+            self._save_firewall_bindings(bindings)
+            return
         if row and binding.get("fingerprint") == _rule_fingerprint(row):
             self.controller.write_and_verify("firewall", lambda: self.client.rpc("devConfig.del", "ip_firewall", {"uuid": [_text(row.get("uuid"))]}), lambda: self.client.firewall(True))
         bindings.pop(rule_id, None)
@@ -658,7 +693,21 @@ class StunService:
     def _restore_firewall(self, rule_id: str, snapshot: Dict[str, Any]) -> None:
         bindings = copy.deepcopy(snapshot.get("bindings", {}))
         old_row = copy.deepcopy(snapshot.get("row")) if isinstance(snapshot.get("row"), dict) else None
-        if old_row is not None:
+        if old_row is None:
+            current_binding = self._firewall_bindings().get(rule_id, {})
+            current_uuid = _text(current_binding.get("uuid"))
+            if current_uuid:
+                current = self.client.firewall(True)
+                created = self._find_firewall(current, current_uuid)
+                if created is not None and _text(current_binding.get("fingerprint")) == _rule_fingerprint(created):
+                    verified = self.controller.write_and_verify(
+                        "firewall",
+                        lambda: self.client.rpc("devConfig.del", "ip_firewall", {"uuid": [current_uuid]}),
+                        lambda: self.client.firewall(True),
+                    )
+                    if self._find_firewall(verified.get("data", {}), current_uuid) is not None:
+                        raise RuntimeError("新建防火墙规则回滚后仍然存在")
+        else:
             old_uuid = _text(old_row.get("uuid"))
             current = self.client.firewall(True)
             existing = self._find_firewall(current, old_uuid)
@@ -780,6 +829,8 @@ class StunService:
                 "runtime": current,
                 "actualState": actual,
                 "firewallState": firewall_state,
+                "firewallMessage": _text(firewall_bindings.get(rule["id"], {}).get("message")),
+                "firewallOwner": _text(firewall_bindings.get(rule["id"], {}).get("owner")) or ("" if self._is_native_forward(rule) else "labprobe-stun"),
                 "nativeMappingState": native_state,
                 "nativeMappingMessage": _text(native_binding.get("message")),
                 "syncError": _text(sync_errors.get(rule["id"])),
@@ -832,6 +883,10 @@ def create_stun_blueprint(hub: Any, service: StunService) -> Blueprint:
                         mapping = service.ensure_native_mapping(rule)
                         if mapping.get("state") != "ready":
                             raise ValueError(_text(mapping.get("message")) or "路由器端口映射未就绪")
+                    if rule["enabled"] and not service._is_native_forward(rule):
+                        firewall = service.ensure_firewall(rule)
+                        if firewall.get("state") != "ready":
+                            raise ValueError(_text(firewall.get("message")) or "本机入站规则未就绪")
                     doc = service._document()
                     saved = service._save_rules([*doc["rules"], rule])
                     service.queue("upsert", {"rule": rule}, revision=saved["revision"])
@@ -840,6 +895,7 @@ def create_stun_blueprint(hub: Any, service: StunService) -> Blueprint:
                     rule["id"],
                     create_operation,
                     snapshot_native=rule["enabled"] and service._is_native_forward(rule),
+                    snapshot_firewall=rule["enabled"] and not service._is_native_forward(rule),
                 )
                 return jsonify({"ok": True, "rule": rule}), 201
         except Exception as error:
@@ -909,6 +965,16 @@ def create_stun_blueprint(hub: Any, service: StunService) -> Blueprint:
                             service.remove_firewall(rule_id)
                         elif service._is_native_forward(old):
                             service.remove_native_mapping(rule_id)
+                            if rule["enabled"]:
+                                firewall = service.ensure_firewall(rule)
+                                if firewall.get("state") != "ready":
+                                    raise ValueError(_text(firewall.get("message")) or "本机入站规则未就绪")
+                        elif rule["enabled"]:
+                            firewall = service.ensure_firewall(rule)
+                            if firewall.get("state") != "ready":
+                                raise ValueError(_text(firewall.get("message")) or "本机入站规则未就绪")
+                        else:
+                            service.remove_firewall(rule_id)
                     saved = service._save_rules(replacement)
                     service.queue("upsert", {"rule": rule}, revision=saved["revision"])
 
@@ -942,6 +1008,10 @@ def create_stun_blueprint(hub: Any, service: StunService) -> Blueprint:
                     mapping = service.ensure_native_mapping(next_rule)
                     if mapping.get("state") != "ready":
                         raise ValueError(_text(mapping.get("message")) or "路由器端口映射未就绪")
+                if action == "start" and not service._is_native_forward(next_rule):
+                    firewall = service.ensure_firewall(next_rule)
+                    if firewall.get("state") != "ready":
+                        raise ValueError(_text(firewall.get("message")) or "本机入站规则未就绪")
                 if action == "stop" and service._is_native_forward(next_rule):
                     service.remove_native_mapping(rule_id)
                 if action == "stop" and not service._is_native_forward(next_rule):

@@ -103,6 +103,46 @@ def test_service_templates_choose_protocol_and_skip_portmap_reservation(tmp_path
     assert https["stunServer"] == DEFAULT_STUN_TCP_SERVER
 
 
+def test_router_self_stun_uses_owned_local_proxy_instead_of_lan_dnat(tmp_path):
+    client = _Client()
+    service = StunService(_hub(tmp_path), client)
+    rule = service.clean_rule({
+        "serviceType": "SSH",
+        "targetType": "router_self",
+        "targetPort": 22,
+    })
+
+    assert rule["targetType"] == "router_self"
+    assert rule["targetIpv4"] == "127.0.0.1"
+    assert rule["forwardMode"] == "relay_proxy"
+    firewall = service._expected_firewall(rule)
+    assert firewall["direction"] == "inbound"
+    assert firewall["ipVersion"] == "ipv4"
+    assert firewall["destPort"] == str(rule["listenPort"])
+    assert firewall["outIface"] == ""
+
+
+def test_router_self_create_uses_firewall_and_exposes_owner_without_native_mapping(tmp_path):
+    hub = _hub(tmp_path)
+    client = _Client()
+    service = StunService(hub, client)
+    hub.app.register_blueprint(create_stun_blueprint(hub, service))
+
+    response = hub.app.test_client().post("/api/stun", json={
+        "serviceType": "SSH",
+        "targetType": "router_self",
+        "targetPort": 22,
+    })
+
+    assert response.status_code == 201
+    assert client.native_rules == []
+    assert len(client.rules) == 1
+    row = service.rows()[0]
+    assert row["firewallState"] == "ready"
+    assert row["firewallOwner"] == "labprobe-stun"
+    assert row["firewallMessage"] == ""
+
+
 def test_legacy_tcp_rule_is_migrated_to_a_tcp_stun_server_and_queued(tmp_path):
     hub = _hub(tmp_path)
     legacy = {
@@ -122,6 +162,34 @@ def test_legacy_tcp_rule_is_migrated_to_a_tcp_stun_server_and_queued(tmp_path):
     assert service._document()["rules"][0]["stunServer"] == DEFAULT_STUN_TCP_SERVER
     assert service._commands()[0]["action"] == "upsert"
     assert service._commands()[0]["payload"]["rule"]["stunServer"] == DEFAULT_STUN_TCP_SERVER
+
+
+def test_router_self_rule_keeps_local_proxy_across_service_restart(tmp_path):
+    hub = _hub(tmp_path)
+    stored = {
+        "id": "stun-router-self",
+        "kind": "stun",
+        "name": "路由器 SSH",
+        "enabled": True,
+        "listenPort": 20001,
+        "targetType": "router_self",
+        "targetIpv4": "127.0.0.1",
+        "targetPort": 22,
+        "transportProtocol": "TCP",
+        "forwardMode": "router_native",
+        "stunServer": DEFAULT_STUN_TCP_SERVER,
+    }
+    hub.save_json(tmp_path / "stun_rules.json", {"revision": 1, "rules": [stored]})
+
+    first = StunService(hub, _Client())
+    assert first._document()["rules"][0]["forwardMode"] == "relay_proxy"
+    assert first._commands()[0]["payload"]["rule"]["forwardMode"] == "relay_proxy"
+
+    second = StunService(hub, _Client())
+    restarted = second._document()["rules"][0]
+    assert restarted["targetType"] == "router_self"
+    assert restarted["targetIpv4"] == "127.0.0.1"
+    assert restarted["forwardMode"] == "relay_proxy"
 
 
 def test_address_history_retains_only_latest_three_unique_endpoints(tmp_path):
@@ -443,6 +511,38 @@ def test_create_command_failure_rolls_back_desired_and_native_mapping(tmp_path):
     assert service._document() == desired_before
     assert service._command_document() == commands_before
     assert router.native_rules == []
+
+
+def test_router_self_create_failure_removes_new_owned_firewall(tmp_path):
+    hub = _hub(tmp_path)
+    router = _Client()
+    service = StunService(hub, router)
+    service._save_rules([])
+    service._save_commands([])
+    hub.app.register_blueprint(create_stun_blueprint(hub, service))
+    app = hub.app.test_client()
+    desired_before = copy.deepcopy(service._document())
+    bindings_before = copy.deepcopy(service._firewall_bindings())
+    original_save = hub.save_json
+    fail_once = {"value": True}
+
+    def fail_new_command(path, value):
+        original_save(path, value)
+        if Path(path) == service.commands_path and fail_once["value"]:
+            fail_once["value"] = False
+            raise OSError("command store unavailable")
+
+    hub.save_json = fail_new_command
+    response = app.post("/api/stun", json={
+        "serviceType": "SSH",
+        "targetType": "router_self",
+        "targetPort": 22,
+    })
+
+    assert response.status_code == 400
+    assert service._document() == desired_before
+    assert service._firewall_bindings() == bindings_before
+    assert router.rules == []
 
 
 def test_stop_save_failure_restores_enabled_rule_and_native_mapping(tmp_path):

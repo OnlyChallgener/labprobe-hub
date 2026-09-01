@@ -16,6 +16,7 @@ from hub0935_sync_fix import (
 from hub_realtime_ws import install_hub_realtime_ws
 from labrelay_sync_patch import install_labrelay_sync_patch
 from lab_ddns import install_lab_ddns
+from portmap_firewall import install_portmap_firewall
 from portmap_persistence_patch import install_portmap_persistence_patch
 from router_compat import install_router_rpc_compat
 from router_config_sync_patch import install_router_config_sync_patch
@@ -242,6 +243,7 @@ router_ws_monitor.start()
 # Retained LabRelay & Product Extensions
 install_router_config_sync_patch(hub, router_driver)
 install_firewall_automation(hub, router_driver)
+install_portmap_firewall(hub, router_driver)
 install_stun_service(hub, router_driver)
 install_wireguard_service(hub)
 install_lab_ddns(hub)

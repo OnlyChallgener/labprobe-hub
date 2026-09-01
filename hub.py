@@ -1,4 +1,5 @@
 import os
+import copy
 import json
 import socket
 import subprocess
@@ -61,6 +62,7 @@ app = Flask(__name__)
 DATA_LOCK = threading.RLock()
 ROUTER_DASHBOARD_LOCK = threading.RLock()
 REFRESH_LOCK = threading.RLock()
+PORTMAP_MUTATION_LOCK = threading.RLock()
 REFRESH_RUNNING = False
 STATUS_REFRESH_TTL_SEC = int(os.environ.get("STATUS_REFRESH_TTL_SEC", "180"))
 STORE = SQLiteStore(DATA_DIR, BACKUPS_DIR, DB_PATH)
@@ -3664,6 +3666,15 @@ def _clean_portmap_rule(payload: Dict[str, Any], existing: Optional[Dict[str, An
     if transport_protocol not in ["TCP", "UDP"]:
         raise ValueError("传输协议只能是 TCP 或 UDP")
 
+    target_type = clean_saved_value(src.get("targetType")).lower()
+    if not target_type:
+        legacy_target = clean_saved_value(src.get("targetIpv4") or src.get("targetIpv6")).strip("[]")
+        try:
+            target_type = "router_self" if legacy_target and ipaddress.ip_address(legacy_target).is_loopback else "manual"
+        except ValueError:
+            target_type = "manual"
+    if target_type not in ["router_self", "device", "manual"]:
+        raise ValueError("目标类型只能是路由器本机、内网设备或手动目标")
     target_mode = clean_saved_value(src.get("targetMode")).lower()
     target_ipv4 = clean_saved_value(src.get("targetIpv4"))
     target_ipv6 = clean_saved_value(src.get("targetIpv6")).strip("[]")
@@ -3674,6 +3685,8 @@ def _clean_portmap_rule(payload: Dict[str, Any], existing: Optional[Dict[str, An
         raise ValueError("目标 MAC 格式无效")
     if mode == "6to4":
         target_mode = "ipv4"
+        if target_type == "router_self":
+            target_ipv4 = "127.0.0.1"
         ip = ipaddress.ip_address(target_ipv4)
         if ip.version != 4 or not (ip.is_private or ip.is_loopback or ip.is_link_local):
             raise ValueError("6to4 目标必须是内网 IPv4")
@@ -3681,12 +3694,18 @@ def _clean_portmap_rule(payload: Dict[str, Any], existing: Optional[Dict[str, An
         target_ipv6_snapshot = ""
         target_suffix = ""
     else:
+        if target_type == "router_self":
+            target_mode = "ipv6_full"
+            target_ipv6 = "::1"
+            target_ipv6_snapshot = "::1"
+            target_suffix = ""
+            target_mac = ""
         if target_mode not in ["ipv6_full", "ipv6_suffix"]:
             target_mode = "ipv6_suffix"
         target_ipv4 = ""
         if target_mode == "ipv6_full":
             ip = ipaddress.ip_address(target_ipv6)
-            if ip.version != 6 or ip.is_link_local or ip.is_multicast or ip.is_loopback or ip.is_unspecified:
+            if ip.version != 6 or ip.is_link_local or ip.is_multicast or (ip.is_loopback and target_type != "router_self") or ip.is_unspecified:
                 raise ValueError("目标 IPv6 无效")
             target_ipv6 = str(ip)
             target_ipv6_snapshot = target_ipv6
@@ -3718,6 +3737,7 @@ def _clean_portmap_rule(payload: Dict[str, Any], existing: Optional[Dict[str, An
         "enabled": bool(src.get("enabled", False)),
         "mode": mode,
         "listenPort": listen_port,
+        "targetType": target_type,
         "targetMode": target_mode,
         "targetIpv4": target_ipv4,
         "targetIpv6": target_ipv6,
@@ -3735,6 +3755,71 @@ def _clean_portmap_rule(payload: Dict[str, Any], existing: Optional[Dict[str, An
         "createdAt": old.get("createdAt") or now,
         "updatedAt": now,
     }
+
+
+def _portmap_firewall_service():
+    service = globals().get("PORTMAP_FIREWALL_SERVICE")
+    return service if service is not None else None
+
+
+def _portmap_firewall_status(rule: Dict[str, Any]) -> Dict[str, Any]:
+    if not bool(rule.get("enabled")):
+        return {"state": "not_required", "message": "", "owner": "labprobe-portmap"}
+    service = _portmap_firewall_service()
+    if service is None:
+        return {"state": "unavailable", "message": "端口映射防火墙服务未加载", "owner": "labprobe-portmap"}
+    return service.cached(clean_saved_value(rule.get("id")))
+
+
+def _require_portmap_firewall(rule: Dict[str, Any]) -> Dict[str, Any]:
+    service = _portmap_firewall_service()
+    if service is None:
+        # Compatibility for direct hub.py test/dev entrypoints. Production
+        # hub_entry installs the ownership service before accepting requests.
+        return {"state": "unavailable"}
+    result = service.ensure(rule)
+    if clean_saved_value(result.get("state")) != "ready":
+        raise RuntimeError(clean_saved_value(result.get("message")) or "端口映射入站规则未就绪")
+    return result
+
+
+def _remove_portmap_firewall(rule_id: str) -> None:
+    service = _portmap_firewall_service()
+    if service is not None:
+        service.remove(rule_id)
+
+
+def _mutate_portmap(rule_id: str, operation):
+    """Compensate PortMap desired/command/firewall state on mutation failure.
+
+    This lock is local to explicit PortMap writes. Agent status, Router realtime,
+    Devices realtime and WSS first-frame delivery never acquire it.
+    """
+    with PORTMAP_MUTATION_LOCK:
+        desired_before = copy.deepcopy(load_json(PORTMAP_RULES_FILE, {"revision": 0, "rules": []}))
+        commands_before = copy.deepcopy(load_json(PORTMAP_COMMANDS_FILE, {"commands": []}))
+        service = _portmap_firewall_service()
+        firewall_before = service.snapshot(rule_id) if service is not None else None
+        try:
+            return operation()
+        except Exception as error:
+            rollback_errors = []
+            if service is not None and firewall_before is not None:
+                try:
+                    service.restore(rule_id, firewall_before)
+                except Exception as rollback_error:
+                    rollback_errors.append(f"防火墙：{rollback_error}")
+            for label, path, value in (
+                ("期望规则", PORTMAP_RULES_FILE, desired_before),
+                ("命令队列", PORTMAP_COMMANDS_FILE, commands_before),
+            ):
+                try:
+                    save_json(path, copy.deepcopy(value))
+                except Exception as rollback_error:
+                    rollback_errors.append(f"{label}：{rollback_error}")
+            if rollback_errors:
+                raise RuntimeError(f"{error}；端口映射回滚失败：{'；'.join(rollback_errors)}") from error
+            raise
 
 
 def _load_portmap_rules_document() -> tuple[Dict[str, Any], bool]:
@@ -3936,14 +4021,24 @@ def _append_portmap_history(status_payload: Dict[str, Any]) -> None:
 def api_portmaps():
     if request.method == "GET":
         if not check_read_token():
-            return jsonify({"ok": False, "error": "unauthorized"}), 401
+            return jsonify({"ok": False, "error": "未授权"}), 401
         document, rules_loaded = _load_portmap_rules_document()
         rules = document["rules"]
         router_status = load_json(PORTMAP_ROUTER_STATUS_FILE, {})
         runtime = _portmap_runtime_map(router_status)
         router = router_status.get("router", _portmap_router_name()) if isinstance(router_status, dict) else _portmap_router_name()
         sync_states = _portmap_command_sync_states(router)
-        rows = [{**r, "runtime": runtime.get(r.get("id"), {}), "syncState": sync_states.get(r.get("id"), "synced")} for r in rules]
+        rows = []
+        for rule in rules:
+            firewall = _portmap_firewall_status(rule)
+            rows.append({
+                **rule,
+                "runtime": runtime.get(rule.get("id"), {}),
+                "syncState": sync_states.get(rule.get("id"), "synced"),
+                "firewallState": firewall.get("state", ""),
+                "firewallMessage": firewall.get("message", ""),
+                "firewallOwner": firewall.get("owner", "labprobe-portmap"),
+            })
         received_epoch = to_int(router_status.get("receivedEpoch"), 0) if isinstance(router_status, dict) else 0
         agent_online = bool(received_epoch and time.time() - received_epoch <= 35)
         return jsonify({
@@ -3959,16 +4054,26 @@ def api_portmaps():
             "agentLastSeenAt": router_status.get("receivedAt", "") if isinstance(router_status, dict) else "",
         })
 
+    with PORTMAP_MUTATION_LOCK:
+        return _api_portmaps_create()
+
+
+def _api_portmaps_create():
     if not check_app_token():
-        return jsonify({"ok": False, "error": "unauthorized"}), 401
+        return jsonify({"ok": False, "error": "未授权"}), 401
     try:
         payload = request.get_json(silent=True) or {}
         rule = _clean_portmap_rule(payload)
         rows = _load_portmap_rules()
         _portmap_check_conflict(rows, rule)
-        rows.append(rule)
-        _save_portmap_rules(rows)
-        _queue_portmap_command("upsert", {"rule": rule}, reactivate=True)
+        def create_operation():
+            if rule["enabled"]:
+                _require_portmap_firewall(rule)
+            rows.append(rule)
+            _save_portmap_rules(rows)
+            _queue_portmap_command("upsert", {"rule": rule}, reactivate=True)
+
+        _mutate_portmap(rule["id"], create_operation)
         add_event({"type": "portmap_created", "title": f"端口映射已创建：{rule['name']}", "name": rule["name"], "newValue": f"IPv6:{rule['listenPort']}"})
         return jsonify({"ok": True, "rule": rule}), 201
     except Exception as e:
@@ -3977,15 +4082,27 @@ def api_portmaps():
 
 @app.route("/api/portmaps/<rule_id>", methods=["PUT", "DELETE"])
 def api_portmap_item(rule_id: str):
+    with PORTMAP_MUTATION_LOCK:
+        return _api_portmap_item_locked(rule_id)
+
+
+def _api_portmap_item_locked(rule_id: str):
     if not check_app_token():
-        return jsonify({"ok": False, "error": "unauthorized"}), 401
+        return jsonify({"ok": False, "error": "未授权"}), 401
     rows = _load_portmap_rules()
     old = next((x for x in rows if x.get("id") == rule_id), None)
     if not old:
-        return jsonify({"ok": False, "error": "rule not found"}), 404
+        return jsonify({"ok": False, "error": "未找到端口映射规则"}), 404
     if request.method == "DELETE":
-        _save_portmap_rules([x for x in rows if x.get("id") != rule_id])
-        _queue_portmap_command("delete", {"id": rule_id}, reactivate=True)
+        def delete_operation():
+            _remove_portmap_firewall(rule_id)
+            _save_portmap_rules([x for x in rows if x.get("id") != rule_id])
+            _queue_portmap_command("delete", {"id": rule_id}, reactivate=True)
+
+        try:
+            _mutate_portmap(rule_id, delete_operation)
+        except Exception as error:
+            return jsonify({"ok": False, "error": str(error)}), 409
         add_event({"type": "portmap_deleted", "title": f"端口映射已删除：{old.get('name')}", "name": old.get("name"), "oldValue": str(old.get("listenPort"))})
         return jsonify({"ok": True, "deleted": True, "id": rule_id})
     try:
@@ -3993,9 +4110,17 @@ def api_portmap_item(rule_id: str):
         payload["id"] = rule_id
         rule = _clean_portmap_rule(payload, old)
         _portmap_check_conflict(rows, rule)
-        rows = [rule if x.get("id") == rule_id else x for x in rows]
-        _save_portmap_rules(rows)
-        _queue_portmap_command("upsert", {"rule": rule}, reactivate=True)
+        replacement = [rule if x.get("id") == rule_id else x for x in rows]
+
+        def update_operation():
+            if rule["enabled"]:
+                _require_portmap_firewall(rule)
+            else:
+                _remove_portmap_firewall(rule_id)
+            _save_portmap_rules(replacement)
+            _queue_portmap_command("upsert", {"rule": rule}, reactivate=True)
+
+        _mutate_portmap(rule_id, update_operation)
         return jsonify({"ok": True, "rule": rule})
     except Exception as e:
         return jsonify({"ok": False, "error": str(e)}), 400
@@ -4003,14 +4128,19 @@ def api_portmap_item(rule_id: str):
 
 @app.route("/api/portmaps/<rule_id>/<action>", methods=["POST"])
 def api_portmap_action(rule_id: str, action: str):
+    with PORTMAP_MUTATION_LOCK:
+        return _api_portmap_action_locked(rule_id, action)
+
+
+def _api_portmap_action_locked(rule_id: str, action: str):
     if not check_app_token():
-        return jsonify({"ok": False, "error": "unauthorized"}), 401
+        return jsonify({"ok": False, "error": "未授权"}), 401
     if action not in ["start", "stop"]:
-        return jsonify({"ok": False, "error": "invalid action"}), 400
+        return jsonify({"ok": False, "error": "不支持的操作"}), 400
     rows = _load_portmap_rules()
     rule = next((x for x in rows if x.get("id") == rule_id), None)
     if not rule:
-        return jsonify({"ok": False, "error": "rule not found"}), 404
+        return jsonify({"ok": False, "error": "未找到端口映射规则"}), 404
     rule = dict(rule)
     rule["enabled"] = action == "start"
     if action == "start":
@@ -4025,13 +4155,24 @@ def api_portmap_action(rule_id: str, action: str):
                 return jsonify({"ok": False, "error": "旧规则缺少有效期时长，请编辑并重新选择有效期"}), 400
             rule["expiresAt"] = now_epoch + lease_seconds
     rule["updatedAt"] = now_str()
-    rows = [rule if x.get("id") == rule_id else x for x in rows]
-    _save_portmap_rules(rows)
-    _queue_portmap_command(
-        "upsert" if action == "start" else "stop",
-        {"rule": rule} if action == "start" else {"id": rule_id},
-        reactivate=True,
-    )
+    replacement = [rule if x.get("id") == rule_id else x for x in rows]
+
+    def action_operation():
+        if action == "start":
+            _require_portmap_firewall(rule)
+        else:
+            _remove_portmap_firewall(rule_id)
+        _save_portmap_rules(replacement)
+        _queue_portmap_command(
+            "upsert" if action == "start" else "stop",
+            {"rule": rule} if action == "start" else {"id": rule_id},
+            reactivate=True,
+        )
+
+    try:
+        _mutate_portmap(rule_id, action_operation)
+    except Exception as error:
+        return jsonify({"ok": False, "error": str(error)}), 409
     return jsonify({"ok": True, "rule": rule, "action": action})
 
 
@@ -4153,7 +4294,7 @@ def api_router_portmap_status():
         rid = clean_saved_value(local_rule.get("id") or (row.get("runtime") or {}).get("id"))
         if rid:
             local[rid] = local_rule
-    compare_keys = ["enabled", "mode", "listenPort", "targetMode", "targetIpv4", "targetIpv6", "targetIpv6Suffix", "targetMac", "targetPort", "transportProtocol", "expiresAt", "leaseSeconds", "maxConnections", "idleTimeoutSec"]
+    compare_keys = ["enabled", "mode", "listenPort", "targetType", "targetMode", "targetIpv4", "targetIpv6", "targetIpv6Suffix", "targetMac", "targetPort", "transportProtocol", "expiresAt", "leaseSeconds", "maxConnections", "idleTimeoutSec"]
     for rid, rule in desired.items():
         local_rule = local.get(rid)
         if not local_rule or any(local_rule.get(k) != rule.get(k) for k in compare_keys):

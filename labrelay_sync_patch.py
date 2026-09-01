@@ -95,7 +95,7 @@ def install_labrelay_sync_patch(hub: Any) -> None:
             rule_id = clean(local_rule.get("id") or runtime.get("id"))
             if rule_id:
                 local[rule_id] = local_rule
-        compare = ("enabled", "mode", "listenPort", "targetMode", "targetIpv4", "targetIpv6", "targetIpv6Suffix", "targetMac", "targetPort", "transportProtocol", "expiresAt", "leaseSeconds", "maxConnections", "idleTimeoutSec")
+        compare = ("enabled", "mode", "listenPort", "targetType", "targetMode", "targetIpv4", "targetIpv6", "targetIpv6Suffix", "targetMac", "targetPort", "transportProtocol", "expiresAt", "leaseSeconds", "maxConnections", "idleTimeoutSec")
 
         def compare_value(row: Dict[str, Any], key: str) -> Any:
             # Rules persisted before UDP support have no transportProtocol and
