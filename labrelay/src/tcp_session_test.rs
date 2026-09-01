@@ -2,6 +2,7 @@ use anyhow::{anyhow, bail, Context, Result};
 use serde::{Deserialize, Serialize};
 use serde_json::{json, Value};
 use socket2::SockRef;
+use std::collections::VecDeque;
 use std::fs;
 use std::net::SocketAddr;
 use std::sync::atomic::{AtomicBool, Ordering};
@@ -14,6 +15,8 @@ use tokio::time::{sleep, timeout};
 
 const ABSOLUTE_CONNECTION_LIMIT: usize = 65_535;
 const MAX_PENDING_CONNECTS: usize = 512;
+const CONSECUTIVE_FAILURE_LIMIT: usize = 200;
+const RECENT_OUTCOME_WINDOW: usize = 200;
 const STATUS_INTERVAL: Duration = Duration::from_secs(1);
 const LOOP_INTERVAL: Duration = Duration::from_millis(50);
 
@@ -335,8 +338,12 @@ impl TcpSessionTestManager {
             push_log(
                 snapshot,
                 format!(
-                    "{} 当前安全连接上限为 {}（{}）",
-                    label, safe_target, plan.limiting_reason
+                    "{} 当前安全连接上限为 {}（{}；进程 FD 软上限 {}，测试前占用 {}）",
+                    label,
+                    safe_target,
+                    plan.limiting_reason,
+                    plan.fd_soft_limit,
+                    plan.baseline_fd
                 ),
             );
         })
@@ -356,11 +363,13 @@ impl TcpSessionTestManager {
         let mut source_port_failures = 0u64;
         let mut fd_failures = 0u64;
         let mut memory_failures = 0u64;
+        let mut consecutive_failures = 0usize;
+        let mut recent_outcomes = VecDeque::with_capacity(RECENT_OUTCOME_WINDOW);
         let mut previous_cpu = read_cpu_counters();
         let mut high_cpu_samples = 0u8;
         let finish_reason: String;
 
-        loop {
+        'testing: loop {
             let now = Instant::now();
             let elapsed = now.duration_since(started);
             if control.stop.load(Ordering::Acquire) {
@@ -415,11 +424,15 @@ impl TcpSessionTestManager {
                         } else {
                             held.push(stream);
                             success += 1;
+                            consecutive_failures = 0;
+                            record_recent_outcome(&mut recent_outcomes, true);
                             last_growth = Instant::now();
                         }
                     }
                     Ok(ConnectResult::Failed(kind)) => {
                         failure += 1;
+                        consecutive_failures = consecutive_failures.saturating_add(1);
+                        record_recent_outcome(&mut recent_outcomes, false);
                         match kind {
                             FailureKind::SourcePort => source_port_failures += 1,
                             FailureKind::FileDescriptor => fd_failures += 1,
@@ -429,8 +442,28 @@ impl TcpSessionTestManager {
                         if kind != FailureKind::Other {
                             resource_failures += 1;
                         }
+                        if let Some(reason) = connection_quality_stop_reason(
+                            &recent_outcomes,
+                            consecutive_failures,
+                            last_growth.elapsed(),
+                        ) {
+                            finish_reason = reason.into();
+                            break 'testing;
+                        }
                     }
-                    Err(_) => failure += 1,
+                    Err(_) => {
+                        failure += 1;
+                        consecutive_failures = consecutive_failures.saturating_add(1);
+                        record_recent_outcome(&mut recent_outcomes, false);
+                        if let Some(reason) = connection_quality_stop_reason(
+                            &recent_outcomes,
+                            consecutive_failures,
+                            last_growth.elapsed(),
+                        ) {
+                            finish_reason = reason.into();
+                            break 'testing;
+                        }
+                    }
                 }
             }
 
@@ -448,7 +481,11 @@ impl TcpSessionTestManager {
             let available = safe_target.saturating_sub(held.len() + pending.len());
             let launches = (credit.floor() as usize)
                 .min(available)
-                .min(MAX_PENDING_CONNECTS.saturating_sub(pending.len()));
+                .min(MAX_PENDING_CONNECTS.saturating_sub(pending.len()))
+                .min(
+                    CONSECUTIVE_FAILURE_LIMIT
+                        .saturating_sub(consecutive_failures.saturating_add(pending.len())),
+                );
             credit -= launches as f64;
             for _ in 0..launches {
                 let timeout_duration = Duration::from_millis(config.connect_timeout_ms);
@@ -692,6 +729,33 @@ enum FailureKind {
     Other,
 }
 
+fn record_recent_outcome(outcomes: &mut VecDeque<bool>, success: bool) {
+    outcomes.push_back(success);
+    while outcomes.len() > RECENT_OUTCOME_WINDOW {
+        outcomes.pop_front();
+    }
+}
+
+fn connection_quality_stop_reason(
+    recent_outcomes: &VecDeque<bool>,
+    consecutive_failures: usize,
+    no_growth: Duration,
+) -> Option<&'static str> {
+    if consecutive_failures >= CONSECUTIVE_FAILURE_LIMIT {
+        return Some("连续连接失败 200 次，停止新增连接");
+    }
+    if recent_outcomes.len() >= 100
+        && consecutive_failures >= 50
+        && no_growth >= Duration::from_secs(3)
+    {
+        let failures = recent_outcomes.iter().filter(|success| !**success).count();
+        if failures.saturating_mul(100) >= recent_outcomes.len().saturating_mul(80) {
+            return Some("连接成功率持续过低，已确认增长平台");
+        }
+    }
+    None
+}
+
 async fn connect_once(address: SocketAddr, connect_timeout: Duration) -> ConnectResult {
     let socket = if address.is_ipv4() {
         TcpSocket::new_v4()
@@ -736,6 +800,7 @@ struct ResourcePlan {
     safe_target: usize,
     limiting_reason: String,
     baseline_fd: usize,
+    fd_soft_limit: usize,
     fd_ceiling: usize,
     baseline_conntrack: usize,
     conntrack_ceiling: usize,
@@ -804,6 +869,7 @@ fn resource_plan(requested: usize) -> ResourcePlan {
         safe_target: safe_target.clamp(1, ABSOLUTE_CONNECTION_LIMIT),
         limiting_reason: limiting_reason.into(),
         baseline_fd,
+        fd_soft_limit: soft_limit,
         fd_ceiling,
         baseline_conntrack,
         conntrack_ceiling,
@@ -953,4 +1019,42 @@ fn now_epoch() -> u64 {
         .duration_since(UNIX_EPOCH)
         .unwrap_or_default()
         .as_secs()
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn consecutive_failure_guard_stops_at_two_hundred() {
+        let outcomes = VecDeque::from(vec![false; CONSECUTIVE_FAILURE_LIMIT]);
+
+        assert_eq!(
+            connection_quality_stop_reason(
+                &outcomes,
+                CONSECUTIVE_FAILURE_LIMIT,
+                Duration::from_millis(500),
+            ),
+            Some("连续连接失败 200 次，停止新增连接")
+        );
+    }
+
+    #[test]
+    fn rolling_failure_guard_requires_rate_streak_and_no_growth() {
+        let mut outcomes = VecDeque::from(vec![true; 20]);
+        outcomes.extend(vec![false; 80]);
+
+        assert_eq!(
+            connection_quality_stop_reason(&outcomes, 50, Duration::from_secs(3)),
+            Some("连接成功率持续过低，已确认增长平台")
+        );
+        assert_eq!(
+            connection_quality_stop_reason(&outcomes, 49, Duration::from_secs(3)),
+            None
+        );
+        assert_eq!(
+            connection_quality_stop_reason(&outcomes, 50, Duration::from_millis(2_999)),
+            None
+        );
+    }
 }
