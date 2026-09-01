@@ -1766,6 +1766,82 @@ async fn sync_wireguard(
     Ok(())
 }
 
+async fn tcp_session_ctl(config: &AgentConfig, request: Value) -> Value {
+    let socket_path = PathBuf::from(&config.relay_socket);
+    match tokio::task::spawn_blocking(move || ctl_request(&socket_path, &request)).await {
+        Ok(Ok(value)) => value,
+        Ok(Err(error)) => json!({"ok":false,"error":error.to_string()}),
+        Err(error) => json!({"ok":false,"error":format!("本地测试任务异常：{}", error)}),
+    }
+}
+
+async fn sync_tcp_session_test(client: &Client, config: &AgentConfig) -> Result<()> {
+    let router = url_encode(&config.router_name);
+    let root = get_json(
+        client,
+        config,
+        &format!("/api/router/tcp-session-test/commands?router={}&limit=5", router),
+    )
+    .await?;
+    let commands = root
+        .get("commands")
+        .and_then(Value::as_array)
+        .cloned()
+        .unwrap_or_default();
+    if !commands.is_empty() {
+        let mut acknowledgements = Vec::new();
+        for command in commands {
+            let command_id = command.get("id").and_then(Value::as_str).unwrap_or("");
+            let action = command.get("action").and_then(Value::as_str).unwrap_or("");
+            let payload = command.get("payload").cloned().unwrap_or_else(|| json!({}));
+            let local = match action {
+                "start" => json!({
+                    "action": "tcp_session_start",
+                    "taskId": payload.get("taskId").cloned().unwrap_or(Value::Null),
+                    "config": payload.get("config").cloned().unwrap_or(Value::Null),
+                }),
+                "stop" => json!({
+                    "action": "tcp_session_stop",
+                    "taskId": payload.get("taskId").cloned().unwrap_or(Value::Null),
+                }),
+                _ => json!({"action":"invalid"}),
+            };
+            let result = tcp_session_ctl(config, local).await;
+            acknowledgements.push(json!({
+                "id": command_id,
+                "ok": result.get("ok").and_then(Value::as_bool).unwrap_or(false),
+                "result": result,
+            }));
+        }
+        post_json(
+            client,
+            config,
+            "/api/router/tcp-session-test/ack",
+            &json!({"acks":acknowledgements}),
+        )
+        .await?;
+    }
+
+    if Path::new(&config.relay_socket).exists() {
+        let status = tcp_session_ctl(config, json!({"action":"tcp_session_status"})).await;
+        if status
+            .get("id")
+            .and_then(Value::as_str)
+            .map(|id| !id.is_empty())
+            .unwrap_or(false)
+        {
+            post_json(
+                client,
+                config,
+                "/api/router/tcp-session-test/status",
+                &status,
+            )
+            .await?;
+        }
+    }
+    Ok(())
+}
+
 async fn agent_cycle(client: &Client, config: &AgentConfig, state: &mut AgentState) -> Result<()> {
     let user_list = collect_user_list()?;
     let mut current = BTreeMap::new();
@@ -1788,6 +1864,29 @@ pub async fn run(args: &[String], once: bool) -> Result<()> {
     let mut last_agent_cycle_at = 0u64;
     let mut last_status_at = 0u64;
     log_line(&config, "INFO", "Rust agent started");
+    let _tcp_session_sync = if once {
+        None
+    } else {
+        let tcp_client = client.clone();
+        let tcp_config = config.clone();
+        Some(tokio::spawn(async move {
+            let mut last_error_log = 0u64;
+            loop {
+                if let Err(error) = sync_tcp_session_test(&tcp_client, &tcp_config).await {
+                    let now = now_epoch();
+                    if now.saturating_sub(last_error_log) >= 30 {
+                        log_line(
+                            &tcp_config,
+                            "WARN",
+                            &format!("TCP 峰值连接数测试同步暂时失败：{:#}", error),
+                        );
+                        last_error_log = now;
+                    }
+                }
+                sleep(Duration::from_secs(1)).await;
+            }
+        }))
+    };
     loop {
         let now = now_epoch();
         let was_unhealthy = !state.last_error.is_empty();
@@ -1796,6 +1895,13 @@ pub async fn run(args: &[String], once: bool) -> Result<()> {
         // slower full inventory cycle, so APP update/cleanup responds in 3–5 s.
         let status_due = once || last_status_at == 0 || now.saturating_sub(last_status_at) >= config.status_interval_seconds.clamp(3, 5);
         if status_due {
+            if once {
+                if let Err(error) = sync_tcp_session_test(&client, &config).await {
+                    let text = redact(&format!("TCP 峰值连接数测试同步：{:#}", error), &config.hook_token);
+                    log_limited(&config, &mut state, "WARN", "tcp-session-test", &text);
+                    errors.push(text);
+                }
+            }
             match sync_agent_update(&client, &config, &mut state).await {
                 Ok(_) => {}
                 Err(error) => log_limited(&config, &mut state, "WARN", "agent-command-check", &format!("agent command check skipped: {:#}", error)),

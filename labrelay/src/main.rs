@@ -20,6 +20,7 @@ use tokio::time::{sleep, timeout};
 
 mod agent;
 mod ddns_address;
+mod tcp_session_test;
 mod wireguard;
 
 const VERSION: &str = env!("CARGO_PKG_VERSION");
@@ -241,6 +242,7 @@ struct Manager {
     rules: Arc<RwLock<HashMap<String, Rule>>>,
     runtimes: Arc<Mutex<HashMap<String, RuntimeHandle>>>,
     operation_lock: Arc<Mutex<()>>,
+    tcp_session_tests: tcp_session_test::TcpSessionTestManager,
     last_status: Arc<RwLock<HashMap<String, RuntimeSnapshot>>>,
     config_path: PathBuf,
     state_path: PathBuf,
@@ -263,6 +265,7 @@ impl Manager {
             rules: Arc::new(RwLock::new(rules)),
             runtimes: Arc::new(Mutex::new(HashMap::new())),
             operation_lock: Arc::new(Mutex::new(())),
+            tcp_session_tests: tcp_session_test::TcpSessionTestManager::new(),
             last_status: Arc::new(RwLock::new(HashMap::new())),
             config_path,
             state_path,
@@ -1964,6 +1967,14 @@ async fn handle_command_fixed(manager: Manager, raw: &str) -> Value {
                 .delete_rule(v.get("id").and_then(Value::as_str).unwrap_or(""))
                 .await
         }
+        "tcp_session_start" => manager.tcp_session_tests.start(&v).await,
+        "tcp_session_stop" => {
+            manager
+                .tcp_session_tests
+                .stop(v.get("taskId").and_then(Value::as_str).unwrap_or(""))
+                .await
+        }
+        "tcp_session_status" => Ok(manager.tcp_session_tests.status().await),
         _ => Err(anyhow!("unknown action")),
     };
     result.unwrap_or_else(|e| json!({"ok": false, "error": e.to_string()}))
@@ -2691,6 +2702,7 @@ mod tests {
             rules: Arc::new(RwLock::new(HashMap::new())),
             runtimes: Arc::new(Mutex::new(HashMap::new())),
             operation_lock: Arc::new(Mutex::new(())),
+            tcp_session_tests: tcp_session_test::TcpSessionTestManager::new(),
             last_status: Arc::new(RwLock::new(HashMap::new())),
             config_path: root.join("config.json"),
             state_path: root.join("state.json"),
@@ -2765,6 +2777,7 @@ mod tests {
             )]))),
             runtimes: Arc::new(Mutex::new(HashMap::new())),
             operation_lock: Arc::new(Mutex::new(())),
+            tcp_session_tests: tcp_session_test::TcpSessionTestManager::new(),
             last_status: Arc::new(RwLock::new(HashMap::new())),
             config_path,
             state_path,

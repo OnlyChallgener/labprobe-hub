@@ -35,6 +35,7 @@ from router_rpc import EncryptedRouterConfigStore
 from router_task_manager_patch import RouterTaskManager
 from router_ws_patch import RouterWebSocketMonitor
 from stun_service import install_stun_service
+from tcp_session_service import install_tcp_session_service
 from wireguard_service import install_wireguard_service
 
 # Router Core v1 Architecture
@@ -246,6 +247,7 @@ install_firewall_automation(hub, router_driver)
 install_portmap_firewall(hub, router_driver)
 install_stun_service(hub, router_driver)
 install_wireguard_service(hub)
+install_tcp_session_service(hub)
 install_lab_ddns(hub)
 install_agent_presence_patch(hub)
 install_device_history_patch(hub)
