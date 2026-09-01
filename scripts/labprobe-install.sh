@@ -34,16 +34,12 @@ esac
 say() { echo "[LabProbe] $*"; }
 fail() {
   say "ERROR: $*" >&2
-  # Failures before a backup exists (for example download or checksum errors)
-  # must still settle an APP-triggered command instead of leaving it "accepted".
   command_ack "failed" "installer failed before service replacement"
   exit 1
 }
 command_ack() {
   state="$1"; message="$2"
   [ -n "$COMMAND_ID" ] && [ -n "$COMMAND_HUB_URL" ] && [ -n "$COMMAND_HOOK_TOKEN" ] || return 0
-  # Command identifiers are Hub-generated hexadecimal values and messages here
-  # are installer-owned constants, so the compact JSON body is safe for ash.
   body="{\"id\":\"$COMMAND_ID\",\"state\":\"$state\",\"message\":\"$message\"}"
   if command -v curl >/dev/null 2>&1; then
     curl -fsS --connect-timeout 4 --max-time 12 -X POST \
@@ -74,11 +70,7 @@ check_router() {
   if command -v curl >/dev/null 2>&1; then
     DOWNLOADER="curl"
   else
-    if command -v wget >/dev/null 2>&1; then
-      DOWNLOADER="wget"
-    else
-      fail "缺少 curl 或 wget，无法下载安装包"
-    fi
+    if command -v wget >/dev/null 2>&1; then DOWNLOADER="wget"; else fail "缺少 curl 或 wget，无法下载安装包"; fi
   fi
   command -v sha256sum >/dev/null 2>&1 || fail "缺少 sha256sum，无法校验下载"
   [ -r /etc/rc.common ] || fail "未检测到兼容的锐捷/OpenWrt 服务环境"
@@ -92,8 +84,7 @@ probe_hub() {
   case "$candidate" in http://*|https://*) base="$candidate" ;; *) base="http://$candidate:58443" ;; esac
   say "正在探测 Hub：$base"
   if command -v curl >/dev/null 2>&1; then
-    curl --fail --location --silent --show-error --connect-timeout 1 --max-time 2 \
-      --output /tmp/labprobe-discovery.json "$base/.well-known/labprobe" 2>/dev/null || return 1
+    curl --fail --location --silent --show-error --connect-timeout 1 --max-time 2 --output /tmp/labprobe-discovery.json "$base/.well-known/labprobe" 2>/dev/null || return 1
   else
     wget -O /tmp/labprobe-discovery.json -T 2 "$base/.well-known/labprobe" >/dev/null 2>&1 || return 1
   fi
@@ -119,47 +110,26 @@ discover_hub() {
 }
 
 download_visible() {
-  url="$1"
-  output="$2"
-  title="$3"
-  rm -f "$output"
-  say "开始下载$title"
-  say "地址：$url"
+  url="$1"; output="$2"; title="$3"; rm -f "$output"
+  say "开始下载$title"; say "地址：$url"
   if [ "$DOWNLOADER" = "curl" ]; then
-    # progress-bar在有Content-Length时显示百分比、总大小和实时速度；
-    # 无Content-Length时curl仍持续显示已传输大小和速度。
-    if ! curl --progress-bar --fail --location --show-error \
-      --connect-timeout 15 --max-time 1800 --speed-limit 1 --speed-time 30 \
-      --retry 2 --retry-delay 1 \
-      --output "$output" "$url"; then
-      rm -f "$output"
-      fail "$title下载失败（curl已返回错误），请检查网络、URL和发布文件"
-    fi
+    if ! curl --progress-bar --fail --location --show-error --connect-timeout 15 --max-time 1800 --speed-limit 1 --speed-time 30 --retry 2 --retry-delay 1 --output "$output" "$url"; then rm -f "$output"; fail "$title下载失败（curl已返回错误），请检查网络、URL和发布文件"; fi
   else
-    # 不使用-q，保留BusyBox wget原生百分比、大小和KB/s进度输出。
-    if ! wget -T 30 -O "$output" "$url"; then
-      rm -f "$output"
-      fail "$title下载失败（wget已返回错误），请检查网络、URL和发布文件"
-    fi
+    if ! wget -T 30 -O "$output" "$url"; then rm -f "$output"; fail "$title下载失败（wget已返回错误），请检查网络、URL和发布文件"; fi
   fi
   [ -s "$output" ] || { rm -f "$output"; fail "$title下载完成但文件为空"; }
-  bytes="$(wc -c < "$output" 2>/dev/null | tr -d ' ')"
-  [ -n "$bytes" ] || bytes="未知"
-  say "$title下载完成：$bytes 字节"
+  bytes="$(wc -c < "$output" 2>/dev/null | tr -d ' ')"; [ -n "$bytes" ] || bytes="未知"; say "$title下载完成：$bytes 字节"
 }
 
 download_binary() {
-  filename="labrelay-linux-$ARCH"
-  url="$AGENT_BASE/$filename"
-  rm -f "$TMP_BIN" "$TMP_SUM"
+  filename="labrelay-linux-$ARCH"; url="$AGENT_BASE/$filename"; rm -f "$TMP_BIN" "$TMP_SUM"
   download_visible "$url" "$TMP_BIN" " Rust Agent"
   download_visible "$AGENT_BASE/checksums.txt" "$TMP_SUM" " SHA256校验文件"
   say "正在校验 Rust Agent SHA256"
   expected="$(awk -v name="$filename" '$2 == name || $2 == "*" name {print $1; exit}' "$TMP_SUM")"
   actual="$(sha256sum "$TMP_BIN" | awk '{print $1}')"
   [ -n "$expected" ] && [ "$expected" = "$actual" ] || fail "SHA256校验失败：下载文件可能不完整或已被修改"
-  say "SHA256校验通过：$actual"
-  chmod 0755 "$TMP_BIN"
+  say "SHA256校验通过：$actual"; chmod 0755 "$TMP_BIN"
 }
 
 backup_old() {
@@ -173,12 +143,7 @@ backup_old() {
 }
 
 prune_backups() {
-  # Keep exactly the backup created for the current install/upgrade.
-  for dir in "$INSTALL_DIR"/backups/*; do
-    [ -d "$dir" ] || continue
-    [ "$dir" = "$BACKUP" ] && continue
-    rm -rf "$dir"
-  done
+  for dir in "$INSTALL_DIR"/backups/*; do [ -d "$dir" ] || continue; [ "$dir" = "$BACKUP" ] && continue; rm -rf "$dir"; done
 }
 
 cleanup_legacy() {
@@ -193,17 +158,14 @@ cleanup_legacy() {
       mv "$old_init" "$BACKUP/$service.legacy-init"
     fi
   done
-  # The unified service has not started yet, so any remaining labrelay process
-  # belongs to a legacy init/script and must not survive the migration.
+  # Some vendor/OpenWrt builds leave stale rc.d links even after disable.
+  # Remove only legacy service links; never touch the unified labprobe links.
+  rm -f /etc/rc.d/S??labrelay /etc/rc.d/K??labrelay /etc/rc.d/S??labrelay_agent /etc/rc.d/K??labrelay_agent
   killall labrelay >/dev/null 2>&1 || true
-  for old_pid in $(ps w 2>/dev/null | awk '/\/etc\/labprobe\/(labrelay_agent|ruijie_push_to_labprobe|push_devices|push_router_wan6|watch_devices)\.sh/ && !/awk/ {print $1}'); do
-    kill "$old_pid" >/dev/null 2>&1 || true
-  done
-  for old in push_devices.sh push_router_wan6.sh watch_devices.sh ruijie_push_to_labprobe.sh labrelay_agent.sh; do
-    [ -f "$INSTALL_DIR/$old" ] && mv "$INSTALL_DIR/$old" "$BACKUP/$old.legacy"
-  done
+  for old_pid in $(ps w 2>/dev/null | awk '/\/etc\/labprobe\/(labrelay_agent|ruijie_push_to_labprobe|push_devices|push_router_wan6|watch_devices)\.sh/ && !/awk/ {print $1}'); do kill "$old_pid" >/dev/null 2>&1 || true; done
+  for old in push_devices.sh push_router_wan6.sh watch_devices.sh ruijie_push_to_labprobe.sh labrelay_agent.sh; do [ -f "$INSTALL_DIR/$old" ] && mv "$INSTALL_DIR/$old" "$BACKUP/$old.legacy"; done
   rm -rf /tmp/labprobe_agent.lock /tmp/labprobe_watch_state
-  say "旧 cron、Shell Agent、旧 init 和残留进程已停用，业务由统一 Rust Agent 接管"
+  say "旧 cron、Shell Agent、旧 init、自启动链接和残留进程已停用，业务由统一 Rust Agent 接管"
 }
 
 write_service() {
@@ -212,20 +174,15 @@ write_service() {
 START=95
 STOP=10
 USE_PROCD=1
-
 start_service() {
   mkdir -p /tmp/labprobe
   procd_open_instance relay
-  # The BE72 vendor procd keeps the inherited hard FD ceiling unless the root
-  # shell raises it immediately before exec. The daemon accepts the union of
-  # PortMap/IPv6 20000-29999 and STUN local channels 30000-32767.
   procd_set_param command /bin/sh -c 'ulimit -n 131072; exec /usr/bin/labrelay daemon --config /etc/labprobe/relay.json --socket /tmp/labrelay.sock --state /tmp/labprobe/relay-state.json --port-min 20000 --port-max 32767 --lan-if br-lan'
   procd_set_param respawn 3600 5 5
   procd_set_param stdout 1
   procd_set_param stderr 1
   procd_set_param limits nofile="131072 131072"
   procd_close_instance
-
   procd_open_instance agent
   procd_set_param command /usr/bin/labrelay agent --config /etc/labprobe/agent.json
   procd_set_param respawn 3600 5 5
@@ -244,87 +201,39 @@ rollback() {
   if [ "${HAD_OLD_RELAY:-0}" = "1" ]; then cp "$BACKUP/relay.json" "$RELAY_CONFIG"; else rm -f "$RELAY_CONFIG"; fi
   if [ "${HAD_OLD_INIT:-0}" = "1" ]; then cp "$BACKUP/init.labprobe" "$INIT_SCRIPT"; chmod 0755 "$INIT_SCRIPT"; else rm -f "$INIT_SCRIPT"; fi
   [ -f /tmp/labprobe-cron.old ] && crontab /tmp/labprobe-cron.old 2>/dev/null || true
-  for legacy in "$BACKUP"/*.legacy; do
-    [ -f "$legacy" ] || continue
-    old_name="$(basename "$legacy" .legacy)"
-    mv "$legacy" "$INSTALL_DIR/$old_name"
-  done
+  for legacy in "$BACKUP"/*.legacy; do [ -f "$legacy" ] || continue; old_name="$(basename "$legacy" .legacy)"; mv "$legacy" "$INSTALL_DIR/$old_name"; done
   for legacy_init in "$BACKUP"/*.legacy-init; do
     [ -f "$legacy_init" ] || continue
     old_name="$(basename "$legacy_init" .legacy-init)"
-    mv "$legacy_init" "/etc/init.d/$old_name"
-    chmod 0755 "/etc/init.d/$old_name"
-    "/etc/init.d/$old_name" enable >/dev/null 2>&1 || true
-    "/etc/init.d/$old_name" start >/dev/null 2>&1 || true
+    mv "$legacy_init" "/etc/init.d/$old_name"; chmod 0755 "/etc/init.d/$old_name"; "/etc/init.d/$old_name" enable >/dev/null 2>&1 || true; "/etc/init.d/$old_name" start >/dev/null 2>&1 || true
   done
   [ -x "$INIT_SCRIPT" ] && "$INIT_SCRIPT" restart >/dev/null 2>&1 || true
-  command_ack "failed" "安装失败：$INSTALL_STAGE"
-  exit 1
+  command_ack "failed" "安装失败：$INSTALL_STAGE"; exit 1
 }
 
-show_stage_log() {
-  file="$1"
-  [ -s "$file" ] || return 0
-  say "$INSTALL_STAGE 的诊断输出："
-  tail -n 30 "$file" 2>/dev/null || cat "$file" 2>/dev/null || true
-}
-
-wait_for_relay() {
-  attempt=1
-  while [ "$attempt" -le 12 ]; do
-    if "$BIN" ctl --socket /tmp/labrelay.sock '{"action":"status"}' >/tmp/labprobe/relay-ready.json 2>/dev/null; then
-      return 0
-    fi
-    sleep 1
-    attempt=$((attempt + 1))
-  done
-  return 1
-}
-
+show_stage_log() { file="$1"; [ -s "$file" ] || return 0; say "$INSTALL_STAGE 的诊断输出："; tail -n 30 "$file" 2>/dev/null || cat "$file" 2>/dev/null || true; }
+wait_for_relay() { attempt=1; while [ "$attempt" -le 12 ]; do if "$BIN" ctl --socket /tmp/labrelay.sock '{"action":"status"}' >/tmp/labprobe/relay-ready.json 2>/dev/null; then return 0; fi; sleep 1; attempt=$((attempt + 1)); done; return 1; }
 verify_relay_nofile() {
   for pid in $(pidof labrelay 2>/dev/null); do
     [ -r "/proc/$pid/cmdline" ] || continue
     cmdline="$(tr '\000' ' ' < "/proc/$pid/cmdline" 2>/dev/null)"
     case "$cmdline" in
       *" labrelay daemon "*|*"/labrelay daemon "*)
-        soft="$(awk '/Max open files/ {print $4; exit}' "/proc/$pid/limits" 2>/dev/null)"
-        hard="$(awk '/Max open files/ {print $5; exit}' "/proc/$pid/limits" 2>/dev/null)"
-        case "$soft:$hard" in
-          *[!0-9:]*|:*) return 1 ;;
-        esac
-        if [ "$soft" -ge 65536 ] && [ "$hard" -ge 65536 ]; then
-          say "Relay FD 上限已生效：soft=$soft hard=$hard"
-          return 0
-        fi
-        say "Relay FD 上限未生效：soft=$soft hard=$hard"
-        return 1
-        ;;
+        soft="$(awk '/Max open files/ {print $4; exit}' "/proc/$pid/limits" 2>/dev/null)"; hard="$(awk '/Max open files/ {print $5; exit}' "/proc/$pid/limits" 2>/dev/null)"
+        case "$soft:$hard" in *[!0-9:]*|:*) return 1 ;; esac
+        if [ "$soft" -ge 65536 ] && [ "$hard" -ge 65536 ]; then say "Relay FD 上限已生效：soft=$soft hard=$hard"; return 0; fi
+        say "Relay FD 上限未生效：soft=$soft hard=$hard"; return 1 ;;
     esac
   done
-  say "未找到 Relay daemon 进程，无法校验 FD 上限"
-  return 1
+  say "未找到 Relay daemon 进程，无法校验 FD 上限"; return 1
 }
-
-wait_for_hub() {
-  attempt=1
-  while [ "$attempt" -le 6 ]; do
-    if "$BIN" test-hub --config "$CONFIG" >/tmp/labprobe/install-test.log 2>&1; then
-      return 0
-    fi
-    sleep 2
-    attempt=$((attempt + 1))
-  done
-  return 1
-}
+wait_for_hub() { attempt=1; while [ "$attempt" -le 6 ]; do if "$BIN" test-hub --config "$CONFIG" >/tmp/labprobe/install-test.log 2>&1; then return 0; fi; sleep 2; attempt=$((attempt + 1)); done; return 1; }
 
 uninstall_agent() {
-  need_root
-  ask_yes "是否卸载 LabProbe Rust Agent？[Y/n]" Y || exit 0
+  need_root; ask_yes "是否卸载 LabProbe Rust Agent？[Y/n]" Y || exit 0
   [ -x "$INIT_SCRIPT" ] && "$INIT_SCRIPT" stop >/dev/null 2>&1
   [ -x "$INIT_SCRIPT" ] && "$INIT_SCRIPT" disable >/dev/null 2>&1
-  rm -f "$INIT_SCRIPT" "$BIN"
-  say "已卸载程序；配置和备份仍保留在 $INSTALL_DIR"
-  exit 0
+  rm -f "$INIT_SCRIPT" "$BIN"; say "已卸载程序；配置和备份仍保留在 $INSTALL_DIR"; exit 0
 }
 
 [ "$ACTION" = "uninstall" ] && uninstall_agent
@@ -335,57 +244,32 @@ check_router
 discover_hub
 say "自动发现 Hub：$HUB_URL"
 ask_yes "自动发现的 Hub 是否正确？[Y/n]" Y || fail "已取消；请设置 HUB_URL 后重试"
-
 HOOK_TOKEN_INPUT="${HOOK_TOKEN:-}"
 if [ "$ACTION" = "install" ] || [ "$ACTION" = "configure" ] || ! grep -q '"hookToken"[[:space:]]*:' "$CONFIG" 2>/dev/null; then
-  if [ -z "$HOOK_TOKEN_INPUT" ]; then
-    printf "请输入 Hub HOOK_TOKEN："; read HOOK_TOKEN_INPUT || HOOK_TOKEN_INPUT=""
-  fi
+  if [ -z "$HOOK_TOKEN_INPUT" ]; then printf "请输入 Hub HOOK_TOKEN："; read HOOK_TOKEN_INPUT || HOOK_TOKEN_INPUT=""; fi
   [ -n "$HOOK_TOKEN_INPUT" ] || fail "HOOK_TOKEN 不能为空"
 fi
-
 say "架构=$ARCH，Hub=$HUB_URL，将安装采集、事件、IPv6、端口映射、重试、日志和开机自启"
 ask_yes "确认安装？[Y/n]" Y || exit 0
-
 mkdir -p "$INSTALL_DIR/backups" /tmp/labprobe
-INSTALL_STAGE="备份现有 Agent"
-backup_old
-prune_backups
-INSTALL_STAGE="下载并校验 ARM64 Agent"
-download_binary
+INSTALL_STAGE="备份现有 Agent"; backup_old; prune_backups
+INSTALL_STAGE="下载并校验 ARM64 Agent"; download_binary
 [ -x "$INIT_SCRIPT" ] && "$INIT_SCRIPT" stop >/dev/null 2>&1 || true
-INSTALL_STAGE="替换 Agent 程序"
-cp "$TMP_BIN" "$BIN" || rollback
-chmod 0755 "$BIN"
-[ -f "$RELAY_CONFIG" ] || echo '{"version":1,"rules":[]}' >"$RELAY_CONFIG"
-chmod 600 "$RELAY_CONFIG"
-
+INSTALL_STAGE="替换 Agent 程序"; cp "$TMP_BIN" "$BIN" || rollback; chmod 0755 "$BIN"
+[ -f "$RELAY_CONFIG" ] || echo '{"version":1,"rules":[]}' >"$RELAY_CONFIG"; chmod 600 "$RELAY_CONFIG"
 if [ -n "$HOOK_TOKEN_INPUT" ]; then
-  ROUTER_NAME="${PRIMARY_ROUTER_NAME:-$(hostname 2>/dev/null || echo router)}"
-  [ -n "$ROUTER_NAME" ] || ROUTER_NAME="router"
-  INSTALL_STAGE="写入 Agent 配置"
-  "$BIN" configure --hub "$HUB_URL" --hook-token "$HOOK_TOKEN_INPUT" --name "$ROUTER_NAME" --config "$CONFIG" || rollback
+  ROUTER_NAME="${PRIMARY_ROUTER_NAME:-$(hostname 2>/dev/null || echo router)}"; [ -n "$ROUTER_NAME" ] || ROUTER_NAME="router"
+  INSTALL_STAGE="写入 Agent 配置"; "$BIN" configure --hub "$HUB_URL" --hook-token "$HOOK_TOKEN_INPUT" --name "$ROUTER_NAME" --config "$CONFIG" || rollback
 fi
-[ -s "$CONFIG" ] || rollback
-chmod 600 "$CONFIG"
-INSTALL_STAGE="迁移旧服务"
-cleanup_legacy
-INSTALL_STAGE="生成 OpenWrt procd 服务"
-write_service
-INSTALL_STAGE="启用 OpenWrt 服务"
-"$INIT_SCRIPT" enable >/tmp/labprobe/service-enable.log 2>&1 || { show_stage_log /tmp/labprobe/service-enable.log; rollback; }
-INSTALL_STAGE="启动 Relay 与 Agent 服务"
-"$INIT_SCRIPT" start >/tmp/labprobe/service-start.log 2>&1 || { show_stage_log /tmp/labprobe/service-start.log; rollback; }
-INSTALL_STAGE="等待 Relay 控制套接字"
-wait_for_relay || { show_stage_log /tmp/labprobe/service-start.log; rollback; }
-INSTALL_STAGE="校验 Relay FD 上限"
-verify_relay_nofile || { show_stage_log /tmp/labprobe/service-start.log; rollback; }
-INSTALL_STAGE="校验 Hub 连通性"
-wait_for_hub || { show_stage_log /tmp/labprobe/install-test.log; rollback; }
-if [ "$0" != "$INSTALL_DIR/labprobe-install.sh" ]; then
-  INSTALL_STAGE="保存安装脚本"
-  cp "$0" "$INSTALL_DIR/labprobe-install.sh" || rollback
-fi
+[ -s "$CONFIG" ] || rollback; chmod 600 "$CONFIG"
+INSTALL_STAGE="迁移旧服务"; cleanup_legacy
+INSTALL_STAGE="生成 OpenWrt procd 服务"; write_service
+INSTALL_STAGE="启用 OpenWrt 服务"; "$INIT_SCRIPT" enable >/tmp/labprobe/service-enable.log 2>&1 || { show_stage_log /tmp/labprobe/service-enable.log; rollback; }
+INSTALL_STAGE="启动 Relay 与 Agent 服务"; "$INIT_SCRIPT" start >/tmp/labprobe/service-start.log 2>&1 || { show_stage_log /tmp/labprobe/service-start.log; rollback; }
+INSTALL_STAGE="等待 Relay 控制套接字"; wait_for_relay || { show_stage_log /tmp/labprobe/service-start.log; rollback; }
+INSTALL_STAGE="校验 Relay FD 上限"; verify_relay_nofile || { show_stage_log /tmp/labprobe/service-start.log; rollback; }
+INSTALL_STAGE="校验 Hub 连通性"; wait_for_hub || { show_stage_log /tmp/labprobe/install-test.log; rollback; }
+if [ "$0" != "$INSTALL_DIR/labprobe-install.sh" ]; then INSTALL_STAGE="保存安装脚本"; cp "$0" "$INSTALL_DIR/labprobe-install.sh" || rollback; fi
 chmod 0755 "$INSTALL_DIR/labprobe-install.sh"
 say "安装完成"
 "$BIN" status --config "$CONFIG"
