@@ -97,11 +97,13 @@ jobs:
           test -x "$BINARY"
           mkdir -p "$OUT"
           cp "$BINARY" "$OUT/labrelay-linux-arm64"
-          cp scripts/labprobe-install.sh "$OUT/install.sh"
-          cp scripts/labprobe-install.sh "$OUT/labprobe-install.sh"
+          cp agent/install.sh "$OUT/install.sh"
+          cp agent/install.sh "$OUT/labprobe-install.sh"
           chmod 755 "$OUT/labrelay-linux-arm64" "$OUT/install.sh" "$OUT/labprobe-install.sh"
           file "$OUT/labrelay-linux-arm64" > "$RUNNER_TEMP/labrelay-file.txt"
           grep -Eqi 'aarch64|ARM aarch64|ARM64' "$RUNNER_TEMP/labrelay-file.txt"
+          sh -n "$OUT/install.sh"
+          grep -q "ulimit -n 131072; exec /usr/bin/labrelay daemon" "$OUT/install.sh"
           python3 - <<'PY'
           import hashlib
           import json
@@ -126,7 +128,7 @@ jobs:
           manifest = {
               'schemaVersion': 1,
               'versionName': version,
-              'changelog': 'Fix existing-device Relay service migration so TCP peak tests inherit nofile=131072 instead of the legacy 4096 limit.',
+              'changelog': 'Raise the Relay daemon nofile limit inside the root launcher shell before exec, bypassing vendor procd builds that leave the legacy 4096 hard limit in place.',
               'installUrl': f'{release_root}/install.sh',
               'checksumsUrl': f'{release_root}/checksums.txt',
               'installer': metadata('install.sh'),
@@ -164,13 +166,13 @@ jobs:
           body: |
             LabRelay OpenWrt/BE72 router test bundle.
 
-            Fixes existing-device upgrades so the Relay daemon is recreated with `nofile=131072`, allowing TCP peak connection tests to go beyond the legacy ~3.2K FD guard while keeping runtime safety limits intact.
+            Fixes BE72/vendor procd environments where the Relay daemon stayed at `4096/4096` open files even after requesting a higher procd limit. The launcher now raises `ulimit -n 131072` in a root shell immediately before `exec labrelay daemon`, and installation verifies the real running limit.
 
             First install:
             `sh install.sh HUB_URL HOOK_TOKEN BE72Pro`
 
             Existing installation upgrade:
-            `sh install.sh`
+            `sh install.sh upgrade`
           files: |
             ${{ runner.temp }}/agent/labrelay-linux-arm64
             ${{ runner.temp }}/agent/install.sh
