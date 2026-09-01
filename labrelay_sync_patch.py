@@ -13,6 +13,9 @@ from typing import Any, Dict, List
 
 from flask import jsonify, request
 
+PORTMAP_PORT_MIN = 20000
+PORTMAP_PORT_MAX = 29999
+
 
 def install_labrelay_sync_patch(hub: Any) -> None:
     if getattr(hub, "LABRELAY_SYNC_PATCHED", False):
@@ -22,6 +25,31 @@ def install_labrelay_sync_patch(hub: Any) -> None:
     original_portmaps = hub.app.view_functions.get("api_portmaps")
     if original_portmaps is None:
         raise RuntimeError("api_portmaps endpoint is required")
+
+    # The legacy Hub core validated only 20000-20020. Keep all of its existing
+    # normalization/validation semantics, but widen only the LabRelay listen
+    # port window. This stays local to the existing authoritative PortMap patch
+    # and avoids touching Router Core, Session, RPC or realtime paths.
+    original_clean_portmap_rule = getattr(hub, "_clean_portmap_rule", None)
+    if callable(original_clean_portmap_rule):
+        def expanded_clean_portmap_rule(payload: Dict[str, Any], existing: Dict[str, Any] | None = None) -> Dict[str, Any]:
+            incoming = dict(payload or {})
+            old = dict(existing or {})
+            requested_port = hub.to_int(incoming.get("listenPort", old.get("listenPort")), 0)
+            if not PORTMAP_PORT_MIN <= requested_port <= PORTMAP_PORT_MAX:
+                raise ValueError(f"监听端口必须在 {PORTMAP_PORT_MIN}-{PORTMAP_PORT_MAX}")
+            shadow_payload = dict(incoming)
+            shadow_existing = dict(old)
+            # Feed a value accepted by the legacy validator, then restore the
+            # requested port after every other field has passed unchanged.
+            shadow_payload["listenPort"] = 20020
+            if shadow_existing:
+                shadow_existing["listenPort"] = 20020
+            cleaned = original_clean_portmap_rule(shadow_payload, shadow_existing or None)
+            cleaned["listenPort"] = requested_port
+            return cleaned
+
+        hub._clean_portmap_rule = expanded_clean_portmap_rule
 
     def clean(value: Any) -> str:
         return hub.clean_saved_value(value)
@@ -189,7 +217,7 @@ def install_labrelay_sync_patch(hub: Any) -> None:
                 "revision": max(rules_revision, runtime_revision, number(agent.get("agentRevision"))),
                 "rulesUpdatedAt": clean(document.get("updatedAt")) if isinstance(document, dict) else "",
                 "serverTime": int(time.time()),
-                "portRange": {"min": 20000, "max": 20020},
+                "portRange": {"min": PORTMAP_PORT_MIN, "max": PORTMAP_PORT_MAX},
                 **agent,
             })
 
