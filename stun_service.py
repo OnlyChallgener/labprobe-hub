@@ -19,7 +19,7 @@ import threading
 import time
 import uuid
 from pathlib import Path
-from typing import Any, Dict, Iterable, List, Optional
+from typing import Any, Callable, Dict, Iterable, List, Optional
 
 from flask import Blueprint, jsonify, request
 
@@ -43,6 +43,7 @@ SERVICE_TEMPLATES = {
 DEFAULT_STUN_UDP_SERVER = "stun.cloudflare.com:3478"
 DEFAULT_STUN_TCP_SERVER = "stunserver2025.stunprotocol.org:3478"
 LEGACY_TCP_STUN_SERVER = DEFAULT_STUN_UDP_SERVER
+STUN_MAPPING_FRESH_SECONDS = 90
 
 # Fields that change Relay execution or the router-owned forwarding path.
 # Presentation metadata such as name/updatedAt is intentionally excluded.
@@ -680,6 +681,59 @@ class StunService:
                 bindings[rule_id] = binding
         self._save_firewall_bindings(bindings)
 
+    def mutate(
+        self,
+        rule_id: str,
+        operation: Callable[[], Any],
+        *,
+        snapshot_native: bool = False,
+        snapshot_firewall: bool = False,
+        snapshot_history: bool = False,
+    ) -> Any:
+        """Run one STUN mutation with compensation for every owned state.
+
+        Router configuration, desired rules and Agent commands form one
+        logical mutation.  A later storage failure must not leave a half
+        configured router, and a router failure must not advance desired
+        state.  This helper is intentionally local to STUN so it does not add
+        locks or IO to Router/Devices realtime.
+        """
+        desired_before = copy.deepcopy(
+            self.hub.load_json(self.rules_path, {"revision": 0, "rules": []})
+        )
+        commands_before = self._command_document()
+        history_before = copy.deepcopy(self.hub.load_json(self.history_path, {})) if snapshot_history else None
+        native_before = self._snapshot_native_mapping(rule_id) if snapshot_native else None
+        firewall_before = self._snapshot_firewall(rule_id) if snapshot_firewall else None
+        try:
+            return operation()
+        except Exception as error:
+            rollback_errors = []
+            if native_before is not None:
+                try:
+                    self._restore_native_mapping(rule_id, native_before)
+                except Exception as rollback_error:
+                    rollback_errors.append(f"路由器映射：{rollback_error}")
+            if firewall_before is not None:
+                try:
+                    self._restore_firewall(rule_id, firewall_before)
+                except Exception as rollback_error:
+                    rollback_errors.append(f"防火墙：{rollback_error}")
+            for label, path, value in (
+                ("期望规则", self.rules_path, desired_before),
+                ("命令队列", self.commands_path, commands_before),
+                ("地址历史", self.history_path, history_before),
+            ):
+                if value is None:
+                    continue
+                try:
+                    self.hub.save_json(path, copy.deepcopy(value))
+                except Exception as rollback_error:
+                    rollback_errors.append(f"{label}: {rollback_error}")
+            if rollback_errors:
+                raise RuntimeError(f"{error}; STUN 回滚失败：{'；'.join(rollback_errors)}") from error
+            raise
+
     def rows(self) -> List[Dict[str, Any]]:
         reported = self._reported_rules()
         firewall_bindings = self._firewall_bindings()
@@ -692,7 +746,7 @@ class StunService:
             item = dict(rule)
             reported_row = reported.get(rule["id"], {})
             local_rule = reported_row.get("rule", {})
-            current = reported_row.get("runtime", {})
+            current = dict(reported_row.get("runtime", {}))
             native_binding = native_bindings.get(rule["id"], {})
             native_state = _text(native_binding.get("state")) or ("ready" if native_binding.get("fingerprint") else "pending")
             firewall_state = "not_required" if self._is_native_forward(rule) else (_text(firewall_bindings.get(rule["id"], {}).get("state")) or ("ready" if firewall_bindings.get(rule["id"], {}).get("uuid") else "pending"))
@@ -705,6 +759,23 @@ class StunService:
                 actual = "router_mapping_error" if native_state not in {"pending", ""} else "router_mapping"
             elif not self._is_native_forward(rule) and actual == "mapped" and firewall_state != "ready":
                 actual = "firewall_error" if firewall_state not in {"pending", ""} else "mapping"
+            mapping_updated_at = _int(current.get("mappingUpdatedAt"))
+            mapping_age = max(0, _now() - mapping_updated_at) if mapping_updated_at else None
+            mapping_fresh = bool(
+                actual == "mapped"
+                and _text(current.get("publicEndpoint"))
+                and mapping_age is not None
+                and mapping_age <= STUN_MAPPING_FRESH_SECONDS
+            )
+            if actual == "mapped" and not mapping_fresh:
+                actual = "mapping"
+                if not _text(current.get("lastError")):
+                    current["lastError"] = "STUN 映射状态已过期，正在重新确认"
+            current["mappingFresh"] = mapping_fresh
+            current["mappingAgeSeconds"] = mapping_age
+            target_host = _text(rule.get("targetIpv4"))
+            target_port = _int(rule.get("targetPort"))
+            channel_port = _int(rule.get("listenPort"))
             item.update({
                 "runtime": current,
                 "actualState": actual,
@@ -712,6 +783,26 @@ class StunService:
                 "nativeMappingState": native_state,
                 "nativeMappingMessage": _text(native_binding.get("message")),
                 "syncError": _text(sync_errors.get(rule["id"])),
+                "addresses": {
+                    "target": {
+                        "host": target_host,
+                        "port": target_port,
+                        "endpoint": f"{target_host}:{target_port}" if target_host and target_port else "",
+                    },
+                    "channel": {
+                        "host": "0.0.0.0",
+                        "port": channel_port,
+                        "endpoint": f"0.0.0.0:{channel_port}" if channel_port else "",
+                    },
+                    "public": {
+                        "host": _text(current.get("publicIp")),
+                        "port": _int(current.get("publicPort")),
+                        "endpoint": _text(current.get("publicEndpoint")),
+                        "updatedAt": mapping_updated_at or None,
+                        "fresh": mapping_fresh,
+                        "reachabilityState": "unknown",
+                    },
+                },
             })
             result.append(item)
         return result
@@ -721,13 +812,13 @@ def create_stun_blueprint(hub: Any, service: StunService) -> Blueprint:
     bp = Blueprint("stun_service", __name__, url_prefix="/api")
 
     def app_auth():
-        return None if hub.check_app_token() else (jsonify({"ok": False, "error": "unauthorized"}), 401)
+        return None if hub.check_app_token() else (jsonify({"ok": False, "error": "未授权"}), 401)
 
     @bp.route("/stun", methods=["GET", "POST"])
     def rules():
         if request.method == "GET":
             if not hub.check_read_token():
-                return jsonify({"ok": False, "error": "unauthorized"}), 401
+                return jsonify({"ok": False, "error": "未授权"}), 401
             doc = service._document()
             status = service._status_record()
             return jsonify({"ok": True, "rules": service.rows(), "revision": doc["revision"], "rulesUpdatedAt": doc["updatedAt"], "portRange": {"min": 20000, "max": 20020}, "agentOnline": _now() - _int(status.get("receivedEpoch"), 0) <= 35, "agentLastSeenAt": _text(status.get("receivedAt"))})
@@ -736,13 +827,20 @@ def create_stun_blueprint(hub: Any, service: StunService) -> Blueprint:
         try:
             with service.lock:
                 rule = service.clean_rule(request.get_json(silent=True) or {})
-                if rule["enabled"] and service._is_native_forward(rule):
-                    mapping = service.ensure_native_mapping(rule)
-                    if mapping.get("state") != "ready":
-                        raise ValueError(_text(mapping.get("message")) or "路由器端口映射未就绪")
-                doc = service._document()
-                saved = service._save_rules([*doc["rules"], rule])
-                service.queue("upsert", {"rule": rule}, revision=saved["revision"])
+                def create_operation() -> None:
+                    if rule["enabled"] and service._is_native_forward(rule):
+                        mapping = service.ensure_native_mapping(rule)
+                        if mapping.get("state") != "ready":
+                            raise ValueError(_text(mapping.get("message")) or "路由器端口映射未就绪")
+                    doc = service._document()
+                    saved = service._save_rules([*doc["rules"], rule])
+                    service.queue("upsert", {"rule": rule}, revision=saved["revision"])
+
+                service.mutate(
+                    rule["id"],
+                    create_operation,
+                    snapshot_native=rule["enabled"] and service._is_native_forward(rule),
+                )
                 return jsonify({"ok": True, "rule": rule}), 201
         except Exception as error:
             return jsonify({"ok": False, "error": str(error)}), 400
@@ -752,30 +850,39 @@ def create_stun_blueprint(hub: Any, service: StunService) -> Blueprint:
         if (denied := app_auth()) is not None:
             return denied
         if request.method == "DELETE":
-            with service.lock:
-                doc = service._document()
-                old = next((row for row in doc["rules"] if _text(row.get("id")) == rule_id), None)
-                if not old:
-                    return jsonify({"ok": False, "error": "rule not found"}), 404
-                cleanup_error = ""
-                try:
-                    service.remove_native_mapping(rule_id)
-                    service.remove_firewall(rule_id)
-                except Exception as error:
-                    return jsonify({"ok": False, "error": str(error)}), 409
-                saved = service._save_rules([row for row in doc["rules"] if _text(row.get("id")) != rule_id])
-                service.queue("delete", {"id": rule_id}, revision=saved["revision"])
-                history = service._history()
-                if rule_id in history:
-                    history.pop(rule_id, None)
-                    service.hub.save_json(service.history_path, history)
-                return jsonify({"ok": True, "id": rule_id, "deleted": True, "cleanupError": cleanup_error})
+            try:
+                with service.lock:
+                    doc = service._document()
+                    old = next((row for row in doc["rules"] if _text(row.get("id")) == rule_id), None)
+                    if not old:
+                        return jsonify({"ok": False, "error": "未找到 STUN 规则"}), 404
+
+                    def delete_operation() -> None:
+                        service.remove_native_mapping(rule_id)
+                        service.remove_firewall(rule_id)
+                        saved = service._save_rules([row for row in doc["rules"] if _text(row.get("id")) != rule_id])
+                        service.queue("delete", {"id": rule_id}, revision=saved["revision"])
+                        history = service._history()
+                        if rule_id in history:
+                            history.pop(rule_id, None)
+                            service.hub.save_json(service.history_path, history)
+
+                    service.mutate(
+                        rule_id,
+                        delete_operation,
+                        snapshot_native=service._is_native_forward(old),
+                        snapshot_firewall=not service._is_native_forward(old),
+                        snapshot_history=True,
+                    )
+                    return jsonify({"ok": True, "id": rule_id, "deleted": True, "cleanupError": ""})
+            except Exception as error:
+                return jsonify({"ok": False, "error": str(error)}), 409
         try:
             with service.lock:
                 doc = service._document()
                 old = next((row for row in doc["rules"] if _text(row.get("id")) == rule_id), None)
                 if not old:
-                    return jsonify({"ok": False, "error": "rule not found"}), 404
+                    return jsonify({"ok": False, "error": "未找到 STUN 规则"}), 404
                 payload = request.get_json(silent=True) or {}
                 payload["id"] = rule_id
                 rule = service.clean_rule(payload, old)
@@ -784,15 +891,11 @@ def create_stun_blueprint(hub: Any, service: StunService) -> Blueprint:
                 # Presentation-only changes are desired-document metadata. They
                 # must not touch router state or restart the Relay runtime.
                 if _same_runtime(old, rule):
-                    service._save_rules(replacement)
+                    service.mutate(rule_id, lambda: service._save_rules(replacement))
                     return jsonify({"ok": True, "rule": rule})
 
-                desired_before = copy.deepcopy(service.hub.load_json(service.rules_path, doc))
-                commands_before = service._command_document()
                 native_changed = any(old.get(field) != rule.get(field) for field in STUN_NATIVE_MAPPING_FIELDS)
-                native_snapshot = service._snapshot_native_mapping(rule_id) if native_changed else None
-                firewall_snapshot = service._snapshot_firewall(rule_id) if native_changed else None
-                try:
+                def update_operation() -> None:
                     if native_changed:
                         if service._is_native_forward(rule):
                             if rule["enabled"]:
@@ -808,30 +911,14 @@ def create_stun_blueprint(hub: Any, service: StunService) -> Blueprint:
                             service.remove_native_mapping(rule_id)
                     saved = service._save_rules(replacement)
                     service.queue("upsert", {"rule": rule}, revision=saved["revision"])
-                    return jsonify({"ok": True, "rule": rule})
-                except Exception as error:
-                    rollback_errors = []
-                    if native_snapshot is not None:
-                        try:
-                            service._restore_native_mapping(rule_id, native_snapshot)
-                        except Exception as rollback_error:
-                            rollback_errors.append(f"native mapping: {rollback_error}")
-                    if firewall_snapshot is not None:
-                        try:
-                            service._restore_firewall(rule_id, firewall_snapshot)
-                        except Exception as rollback_error:
-                            rollback_errors.append(f"firewall: {rollback_error}")
-                    try:
-                        service.hub.save_json(service.rules_path, copy.deepcopy(desired_before))
-                    except Exception as rollback_error:
-                        rollback_errors.append(f"desired: {rollback_error}")
-                    try:
-                        service.hub.save_json(service.commands_path, copy.deepcopy(commands_before))
-                    except Exception as rollback_error:
-                        rollback_errors.append(f"commands: {rollback_error}")
-                    if rollback_errors:
-                        raise RuntimeError(f"{error}; STUN 回滚失败：{'；'.join(rollback_errors)}") from error
-                    raise
+
+                service.mutate(
+                    rule_id,
+                    update_operation,
+                    snapshot_native=native_changed,
+                    snapshot_firewall=native_changed,
+                )
+                return jsonify({"ok": True, "rule": rule})
         except Exception as error:
             return jsonify({"ok": False, "error": str(error)}), 400
 
@@ -840,47 +927,55 @@ def create_stun_blueprint(hub: Any, service: StunService) -> Blueprint:
         if (denied := app_auth()) is not None:
             return denied
         if action not in {"start", "stop"}:
-            return jsonify({"ok": False, "error": "invalid action"}), 400
+            return jsonify({"ok": False, "error": "不支持的操作"}), 400
         with service.lock:
             doc = service._document()
             rule = next((dict(row) for row in doc["rules"] if _text(row.get("id")) == rule_id), None)
             if not rule:
-                return jsonify({"ok": False, "error": "rule not found"}), 404
-            if action == "start" and service._is_native_forward(rule):
-                try:
-                    mapping = service.ensure_native_mapping(rule)
+                return jsonify({"ok": False, "error": "未找到 STUN 规则"}), 404
+            next_rule = dict(rule)
+            next_rule["enabled"] = action == "start"
+            next_rule["updatedAt"] = _now_text()
+
+            def action_operation() -> None:
+                if action == "start" and service._is_native_forward(next_rule):
+                    mapping = service.ensure_native_mapping(next_rule)
                     if mapping.get("state") != "ready":
                         raise ValueError(_text(mapping.get("message")) or "路由器端口映射未就绪")
-                except Exception as error:
-                    return jsonify({"ok": False, "error": str(error)}), 409
-            if action == "stop" and service._is_native_forward(rule):
-                try:
+                if action == "stop" and service._is_native_forward(next_rule):
                     service.remove_native_mapping(rule_id)
-                except Exception as error:
-                    return jsonify({"ok": False, "error": str(error)}), 409
-            rule["enabled"] = action == "start"
-            rule["updatedAt"] = _now_text()
-            saved = service._save_rules([rule if _text(row.get("id")) == rule_id else row for row in doc["rules"]])
-            service.queue("upsert" if action == "start" else "stop", {"rule": rule} if action == "start" else {"id": rule_id}, revision=saved["revision"])
-            if action == "stop" and not service._is_native_forward(rule):
-                try:
+                if action == "stop" and not service._is_native_forward(next_rule):
                     service.remove_firewall(rule_id)
-                except Exception:
-                    pass
-            return jsonify({"ok": True, "rule": rule, "action": action})
+                saved = service._save_rules([next_rule if _text(row.get("id")) == rule_id else row for row in doc["rules"]])
+                service.queue(
+                    "upsert" if action == "start" else "stop",
+                    {"rule": next_rule} if action == "start" else {"id": rule_id},
+                    revision=saved["revision"],
+                )
+
+            try:
+                service.mutate(
+                    rule_id,
+                    action_operation,
+                    snapshot_native=service._is_native_forward(next_rule),
+                    snapshot_firewall=not service._is_native_forward(next_rule),
+                )
+            except Exception as error:
+                return jsonify({"ok": False, "error": str(error)}), 409
+            return jsonify({"ok": True, "rule": next_rule, "action": action})
 
     @bp.get("/stun/<rule_id>/addresses")
     def addresses(rule_id: str):
         if not hub.check_read_token():
-            return jsonify({"ok": False, "error": "unauthorized"}), 401
+            return jsonify({"ok": False, "error": "未授权"}), 401
         if not any(_text(row.get("id")) == rule_id for row in service._document()["rules"]):
-            return jsonify({"ok": False, "error": "rule not found"}), 404
+            return jsonify({"ok": False, "error": "未找到 STUN 规则"}), 404
         return jsonify({"ok": True, "id": rule_id, "addresses": service._history().get(rule_id, [])[:3]})
 
     @bp.get("/router/stun/commands")
     def agent_commands():
         if not hub.check_hook_token():
-            return jsonify({"ok": False, "error": "bad hook token"}), 401
+            return jsonify({"ok": False, "error": "Hook 令牌无效"}), 401
         router = _text(request.args.get("router")) or service._router_name()
         limit = max(1, min(50, _int(request.args.get("limit"), 20)))
         with service.lock:
@@ -905,7 +1000,7 @@ def create_stun_blueprint(hub: Any, service: StunService) -> Blueprint:
     @bp.post("/router/stun/ack")
     def agent_ack():
         if not hub.check_hook_token():
-            return jsonify({"ok": False, "error": "bad hook token"}), 401
+            return jsonify({"ok": False, "error": "Hook 令牌无效"}), 401
         acks = (request.get_json(silent=True) or {}).get("acks", [])
         values = {_text(row.get("id")): row for row in acks if isinstance(row, dict)} if isinstance(acks, list) else {}
         with service.lock:
@@ -923,7 +1018,7 @@ def create_stun_blueprint(hub: Any, service: StunService) -> Blueprint:
     @bp.post("/router/stun/status")
     def agent_status():
         if not hub.check_hook_token():
-            return jsonify({"ok": False, "error": "bad hook token"}), 401
+            return jsonify({"ok": False, "error": "Hook 令牌无效"}), 401
         payload = request.get_json(silent=True) or {}
         with service.lock:
             document = service._document()

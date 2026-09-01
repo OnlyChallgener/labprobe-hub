@@ -2,6 +2,7 @@ from pathlib import Path
 from types import SimpleNamespace
 import copy
 import threading
+import time
 
 from flask import Flask
 
@@ -147,6 +148,55 @@ def test_dynamic_public_endpoint_never_changes_the_relay_to_lan_forward_target(t
         assert current["targetIpv4"] == "192.168.5.46"
         assert current["targetPort"] == 443
         assert current["runtime"]["publicEndpoint"] == endpoint
+
+
+def test_stale_mapping_is_not_reported_ready_and_addresses_are_layered(tmp_path):
+    hub, _, service, rule, _ = _running_rule(tmp_path)
+    now = int(time.time())
+    hub.save_json(service.status_path, {
+        "status": {"rules": [{
+            "rule": rule,
+            "runtime": {
+                "id": rule["id"],
+                "state": "mapped",
+                "publicEndpoint": "203.0.113.9:28764",
+                "publicIp": "203.0.113.9",
+                "publicPort": 28764,
+                "mappingUpdatedAt": now - 91,
+            },
+        }]},
+    })
+
+    stale = service.rows()[0]
+    assert stale["actualState"] == "mapping"
+    assert stale["runtime"]["mappingFresh"] is False
+    assert stale["addresses"]["target"]["endpoint"] == "192.168.5.46:443"
+    assert stale["addresses"]["channel"]["endpoint"] == f"0.0.0.0:{rule['listenPort']}"
+    assert stale["addresses"]["public"] == {
+        "host": "203.0.113.9",
+        "port": 28764,
+        "endpoint": "203.0.113.9:28764",
+        "updatedAt": now - 91,
+        "fresh": False,
+        "reachabilityState": "unknown",
+    }
+
+    hub.save_json(service.status_path, {
+        "status": {"rules": [{
+            "rule": rule,
+            "runtime": {
+                "id": rule["id"],
+                "state": "mapped",
+                "publicEndpoint": "203.0.113.9:28764",
+                "publicIp": "203.0.113.9",
+                "publicPort": 28764,
+                "mappingUpdatedAt": now,
+            },
+        }]},
+    })
+    fresh = service.rows()[0]
+    assert fresh["actualState"] == "mapped"
+    assert fresh["runtime"]["mappingFresh"] is True
 
 
 def test_tcp_stun_uses_one_router_native_map_while_public_endpoint_changes(tmp_path):
@@ -362,6 +412,86 @@ def test_command_save_failure_restores_desired_and_native_mapping(tmp_path):
     assert router.native_rules == mapping_before
 
 
+def test_create_command_failure_rolls_back_desired_and_native_mapping(tmp_path):
+    hub = _hub(tmp_path)
+    router = _Client()
+    service = StunService(hub, router)
+    service._save_rules([])
+    service._save_commands([])
+    hub.app.register_blueprint(create_stun_blueprint(hub, service))
+    app = hub.app.test_client()
+    desired_before = copy.deepcopy(service._document())
+    commands_before = copy.deepcopy(service._command_document())
+    original_save = hub.save_json
+    fail_once = {"value": True}
+
+    def fail_new_command(path, value):
+        original_save(path, value)
+        if Path(path) == service.commands_path and fail_once["value"]:
+            fail_once["value"] = False
+            raise OSError("command store unavailable")
+
+    hub.save_json = fail_new_command
+    response = app.post("/api/stun", json={
+        "serviceType": "HTTPS",
+        "targetIpv4": "192.168.5.46",
+        "targetPort": 443,
+        "name": "家庭 HTTPS",
+    })
+
+    assert response.status_code == 400
+    assert service._document() == desired_before
+    assert service._command_document() == commands_before
+    assert router.native_rules == []
+
+
+def test_stop_save_failure_restores_enabled_rule_and_native_mapping(tmp_path):
+    hub, router, service, rule, app = _running_rule(tmp_path)
+    desired_before = copy.deepcopy(service._document())
+    mapping_before = copy.deepcopy(router.native_rules)
+    original_save = hub.save_json
+    fail_once = {"value": True}
+
+    def fail_new_desired(path, value):
+        original_save(path, value)
+        if Path(path) == service.rules_path and fail_once["value"] and value.get("revision") == desired_before["revision"] + 1:
+            fail_once["value"] = False
+            raise OSError("desired store unavailable")
+
+    hub.save_json = fail_new_desired
+    response = app.post(f"/api/stun/{rule['id']}/stop")
+
+    assert response.status_code == 409
+    assert service._document() == desired_before
+    assert router.native_rules == mapping_before
+
+
+def test_delete_command_failure_restores_rule_mapping_and_history(tmp_path):
+    hub, router, service, rule, app = _running_rule(tmp_path)
+    service._remember_endpoint(rule["id"], {"publicEndpoint": "203.0.113.9:20001"})
+    desired_before = copy.deepcopy(service._document())
+    commands_before = copy.deepcopy(service._command_document())
+    history_before = copy.deepcopy(service._history())
+    mapping_before = copy.deepcopy(router.native_rules)
+    original_save = hub.save_json
+    fail_once = {"value": True}
+
+    def fail_new_command(path, value):
+        original_save(path, value)
+        if Path(path) == service.commands_path and fail_once["value"]:
+            fail_once["value"] = False
+            raise OSError("command store unavailable")
+
+    hub.save_json = fail_new_command
+    response = app.delete(f"/api/stun/{rule['id']}")
+
+    assert response.status_code == 409
+    assert service._document() == desired_before
+    assert service._command_document() == commands_before
+    assert service._history() == history_before
+    assert router.native_rules == mapping_before
+
+
 def test_old_failed_ack_cannot_override_new_revision_sync_state(tmp_path):
     _, _, service, rule, app = _running_rule(tmp_path)
     first = app.put(f"/api/stun/{rule['id']}", json={"targetPort": 8443})
@@ -569,3 +699,6 @@ def test_relay_stun_startup_does_not_block_the_agent_control_loop():
     assert "confirm_stun_startup(&shared, Duration::from_secs(30))" not in source
     assert "Duration::from_secs(if is_stun_upsert { 70 } else { 8 })" not in source
     assert 'let startup_state = if rule.kind == "stun" { "mapping" } else { "running" };' in source
+    assert "pending_transaction.take().is_some()" in source
+    assert "STUN UDP 响应超时，正在重试" in source
+    assert "STUN 绑定响应事务不匹配" in source
