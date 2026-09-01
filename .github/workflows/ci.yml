@@ -73,7 +73,7 @@ jobs:
           grep -q '/api/realtime/ws' hub_realtime_ws.py
           test ! -e assistant/wechat.py
           ! git grep -qi -E 'wechat|clawbot|openclaw' -- '*.py' '*.md' '*.env*' 'Dockerfile'
-          grep -q 'version = "0.2.38"' labrelay/Cargo.toml
+          grep -q 'version = "0.2.39"' labrelay/Cargo.toml
           grep -q 'PORTMAP_PORT_MAX = 29999' labrelay_sync_patch.py
           grep -q 'STUN_LOCAL_PORT_MIN = 30000' labrelay_sync_patch.py
           grep -q 'STUN_LOCAL_PORT_MAX = 32767' labrelay_sync_patch.py
