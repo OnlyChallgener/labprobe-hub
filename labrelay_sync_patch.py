@@ -42,9 +42,14 @@ def install_labrelay_sync_patch(hub: Any) -> None:
 
     def presence(router: str = "") -> Dict[str, Any]:
         router = router_name(router)
-        heartbeat = statuses().get(router, {})
-        if not isinstance(heartbeat, dict):
-            heartbeat = {}
+        heartbeat: Dict[str, Any] = {}
+        for candidate_router, candidate in statuses().items():
+            if (
+                isinstance(candidate, dict)
+                and router_name(candidate_router) == router
+                and number(candidate.get("lastSeenEpoch")) >= number(heartbeat.get("lastSeenEpoch"))
+            ):
+                heartbeat = candidate
         runtime = runtime_document()
         same_router = router_name(runtime.get("router")) == router
         heartbeat_seen = number(heartbeat.get("lastSeenEpoch"))
@@ -69,7 +74,18 @@ def install_labrelay_sync_patch(hub: Any) -> None:
         }
 
     def reconcile(payload: Dict[str, Any], router: str) -> None:
-        desired = {clean(row.get("id")): row for row in hub._load_portmap_rules() if clean(row.get("id"))}
+        document, rules_loaded = hub._load_portmap_rules_document()
+        if not rules_loaded:
+            hub.LOGGER.warning(
+                "Port-map rules document unavailable; skip router reconciliation for %s",
+                router,
+            )
+            return
+        desired = {
+            clean(row.get("id")): row
+            for row in document.get("rules", [])
+            if isinstance(row, dict) and clean(row.get("id"))
+        }
         local: Dict[str, Dict[str, Any]] = {}
         for row in payload.get("rules", []) if isinstance(payload.get("rules"), list) else []:
             if not isinstance(row, dict):
@@ -101,6 +117,7 @@ def install_labrelay_sync_patch(hub: Any) -> None:
         runtime = hub._portmap_runtime_map(document) if same_router else {}
         runtime_revision = number(document.get("runtimeRevision")) if same_router else 0
         agent = presence(router)
+        command_states = hub._portmap_command_sync_states(router)
         now = int(time.time())
         result: List[Dict[str, Any]] = []
         for source in rules:
@@ -131,6 +148,14 @@ def install_labrelay_sync_patch(hub: Any) -> None:
                 actual, sync = "waiting_agent", "syncing"
             else:
                 actual, sync = "waiting_agent", "agent_offline"
+            command_sync = command_states.get(clean(row.get("id")))
+            desired_satisfied = (
+                (desired == "running" and state == "running")
+                or (desired == "stopped" and state not in {"running", "starting", "draining"})
+            )
+            if command_sync == "error" and not desired_satisfied:
+                actual, sync = "error", "error"
+                local.setdefault("lastError", "command delivery failed")
             row.update({
                 "desiredState": desired,
                 "actualState": actual,
@@ -147,8 +172,8 @@ def install_labrelay_sync_patch(hub: Any) -> None:
         if not hub.check_read_token():
             return jsonify({"ok": False, "error": "unauthorized"}), 401
         with lock:
-            document = hub.load_json(hub.PORTMAP_RULES_FILE, {})
-            rules = document.get("rules", []) if isinstance(document, dict) else []
+            document, rules_loaded = hub._load_portmap_rules_document()
+            rules = document.get("rules", [])
             rows = [row for row in rules if isinstance(row, dict)]
             router = router_name(request.args.get("router"))
             rows, runtime_revision = decorated_rules(rows, router)
@@ -158,7 +183,7 @@ def install_labrelay_sync_patch(hub: Any) -> None:
                 "ok": True,
                 "router": router,
                 "rules": rows,
-                "rulesLoaded": True,
+                "rulesLoaded": rules_loaded,
                 "rulesRevision": rules_revision,
                 "runtimeRevision": runtime_revision,
                 "revision": max(rules_revision, runtime_revision, number(agent.get("agentRevision"))),
@@ -193,7 +218,7 @@ def install_labrelay_sync_patch(hub: Any) -> None:
             rows = commands.get("commands", []) if isinstance(commands, dict) else []
             changed = False
             for command in rows:
-                if isinstance(command, dict) and command.get("router") == router and command.get("action") == "update" and command.get("state") == "accepted" and hub.version_parts(data[router]["version"]) >= hub.version_parts(command.get("targetVersion")):
+                if isinstance(command, dict) and router_name(command.get("router")) == router and command.get("action") == "update" and command.get("state") == "accepted" and hub.version_parts(data[router]["version"]) >= hub.version_parts(command.get("targetVersion")):
                     command.update({"state": "completed", "message": f"updated to {data[router]['version']}", "updatedAt": hub.now_str()})
                     changed = True
             if changed:

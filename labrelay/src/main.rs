@@ -444,10 +444,18 @@ impl Manager {
             mapping_updated_at: previous.as_ref().and_then(|x| x.mapping_updated_at),
         };
         let shared = Arc::new(RuntimeShared::new(snapshot));
-        let target = Arc::new(RwLock::new(
-            resolve_rule_target(&rule, &self.lan_if).await.ok(),
-        ));
-        update_target_status(&shared, &rule, target.read().await.clone(), None).await;
+        let (initial_target, initial_target_error) = match resolve_rule_target(&rule, &self.lan_if).await {
+            Ok(target) => (Some(target), None),
+            Err(error) => (None, Some(error.to_string())),
+        };
+        let target = Arc::new(RwLock::new(initial_target));
+        update_target_status(
+            &shared,
+            &rule,
+            target.read().await.clone(),
+            initial_target_error,
+        )
+        .await;
 
         let (cancel_tx, cancel_rx) = watch::channel(false);
         let shared_task = shared.clone();
@@ -1001,7 +1009,9 @@ async fn run_tcp_listener(
                     base.last_error = "rule expired".to_string();
                     break;
                 }
-                if rule.mode == "6to6" && rule.target_mode == "ipv6_suffix" {
+                if rule.mode == "6to6"
+                    && (rule.target_mode == "ipv6_suffix" || target.read().await.is_none())
+                {
                     match resolve_rule_target(&rule, &lan_if).await {
                         Ok(ip) => {
                             *target.write().await = Some(ip);
@@ -1203,7 +1213,9 @@ async fn run_udp_listener(
                     base.last_error = "rule expired".to_string();
                     break;
                 }
-                if rule.mode == "6to6" && rule.target_mode == "ipv6_suffix" {
+                if rule.mode == "6to6"
+                    && (rule.target_mode == "ipv6_suffix" || target.read().await.is_none())
+                {
                     match resolve_rule_target(&rule, &lan_if).await {
                         Ok(ip) => {
                             *target.write().await = Some(ip);
@@ -1503,9 +1515,24 @@ fn ensure_target_uses_lan(ip: IpAddr, lan_if: &str) -> Result<()> {
                 fallback.arg("-6");
             }
             fallback.args(["route", "get", text_ip.as_str()]).output()
-        })
-        .context("run ip route get")?;
+        });
+    let output = match output {
+        Ok(output) => output,
+        Err(error) => {
+            if let IpAddr::V6(ipv6) = ip {
+                if ipv6_matches_lan_prefix(ipv6, lan_if) {
+                    return Ok(());
+                }
+            }
+            return Err(error).context("run ip route get");
+        }
+    };
     if !output.status.success() {
+        if let IpAddr::V6(ipv6) = ip {
+            if ipv6_matches_lan_prefix(ipv6, lan_if) {
+                return Ok(());
+            }
+        }
         bail!("target route lookup failed");
     }
     let text = String::from_utf8_lossy(&output.stdout);
@@ -1520,6 +1547,13 @@ fn ensure_target_uses_lan(ip: IpAddr, lan_if: &str) -> Result<()> {
         bail!("target is not routed through {}", lan_if);
     }
     Ok(())
+}
+
+fn ipv6_matches_lan_prefix(ip: Ipv6Addr, lan_if: &str) -> bool {
+    let octets = ip.octets();
+    current_lan_prefixes(lan_if)
+        .iter()
+        .any(|prefix| octets[..8] == prefix[..])
 }
 
 fn resolve_ipv6_suffix(rule: &Rule, lan_if: &str) -> Result<IpAddr> {

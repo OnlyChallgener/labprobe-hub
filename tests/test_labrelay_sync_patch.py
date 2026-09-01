@@ -9,6 +9,9 @@ class _Logger:
     def info(self, *args, **kwargs):
         pass
 
+    def warning(self, *args, **kwargs):
+        pass
+
 
 class _Hub(SimpleNamespace):
     def clean_saved_value(self, value):
@@ -60,7 +63,7 @@ def _rule(transport_protocol):
     return rule
 
 
-def _installed_hub(desired):
+def _installed_hub(desired, *, rules_loaded=True):
     app = Flask(__name__)
     app.add_url_rule("/api/portmaps", endpoint="api_portmaps", view_func=lambda: ("original", 200))
     queued = []
@@ -71,9 +74,13 @@ def _installed_hub(desired):
         AGENT_STATUS_FILE="agent_status.json",
         PORTMAP_RULES_FILE="portmap_rules.json",
         PORTMAP_ROUTER_STATUS_FILE="portmap_status.json",
-        _load_portmap_rules=lambda: [desired],
+        _load_portmap_rules_document=lambda: (
+            {"version": 1, "revision": 1, "updatedAt": "", "rules": [desired]},
+            rules_loaded,
+        ),
         _portmap_epoch=lambda value: value,
         _portmap_runtime_map=lambda document: {},
+        _portmap_command_sync_states=lambda router: {},
         load_json=lambda path, default=None: default,
         save_json=lambda path, value: saved.update({path: value}),
         _append_portmap_history=lambda record: None,
@@ -109,6 +116,56 @@ def test_production_reconcile_treats_missing_legacy_transport_as_tcp():
 
     assert response.status_code == 200
     assert queued == []
+
+
+def test_unavailable_rules_document_never_reconciles_runtime_as_empty():
+    hub, queued = _installed_hub(_rule("TCP"), rules_loaded=False)
+    local = _rule("TCP")
+    local["id"] = "router-only-rule"
+
+    with hub.app.test_request_context(
+        "/api/router/portmaps/status", method="POST", json=_status_payload(local)
+    ):
+        response = hub.app.view_functions["api_router_portmap_status"]()
+
+    assert response.status_code == 200
+    assert queued == []
+
+
+def test_get_reports_unavailable_rules_document_truthfully():
+    hub, _queued = _installed_hub(_rule("TCP"), rules_loaded=False)
+
+    with hub.app.test_request_context("/api/portmaps", method="GET"):
+        response = hub.app.view_functions["api_portmaps"]()
+
+    assert response.get_json()["rulesLoaded"] is False
+
+
+def test_exhausted_command_is_reported_as_error_instead_of_syncing_forever():
+    desired = _rule("TCP")
+    hub, _queued = _installed_hub(desired)
+    hub._portmap_command_sync_states = lambda router: {desired["id"]: "error"}
+    documents = {
+        hub.PORTMAP_RULES_FILE: {
+            "version": 1,
+            "revision": 1,
+            "updatedAt": "2026-09-01 12:00:00",
+            "rules": [desired],
+        },
+        hub.PORTMAP_ROUTER_STATUS_FILE: {},
+        hub.AGENT_STATUS_FILE: {
+            "router": {"lastSeenAt": "2026-09-01 12:00:00", "lastSeenEpoch": 1_788_200_000}
+        },
+    }
+    hub.load_json = lambda path, default=None: documents.get(path, default)
+
+    with hub.app.test_request_context("/api/portmaps", method="GET"):
+        response = hub.app.view_functions["api_portmaps"]()
+
+    rule = response.get_json()["rules"][0]
+    assert rule["actualState"] == "error"
+    assert rule["syncState"] == "error"
+    assert rule["runtime"]["lastError"] == "command delivery failed"
 
 
 def test_running_rule_with_connection_error_remains_synced():
