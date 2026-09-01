@@ -1,0 +1,56 @@
+name: Patch legacy rc cleanup
+
+on:
+  push:
+    branches:
+      - fix/relay-nofile-upgrade-0.2.33-v2
+
+permissions:
+  contents: write
+
+jobs:
+  patch:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          ref: fix/relay-nofile-upgrade-0.2.33-v2
+      - name: Patch installer cleanup
+        shell: bash
+        run: |
+          set -euo pipefail
+          python3 - <<'PY'
+          from pathlib import Path
+          p = Path('scripts/labprobe-install.sh')
+          s = p.read_text()
+          marker = '# Vendor/OpenWrt disable can leave stale rc.d symlinks behind.'
+          if marker in s:
+              raise SystemExit(0)
+          old = '''  for service in labrelay_agent labrelay; do
+    old_init="/etc/init.d/$service"
+    if [ -f "$old_init" ]; then
+      [ -x "$old_init" ] && "$old_init" stop >/dev/null 2>&1 || true
+      [ -x "$old_init" ] && "$old_init" disable >/dev/null 2>&1 || true
+      mv "$old_init" "$BACKUP/$service.legacy-init"
+    fi
+  done
+'''
+          new = old + '''  # Vendor/OpenWrt disable can leave stale rc.d symlinks behind.
+  # Remove only the legacy service links; the unified /etc/init.d/labprobe link is untouched.
+  rm -f \
+    /etc/rc.d/S??labrelay /etc/rc.d/K??labrelay \
+    /etc/rc.d/S??labrelay_agent /etc/rc.d/K??labrelay_agent
+'''
+          if old not in s:
+              raise SystemExit('cleanup_legacy anchor not found')
+          p.write_text(s.replace(old, new, 1))
+          PY
+          if git diff --quiet -- scripts/labprobe-install.sh; then
+            echo 'already patched'
+            exit 0
+          fi
+          git config user.name 'OnlyChallgener'
+          git config user.email '710646773@qq.com'
+          git add scripts/labprobe-install.sh
+          git commit -m 'fix(installer): remove stale legacy rc links'
+          git push origin HEAD:fix/relay-nofile-upgrade-0.2.33-v2
