@@ -73,7 +73,7 @@ jobs:
           grep -q '/api/realtime/ws' hub_realtime_ws.py
           test ! -e assistant/wechat.py
           ! git grep -qi -E 'wechat|clawbot|openclaw' -- '*.py' '*.md' '*.env*' 'Dockerfile'
-          grep -q 'version = "0.2.36"' labrelay/Cargo.toml
+          grep -q 'version = "0.2.37"' labrelay/Cargo.toml
           sh -n agent/install.sh
           sh -n scripts/labprobe-install.sh
           grep -q 'procd_set_param limits nofile="131072 131072"' agent/install.sh
