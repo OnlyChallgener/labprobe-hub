@@ -14,14 +14,15 @@ use tokio::sync::Mutex;
 use tokio::time::{sleep, timeout};
 
 const ABSOLUTE_CONNECTION_LIMIT: usize = 65_535;
-const MAX_PENDING_CONNECTS: usize = 256;
+const MIN_PENDING_CONNECTS: usize = 256;
+const MAX_PENDING_CONNECTS: usize = 1_024;
 const CONSECUTIVE_FAILURE_LIMIT: usize = 200;
 const RECENT_OUTCOME_WINDOW: usize = 200;
 const STATUS_INTERVAL: Duration = Duration::from_secs(1);
-const HEAVY_RESOURCE_SAMPLE_INTERVAL: Duration = Duration::from_secs(5);
+const HEAVY_RESOURCE_SAMPLE_INTERVAL: Duration = Duration::from_secs(10);
 const LOOP_INTERVAL: Duration = Duration::from_millis(100);
-const CPU_HIGH_SAMPLE_PERCENT: f64 = 95.0;
-const CPU_RECOVERY_PERCENT: f64 = 90.0;
+const CPU_HIGH_SAMPLE_PERCENT: f64 = 99.0;
+const CPU_RECOVERY_PERCENT: f64 = 94.0;
 const CPU_HIGH_SAMPLE_LIMIT: u8 = 3;
 
 #[derive(Debug, Clone, Deserialize)]
@@ -71,7 +72,7 @@ impl TcpSessionConfig {
             bail!("测试协议只能选择 IPv4、IPv6 或分别测试");
         }
         self.target_connections = self.target_connections.clamp(1, ABSOLUTE_CONNECTION_LIMIT);
-        self.cps = self.cps.clamp(1, 2_000);
+        self.cps = self.cps.clamp(1, 10_000);
         self.connect_timeout_ms = self.connect_timeout_ms.clamp(300, 10_000);
         self.max_duration_seconds = self.max_duration_seconds.clamp(10, 300);
         Ok(self)
@@ -334,6 +335,7 @@ impl TcpSessionTestManager {
         let address = resolve_target(&config.host, config.port, ipv6).await?;
         let plan = resource_plan(config.target_connections);
         let safe_target = plan.safe_target;
+        let pending_limit = pending_connect_limit(config.cps, safe_target);
         self.update(&control.task_id, |snapshot| {
             snapshot.status = format!("{} 正在建立连接", label);
             snapshot.resources_released = false;
@@ -360,7 +362,7 @@ impl TcpSessionTestManager {
         let mut last_growth = Instant::now();
         let mut last_heavy_resource_sample = Instant::now();
         let mut credit = 0f64;
-        let mut held: Vec<TcpStream> = Vec::with_capacity(safe_target.min(16_384));
+        let mut held: Vec<TcpStream> = Vec::with_capacity(safe_target);
         let mut pending = FuturesUnordered::new();
         let mut success = 0u64;
         let mut failure = 0u64;
@@ -477,7 +479,7 @@ impl TcpSessionTestManager {
                 credit = 0.0;
             } else {
                 credit = (credit + config.cps as f64 * rate_scale * tick_seconds)
-                    .min(MAX_PENDING_CONNECTS as f64);
+                    .min(pending_limit as f64);
             }
             let available = safe_target.saturating_sub(held.len() + pending.len());
             let launches = if rate_scale <= f64::EPSILON {
@@ -485,7 +487,7 @@ impl TcpSessionTestManager {
             } else {
                 (credit.floor() as usize)
                     .min(available)
-                    .min(MAX_PENDING_CONNECTS.saturating_sub(pending.len()))
+                    .min(pending_limit.saturating_sub(pending.len()))
                     .min(
                         CONSECUTIVE_FAILURE_LIMIT
                             .saturating_sub(consecutive_failures.saturating_add(pending.len())),
@@ -506,13 +508,10 @@ impl TcpSessionTestManager {
                     .baseline_source_ports
                     .saturating_add(held.len())
                     .saturating_add(pending.len());
-                let near_fd_limit = approximate_fd >= plan.fd_ceiling.saturating_mul(8) / 10;
-                let near_source_limit = approximate_source_ports
-                    >= plan.source_port_ceiling.saturating_mul(8) / 10;
-                if last_heavy_resource_sample.elapsed() >= HEAVY_RESOURCE_SAMPLE_INTERVAL
-                    || near_fd_limit
-                    || near_source_limit
-                {
+                // Keep the 1-second safety/report loop on cheap in-memory estimates.
+                // Full /proc/self/fd and /proc/net/tcp* scans are O(connection-count)
+                // and previously became self-inflicted CPU load around ~20k sockets.
+                if last_heavy_resource_sample.elapsed() >= HEAVY_RESOURCE_SAMPLE_INTERVAL {
                     cached_fd_used = current_fd_count();
                     let (source_first, source_last) = source_port_range();
                     cached_source_ports = source_ports_in_use(source_first, source_last);
@@ -787,15 +786,20 @@ fn connection_quality_stop_reason(
     None
 }
 
+fn pending_connect_limit(cps: u64, safe_target: usize) -> usize {
+    let desired = (cps as usize / 4).clamp(MIN_PENDING_CONNECTS, MAX_PENDING_CONNECTS);
+    desired.min(safe_target.max(1))
+}
+
 fn cpu_rate_scale(cpu_percent: f64) -> f64 {
-    if cpu_percent >= 90.0 {
+    if cpu_percent >= 98.0 {
         0.0
-    } else if cpu_percent >= 85.0 {
+    } else if cpu_percent >= 95.0 {
         0.15
-    } else if cpu_percent >= 75.0 {
+    } else if cpu_percent >= 90.0 {
         0.40
-    } else if cpu_percent >= 65.0 {
-        0.70
+    } else if cpu_percent >= 82.0 {
+        0.75
     } else {
         1.0
     }
@@ -1135,10 +1139,13 @@ mod tests {
     #[test]
     fn cpu_rate_scale_throttles_before_system_protection() {
         assert_eq!(cpu_rate_scale(50.0), 1.0);
-        assert_eq!(cpu_rate_scale(65.0), 0.70);
-        assert_eq!(cpu_rate_scale(75.0), 0.40);
-        assert_eq!(cpu_rate_scale(85.0), 0.15);
-        assert_eq!(cpu_rate_scale(90.0), 0.0);
+        assert_eq!(cpu_rate_scale(82.0), 0.75);
+        assert_eq!(cpu_rate_scale(90.0), 0.40);
+        assert_eq!(cpu_rate_scale(95.0), 0.15);
+        assert_eq!(cpu_rate_scale(98.0), 0.0);
+        assert_eq!(pending_connect_limit(500, 65_535), 256);
+        assert_eq!(pending_connect_limit(4_000, 65_535), 1_000);
+        assert_eq!(pending_connect_limit(10_000, 65_535), 1_024);
         assert_eq!(cpu_rate_scale(99.0), 0.0);
     }
 }
