@@ -1,0 +1,254 @@
+name: One-shot Relay FD Extreme STUN 0.2.41
+
+on:
+  push:
+    branches:
+      - fix/relay-nofile-upgrade-0.2.33-v2
+    paths:
+      - .github/workflows/one-shot-fd-extreme-stun-0241.yml
+
+permissions:
+  contents: write
+
+jobs:
+  patch:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          ref: fix/relay-nofile-upgrade-0.2.33-v2
+
+      - name: Apply focused fixes
+        shell: bash
+        run: |
+          set -euo pipefail
+          python3 - <<'PY'
+          from pathlib import Path
+
+          def replace_once(path, old, new):
+              p = Path(path)
+              text = p.read_text(encoding='utf-8')
+              if old not in text:
+                  raise SystemExit(f'missing expected snippet in {path}: {old[:120]!r}')
+              p.write_text(text.replace(old, new, 1), encoding='utf-8')
+
+          # Version + direct libc dependency for setrlimit.
+          replace_once('labrelay/Cargo.toml', 'version = "0.2.40"', 'version = "0.2.41"')
+          replace_once('labrelay/Cargo.toml', 'anyhow = "1"\n', 'anyhow = "1"\nlibc = "0.2"\n')
+
+          # Unified installer: raise hard limit first, then soft. The old command
+          # tried only the soft limit and silently inherited BE72 hard=4096.
+          replace_once(
+              'scripts/labprobe-install.sh',
+              "procd_set_param command /bin/sh -c 'ulimit -n 131072; exec /usr/bin/labrelay daemon --config /etc/labprobe/relay.json --socket /tmp/labrelay.sock --state /tmp/labprobe/relay-state.json --port-min 20000 --port-max 32767 --lan-if br-lan'",
+              "procd_set_param command /bin/sh -c 'ulimit -Hn 131072 2>/dev/null || true; ulimit -Sn 131072 2>/dev/null || true; exec /usr/bin/labrelay daemon --config /etc/labprobe/relay.json --socket /tmp/labrelay.sock --state /tmp/labprobe/relay-state.json --port-min 20000 --port-max 32767 --lan-if br-lan'",
+          )
+
+          # Hub image must ship the canonical unified installer, not the legacy
+          # split labrelay/labrelay_agent installer.
+          replace_once(
+              'Dockerfile',
+              'COPY agent/install.sh /app/agent/install.sh',
+              'COPY scripts/labprobe-install.sh /app/agent/install.sh',
+          )
+
+          # Hub contract: 10k CPS and explicit Relay-only extreme mode flag.
+          replace_once(
+              'tcp_session_service.py',
+              '"cps": max(1, min(2000, _integer(payload.get("cps"), 500))),\n            "connectTimeoutMs":',
+              '"cps": max(1, min(10000, _integer(payload.get("cps"), 500))),\n            "extremeMode": payload.get("extremeMode") is True,\n            "connectTimeoutMs":',
+          )
+          replace_once(
+              'tests/test_tcp_session_service.py',
+              'task = client.post("/api/tcp-session-test/start", json=start_payload(targetConnections=999999, cps=9999)).get_json()["task"]',
+              'task = client.post("/api/tcp-session-test/start", json=start_payload(targetConnections=999999, cps=99999, extremeMode=True)).get_json()["task"]',
+          )
+          replace_once(
+              'tests/test_tcp_session_service.py',
+              'assert task["config"]["cps"] == 2000',
+              'assert task["config"]["cps"] == 10000\n    assert task["config"]["extremeMode"] is True',
+          )
+
+          # LabRelay main: reuse the TCP middle port safely for listener + STUN
+          # connected socket, and enforce nofile in-process as a second guard.
+          replace_once(
+              'labrelay/src/main.rs',
+              'use socket2::{Domain, Protocol, Socket, Type};',
+              'use socket2::{Domain, Protocol, SockRef, Socket, Type};',
+          )
+          replace_once(
+              'labrelay/src/main.rs',
+              '''    socket\n        .set_reuseaddr(true)\n        .context("设置 STUN TCP 套接字失败")?;\n    socket.bind(SocketAddr::V4(SocketAddrV4::new(\n''',
+              '''    socket\n        .set_reuseaddr(true)\n        .context("设置 STUN TCP 套接字失败")?;\n    #[cfg(unix)]\n    SockRef::from(&socket)\n        .set_reuse_port(true)\n        .context("设置 STUN TCP 端口复用失败")?;\n    socket.bind(SocketAddr::V4(SocketAddrV4::new(\n''',
+          )
+          replace_once(
+              'labrelay/src/main.rs',
+              '''async fn daemon(args: &[String]) -> Result<()> {\n    let config =\n''',
+              '''fn raise_daemon_nofile_limit(target: u64) -> Result<()> {\n    #[cfg(target_os = "linux")]\n    {\n        let target = target as libc::rlim_t;\n        let mut current = libc::rlimit { rlim_cur: 0, rlim_max: 0 };\n        if unsafe { libc::getrlimit(libc::RLIMIT_NOFILE, &mut current) } != 0 {\n            return Err(anyhow!(\n                "读取 Relay FD 上限失败：{}",\n                std::io::Error::last_os_error()\n            ));\n        }\n        if current.rlim_cur < target || current.rlim_max < target {\n            let requested = libc::rlimit { rlim_cur: target, rlim_max: target };\n            if unsafe { libc::setrlimit(libc::RLIMIT_NOFILE, &requested) } != 0 {\n                return Err(anyhow!(\n                    "提升 Relay FD 上限失败（当前 soft={} hard={}，目标={}）：{}",\n                    current.rlim_cur,\n                    current.rlim_max,\n                    target,\n                    std::io::Error::last_os_error()\n                ));\n            }\n        }\n        let mut verified = libc::rlimit { rlim_cur: 0, rlim_max: 0 };\n        if unsafe { libc::getrlimit(libc::RLIMIT_NOFILE, &mut verified) } != 0 {\n            return Err(anyhow!(\n                "复核 Relay FD 上限失败：{}",\n                std::io::Error::last_os_error()\n            ));\n        }\n        if verified.rlim_cur < target || verified.rlim_max < target {\n            bail!(\n                "Relay FD 上限未达到要求：soft={} hard={} target={}",\n                verified.rlim_cur,\n                verified.rlim_max,\n                target\n            );\n        }\n    }\n    #[cfg(not(target_os = "linux"))]\n    {\n        let _ = target;\n    }\n    Ok(())\n}\n\nasync fn daemon(args: &[String]) -> Result<()> {\n    raise_daemon_nofile_limit(131_072)?;\n    tcp_session_test::restore_stale_extreme_port_range()?;\n    let config =\n''',
+          )
+          replace_once(
+              'labrelay/src/main.rs',
+              '''    async fn tcp_stun_connect_keeps_the_same_port_as_the_listener() {\n        // Reserve a port briefly, then release it before the outbound socket\n        // binds. The production path has only the STUN socket on this port;\n        // keeping this helper listener alive would create a false conflict.\n        let inbound = TcpListener::bind("127.0.0.1:0").await.unwrap();\n        let source_port = inbound.local_addr().unwrap().port();\n        drop(inbound);\n''',
+              '''    async fn tcp_stun_socket_shares_middle_port_with_listener() {\n        // router_self TCP STUN keeps a listener and an outbound STUN flow on\n        // the same local middle port. Both sockets must join SO_REUSEPORT.\n        let inbound = create_ipv4_listener(0).unwrap();\n        let source_port = inbound.local_addr().unwrap().port();\n''',
+          )
+
+          # Extreme mode in the daemon: temporary 1024-65535 source-port range,
+          # higher but still bounded resource ceilings, guaranteed restoration.
+          replace_once(
+              'labrelay/src/tcp_session_test.rs',
+              'use std::net::SocketAddr;\n',
+              'use std::net::SocketAddr;\nuse std::path::Path;\n',
+          )
+          replace_once(
+              'labrelay/src/tcp_session_test.rs',
+              'const CPU_HIGH_SAMPLE_LIMIT: u8 = 3;\n',
+              'const CPU_HIGH_SAMPLE_LIMIT: u8 = 3;\nconst IP_LOCAL_PORT_RANGE_PATH: &str = "/proc/sys/net/ipv4/ip_local_port_range";\nconst EXTREME_PORT_RANGE_BACKUP: &str = "/tmp/labprobe/tcp-peak-port-range.original";\nconst EXTREME_PORT_RANGE: &str = "1024 65535\\n";\n',
+          )
+          replace_once(
+              'labrelay/src/tcp_session_test.rs',
+              '    max_duration_seconds: u64,\n}',
+              '    max_duration_seconds: u64,\n    extreme_mode: bool,\n}',
+          )
+          replace_once(
+              'labrelay/src/tcp_session_test.rs',
+              '            max_duration_seconds: 180,\n        }',
+              '            max_duration_seconds: 180,\n            extreme_mode: false,\n        }',
+          )
+          replace_once(
+              'labrelay/src/tcp_session_test.rs',
+              '        self.max_duration_seconds = self.max_duration_seconds.clamp(10, 300);\n        Ok(self)',
+              '        self.max_duration_seconds = self.max_duration_seconds.clamp(10, 300);\n        if self.extreme_mode && fd_soft_limit().unwrap_or(0) < 65_536 {\n            bail!("极限模式不可用：Relay FD 软上限低于 65536");\n        }\n        Ok(self)',
+          )
+          marker = '#[derive(Debug, Clone, Serialize)]\n#[serde(rename_all = "camelCase")]\nstruct FamilyMetric {'
+          guard = r'''struct ExtremePortRangeGuard {
+    original: String,
+    active: bool,
+}
+
+impl ExtremePortRangeGuard {
+    fn activate() -> Result<Self> {
+        restore_stale_extreme_port_range()?;
+        let original = fs::read_to_string(IP_LOCAL_PORT_RANGE_PATH)
+            .context("读取临时源端口范围失败")?;
+        let current: Vec<&str> = original.split_whitespace().collect();
+        if current == ["1024", "65535"] {
+            return Ok(Self { original, active: false });
+        }
+        if let Some(parent) = Path::new(EXTREME_PORT_RANGE_BACKUP).parent() {
+            fs::create_dir_all(parent).context("创建极限模式状态目录失败")?;
+        }
+        fs::write(EXTREME_PORT_RANGE_BACKUP, &original)
+            .context("保存原临时源端口范围失败")?;
+        if let Err(error) = fs::write(IP_LOCAL_PORT_RANGE_PATH, EXTREME_PORT_RANGE) {
+            let _ = fs::remove_file(EXTREME_PORT_RANGE_BACKUP);
+            return Err(error).context("启用极限模式临时源端口范围失败");
+        }
+        let (first, last) = source_port_range();
+        if first > 1024 || last < 65535 {
+            let _ = fs::write(IP_LOCAL_PORT_RANGE_PATH, &original);
+            let _ = fs::remove_file(EXTREME_PORT_RANGE_BACKUP);
+            bail!("极限模式临时源端口范围未生效");
+        }
+        Ok(Self { original, active: true })
+    }
+
+    fn restore(&mut self) -> Result<()> {
+        if !self.active {
+            return Ok(());
+        }
+        fs::write(IP_LOCAL_PORT_RANGE_PATH, &self.original)
+            .context("恢复原临时源端口范围失败")?;
+        let _ = fs::remove_file(EXTREME_PORT_RANGE_BACKUP);
+        self.active = false;
+        Ok(())
+    }
+}
+
+impl Drop for ExtremePortRangeGuard {
+    fn drop(&mut self) {
+        let _ = self.restore();
+    }
+}
+
+pub(crate) fn restore_stale_extreme_port_range() -> Result<()> {
+    let backup = Path::new(EXTREME_PORT_RANGE_BACKUP);
+    if !backup.exists() {
+        return Ok(());
+    }
+    let original = fs::read_to_string(backup).context("读取极限模式恢复信息失败")?;
+    fs::write(IP_LOCAL_PORT_RANGE_PATH, original).context("恢复遗留临时源端口范围失败")?;
+    fs::remove_file(backup).context("清理极限模式恢复信息失败")?;
+    Ok(())
+}
+
+'''
+          p = Path('labrelay/src/tcp_session_test.rs')
+          text = p.read_text(encoding='utf-8')
+          if marker not in text:
+              raise SystemExit('missing FamilyMetric marker')
+          p.write_text(text.replace(marker, guard + marker, 1), encoding='utf-8')
+
+          replace_once(
+              'labrelay/src/tcp_session_test.rs',
+              '''    async fn run_task(&self, config: TcpSessionConfig, control: Arc<ActiveControl>) {\n        let families: Vec<bool> = match config.family.as_str() {\n''',
+              '''    async fn run_task(&self, config: TcpSessionConfig, control: Arc<ActiveControl>) {\n        let mut extreme_port_guard = if config.extreme_mode {\n            match ExtremePortRangeGuard::activate() {\n                Ok(guard) => {\n                    self.update(&control.task_id, |snapshot| {\n                        push_log(snapshot, "极限模式已启用：临时源端口范围 1024-65535，测试结束自动恢复".into());\n                    })\n                    .await;\n                    Some(guard)\n                }\n                Err(error) => {\n                    let reason = format!("极限模式准备失败：{error:#}");\n                    self.update(&control.task_id, |snapshot| {\n                        snapshot.state = "failed".into();\n                        snapshot.status = "极限模式准备失败".into();\n                        snapshot.finish_reason = reason.clone();\n                        snapshot.resources_released = true;\n                        snapshot.release_status = "未创建测试连接".into();\n                        snapshot.finished_epoch = now_epoch();\n                        push_log(snapshot, reason.clone());\n                    })\n                    .await;\n                    let mut inner = self.inner.lock().await;\n                    if inner.active.as_ref().map(|value| value.task_id.as_str())\n                        == Some(control.task_id.as_str())\n                    {\n                        inner.active = None;\n                    }\n                    return;\n                }\n            }\n        } else {\n            None\n        };\n        let families: Vec<bool> = match config.family.as_str() {\n''',
+          )
+          replace_once(
+              'labrelay/src/tcp_session_test.rs',
+              '''        let stopped = control.stop.load(Ordering::Acquire);\n        let reason = if stopped {\n''',
+              '''        if let Some(guard) = extreme_port_guard.as_mut() {\n            match guard.restore() {\n                Ok(()) => {\n                    self.update(&control.task_id, |snapshot| {\n                        push_log(snapshot, "极限模式已恢复原临时源端口范围".into());\n                    })\n                    .await;\n                }\n                Err(error) => {\n                    failed = true;\n                    reasons.push(format!("恢复临时源端口范围失败：{error:#}"));\n                }\n            }\n        }\n        let stopped = control.stop.load(Ordering::Acquire);\n        let reason = if stopped {\n''',
+          )
+          replace_once(
+              'labrelay/src/tcp_session_test.rs',
+              '        let plan = resource_plan(config.target_connections);',
+              '        let plan = resource_plan(config.target_connections, config.extreme_mode);',
+          )
+          replace_once(
+              'labrelay/src/tcp_session_test.rs',
+              'fn resource_plan(requested: usize) -> ResourcePlan {',
+              'fn resource_plan(requested: usize, extreme_mode: bool) -> ResourcePlan {',
+          )
+          replace_once(
+              'labrelay/src/tcp_session_test.rs',
+              '''    let fd_ceiling = soft_limit\n        .saturating_mul(80)\n''',
+              '''    let fd_ceiling_percent = if extreme_mode { 90 } else { 80 };\n    let fd_ceiling = soft_limit\n        .saturating_mul(fd_ceiling_percent)\n''',
+          )
+          replace_once(
+              'labrelay/src/tcp_session_test.rs',
+              '    let conntrack_ceiling = conntrack_max.saturating_mul(75) / 100;',
+              '    let conntrack_ceiling = conntrack_max.saturating_mul(if extreme_mode { 90 } else { 75 }) / 100;',
+          )
+          replace_once(
+              'labrelay/src/tcp_session_test.rs',
+              '    let source_port_ceiling = source_port_capacity.saturating_mul(90) / 100;',
+              '    let source_port_ceiling = source_port_capacity.saturating_mul(if extreme_mode { 95 } else { 90 }) / 100;',
+          )
+
+          # Keep release metadata wording aligned in non-workflow source only.
+          PY
+
+          cargo fmt --manifest-path labrelay/Cargo.toml
+          cargo test --manifest-path labrelay/Cargo.toml --all-targets
+          python -m pytest -q tests/test_tcp_session_service.py tests/test_stun_service.py tests/test_stun_middle_port_wiring.py
+          sh -n scripts/labprobe-install.sh
+          grep -q "ulimit -Hn 131072" scripts/labprobe-install.sh
+          grep -q "COPY scripts/labprobe-install.sh /app/agent/install.sh" Dockerfile
+
+      - name: Commit source fixes
+        shell: bash
+        run: |
+          set -euo pipefail
+          git config user.name "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+          git add \
+            Dockerfile \
+            scripts/labprobe-install.sh \
+            tcp_session_service.py \
+            tests/test_tcp_session_service.py \
+            labrelay/Cargo.toml \
+            labrelay/Cargo.lock \
+            labrelay/src/main.rs \
+            labrelay/src/tcp_session_test.rs
+          git diff --cached --check
+          git commit -m "fix(relay): restore FD headroom and add extreme mode"
+          git push origin HEAD:fix/relay-nofile-upgrade-0.2.33-v2
