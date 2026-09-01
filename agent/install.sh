@@ -249,7 +249,9 @@ start_service() {
   # Some vendor procd builds keep the inherited hard nofile ceiling even when
   # procd_set_param limits requests a higher value. Raise it in a root shell
   # immediately before exec so the Relay daemon really inherits 131072.
-  procd_set_param command /bin/sh -c 'ulimit -n 131072; exec /usr/bin/labrelay daemon --config /etc/labprobe/relay.json --socket /tmp/labrelay.sock --state /tmp/labrelay/state.json --pid /tmp/labrelay.pid --port-min 20000 --port-max 20020 --lan-if br-lan'
+  # Relay accepts the union of the two Hub-owned pools:
+  # PortMap/IPv6 20000-29999 and STUN local channels 30000-32767.
+  procd_set_param command /bin/sh -c 'ulimit -n 131072; exec /usr/bin/labrelay daemon --config /etc/labprobe/relay.json --socket /tmp/labrelay.sock --state /tmp/labrelay/state.json --pid /tmp/labrelay.pid --port-min 20000 --port-max 32767 --lan-if br-lan'
   procd_set_param respawn 5 5 0
   procd_set_param stdout 1
   procd_set_param stderr 1
