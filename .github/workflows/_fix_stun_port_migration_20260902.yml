@@ -24,7 +24,18 @@ jobs:
         run: pip install --disable-pip-version-check -r requirements.txt pytest
 
       - name: Apply patch
-        run: python3 tools/_fix_stun_port_migration_20260902.py
+        shell: bash
+        run: |
+          python3 - <<'PY'
+          from pathlib import Path
+          path = Path('tools/_fix_stun_port_migration_20260902.py')
+          text = path.read_text(encoding='utf-8')
+          start = text.index("lock_path = Path('labrelay/Cargo.lock')")
+          end = text.index("ci_path = Path('.github/workflows/ci.yml')", start)
+          text = text[:start] + "# Cargo updates labrelay/Cargo.lock during the validation test run.\n\n" + text[end:]
+          path.write_text(text, encoding='utf-8')
+          PY
+          python3 tools/_fix_stun_port_migration_20260902.py
 
       - name: Validate Hub and Relay
         shell: bash
