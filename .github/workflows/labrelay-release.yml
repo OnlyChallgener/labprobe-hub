@@ -2,6 +2,9 @@ name: Publish LabRelay Router Bundle
 
 on:
   workflow_dispatch:
+  push:
+    branches:
+      - fix/relay-nofile-upgrade-0.2.33-v2
 
 concurrency:
   group: publish-labrelay-${{ github.ref }}
@@ -123,7 +126,7 @@ jobs:
           manifest = {
               'schemaVersion': 1,
               'versionName': version,
-              'changelog': 'Add Agent-managed WireGuard server, DDNS/STUN endpoint ownership, router Web firewall integration, and first-apply interface creation.',
+              'changelog': 'Fix existing-device Relay service migration so TCP peak tests inherit nofile=131072 instead of the legacy 4096 limit.',
               'installUrl': f'{release_root}/install.sh',
               'checksumsUrl': f'{release_root}/checksums.txt',
               'installer': metadata('install.sh'),
@@ -158,7 +161,9 @@ jobs:
           prerelease: false
           generate_release_notes: false
           body: |
-            LabRelay OpenWrt/BE72 router bundle.
+            LabRelay OpenWrt/BE72 router test bundle.
+
+            Fixes existing-device upgrades so the Relay daemon is recreated with `nofile=131072`, allowing TCP peak connection tests to go beyond the legacy ~3.2K FD guard while keeping runtime safety limits intact.
 
             First install:
             `sh install.sh HUB_URL HOOK_TOKEN BE72Pro`
