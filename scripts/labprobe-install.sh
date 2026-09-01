@@ -216,7 +216,10 @@ USE_PROCD=1
 start_service() {
   mkdir -p /tmp/labprobe
   procd_open_instance relay
-  procd_set_param command /usr/bin/labrelay daemon --config /etc/labprobe/relay.json --socket /tmp/labrelay.sock --state /tmp/labprobe/relay-state.json
+  # The BE72 vendor procd keeps the inherited hard FD ceiling unless the root
+  # shell raises it immediately before exec. The daemon accepts the union of
+  # PortMap/IPv6 20000-29999 and STUN local channels 30000-32767.
+  procd_set_param command /bin/sh -c 'ulimit -n 131072; exec /usr/bin/labrelay daemon --config /etc/labprobe/relay.json --socket /tmp/labrelay.sock --state /tmp/labprobe/relay-state.json --port-min 20000 --port-max 32767 --lan-if br-lan'
   procd_set_param respawn 3600 5 5
   procd_set_param stdout 1
   procd_set_param stderr 1
