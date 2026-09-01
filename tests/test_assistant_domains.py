@@ -133,6 +133,40 @@ class FakeRouterService:
         return {"data": {"rules": [dict(row) for row in self.firewall["rules"]]}}
 
 
+class FakeTcpSessionService:
+    def __init__(self):
+        self.started = []
+        self.task = {}
+
+    def _config(self, payload):
+        return {
+            "host": str(payload.get("host") or "").strip(),
+            "port": int(payload.get("port") or 443),
+            "family": str(payload.get("family") or "both"),
+            "targetConnections": int(payload.get("targetConnections") or 65535),
+            "cps": int(payload.get("cps") or 500),
+            "connectTimeoutMs": int(payload.get("connectTimeoutMs") or 1500),
+            "maxDurationSeconds": int(payload.get("maxDurationSeconds") or 180),
+        }
+
+    def start(self, payload):
+        config = self._config(payload)
+        self.started.append(config)
+        self.task = {
+            "id": "tcp-1", "state": "queued", "status": "等待 Relay 领取测试任务",
+            "ipv4": {}, "ipv6": {}, "resourcesReleased": True,
+        }
+        return dict(self.task)
+
+    def stop(self, task_id=""):
+        assert not task_id or task_id == self.task.get("id")
+        self.task.update({"state": "stop_requested", "status": "正在停止"})
+        return dict(self.task)
+
+    def snapshot(self):
+        return dict(self.task)
+
+
 def make_hub():
     saved_rules = []
     commands = []
@@ -153,6 +187,7 @@ def make_hub():
         STUN_SERVICE=FakeStunService(),
         ROUTER_SERVICE=FakeRouterService(),
         ROUTER_TASK_MANAGER=task_manager,
+        TCP_SESSION_SERVICE=FakeTcpSessionService(),
         STATE_FILE="state.json",
         status_document=lambda: {"hub": {"status": "ok"}},
         agent_presence_snapshot=lambda: {"online": True, "router": "BE72"},
@@ -203,7 +238,47 @@ def test_builtin_domains_are_catalogued_and_bound():
     for tool_id in PREVIEWS:
         assert executor._previews.get(tool_id) is not None
     assert set(NAVIGATE_ROUTES) <= {"home", "devices", "router", "tools", "ai_chat", "favorites",
-                                    "settings", "stun", "wireguard", "ipv6", "portmap", "ddns", "nat", "wol"}
+                                    "settings", "stun", "wireguard", "ipv6", "portmap", "ddns", "nat", "wol", "tcp_peak"}
+
+
+def test_tcp_peak_relay_confirmation_executes_canonical_service_arguments():
+    hub, executor = make_executor()
+    preview = executor.preview("tcp.peak.start", {
+        "side": "relay", "host": " example.com ", "port": 443,
+        "family": "both", "targetConnections": 65535, "cps": 500,
+    })
+    assert preview["executor"] == "hub"
+    assert preview["arguments"] == {
+        "side": "relay", "host": "example.com", "port": 443, "family": "both",
+        "targetConnections": 65535, "cps": 500,
+        "connectTimeoutMs": 1500, "maxDurationSeconds": 180,
+    }
+    result = executor.execute("tcp.peak.start", preview["arguments"], allow_write=True)
+    assert result["task"]["id"] == "tcp-1"
+    assert hub.TCP_SESSION_SERVICE.started == [{
+        "host": "example.com", "port": 443, "family": "both",
+        "targetConnections": 65535, "cps": 500,
+        "connectTimeoutMs": 1500, "maxDurationSeconds": 180,
+    }]
+
+
+def test_tcp_peak_app_status_uses_sanitized_client_context_and_start_stays_local():
+    _, executor = make_executor()
+    context = {
+        "tcpPeak": {
+            "taskId": "app-1", "side": "app", "state": "completed", "status": "测试已完成",
+            "ipv4": {"peak": 123, "success": 123, "failure": 1, "elapsedMs": 2000},
+            "resourcesReleased": True, "secret": "must-not-leak",
+        },
+    }
+    status = executor.execute("tcp.peak.status", {"side": "app"}, client_context=context)
+    assert "IPv4" in status["content"] and "123" in status["content"]
+    assert "must-not-leak" not in json.dumps(status, ensure_ascii=False)
+    preview = executor.preview("tcp.peak.start", {
+        "side": "app", "host": "example.com", "port": 443,
+        "family": "ipv4", "targetConnections": 1000, "cps": 100,
+    })
+    assert preview["executor"] == "app"
 
 
 def test_write_tool_requires_confirmation():

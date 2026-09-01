@@ -58,10 +58,10 @@ def test_provider_normalizes_error_events_and_rejects_scalars_cleanly():
     with pytest.raises(ProviderError, match="quota exhausted") as error:
         list(provider_for(['data: {"error":{"message":"quota exhausted","code":429}}']).stream([]))
     assert error.value.status_code == 429
-    with pytest.raises(ProviderError, match="non-object"):
+    with pytest.raises(ProviderError, match="不是对象"):
         parse_sse_line('data: "not-an-object"')
     assert usage_from_chunk("scalar") is None
-    with pytest.raises(ProviderError, match="malformed SSE"):
+    with pytest.raises(ProviderError, match="SSE 数据格式错误"):
         list(provider_for(["data: 123"]).stream([]))
     with pytest.raises(ProviderError, match="gateway rejected"):
         list(provider_for(["event: error", 'data: {"message":"gateway rejected"}']).stream([]))
@@ -131,7 +131,7 @@ def test_provider_skips_bad_frame_when_a_later_frame_is_valid_and_reports_empty_
         'data: {"choices":[{"delta":{"content":"ok"}}]}',
     ]).stream([]))
     assert chunks[0]["choices"][0]["delta"]["content"] == "ok"
-    with pytest.raises(ProviderError, match="empty SSE stream"):
+    with pytest.raises(ProviderError, match="空 SSE 数据流"):
         list(provider_for([": ping", "data:"]).stream([]))
 
 
@@ -145,7 +145,7 @@ def test_provider_decodes_tokenhub_sse_bytes_as_utf8_without_charset():
 
 
 def test_provider_rejects_non_utf8_sse_instead_of_saving_replacement_text():
-    with pytest.raises(ProviderError, match="non-UTF-8 SSE"):
+    with pytest.raises(ProviderError, match="有效 UTF-8"):
         list(provider_for([b"data: {\"message\":\"\xff\"}"]).stream([]))
 
 

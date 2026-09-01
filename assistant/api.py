@@ -34,7 +34,7 @@ MAX_REPLAY_CHARS = 24_000
 TOOL_SYSTEM_PROMPT = (
     "你是极客网探 Hub 助手，可以查看和控制整个网络：设备、事件、Agent/Relay、STUN 穿透、"
     "WireGuard、路由器端口映射、IPv6、每日记录、防火墙（转发/入站/出站规则的查询、启停、"
-    "新建、修改、删除）、路由器 Beta 固件（版本查询与检测更新），以及让 APP 跳转页面或刷新数据。"
+    "新建、修改、删除）、TCP 峰值连接数测试、路由器 Beta 固件（版本查询与检测更新），以及让 APP 跳转页面或刷新数据。"
     "涉及查询时必须调用工具，不得猜测。只读工具可以直接调用；写入操作（新增/删除/启停端口映射、"
     "穿透规则、防火墙规则或 WireGuard 网关，升级 Agent）只能生成确认请求，在对话中出现对应的〔操作记录〕之前"
     "绝不能声称操作已经完成。"
@@ -48,6 +48,8 @@ TOOL_SYSTEM_PROMPT = (
     "告知，禁止凭对话记忆声称“仍在等待确认”。"
     "用户说‘网络自检’时调用 network.self_check；说‘路由网络自检/路由器自检’时调用 router.diagnostic；"
     "说‘NAT检测’时调用 router.nat.diagnostic。检测和自检绝不能调用 app.navigate，只有明确要求打开/进入/跳转页面时才允许导航。"
+    "TCP 峰值连接数测试必须调用 tcp.peak.start、tcp.peak.stop 或 tcp.peak.status；65535 只是量程上限，"
+    "不得把停止原因笼统描述为宽带最大连接数，也不得输出原始 JSON。"
     "回答使用简洁中文。"
 )
 
@@ -487,7 +489,7 @@ def create_ai_blueprint(*, check_app_token: Callable[[], bool], db_path, logger,
 
     def authorized():
         if not check_app_token():
-            return jsonify({"error": "unauthorized"}), 401
+            return jsonify({"error": "未授权"}), 401
         return None
 
     def sse_response(events) -> Response:
@@ -646,9 +648,9 @@ def create_ai_blueprint(*, check_app_token: Callable[[], bool], db_path, logger,
             try:
                 current = store.get_config(int(config_id)) if config_id is not None else store.get_config()
             except (TypeError, ValueError):
-                return jsonify({"error": "id must be an integer"}), 400
+                return jsonify({"error": "配置 ID 必须是整数"}), 400
             if config_id is not None and current is None:
-                return jsonify({"error": "AI configuration was not found"}), 404
+                return jsonify({"error": "未找到 AI 配置"}), 404
             if current is not None:
                 try:
                     canonicalize_config_base_url(current)
@@ -656,22 +658,22 @@ def create_ai_blueprint(*, check_app_token: Callable[[], bool], db_path, logger,
                     return jsonify({"error": str(exc)}), 409
         provider = str(body.get("provider") or (current["provider"] if current else "deepseek")).strip().lower()
         if not provider or len(provider) > 64:
-            return jsonify({"error": "provider is invalid"}), 400
+            return jsonify({"error": "AI 服务商配置无效"}), 400
         model = str(body.get("model") or (current["model"] if current else DEFAULT_MODEL)).strip()
         if not model or len(model) > 200:
-            return jsonify({"error": "model is invalid"}), 400
+            return jsonify({"error": "模型名称无效"}), 400
         name = str(body.get("name") or (current["name"] if current else model)).strip()
         if not name or len(name) > 64:
-            return jsonify({"error": "name must contain 1 to 64 characters"}), 400
+            return jsonify({"error": "配置名称长度必须为 1–64 个字符"}), 400
         provider_changed = bool(current and provider != str(current["provider"]).lower())
         fallback_url = default_base_url(provider) if provider_changed or not current else current["base_url"]
         base_url = str(body.get("baseUrl") or fallback_url).strip().rstrip("/")
         parsed = urlparse(base_url)
         local_http = parsed.scheme == "http" and parsed.hostname in {"localhost", "127.0.0.1", "::1"}
         if (parsed.scheme != "https" and not local_http) or not parsed.netloc:
-            return jsonify({"error": "baseUrl is invalid"}), 400
+            return jsonify({"error": "AI 服务地址无效"}), 400
         if parsed.username is not None or parsed.password is not None or parsed.query or parsed.fragment:
-            return jsonify({"error": "baseUrl must not contain credentials, a query, or a fragment"}), 400
+            return jsonify({"error": "AI 服务地址不能包含账号凭据、查询参数或片段"}), 400
         api_key = body.get("apiKey")
         if current and (api_key is None or str(api_key).strip() in {"", "configured"}):
             try:
@@ -687,7 +689,7 @@ def create_ai_blueprint(*, check_app_token: Callable[[], bool], db_path, logger,
             except MasterKeyUnavailable as exc:
                 return jsonify({"error": str(exc)}), 503
         else:
-            return jsonify({"error": "apiKey is required for a new configuration"}), 400
+            return jsonify({"error": "新建配置必须填写 API Key"}), 400
         try:
             quota = parse_quota(body, current)
         except ValueError as exc:
@@ -739,7 +741,7 @@ def create_ai_blueprint(*, check_app_token: Callable[[], bool], db_path, logger,
         if denial:
             return denial
         if not store.delete_config(config_id):
-            return jsonify({"error": "AI configuration was not found"}), 404
+            return jsonify({"error": "未找到 AI 配置"}), 404
         return "", 204
 
     @bp.post("/config/<int:config_id>/promote")
@@ -749,7 +751,7 @@ def create_ai_blueprint(*, check_app_token: Callable[[], bool], db_path, logger,
             return denial
         row = store.promote_config(config_id)
         if row is None:
-            return jsonify({"error": "AI configuration was not found"}), 404
+            return jsonify({"error": "未找到 AI 配置"}), 404
         return jsonify(config_view(row))
 
     @bp.post("/config/<int:config_id>/move")
@@ -760,7 +762,7 @@ def create_ai_blueprint(*, check_app_token: Callable[[], bool], db_path, logger,
         body = request.get_json(silent=True) or {}
         direction = "up" if str(body.get("direction") or "").lower() == "up" else "down"
         if not store.move_config(config_id, direction):
-            return jsonify({"error": "AI configuration was not found"}), 404
+            return jsonify({"error": "未找到 AI 配置"}), 404
         return jsonify({"ok": True})
 
     @bp.post("/usage/adjust")
@@ -773,9 +775,9 @@ def create_ai_blueprint(*, check_app_token: Callable[[], bool], db_path, logger,
             config_id = int(body.get("configId"))
             target = int(body.get("totalTokens"))
         except (TypeError, ValueError):
-            return jsonify({"error": "configId and totalTokens must be integers"}), 400
+            return jsonify({"error": "配置 ID 与 Token 总数必须是整数"}), 400
         if target < 0:
-            return jsonify({"error": "totalTokens must be >= 0"}), 400
+            return jsonify({"error": "Token 总数不能小于 0"}), 400
         quota_supplied = "tokenQuota" in body or "modelQuotaTokens" in body
         try:
             quota = parse_quota(body) if quota_supplied else None
@@ -786,7 +788,7 @@ def create_ai_blueprint(*, check_app_token: Callable[[], bool], db_path, logger,
             if quota_supplied else store.record_usage_adjustment(config_id, target)
         )
         if result is None:
-            return jsonify({"error": "AI configuration was not found"}), 404
+            return jsonify({"error": "未找到 AI 配置"}), 404
         saved = store.get_config(config_id)
         return jsonify({"ok": True, **result, "adjustment": result, "config": config_view(saved)})
 
@@ -796,7 +798,7 @@ def create_ai_blueprint(*, check_app_token: Callable[[], bool], db_path, logger,
         if denial:
             return denial
         if not store.delete_usage_record(usage_id):
-            return jsonify({"error": "usage record was not found"}), 404
+            return jsonify({"error": "未找到用量记录"}), 404
         return jsonify({"ok": True, "deleted": usage_id})
 
     @bp.delete("/usage/config/<int:config_id>")
@@ -806,7 +808,7 @@ def create_ai_blueprint(*, check_app_token: Callable[[], bool], db_path, logger,
         if denial:
             return denial
         if not store.delete_config_usage_record(config_id):
-            return jsonify({"error": "AI configuration was not found"}), 404
+            return jsonify({"error": "未找到 AI 配置"}), 404
         return jsonify({
             "ok": True,
             "configId": config_id,
@@ -822,7 +824,7 @@ def create_ai_blueprint(*, check_app_token: Callable[[], bool], db_path, logger,
         try:
             limit = int(request.args.get("limit", 50))
         except (TypeError, ValueError):
-            return jsonify({"error": "limit must be an integer"}), 400
+            return jsonify({"error": "数量上限必须是整数"}), 400
         return jsonify({**store.usage_summary(), "recent": store.list_usage(limit),
                         "daily": store.usage_daily(14), "storage": store.conversation_storage(),
                         "config_usage": store.usage_by_config(),
@@ -854,7 +856,7 @@ def create_ai_blueprint(*, check_app_token: Callable[[], bool], db_path, logger,
         if denial:
             return denial
         if not store.delete_message(conversation_id, message_id):
-            return jsonify({"error": "message was not found"}), 404
+            return jsonify({"error": "未找到该消息"}), 404
         return jsonify({"ok": True, "deleted": message_id})
 
     @bp.patch("/conversations/<conversation_id>")
@@ -864,13 +866,13 @@ def create_ai_blueprint(*, check_app_token: Callable[[], bool], db_path, logger,
             return denial
         body = request.get_json(silent=True) or {}
         if not isinstance(body.get("title"), str):
-            return jsonify({"error": "title is required"}), 400
+            return jsonify({"error": "必须填写对话标题"}), 400
         try:
             row = store.rename_conversation(conversation_id, body["title"])
         except ValueError as exc:
             return jsonify({"error": str(exc)}), 400
         if row is None:
-            return jsonify({"error": "conversation was not found"}), 404
+            return jsonify({"error": "未找到该对话"}), 404
         return jsonify({"conversation": row})
 
     @bp.delete("/conversations/<conversation_id>")
@@ -879,7 +881,7 @@ def create_ai_blueprint(*, check_app_token: Callable[[], bool], db_path, logger,
         if denial:
             return denial
         if not store.delete_conversation(conversation_id):
-            return jsonify({"error": "conversation was not found"}), 404
+            return jsonify({"error": "未找到该对话"}), 404
         return jsonify({"ok": True, "deleted": conversation_id})
 
     @bp.get("/catalog")
@@ -1074,7 +1076,7 @@ def create_ai_blueprint(*, check_app_token: Callable[[], bool], db_path, logger,
         body = request.get_json(silent=True) or {}
         confirmation_id = str(body.get("confirmationId") or "").strip()
         if not confirmation_id:
-            return jsonify({"error": "confirmationId is required"}), 400
+            return jsonify({"error": "缺少确认单 ID"}), 400
         cancelled = store.cancel_confirmation(confirmation_id)
         if cancelled is None:
             current = store.get_confirmation(confirmation_id)
@@ -1156,7 +1158,7 @@ def create_ai_blueprint(*, check_app_token: Callable[[], bool], db_path, logger,
                 query_id = request.args.get("id")
                 config_id = int(query_id) if query_id is not None else None
             except (TypeError, ValueError):
-                return jsonify({"error": "id must be an integer"}), 400
+                return jsonify({"error": "配置 ID 必须是整数"}), 400
         if path_config_id is not None:
             selected = store.get_config(config_id)
             rows = [selected] if selected and selected["enabled"] else []
@@ -1165,7 +1167,7 @@ def create_ai_blueprint(*, check_app_token: Callable[[], bool], db_path, logger,
             if config_id is not None:
                 rows.sort(key=lambda row: 0 if int(row["id"]) == config_id else 1)
         if not rows:
-            return jsonify({"error": "AI provider is not configured or disabled"}), 409
+            return jsonify({"error": "AI 服务商尚未配置或已停用"}), 409
         last_error: Exception | None = None
         last_status = 502
         for row in rows:
@@ -1189,7 +1191,7 @@ def create_ai_blueprint(*, check_app_token: Callable[[], bool], db_path, logger,
             if path_config_id is not None:
                 response.update({"configId": row["id"], "provider": row["provider"], "model": row["model"]})
             return jsonify(response)
-        return jsonify({"error": str(last_error or "AI provider is unavailable"), "status": "failed"}), last_status
+        return jsonify({"error": str(last_error or "AI 服务商暂不可用"), "status": "failed"}), last_status
 
     @bp.post("/chat")
     def chat():
@@ -1199,26 +1201,26 @@ def create_ai_blueprint(*, check_app_token: Callable[[], bool], db_path, logger,
         body = request.get_json(silent=True) or {}
         client_context = body.get("clientContext") or {}
         if len(json.dumps(client_context, ensure_ascii=False)) > 32_000:
-            return jsonify({"error": "clientContext exceeds the size limit"}), 413
+            return jsonify({"error": "APP 上下文超过大小限制"}), 413
         incremental = isinstance(body.get("message"), str) and body.get("messages") is None
         supplied = [{"role": "user", "content": body["message"]}] if incremental else body.get("messages")
         if not isinstance(supplied, list) or not supplied:
-            return jsonify({"error": "messages must be a non-empty list"}), 400
+            return jsonify({"error": "消息列表不能为空"}), 400
         if len(supplied) > MAX_MESSAGES:
-            return jsonify({"error": f"messages exceed the count limit (max {MAX_MESSAGES}); send only the latest turns"}), 400
+            return jsonify({"error": f"消息数量超过限制（最多 {MAX_MESSAGES} 条），请只发送最近对话"}), 400
         messages: List[Dict[str, str]] = []
         total_chars = 0
         for item in supplied:
             if not isinstance(item, dict) or item.get("role") not in {"user", "assistant"} or not isinstance(item.get("content"), str):
-                return jsonify({"error": "messages contain an invalid role or content"}), 400
+                return jsonify({"error": "消息角色或内容格式无效"}), 400
             if len(item["content"]) > MAX_MESSAGE_CHARS:
-                return jsonify({"error": "a message exceeds the size limit"}), 413
+                return jsonify({"error": "单条消息超过大小限制"}), 413
             total_chars += len(item["content"])
             messages.append({"role": item["role"], "content": item["content"]})
         if total_chars > MAX_REQUEST_CHARS:
-            return jsonify({"error": "messages exceed the request size limit"}), 413
+            return jsonify({"error": "消息总量超过请求大小限制"}), 413
         if incremental and len(messages[0]["content"]) > MAX_REPLAY_CHARS:
-            return jsonify({"error": "message exceeds the replay budget"}), 413
+            return jsonify({"error": "消息超过上下文回放上限"}), 413
         conversation_id = str(body.get("conversationId") or uuid.uuid4())
         first_user_message = next((item["content"] for item in messages if item["role"] == "user"), None)
         store.create_conversation(conversation_id, title=first_user_message)
@@ -1242,7 +1244,10 @@ def create_ai_blueprint(*, check_app_token: Callable[[], bool], db_path, logger,
                 messages.pop(0)
         else:
             # Compatibility for older APP builds that still send a bounded transcript.
-            store.replace_messages(conversation_id, messages)
+            # Merge the visible replay instead of replacing the authoritative
+            # transcript: a model context/window limit must never erase older
+            # stored history.
+            store.merge_replayed_messages(conversation_id, messages)
             stored_messages = store.get_messages(conversation_id, limit=MAX_MESSAGES)
             user_message_id = next(
                 (int(item["id"]) for item in reversed(stored_messages) if item["role"] == "user"),
@@ -1345,7 +1350,7 @@ def create_ai_blueprint(*, check_app_token: Callable[[], bool], db_path, logger,
         # 模型名与真实原因返回给 APP 提醒用户切换，而不是悄悄换下一个继续烧。
         config_rows = store.list_configs(enabled_only=True)[:1]
         if not config_rows:
-            return post_persist_failure("AI provider is not configured", 409)
+            return post_persist_failure("AI 服务商尚未配置", 409)
         internal_messages: List[Dict[str, Any]] = list(messages)
         if not internal_messages or internal_messages[0].get("role") != "system":
             internal_messages.insert(0, {"role": "system", "content": TOOL_SYSTEM_PROMPT})
@@ -1365,7 +1370,7 @@ def create_ai_blueprint(*, check_app_token: Callable[[], bool], db_path, logger,
 
         def model_unavailable_error() -> ProviderError:
             if last_provider_error is None:
-                return ProviderError("AI provider is unavailable")
+                return ProviderError("AI 服务商暂不可用")
             detail = str(last_provider_error)
             status = last_provider_error.status_code
             model = last_failed_model or "当前模型"
@@ -1460,6 +1465,7 @@ def create_ai_blueprint(*, check_app_token: Callable[[], bool], db_path, logger,
                             pending_writes.append({
                                 "signature": signature, "toolId": tool_id,
                                 "arguments": normalized_arguments, "preview": preview,
+                                "executor": str(preview.get("executor") or "hub"),
                             })
                         return call_id, tool_id, None
                 else:
@@ -1474,32 +1480,62 @@ def create_ai_blueprint(*, check_app_token: Callable[[], bool], db_path, logger,
                         store.add_tool_audit(call_id, tool_id, str(spec["risk"]), "failed", arguments, tool_payload)
             return call_id, tool_id, tool_payload
 
+        def normalize_tool_calls(raw_calls):
+            """Give every model call a stable id before echoing it upstream."""
+            normalized = []
+            for source in raw_calls if isinstance(raw_calls, list) else []:
+                call = dict(source) if isinstance(source, dict) else {}
+                call["id"] = str(call.get("id") or uuid.uuid4())
+                normalized.append(call)
+            return normalized
+
+        def rejected_overflow_call(call):
+            """Produce the mandatory tool result for calls above the safety cap."""
+            call_id = str(call.get("id") or uuid.uuid4())
+            function = call.get("function") if isinstance(call.get("function"), dict) else {}
+            raw_name = str(function.get("name") or "")
+            tool_id = tool_id_from_function(raw_name) or raw_name or "unknown"
+            return call_id, tool_id, {
+                "ok": False,
+                "code": "TOOL_CALL_LIMIT",
+                "error": "单轮最多执行 4 个工具，其余调用已安全跳过",
+            }
+
         def build_confirmation_payload(executions, client_actions, pending_writes, usage_snapshot):
             confirmation_id = str(uuid.uuid4())
             expires_at = (datetime.now(timezone.utc) + timedelta(minutes=5)).isoformat(timespec="seconds")
-            if len(pending_writes) == 1:
-                first = pending_writes[0]
+            executors = {str(item.get("executor") or "hub") for item in pending_writes}
+            # APP-local actions have a separate executor and completion
+            # handshake.  Never put them in a Hub batch (or combine multiple
+            # local actions into a payload the APP cannot execute atomically).
+            batchable = len(pending_writes) > 1 and executors == {"hub"}
+            selected = pending_writes if batchable else pending_writes[:1]
+            deferred_count = len(pending_writes) - len(selected)
+            if len(selected) == 1:
+                first = selected[0]
                 preview = dict(first["preview"])
                 confirm_tool_id = first["toolId"]
                 confirm_arguments = first["arguments"]
             else:
                 confirm_tool_id = "batch"
-                confirm_arguments = {"tools": [{"toolId": p["toolId"], "arguments": p["arguments"]} for p in pending_writes]}
+                confirm_arguments = {"tools": [{"toolId": p["toolId"], "arguments": p["arguments"]} for p in selected]}
                 preview = {
                     "toolId": "batch",
-                    "title": f"确认执行 {len(pending_writes)} 项操作",
+                    "title": f"确认执行 {len(selected)} 项操作",
                     "summary": "；".join(
                         str(p["preview"].get("summary") or p["preview"].get("title") or p["toolId"])
-                        for p in pending_writes
+                        for p in selected
                     ),
                     "arguments": confirm_arguments,
                     "executor": "hub",
                 }
             store.create_confirmation(confirmation_id, confirm_tool_id, confirm_arguments, preview, expires_at,
                                       conversation_id=conversation_id)
-            for item in pending_writes:
+            for item in selected:
                 store.add_tool_audit(confirmation_id, item["toolId"], "write", "confirmation_required", item["arguments"], item["preview"])
             content = "需要你的确认：" + str(preview.get("summary") or preview.get("title") or confirm_tool_id)
+            if deferred_count:
+                content += f"。为避免混用 APP 与 Hub 执行器，本次仅处理第一项，其余 {deferred_count} 项未排队，请分别发起"
             message_id = store.add_message(conversation_id, "assistant", content)
             store.add_usage(conversation_id, active_row["provider"], active_row["model"],
                             usage_snapshot, config_id=active_row["id"])
@@ -1570,7 +1606,7 @@ def create_ai_blueprint(*, check_app_token: Callable[[], bool], db_path, logger,
                                     round_usage.clear()
                                     yield stream_event({"type": "reset"})
                         merge_usage(accumulated_usage, round_usage)
-                        tool_calls = tool_calls_from_accumulated(tool_acc)
+                        tool_calls = normalize_tool_calls(tool_calls_from_accumulated(tool_acc))
                         if tool_calls:
                             assistant_tool_message = {
                                 "role": "assistant",
@@ -1595,6 +1631,14 @@ def create_ai_blueprint(*, check_app_token: Callable[[], bool], db_path, logger,
                                     "content": json.dumps(tool_payload, ensure_ascii=False, separators=(",", ":")),
                                 })
                                 yield stream_event({"type": "tool", "toolId": tool_id, "status": "completed" if succeeded else "failed"})
+                            for call in tool_calls[4:]:
+                                call_id, tool_id, tool_payload = rejected_overflow_call(call)
+                                executions.append({"toolId": tool_id, "status": "failed"})
+                                internal_messages.append({
+                                    "role": "tool", "tool_call_id": call_id,
+                                    "content": json.dumps(tool_payload, ensure_ascii=False, separators=(",", ":")),
+                                })
+                                yield stream_event({"type": "tool", "toolId": tool_id, "status": "failed"})
                             if pending_writes:
                                 payload = build_confirmation_payload(executions, client_actions, pending_writes, accumulated_usage)
                                 yield stream_event({"type": "confirmation", **payload})
@@ -1602,7 +1646,7 @@ def create_ai_blueprint(*, check_app_token: Callable[[], bool], db_path, logger,
                             continue
                         content_text = "".join(content_parts)
                         if not content_text:
-                            raise ProviderError("AI provider returned an empty response")
+                            raise ProviderError("AI 服务商返回了空响应")
                         message_id = store.add_message(conversation_id, "assistant", content_text)
                         if not accumulated_usage and logger is not None:
                             logger.warning("ai: provider returned no usage tokens (model=%s)", active_row["model"])
@@ -1623,7 +1667,7 @@ def create_ai_blueprint(*, check_app_token: Callable[[], bool], db_path, logger,
                             "clientActions": client_actions,
                         })
                         return
-                    raise ProviderError("AI tool call limit exceeded")
+                    raise ProviderError("AI 工具调用轮次超过限制")
                 except ProviderError as exc:
                     if active_row is not None:
                         store.add_usage(conversation_id, active_row["provider"], active_row["model"],
@@ -1639,7 +1683,7 @@ def create_ai_blueprint(*, check_app_token: Callable[[], bool], db_path, logger,
                         )
                     if logger is not None:
                         logger.exception("ai: unexpected provider stream failure")
-                    yield stream_event({"type": "error", **failure_payload("AI provider stream failed unexpectedly")})
+                    yield stream_event({"type": "error", **failure_payload("AI 服务流发生异常")})
             return sse_response(generate())
         executions: List[Dict[str, Any]] = []
         client_actions: List[Dict[str, Any]] = []
@@ -1649,10 +1693,10 @@ def create_ai_blueprint(*, check_app_token: Callable[[], bool], db_path, logger,
                 result = provider_chat(internal_messages, tools=provider_tools() if executor is not None else None)
                 assistant_message = result.message or {"role": "assistant", "content": result.content}
                 assistant_message.setdefault("role", "assistant")
-                tool_calls = assistant_message.get("tool_calls") or []
+                tool_calls = normalize_tool_calls(assistant_message.get("tool_calls") or [])
                 if not isinstance(tool_calls, list) or not tool_calls:
                     if not result.content:
-                        raise ProviderError("AI provider returned an empty response")
+                        raise ProviderError("AI 服务商返回了空响应")
                     message_id = store.add_message(conversation_id, "assistant", result.content)
                     if not accumulated_usage and logger is not None:
                         logger.warning("ai: provider returned no usage tokens (model=%s)", active_row["model"])
@@ -1671,6 +1715,7 @@ def create_ai_blueprint(*, check_app_token: Callable[[], bool], db_path, logger,
                         "toolExecutions": executions,
                         "clientActions": client_actions,
                     })
+                assistant_message["tool_calls"] = tool_calls
                 internal_messages.append(assistant_message)
                 for call in tool_calls[:4]:
                     call_id, tool_id, tool_payload = process_tool_call(call, executions, client_actions, pending_writes)
@@ -1681,9 +1726,16 @@ def create_ai_blueprint(*, check_app_token: Callable[[], bool], db_path, logger,
                         "role": "tool", "tool_call_id": call_id,
                         "content": json.dumps(tool_payload, ensure_ascii=False, separators=(",", ":")),
                     })
+                for call in tool_calls[4:]:
+                    call_id, tool_id, tool_payload = rejected_overflow_call(call)
+                    executions.append({"toolId": tool_id, "status": "failed"})
+                    internal_messages.append({
+                        "role": "tool", "tool_call_id": call_id,
+                        "content": json.dumps(tool_payload, ensure_ascii=False, separators=(",", ":")),
+                    })
                 if pending_writes:
                     return jsonify(build_confirmation_payload(executions, client_actions, pending_writes, accumulated_usage))
-            raise ProviderError("AI tool call limit exceeded")
+            raise ProviderError("AI 工具调用轮次超过限制")
         except ProviderError as exc:
             if active_row is not None:
                 store.add_usage(conversation_id, active_row["provider"], active_row["model"],
@@ -1698,6 +1750,6 @@ def create_ai_blueprint(*, check_app_token: Callable[[], bool], db_path, logger,
                 )
             if logger is not None:
                 logger.exception("ai: unexpected provider failure")
-            return jsonify(failure_payload("AI provider failed unexpectedly")), 502
+            return jsonify(failure_payload("AI 服务发生异常")), 502
 
     return bp

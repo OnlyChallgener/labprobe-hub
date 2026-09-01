@@ -109,27 +109,52 @@ class ToolExecutor:
         clean: Dict[str, Any] = {}
         for name, value in arguments.items():
             rule = properties.get(name) or {}
-            if rule.get("type") == "string":
+            value_type = rule.get("type")
+            if value_type == "string":
                 if not isinstance(value, str):
                     raise ToolError(f"参数 {name} 必须是文本", "INVALID_ARGUMENTS")
                 value = value.strip()
+                if len(value) < int(rule.get("minLength") or 0):
+                    raise ToolError(f"参数 {name} 过短", "INVALID_ARGUMENTS")
                 if len(value) > int(rule.get("maxLength") or 4096):
                     raise ToolError(f"参数 {name} 过长", "INVALID_ARGUMENTS")
                 if rule.get("pattern") and not re.fullmatch(str(rule["pattern"]), value):
                     raise ToolError(f"参数 {name} 格式错误", "INVALID_ARGUMENTS")
                 if rule.get("enum") and value not in rule["enum"]:
                     raise ToolError(f"参数 {name} 不在允许范围", "INVALID_ARGUMENTS")
-            elif rule.get("type") == "boolean" and not isinstance(value, bool):
-                raise ToolError(f"参数 {name} 必须是布尔值", "INVALID_ARGUMENTS")
+            elif value_type == "boolean":
+                if not isinstance(value, bool):
+                    raise ToolError(f"参数 {name} 必须是布尔值", "INVALID_ARGUMENTS")
+            elif value_type == "integer":
+                # Python's bool is a subclass of int; accepting true as 1 would
+                # silently turn malformed model arguments into a real mutation.
+                if not isinstance(value, int) or isinstance(value, bool):
+                    raise ToolError(f"参数 {name} 必须是整数", "INVALID_ARGUMENTS")
+                if "minimum" in rule and value < rule["minimum"]:
+                    raise ToolError(f"参数 {name} 小于允许范围", "INVALID_ARGUMENTS")
+                if "maximum" in rule and value > rule["maximum"]:
+                    raise ToolError(f"参数 {name} 超出允许范围", "INVALID_ARGUMENTS")
+            elif value_type == "number":
+                if not isinstance(value, (int, float)) or isinstance(value, bool):
+                    raise ToolError(f"参数 {name} 必须是数字", "INVALID_ARGUMENTS")
+                if "minimum" in rule and value < rule["minimum"]:
+                    raise ToolError(f"参数 {name} 小于允许范围", "INVALID_ARGUMENTS")
+                if "maximum" in rule and value > rule["maximum"]:
+                    raise ToolError(f"参数 {name} 超出允许范围", "INVALID_ARGUMENTS")
+            elif value_type == "array" and not isinstance(value, list):
+                raise ToolError(f"参数 {name} 必须是列表", "INVALID_ARGUMENTS")
+            elif value_type == "object" and not isinstance(value, dict):
+                raise ToolError(f"参数 {name} 必须是对象", "INVALID_ARGUMENTS")
             clean[name] = value
         return spec, clean
 
     @staticmethod
     def _client_context(client_context: Any) -> Dict[str, Any]:
         if not isinstance(client_context, dict):
-            return {"settings": {}, "favorites": []}
+            return {"settings": {}, "favorites": [], "tcpPeak": {}}
         settings = client_context.get("settings") if isinstance(client_context.get("settings"), dict) else {}
         favorites = client_context.get("favorites") if isinstance(client_context.get("favorites"), list) else []
+        tcp_peak = client_context.get("tcpPeak") if isinstance(client_context.get("tcpPeak"), dict) else {}
         safe_settings: Dict[str, Any] = {}
         if isinstance(settings.get("privacyMode"), bool):
             safe_settings["privacyMode"] = settings["privacyMode"]
@@ -138,6 +163,34 @@ class ToolExecutor:
         if settings.get("routerDisplayName") is not None:
             safe_settings["routerDisplayName"] = str(settings["routerDisplayName"])[:256]
         safe_favorites: List[Dict[str, Any]] = []
+        safe_tcp_peak: Dict[str, Any] = {}
+        for key, limit in (
+            ("taskId", 80), ("side", 16), ("state", 32), ("status", 240),
+            ("finishReason", 240), ("releaseStatus", 240), ("host", 253),
+        ):
+            if tcp_peak.get(key) not in (None, ""):
+                safe_tcp_peak[key] = str(tcp_peak[key])[:limit]
+        for key in ("port", "conntrackPeak", "memoryMinAvailableMb", "startedEpoch", "finishedEpoch"):
+            value = tcp_peak.get(key)
+            if isinstance(value, int) and not isinstance(value, bool):
+                safe_tcp_peak[key] = max(0, value)
+        cpu_peak = tcp_peak.get("cpuPeak")
+        if isinstance(cpu_peak, (int, float)) and not isinstance(cpu_peak, bool):
+            safe_tcp_peak["cpuPeak"] = max(0.0, min(100.0, float(cpu_peak)))
+        if isinstance(tcp_peak.get("resourcesReleased"), bool):
+            safe_tcp_peak["resourcesReleased"] = tcp_peak["resourcesReleased"]
+        for family in ("ipv4", "ipv6"):
+            metric = tcp_peak.get(family) if isinstance(tcp_peak.get(family), dict) else {}
+            safe_metric: Dict[str, Any] = {}
+            for key in ("current", "peak", "success", "failure", "cps", "elapsedMs"):
+                value = metric.get(key)
+                if isinstance(value, int) and not isinstance(value, bool):
+                    safe_metric[key] = max(0, value)
+            for key in ("status", "finishReason"):
+                if metric.get(key) not in (None, ""):
+                    safe_metric[key] = str(metric[key])[:240]
+            if safe_metric:
+                safe_tcp_peak[family] = safe_metric
         for item in favorites[:100]:
             if not isinstance(item, dict):
                 continue
@@ -149,11 +202,11 @@ class ToolExecutor:
                 safe_url = _safe_favorite_url(item.get(key))
                 if safe_url:
                     favorite[key] = safe_url
-            candidate = {"settings": safe_settings, "favorites": [*safe_favorites, favorite]}
+            candidate = {"settings": safe_settings, "favorites": [*safe_favorites, favorite], "tcpPeak": safe_tcp_peak}
             if len(json.dumps(candidate, ensure_ascii=False).encode("utf-8")) > _CLIENT_CONTEXT_LIMIT_BYTES:
                 break
             safe_favorites.append(favorite)
-        return {"settings": safe_settings, "favorites": safe_favorites}
+        return {"settings": safe_settings, "favorites": safe_favorites, "tcpPeak": safe_tcp_peak}
 
     def _device_documents(self) -> List[Dict[str, Any]]:
         document = self.hub.load_json(self.hub.DEVICES_FILE, {"online": [], "watched": []})

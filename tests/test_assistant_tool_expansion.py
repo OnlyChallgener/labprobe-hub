@@ -45,10 +45,17 @@ def test_events_list_returns_newest_first_without_deleted(tmp_path):
     assert result["total"] == 2
 
 
-def test_events_list_clamps_limit_and_survives_bad_input(tmp_path):
+def test_events_list_rejects_out_of_range_and_non_integer_limit(tmp_path):
     executor = ToolExecutor(make_hub(tmp_path))
-    assert len(executor.execute("events.list", {"limit": 999})["events"]) == 2
-    assert len(executor.execute("events.list", {"limit": "abc"})["events"]) == 2
+    for value in (999, "2", True):
+        with pytest.raises(ToolError) as error:
+            executor.execute("events.list", {"limit": value})
+        assert error.value.code == "INVALID_ARGUMENTS"
+
+
+def test_integer_schema_accepts_real_integer_only(tmp_path):
+    executor = ToolExecutor(make_hub(tmp_path))
+    assert len(executor.execute("events.list", {"limit": 1})["events"]) == 1
 
 
 def test_agent_status_hides_token_like_fields(tmp_path):

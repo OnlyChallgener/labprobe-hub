@@ -26,7 +26,7 @@ from . import catalog
 from .tools import ToolError
 
 NAVIGATE_ROUTES = ("home", "devices", "router", "tools", "ai_chat", "favorites", "settings",
-                   "stun", "wireguard", "ipv6", "portmap", "ddns", "nat", "wol")
+                   "stun", "wireguard", "ipv6", "portmap", "ddns", "nat", "wol", "tcp_peak")
 
 
 def _spec(tool_id: str, name: str, description: str, examples: List[str], scope: str,
@@ -383,6 +383,53 @@ _SPECS: List[Dict[str, Any]] = [
                 "enabled": {"type": "boolean"},
             },
             "required": ["rule", "enabled"],
+            "additionalProperties": False,
+        },
+    ),
+    _spec(
+        "tcp.peak.status", "查询 TCP 峰值连接数测试",
+        "查询本机 APP 或 Relay 最近一次 TCP 峰值连接数测试的状态与正式排版结果。",
+        ["查询 Relay TCP 峰值连接数测试结果", "本机 TCP 连接测试完成了吗"],
+        "tcp_peak.read", "read", "none",
+        {
+            "type": "object",
+            "properties": {"side": {"type": "string", "enum": ["app", "relay"]}},
+            "additionalProperties": False,
+        },
+    ),
+    _spec(
+        "tcp.peak.start", "启动 TCP 峰值连接数测试",
+        "使用 APP 设置中的同类目标参数启动一次本机 APP 或 Relay 测试；Relay 目标作为一次性任务参数下发。",
+        ["用 Relay 测试 example.com:443 的 IPv4 TCP 峰值连接数", "在本机分别测试 IPv4 和 IPv6 TCP 峰值连接数"],
+        "tcp_peak.write", "write", "always",
+        {
+            "type": "object",
+            "properties": {
+                "side": {"type": "string", "enum": ["app", "relay"]},
+                "host": {"type": "string", "minLength": 1, "maxLength": 253},
+                "port": {"type": "integer", "minimum": 1, "maximum": 65535},
+                "family": {"type": "string", "enum": ["ipv4", "ipv6", "both"]},
+                "targetConnections": {"type": "integer", "minimum": 1, "maximum": 65535},
+                "cps": {"type": "integer", "minimum": 1, "maximum": 2000},
+                "connectTimeoutMs": {"type": "integer", "minimum": 300, "maximum": 10000},
+                "maxDurationSeconds": {"type": "integer", "minimum": 10, "maximum": 300},
+            },
+            "required": ["side", "host", "port", "family", "targetConnections", "cps"],
+            "additionalProperties": False,
+        },
+    ),
+    _spec(
+        "tcp.peak.stop", "停止 TCP 峰值连接数测试",
+        "停止 Relay 当前测试；Relay 会取消待建立连接、关闭全部测试连接并确认资源回落。本机测试在正式测试页停止。",
+        ["停止当前 Relay TCP 峰值连接数测试"],
+        "tcp_peak.write", "write", "always",
+        {
+            "type": "object",
+            "properties": {
+                "side": {"type": "string", "enum": ["relay"]},
+                "taskId": {"type": "string", "maxLength": 80},
+            },
+            "required": ["side"],
             "additionalProperties": False,
         },
     ),
@@ -1155,6 +1202,74 @@ def _portmap_toggle(executor, args, client_context) -> Dict[str, Any]:
             "message": f"已{'启用' if enabled else '停用'}端口映射：{target.get('name')}"}
 
 
+def _tcp_peak_content(task: Dict[str, Any], side: str) -> str:
+    if not task:
+        return f"{'本机 APP' if side == 'app' else 'Relay'} 还没有 TCP 峰值连接数测试记录。"
+    lines = [
+        f"【{'本机 APP' if side == 'app' else 'Relay'} TCP 峰值连接数】",
+        f"• 状态：{task.get('status') or task.get('state') or '未知'}",
+    ]
+    for family, label in (("ipv4", "IPv4"), ("ipv6", "IPv6")):
+        metric = task.get(family) if isinstance(task.get(family), dict) else {}
+        lines.append(
+            f"• {label}：当前 {int(metric.get('current') or 0)}，峰值 {int(metric.get('peak') or 0)}，"
+            f"成功 {int(metric.get('success') or 0)}，失败 {int(metric.get('failure') or 0)}，"
+            f"CPS {int(metric.get('cps') or 0)}，耗时 {int(metric.get('elapsedMs') or 0) / 1000:.1f} 秒"
+        )
+    reason = str(task.get("finishReason") or "").strip()
+    if reason:
+        lines.append(f"• 结束原因：{reason}")
+    if side == "relay":
+        lines.append(
+            f"• 资源：Conntrack 峰值 {int(task.get('conntrackPeak') or 0)}，"
+            f"CPU 峰值 {float(task.get('cpuPeak') or 0):.1f}%，"
+            f"最低可用内存 {int(task.get('memoryMinAvailableMb') or 0)} MB"
+        )
+    released = task.get("resourcesReleased")
+    if isinstance(released, bool):
+        lines.append(f"• 资源释放：{'已完成' if released else '尚未确认'}（{task.get('releaseStatus') or '无说明'}）")
+    return "\n".join(lines)
+
+
+def _tcp_peak_status(executor, args, client_context) -> Dict[str, Any]:
+    side = str(args.get("side") or "relay")
+    if side == "app":
+        task = executor._client_context(client_context).get("tcpPeak") or {}
+    else:
+        task = _require_service(executor, "TCP_SESSION_SERVICE").snapshot()
+    return {
+        "ok": True,
+        "side": side,
+        "task": task,
+        "content": _tcp_peak_content(task, side),
+        "message": _tcp_peak_content(task, side),
+    }
+
+
+def _tcp_peak_start(executor, args, client_context) -> Dict[str, Any]:
+    if args.get("side") != "relay":
+        raise ToolError("本机测试必须由 APP 执行", "CLIENT_EXECUTION_REQUIRED", 409)
+    service = _require_service(executor, "TCP_SESSION_SERVICE")
+    try:
+        task = service.start({key: value for key, value in args.items() if key != "side"})
+    except ValueError as error:
+        raise ToolError(str(error), "INVALID_ARGUMENTS", 400) from error
+    except RuntimeError as error:
+        raise ToolError(str(error), "TCP_TEST_CONFLICT", 409) from error
+    return {"ok": True, "task": task, "message": "Relay TCP 峰值连接数测试任务已提交"}
+
+
+def _tcp_peak_stop(executor, args, client_context) -> Dict[str, Any]:
+    if args.get("side") != "relay":
+        raise ToolError("本机测试必须由 APP 执行", "CLIENT_EXECUTION_REQUIRED", 409)
+    service = _require_service(executor, "TCP_SESSION_SERVICE")
+    try:
+        task = service.stop(str(args.get("taskId") or ""))
+    except RuntimeError as error:
+        raise ToolError(str(error), "TCP_TEST_CONFLICT", 409) from error
+    return {"ok": True, "task": task, "message": "已通知 Relay 停止测试并释放连接"}
+
+
 def _assistant_confirmations_list(executor, args, client_context) -> Dict[str, Any]:
     store = getattr(executor.hub, "ASSISTANT_AI_STORE", None)
     if store is None:
@@ -1237,6 +1352,9 @@ HANDLERS: Dict[str, Any] = {
     "router.portmap.create": _portmap_create,
     "router.portmap.remove": _portmap_remove,
     "router.portmap.toggle": _portmap_toggle,
+    "tcp.peak.status": _tcp_peak_status,
+    "tcp.peak.start": _tcp_peak_start,
+    "tcp.peak.stop": _tcp_peak_stop,
     "app.navigate": _app_navigate,
     "app.refresh": _app_refresh,
 }
@@ -1338,6 +1456,54 @@ def _preview_portmap_toggle(executor, args, client_context) -> Dict[str, Any]:
         "title": f"确认{action}端口映射",
         "summary": f"{action}端口映射：{target.get('name')}（{target.get('id')}）",
         "arguments": {"rule": str(target.get("id")), "enabled": bool(args["enabled"])},
+        "expiresInSeconds": 300,
+    }
+
+
+def _preview_tcp_peak_start(executor, args, client_context) -> Dict[str, Any]:
+    service = _require_service(executor, "TCP_SESSION_SERVICE")
+    try:
+        config = service._config({key: value for key, value in args.items() if key != "side"})
+    except ValueError as error:
+        raise ToolError(str(error), "INVALID_ARGUMENTS", 400) from error
+    side = str(args["side"])
+    canonical = {"side": side, **config}
+    side_label = "本机 APP" if side == "app" else "Relay"
+    family_label = {"ipv4": "IPv4", "ipv6": "IPv6", "both": "IPv4/IPv6 分别"}[config["family"]]
+    return {
+        "toolId": "tcp.peak.start",
+        "executor": "app" if side == "app" else "hub",
+        "title": f"确认启动{side_label} TCP 峰值连接数测试",
+        "summary": (
+            f"由{side_label}测试 {config['host']}:{config['port']}，{family_label}，"
+            f"量程上限 {config['targetConnections']}，目标 CPS {config['cps']}"
+        ),
+        "arguments": canonical,
+        "expiresInSeconds": 300,
+    }
+
+
+def _preview_tcp_peak_stop(executor, args, client_context) -> Dict[str, Any]:
+    side = str(args["side"])
+    if side == "app":
+        task = executor._client_context(client_context).get("tcpPeak") or {}
+    else:
+        task = _require_service(executor, "TCP_SESSION_SERVICE").snapshot()
+    task_id = str(task.get("taskId") or task.get("id") or "").strip()
+    requested_id = str(args.get("taskId") or "").strip()
+    if not task_id or str(task.get("state") or "") not in {
+        "queued", "accepted", "running", "stop_requested", "releasing",
+    }:
+        raise ToolError("当前没有正在运行的 TCP 峰值连接数测试", "TCP_TEST_NOT_ACTIVE", 409)
+    if requested_id and requested_id != task_id:
+        raise ToolError("测试任务已经变化，请刷新后重新确认", "TCP_TEST_CONFLICT", 409)
+    side_label = "本机 APP" if side == "app" else "Relay"
+    return {
+        "toolId": "tcp.peak.stop",
+        "executor": "app" if side == "app" else "hub",
+        "title": f"确认停止{side_label}测试",
+        "summary": f"停止{side_label} TCP 峰值连接数测试，并释放全部测试连接（任务 {task_id}）",
+        "arguments": {"side": side, "taskId": task_id},
         "expiresInSeconds": 300,
     }
 
@@ -1456,6 +1622,8 @@ PREVIEWS: Dict[str, Any] = {
     "router.portmap.create": _preview_portmap_create,
     "router.portmap.remove": _preview_portmap_remove,
     "router.portmap.toggle": _preview_portmap_toggle,
+    "tcp.peak.start": _preview_tcp_peak_start,
+    "tcp.peak.stop": _preview_tcp_peak_stop,
     "router.upnp.set": _preview_router_upnp_set,
     "router.native_portmap.create": _preview_native_portmap_create,
     "router.native_portmap.remove": _preview_native_portmap_remove,

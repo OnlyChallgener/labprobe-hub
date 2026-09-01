@@ -19,9 +19,9 @@ def _json_object(data: str) -> Dict[str, Any]:
     try:
         value = json.loads(data)
     except json.JSONDecodeError as exc:
-        raise ProviderError("AI provider returned malformed SSE data") from exc
+        raise ProviderError("AI 服务商返回的 SSE 数据格式错误") from exc
     if not isinstance(value, dict):
-        raise ProviderError("AI provider returned a non-object SSE event")
+        raise ProviderError("AI 服务商返回的 SSE 事件不是对象")
     return value
 
 
@@ -183,14 +183,14 @@ def _event_error(chunk: Dict[str, Any]) -> Optional[ProviderError]:
         code = code or error.get("status") or error.get("status_code") or error.get("code")
     else:
         message = error
-    message = str(message or "AI provider returned an error event")[:300]
+    message = str(message or "AI 服务商返回错误事件")[:300]
     try:
         numeric_code = int(code)
     except (TypeError, ValueError):
         numeric_code = 502
     if numeric_code < 400 or numeric_code > 599:
         numeric_code = 502
-    return ProviderError(f"AI provider error: {message}", numeric_code if numeric_code < 500 else 502)
+    return ProviderError(f"AI 服务商错误：{message}", numeric_code if numeric_code < 500 else 502)
 
 
 class OpenAICompatibleProvider:
@@ -216,13 +216,13 @@ class OpenAICompatibleProvider:
                 timeout=(5, 90), stream=stream,
             )
         except requests.RequestException as exc:
-            raise ProviderError(f"AI provider is unavailable: {str(exc)[:150]}") from exc
+            raise ProviderError(f"AI 服务商暂不可用：{str(exc)[:150]}") from exc
         if not response.ok:
             status_code = response.status_code if response.status_code < 500 else 502
             detail = _provider_detail(response)
             response.close()
-            message = "AI provider rejected the request" if not detail else \
-                f"AI provider HTTP {response.status_code}: {detail}"
+            message = "AI 服务商拒绝了请求" if not detail else \
+                f"AI 服务商 HTTP {response.status_code}：{detail}"
             raise ProviderError(message, status_code)
         return response
 
@@ -248,14 +248,14 @@ class OpenAICompatibleProvider:
         except ProviderError:
             raise
         except (KeyError, IndexError, ValueError, TypeError) as exc:
-            raise ProviderError("AI provider returned an invalid response") from exc
+            raise ProviderError("AI 服务商返回了无效响应") from exc
         finally:
             response.close()
 
     @staticmethod
     def _validated_event(value: Any) -> Dict[str, Any]:
         if not isinstance(value, dict):
-            raise ProviderError("AI provider returned a non-object SSE event")
+            raise ProviderError("AI 服务商返回的 SSE 事件不是对象")
         event_error = _event_error(value)
         if event_error is not None:
             raise event_error
@@ -304,7 +304,7 @@ class OpenAICompatibleProvider:
                     try:
                         raw = raw.decode("utf-8")
                     except UnicodeDecodeError as exc:
-                        raise ProviderError("AI provider returned non-UTF-8 SSE data") from exc
+                        raise ProviderError("AI 服务商返回的 SSE 数据不是有效 UTF-8") from exc
                 elif not isinstance(raw, str):
                     raw = str(raw)
                 raw = raw.lstrip("\ufeff")
@@ -358,11 +358,11 @@ class OpenAICompatibleProvider:
                 yield event
             if not saw_valid:
                 if malformed or saw_payload:
-                    raise ProviderError("AI provider returned malformed SSE data")
-                raise ProviderError("AI provider returned an empty SSE stream")
+                    raise ProviderError("AI 服务商返回的 SSE 数据格式错误")
+                raise ProviderError("AI 服务商返回了空 SSE 数据流")
         except ProviderError:
             raise
         except requests.RequestException as exc:
-            raise ProviderError(f"AI provider stream was interrupted: {str(exc)[:150]}") from exc
+            raise ProviderError(f"AI 服务数据流已中断：{str(exc)[:150]}") from exc
         finally:
             response.close()

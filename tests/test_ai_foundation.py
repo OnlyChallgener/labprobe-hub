@@ -119,6 +119,24 @@ def test_usage_parsing_handles_deepseek_stream_usage():
     assert usage_from_chunk({"usage": {"total_tokens": 7}}) == {"total_tokens": 7}
 
 
+def test_provider_without_usage_is_safe_when_logger_is_absent(tmp_path, monkeypatch):
+    client = make_client(tmp_path, monkeypatch)
+    assert client.put("/api/ai/config", json={"apiKey": "sk-test"}).status_code == 200
+
+    class NoUsageProvider:
+        def __init__(self, *args, **kwargs):
+            pass
+
+        def chat(self, messages, tools=None):
+            from assistant.provider import ChatResult
+            return ChatResult("正常回复", {}, {"role": "assistant", "content": "正常回复"})
+
+    monkeypatch.setattr("assistant.api.OpenAICompatibleProvider", NoUsageProvider)
+    response = client.post("/api/ai/chat", json={"message": "你好"})
+    assert response.status_code == 200
+    assert response.json["usageKnown"] is False
+
+
 def test_usage_returns_bounded_recent_task_details(tmp_path, monkeypatch):
     client = make_client(tmp_path, monkeypatch)
     store = AIStore(tmp_path / "ai.db")
@@ -405,6 +423,29 @@ def test_notification_inbox_deduplicates_watched_events_and_daily_summary(tmp_pa
     assert "30 Token" in rows[1]["content"]
 
 
+def test_notification_inbox_rows_never_enter_model_conversation_context(tmp_path, monkeypatch):
+    client = make_client(tmp_path, monkeypatch)
+    store = AIStore(tmp_path / "ai.db")
+    store.add_notification("device", "ANS 上线", "这是一条系统通知", "event:context-test")
+    assert client.put("/api/ai/config", json={"apiKey": "sk-test"}).status_code == 200
+
+    class CapturingProvider:
+        seen = []
+
+        def __init__(self, *args, **kwargs):
+            pass
+
+        def chat(self, messages, tools=None):
+            from assistant.provider import ChatResult
+            self.__class__.seen = list(messages)
+            return ChatResult("你好", {"total_tokens": 1}, {"role": "assistant", "content": "你好"})
+
+    monkeypatch.setattr("assistant.api.OpenAICompatibleProvider", CapturingProvider)
+    assert client.post("/api/ai/chat", json={"message": "你好"}).status_code == 200
+    encoded = json.dumps(CapturingProvider.seen, ensure_ascii=False)
+    assert "这是一条系统通知" not in encoded and "ANS 上线" not in encoded
+
+
 def test_prune_history_preserves_unlimited_conversation_count_and_bounds_auxiliary_rows(tmp_path):
     store = AIStore(tmp_path / "ai.db")
     store.initialize()
@@ -530,7 +571,7 @@ def test_incremental_chat_rejects_a_message_larger_than_replay_budget(tmp_path, 
     client = make_client(tmp_path, monkeypatch)
     response = client.post("/api/ai/chat", json={"message": "x" * 24_001})
     assert response.status_code == 413
-    assert "replay budget" in response.json["error"]
+    assert "上下文回放上限" in response.json["error"]
 
 
 def test_replace_messages_keeps_history_bounded_without_duplicates(tmp_path):
@@ -584,6 +625,112 @@ def test_batch_write_tools_need_single_confirmation(tmp_path, monkeypatch):
     confirmed = client.post("/api/ai/tools/confirm", json={"confirmationId": confirmation["confirmationId"]})
     assert confirmed.status_code == 200
     assert "2/2" in confirmed.json["result"]["message"]
+
+
+def test_mixed_app_and_hub_writes_are_never_combined_into_one_batch(tmp_path, monkeypatch):
+    client = make_client(tmp_path, monkeypatch, hub_runtime=fake_hub(tmp_path))
+
+    class FakeMixedProvider:
+        def __init__(self, *args, **kwargs):
+            pass
+
+        def chat(self, messages, tools=None):
+            from assistant.provider import ChatResult
+            return ChatResult("", {"total_tokens": 4}, {
+                "role": "assistant", "content": None,
+                "tool_calls": [
+                    {"id": "local", "type": "function", "function": {
+                        "name": "app_setting_update",
+                        "arguments": '{"setting":"privacyMode","value":"true"}',
+                    }},
+                    {"id": "hub", "type": "function", "function": {
+                        "name": "device_wol", "arguments": '{"device":"Mate60"}',
+                    }},
+                ],
+            })
+
+    monkeypatch.setattr("assistant.api.OpenAICompatibleProvider", FakeMixedProvider)
+    assert client.put("/api/ai/config", json={"apiKey": "sk-test"}).status_code == 200
+    response = client.post("/api/ai/chat", json={
+        "message": "打开隐私模式并唤醒 Mate60",
+        "clientContext": {"settings": {"privacyMode": False}},
+    })
+    confirmation = response.json["confirmation"]
+    assert confirmation["preview"]["toolId"] == "app.setting.update"
+    assert confirmation["preview"]["executor"] == "app"
+    assert "避免混用" in response.json["message"]["content"]
+    claimed = client.post("/api/ai/tools/confirm", json={"confirmationId": confirmation["confirmationId"]})
+    assert claimed.json["toolId"] == "app.setting.update"
+
+
+def test_more_than_four_tool_calls_receive_complete_tool_results(tmp_path, monkeypatch):
+    client = make_client(tmp_path, monkeypatch, hub_runtime=fake_hub(tmp_path))
+
+    class FiveCallProvider:
+        def __init__(self, *args, **kwargs):
+            self.round = 0
+
+        def chat(self, messages, tools=None):
+            from assistant.provider import ChatResult
+            self.round += 1
+            if self.round == 1:
+                return ChatResult("", {"total_tokens": 2}, {
+                    "role": "assistant", "content": None,
+                    "tool_calls": [
+                        {"id": f"call-{index}", "type": "function", "function": {
+                            "name": "devices_list", "arguments": "{}",
+                        }} for index in range(5)
+                    ],
+                })
+            assistant_call = next(item for item in messages if item.get("tool_calls"))
+            tool_results = [item for item in messages if item.get("role") == "tool"]
+            assert [item["tool_call_id"] for item in tool_results] == [
+                call["id"] for call in assistant_call["tool_calls"]
+            ]
+            assert json.loads(tool_results[-1]["content"])["code"] == "TOOL_CALL_LIMIT"
+            return ChatResult("已完成安全范围内的查询。", {"total_tokens": 2}, {
+                "role": "assistant", "content": "已完成安全范围内的查询。",
+            })
+
+    monkeypatch.setattr("assistant.api.OpenAICompatibleProvider", FiveCallProvider)
+    assert client.put("/api/ai/config", json={"apiKey": "sk-test"}).status_code == 200
+    response = client.post("/api/ai/chat", json={"message": "查询五次设备列表"})
+    assert response.status_code == 200
+    assert len(response.json["toolExecutions"]) == 5
+    assert response.json["toolExecutions"][-1]["status"] == "failed"
+
+
+def test_legacy_bounded_replay_never_deletes_older_stored_messages(tmp_path, monkeypatch):
+    client = make_client(tmp_path, monkeypatch)
+    assert client.put("/api/ai/config", json={"apiKey": "sk-test"}).status_code == 200
+    store = AIStore(tmp_path / "ai.db")
+    store.create_conversation("legacy-window", "旧客户端")
+    seeded = []
+    for index in range(60):
+        row = {"role": "user" if index % 2 == 0 else "assistant", "content": f"历史-{index}"}
+        seeded.append(row)
+        store.add_message("legacy-window", row["role"], row["content"])
+
+    class FinalProvider:
+        def __init__(self, *args, **kwargs):
+            pass
+
+        def chat(self, messages, tools=None):
+            from assistant.provider import ChatResult
+            return ChatResult("收到", {"total_tokens": 1}, {"role": "assistant", "content": "收到"})
+
+    monkeypatch.setattr("assistant.api.OpenAICompatibleProvider", FinalProvider)
+    replay = seeded[-40:] + [{"role": "user", "content": "当前问题"}]
+    response = client.post("/api/ai/chat", json={"conversationId": "legacy-window", "messages": replay})
+    assert response.status_code == 200
+    with store._connect() as connection:
+        rows = connection.execute(
+            "SELECT role,content FROM messages WHERE conversation_id=? ORDER BY id",
+            ("legacy-window",),
+        ).fetchall()
+    assert len(rows) == 62
+    assert rows[0]["content"] == "历史-0"
+    assert rows[-2]["content"] == "当前问题" and rows[-1]["content"] == "收到"
 
 
 def test_conversation_title_comes_from_latest_message(tmp_path):
@@ -1166,6 +1313,43 @@ def test_stream_chat_runs_tool_loop_and_emits_typed_events(tmp_path, monkeypatch
     assert done["usage"]["total_tokens"] == 15
     assert done["usageKnown"] is True
     assert done["toolExecutions"] == [{"toolId": "device.ipv6", "status": "completed"}]
+
+
+def test_stream_more_than_four_tool_calls_keep_protocol_valid(tmp_path, monkeypatch):
+    client = make_client(tmp_path, monkeypatch, hub_runtime=fake_hub(tmp_path))
+    assert client.put("/api/ai/config", json={"apiKey": "sk-test"}).status_code == 200
+
+    class FiveStreamCalls:
+        def __init__(self, *args, **kwargs):
+            self.round = 0
+
+        def chat(self, messages, tools=None):  # pragma: no cover - stream only
+            raise AssertionError("流式请求不应调用非流式接口")
+
+        def stream(self, messages, tools=None):
+            self.round += 1
+            if self.round == 1:
+                yield {"choices": [{"delta": {"tool_calls": [
+                    {"index": index, "id": f"stream-{index}", "type": "function", "function": {
+                        "name": "devices_list", "arguments": "{}",
+                    }} for index in range(5)
+                ]}}]}
+                return
+            assistant_call = next(item for item in messages if item.get("tool_calls"))
+            tool_results = [item for item in messages if item.get("role") == "tool"]
+            assert [item["tool_call_id"] for item in tool_results] == [
+                call["id"] for call in assistant_call["tool_calls"]
+            ]
+            assert json.loads(tool_results[-1]["content"])["code"] == "TOOL_CALL_LIMIT"
+            yield {"choices": [{"delta": {"content": "流式工具结果完整。"}}]}
+
+    monkeypatch.setattr("assistant.api.OpenAICompatibleProvider", FiveStreamCalls)
+    response = client.post("/api/ai/chat", json={"message": "流式查询五次", "stream": True})
+    events = [json.loads(line[len("data: "):]) for line in response.get_data(as_text=True).splitlines()
+              if line.startswith("data: ")]
+    tool_events = [event for event in events if event["type"] == "tool"]
+    assert len(tool_events) == 5 and tool_events[-1]["status"] == "failed"
+    assert events[-1]["type"] == "done"
 
 
 def test_stream_chat_emits_confirmation_payload_for_write_tools(tmp_path, monkeypatch):

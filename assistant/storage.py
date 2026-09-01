@@ -522,6 +522,48 @@ class AIStore:
                 raise
         self.enforce_conversation_storage(protected_conversation_id=conversation_id)
 
+    def merge_replayed_messages(self, conversation_id: str,
+                                messages: List[Dict[str, str]]) -> List[int]:
+        """Append the unseen tail of a legacy client transcript.
+
+        Older APP builds post their visible, bounded transcript instead of one
+        incremental user message.  Replacing the database with that window
+        permanently discarded messages that merely fell outside the model
+        context.  Match the longest stored-suffix/client-prefix overlap and
+        append only the new tail so context limits never become retention
+        limits.
+        """
+        incoming = [(str(item["role"]), str(item["content"])) for item in messages]
+        now = utc_now()
+        inserted: List[int] = []
+        with self._connect() as conn:
+            conn.execute("BEGIN IMMEDIATE")
+            try:
+                rows = conn.execute(
+                    "SELECT role,content FROM messages WHERE conversation_id=? ORDER BY id ASC",
+                    (conversation_id,),
+                ).fetchall()
+                existing = [(str(row["role"]), str(row["content"])) for row in rows]
+                overlap = 0
+                for size in range(min(len(existing), len(incoming)), 0, -1):
+                    if existing[-size:] == incoming[:size]:
+                        overlap = size
+                        break
+                for role, content in incoming[overlap:]:
+                    cursor = conn.execute(
+                        "INSERT INTO messages(conversation_id,role,content,created_at) VALUES(?,?,?,?)",
+                        (conversation_id, role, content, now),
+                    )
+                    inserted.append(int(cursor.lastrowid))
+                if inserted:
+                    conn.execute("UPDATE conversations SET updated_at=? WHERE id=?", (now, conversation_id))
+                conn.execute("COMMIT")
+            except Exception:
+                conn.execute("ROLLBACK")
+                raise
+        self.enforce_conversation_storage(protected_conversation_id=conversation_id)
+        return inserted
+
     def add_usage(self, conversation_id: str, provider: str, model: str, usage: Dict[str, Any],
                   status: str = "completed", config_id: Optional[int] = None,
                   error: Optional[str] = None) -> None:
