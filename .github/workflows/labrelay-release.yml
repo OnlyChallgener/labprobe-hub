@@ -2,6 +2,9 @@ name: Publish LabRelay Router Bundle
 
 on:
   workflow_dispatch:
+  push:
+    branches:
+      - fix/relay-nofile-upgrade-0.2.33-v2
 
 concurrency:
   group: publish-labrelay-${{ github.ref }}
