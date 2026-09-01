@@ -465,7 +465,7 @@ impl TcpSessionTestManager {
             let tick_seconds = now.duration_since(last_tick).as_secs_f64();
             last_tick = now;
             let load = (held.len() + pending.len()) as f64 / safe_target.max(1) as f64;
-            let load_scale = if load >= 0.95 {
+            let load_scale: f64 = if load >= 0.95 {
                 0.20
             } else if load >= 0.80 {
                 0.50
