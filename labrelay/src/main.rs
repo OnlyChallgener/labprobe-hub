@@ -1825,7 +1825,14 @@ fn validate_rule(rule: &Rule, port_min: u16, port_max: u16) -> Result<()> {
             bail!("目标 MAC 地址无效");
         }
     }
-    if rule.listen_port < port_min || rule.listen_port > port_max {
+    if rule.kind == "stun" {
+        // STUN middle ports are user-facing local channel ports. They may be
+        // explicitly selected outside the daemon's managed PortMap range;
+        // the actual bind below remains the final OS-level conflict check.
+        if rule.listen_port < 1024 {
+            bail!("STUN 中间端口超出允许范围 1024-65535");
+        }
+    } else if rule.listen_port < port_min || rule.listen_port > port_max {
         bail!("监听端口超出允许范围 {}-{}", port_min, port_max);
     }
     if rule.target_port == 0 {
@@ -2568,6 +2575,33 @@ mod tests {
             "203.0.113.9:34789"
         );
         assert!(parse_stun_mapped_address(&response, &[0x6bu8; 12]).is_err());
+    }
+
+    #[test]
+    fn stun_middle_port_can_be_outside_managed_portmap_range() {
+        let mut stun = Rule {
+            id: "stun-middle-port".into(),
+            name: "router ssh".into(),
+            kind: "stun".into(),
+            listen_port: 3499,
+            target_type: "router_self".into(),
+            target_port: 54133,
+            ..Rule::default()
+        };
+        normalize_rule(&mut stun);
+        validate_rule(&stun, 20000, 32767).unwrap();
+        assert_eq!(stun.target_ipv4, "127.0.0.1");
+        assert_eq!(stun.forward_mode, "relay_proxy");
+
+        let mut portmap = Rule {
+            id: "portmap-low-port".into(),
+            listen_port: 3499,
+            target_ipv4: "192.168.5.46".into(),
+            target_port: 443,
+            ..Rule::default()
+        };
+        normalize_rule(&mut portmap);
+        assert!(validate_rule(&portmap, 20000, 32767).is_err());
     }
 
     #[test]
