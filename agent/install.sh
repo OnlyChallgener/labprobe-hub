@@ -148,7 +148,7 @@ verify_downloaded_binary() {
     return 0
   fi
   actual="$(sha256sum "$DOWNLOADED_BINARY" | awk '{print $1}')"
-  [ "$actual" = "$expected" ] || fail "下载的二进制 sha256 校验失败（$actual != $expected）；未安装任何文件"
+  [ -n "$expected" ] && [ "$actual" = "$expected" ] || fail "下载的二进制 sha256 校验失败（$actual != $expected）；未安装任何文件"
   log "sha256 verified: $actual"
 }
 
@@ -246,13 +246,13 @@ STOP=10
 start_service() {
   mkdir -p /tmp/labrelay
   procd_open_instance
-  procd_set_param command /usr/bin/labrelay daemon --config /etc/labprobe/relay.json --socket /tmp/labrelay.sock --state /tmp/labrelay/state.json --pid /tmp/labrelay.pid --port-min 20000 --port-max 20020 --lan-if br-lan
+  # Some vendor procd builds keep the inherited hard nofile ceiling even when
+  # procd_set_param limits requests a higher value. Raise it in a root shell
+  # immediately before exec so the Relay daemon really inherits 131072.
+  procd_set_param command /bin/sh -c 'ulimit -n 131072; exec /usr/bin/labrelay daemon --config /etc/labprobe/relay.json --socket /tmp/labrelay.sock --state /tmp/labrelay/state.json --pid /tmp/labrelay.pid --port-min 20000 --port-max 20020 --lan-if br-lan'
   procd_set_param respawn 5 5 0
   procd_set_param stdout 1
   procd_set_param stderr 1
-  # Keep the Relay process FD ceiling above the TCP test scale. Runtime guards
-  # still reserve 20% and stop earlier on conntrack, memory, source-port or CPU
-  # pressure, so raising RLIMIT_NOFILE does not bypass resource protection.
   procd_set_param limits nofile="131072 131072"
   procd_close_instance
 }
@@ -290,6 +290,26 @@ sleep 2
 
 if ! /usr/bin/labrelay ctl '{"action":"status"}' >/tmp/labrelay-install-status.json 2>/dev/null; then
   log 'daemon status is not ready yet; procd will continue retrying'
+fi
+
+relay_pid=""
+for p in $(pidof labrelay 2>/dev/null || true); do
+  [ -r "/proc/$p/cmdline" ] || continue
+  cmdline="$(tr '\000' ' ' < "/proc/$p/cmdline" 2>/dev/null || true)"
+  case "$cmdline" in
+    *"/labrelay daemon "*|*" labrelay daemon "*) relay_pid="$p"; break ;;
+  esac
+done
+if [ -n "$relay_pid" ] && [ -r "/proc/$relay_pid/limits" ]; then
+  soft="$(awk '/Max open files/ {print $4; exit}' "/proc/$relay_pid/limits" 2>/dev/null || true)"
+  hard="$(awk '/Max open files/ {print $5; exit}' "/proc/$relay_pid/limits" 2>/dev/null || true)"
+  log "Relay FD limit: soft=${soft:-unknown} hard=${hard:-unknown}"
+  case "${soft:-}:${hard:-}" in
+    *[!0-9:]*|:*) fail 'unable to verify Relay FD limit' ;;
+  esac
+  [ "$soft" -ge 65536 ] && [ "$hard" -ge 65536 ] || fail "Relay FD limit did not take effect: soft=$soft hard=$hard"
+else
+  fail 'Relay daemon is not running; unable to verify FD limit'
 fi
 
 log "installed $(/usr/bin/labrelay version 2>/dev/null || echo LabRelay)"
