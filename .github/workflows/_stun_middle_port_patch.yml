@@ -1,0 +1,98 @@
+name: Complete STUN middle-port wiring
+
+on:
+  push:
+    branches:
+      - fix/stun-middle-port-complete
+
+permissions:
+  contents: write
+
+jobs:
+  patch:
+    runs-on: ubuntu-latest
+    env:
+      APP_TOKEN: ci-app-token
+      HOOK_TOKEN: ci-hook-token
+      PYTHONPATH: ${{ github.workspace }}
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.12'
+
+      - name: Install Python dependencies
+        run: pip install --disable-pip-version-check -r requirements.txt pytest
+
+      - name: Apply source patch
+        shell: bash
+        run: |
+          set -euo pipefail
+          python3 - <<'PY'
+          from pathlib import Path
+
+          entry = Path('hub_entry.py')
+          text = entry.read_text(encoding='utf-8')
+
+          def replace_once(value: str, old: str, new: str, label: str) -> str:
+              count = value.count(old)
+              if count != 1:
+                  raise SystemExit(f'{label}: expected exactly one match, found {count}')
+              return value.replace(old, new, 1)
+
+          text = replace_once(
+              text,
+              'from stun_service import install_stun_service\n',
+              'from stun_service import install_stun_service\nfrom stun_port_config_patch import install_stun_port_config_patch\n',
+              'hub import',
+          )
+          text = replace_once(
+              text,
+              'install_stun_service(hub, router_driver)\ninstall_wireguard_service(hub)\n',
+              'install_stun_service(hub, router_driver)\ninstall_stun_port_config_patch(hub)\ninstall_wireguard_service(hub)\n',
+              'hub install order',
+          )
+          entry.write_text(text, encoding='utf-8')
+
+          relay = Path('labrelay/src/main.rs')
+          rust = relay.read_text(encoding='utf-8')
+          rust = replace_once(
+              rust,
+              '''    if rule.listen_port < port_min || rule.listen_port > port_max {\n        bail!("监听端口超出允许范围 {}-{}", port_min, port_max);\n    }\n''',
+              '''    if rule.kind == "stun" {\n        // STUN middle ports are user-facing local channel ports. They may be\n        // explicitly selected outside the daemon's managed PortMap range;\n        // the actual bind below remains the final OS-level conflict check.\n        if rule.listen_port < 1024 {\n            bail!("STUN 中间端口超出允许范围 1024-65535");\n        }\n    } else if rule.listen_port < port_min || rule.listen_port > port_max {\n        bail!("监听端口超出允许范围 {}-{}", port_min, port_max);\n    }\n''',
+              'relay validation',
+          )
+          test_anchor = '''    #[test]\n    fn stun_rule_is_ipv4_and_reserves_a_transport_port() {\n'''
+          test_block = '''    #[test]\n    fn stun_middle_port_can_be_outside_managed_portmap_range() {\n        let mut stun = Rule {\n            id: "stun-middle-port".into(),\n            name: "router ssh".into(),\n            kind: "stun".into(),\n            listen_port: 3499,\n            target_type: "router_self".into(),\n            target_port: 54133,\n            ..Rule::default()\n        };\n        normalize_rule(&mut stun);\n        validate_rule(&stun, 20000, 32767).unwrap();\n        assert_eq!(stun.target_ipv4, "127.0.0.1");\n        assert_eq!(stun.forward_mode, "relay_proxy");\n\n        let mut portmap = Rule {\n            id: "portmap-low-port".into(),\n            listen_port: 3499,\n            target_ipv4: "192.168.5.46".into(),\n            target_port: 443,\n            ..Rule::default()\n        };\n        normalize_rule(&mut portmap);\n        assert!(validate_rule(&portmap, 20000, 32767).is_err());\n    }\n\n'''
+          if rust.count(test_anchor) != 1:
+              raise SystemExit('relay test insertion anchor mismatch')
+          rust = rust.replace(test_anchor, test_block + test_anchor, 1)
+          relay.write_text(rust, encoding='utf-8')
+
+          wiring_test = Path('tests/test_stun_middle_port_wiring.py')
+          wiring_test.write_text('''from pathlib import Path\n\nimport stun_port_config_patch as patch\n\n\ndef test_stun_middle_port_patch_is_installed_in_runtime_order():\n    text = Path("hub_entry.py").read_text(encoding="utf-8")\n    assert "from stun_port_config_patch import install_stun_port_config_patch" in text\n    service = text.index("install_stun_service(hub, router_driver)")\n    port_patch = text.index("install_stun_port_config_patch(hub)")\n    legacy_sync = text.index("install_labrelay_sync_patch(hub)")\n    assert service < port_patch < legacy_sync\n\n\ndef test_stun_middle_port_policy_matches_app_contract():\n    assert patch.STUN_USER_PORT_MIN == 1024\n    assert patch.STUN_USER_PORT_MAX == 65535\n    assert patch.STUN_AUTO_PORT_MIN == 30000\n    assert patch.STUN_AUTO_PORT_MAX == 32767\n''', encoding='utf-8')
+          PY
+
+          rm .github/workflows/_stun_middle_port_patch.yml
+          git diff --check
+
+      - name: Run Hub STUN tests
+        run: python -m pytest -q tests/test_stun_middle_port_wiring.py tests/test_stun_service.py
+
+      - name: Run LabRelay tests
+        working-directory: labrelay
+        run: cargo test --all-targets
+
+      - name: Commit patch
+        shell: bash
+        run: |
+          set -euo pipefail
+          git config user.name "ChatGPT"
+          git config user.email "actions@users.noreply.github.com"
+          git add hub_entry.py labrelay/src/main.rs tests/test_stun_middle_port_wiring.py \
+                  .github/workflows/_stun_middle_port_patch.yml
+          git commit -m "fix(stun): complete configurable middle-port path"
+          git push origin HEAD:fix/stun-middle-port-complete
