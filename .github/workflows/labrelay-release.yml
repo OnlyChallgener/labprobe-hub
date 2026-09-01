@@ -128,7 +128,7 @@ jobs:
           manifest = {
               'schemaVersion': 1,
               'versionName': version,
-              'changelog': 'Raise the Relay daemon nofile limit inside the root launcher shell before exec, bypassing vendor procd builds that leave the legacy 4096 hard limit in place.',
+              'changelog': 'Reduce TCP peak-test CPU pressure with adaptive CPS throttling, lighter async connect scheduling, and lower-frequency heavy /proc scans while preserving resource guards and fast release.',
               'installUrl': f'{release_root}/install.sh',
               'checksumsUrl': f'{release_root}/checksums.txt',
               'installer': metadata('install.sh'),
@@ -166,7 +166,14 @@ jobs:
           body: |
             LabRelay OpenWrt/BE72 router test bundle.
 
-            Fixes BE72/vendor procd environments where the Relay daemon stayed at `4096/4096` open files even after requesting a higher procd limit. The launcher now raises `ulimit -n 131072` in a root shell immediately before `exec labrelay daemon`, and installation verifies the real running limit.
+            TCP peak-test CPU optimization:
+            - adaptively reduces or pauses new connects as CPU rises;
+            - lowers pending connect concurrency from 512 to 256;
+            - replaces per-connect Tokio task spawning with a lightweight `FuturesUnordered` set;
+            - moves expensive FD and `/proc/net/tcp*` scans to a 5-second cadence until near a safety ceiling;
+            - keeps Conntrack, memory, FD, source-port and CPU protection plus release verification intact.
+
+            The Relay daemon still starts with `nofile=131072` through the root launcher.
 
             First install:
             `sh install.sh HUB_URL HOOK_TOKEN BE72Pro`
