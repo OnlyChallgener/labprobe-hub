@@ -76,8 +76,8 @@ jobs:
           grep -q 'version = "0.2.33"' labrelay/Cargo.toml
           sh -n agent/install.sh
           sh -n scripts/labprobe-install.sh
-          grep -q 'procd_set_param limits nofile=131072 131072' agent/install.sh
-          grep -q 'procd_set_param limits nofile=131072 131072' scripts/labprobe-install.sh
+          grep -q 'procd_set_param limits nofile="131072 131072"' agent/install.sh
+          grep -q 'procd_set_param limits nofile="131072 131072"' scripts/labprobe-install.sh
 
       - name: Test and build LabRelay
         working-directory: labrelay
