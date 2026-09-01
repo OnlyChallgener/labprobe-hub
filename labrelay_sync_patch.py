@@ -7,14 +7,18 @@ HTTP completion order.
 """
 from __future__ import annotations
 
+import secrets
 import threading
 import time
+import types
 from typing import Any, Dict, List
 
 from flask import jsonify, request
 
 PORTMAP_PORT_MIN = 20000
 PORTMAP_PORT_MAX = 29999
+STUN_LOCAL_PORT_MIN = 30000
+STUN_LOCAL_PORT_MAX = 32767
 
 
 def install_labrelay_sync_patch(hub: Any) -> None:
@@ -50,6 +54,145 @@ def install_labrelay_sync_patch(hub: Any) -> None:
             return cleaned
 
         hub._clean_portmap_rule = expanded_clean_portmap_rule
+
+    # STUN and IPv6/PortMap used to share 20000-20020.  Give STUN its own
+    # non-ephemeral local channel pool and keep a rule's assigned port stable
+    # after the one-time migration. New assignments start at a random offset
+    # and then probe the pool, so neighbouring rules are not predictably packed.
+    stun = getattr(hub, "STUN_SERVICE", None)
+    if stun is not None and not getattr(stun, "_labprobe_port_pool_v2", False):
+        original_stun_used_ports = stun._used_ports
+        original_stun_clean_rule = stun.clean_rule
+        original_ensure_firewall = stun.ensure_firewall
+
+        def allocate_stun_port(self: Any, protocol: str, excluding: str = "") -> int:
+            used = set(original_stun_used_ports(protocol, excluding))
+            span = STUN_LOCAL_PORT_MAX - STUN_LOCAL_PORT_MIN + 1
+            start = secrets.randbelow(span)
+            for offset in range(span):
+                port = STUN_LOCAL_PORT_MIN + ((start + offset) % span)
+                if port not in used:
+                    return port
+            raise ValueError("STUN 本地端口已用完，请先停止一个穿透规则")
+
+        def clean_stun_rule(self: Any, payload: Dict[str, Any], old: Dict[str, Any] | None = None) -> Dict[str, Any]:
+            cleaned = original_stun_clean_rule(payload, old)
+            listen_port = int(cleaned.get("listenPort") or 0)
+            if not STUN_LOCAL_PORT_MIN <= listen_port <= STUN_LOCAL_PORT_MAX:
+                cleaned["listenPort"] = self._allocated_port(
+                    str(cleaned.get("transportProtocol") or "TCP"),
+                    str(cleaned.get("id") or ""),
+                )
+            return cleaned
+
+        stun._allocated_port = types.MethodType(allocate_stun_port, stun)
+        stun.clean_rule = types.MethodType(clean_stun_rule, stun)
+
+        # An owned router-self firewall rule may need only its STUN channel
+        # port changed during migration. Update that owned rule in place rather
+        # than treating the new port as a verification failure. Fingerprints
+        # still protect any rule changed manually outside LabProbe.
+        def ensure_stun_firewall(self: Any, rule: Dict[str, Any]) -> Dict[str, Any]:
+            if str(rule.get("firewallMode") or "").strip().lower() == "wireguard_lan_forward":
+                return original_ensure_firewall(rule)
+            try:
+                from stun_service import _rule_fingerprint
+
+                expected = self._expected_firewall(rule)
+                bindings = self._firewall_bindings()
+                binding = bindings.get(rule["id"], {})
+                firewall_uuid = str(binding.get("uuid") or "").strip()
+                if firewall_uuid and binding.get("fingerprint"):
+                    current = self.client.firewall(True)
+                    existing = self._find_firewall(current, firewall_uuid)
+                    if (
+                        existing is not None
+                        and binding.get("fingerprint") == _rule_fingerprint(existing)
+                        and not self._firewall_matches(existing, expected)
+                    ):
+                        written = self.controller.write_and_verify(
+                            "firewall",
+                            lambda: self.client.rpc(
+                                "devConfig.update",
+                                "ip_firewall",
+                                {"old": existing, "new": expected},
+                            ),
+                            lambda: self.client.firewall(True),
+                        )
+                        verified = written.get("data") if isinstance(written, dict) else {}
+                        rows = verified.get("list", []) if isinstance(verified, dict) else []
+                        updated = next(
+                            (
+                                dict(row)
+                                for row in rows
+                                if isinstance(row, dict) and self._firewall_matches(row, expected)
+                            ),
+                            None,
+                        )
+                        if updated is None or not str(updated.get("uuid") or "").strip():
+                            return {"state": "verify_failed", "message": "本机入站规则更新后未能确认"}
+                        result = {
+                            "owner": "labprobe-stun",
+                            "state": "ready",
+                            "uuid": str(updated.get("uuid") or "").strip(),
+                            "fingerprint": _rule_fingerprint(updated),
+                        }
+                        bindings[rule["id"]] = result
+                        self._save_firewall_bindings(bindings)
+                        return result
+            except Exception as error:
+                hub.LOGGER.warning("STUN owned firewall port migration deferred: %s", error)
+            return original_ensure_firewall(rule)
+
+        stun.ensure_firewall = types.MethodType(ensure_stun_firewall, stun)
+
+        # Migrate desired STUN rules once. This changes only the local channel
+        # port and queues normal Agent reconciliation. Router mapping/firewall
+        # convergence remains on the existing status path, so Hub startup and
+        # realtime first-frame delivery are never blocked on router writes.
+        document = stun._document()
+        migrated_rows: List[Dict[str, Any]] = []
+        reserved: Dict[str, set[int]] = {}
+        migrated_any = False
+        for raw in document.get("rules", []):
+            rule = dict(raw)
+            if str(rule.get("kind") or "").strip().lower() != "stun":
+                migrated_rows.append(rule)
+                continue
+            protocol = str(rule.get("transportProtocol") or "TCP").strip().upper()
+            occupied = reserved.setdefault(protocol, set())
+            old_port = int(rule.get("listenPort") or 0)
+            if old_port not in range(STUN_LOCAL_PORT_MIN, STUN_LOCAL_PORT_MAX + 1) or old_port in occupied:
+                used = set(original_stun_used_ports(protocol, str(rule.get("id") or ""))) | occupied
+                span = STUN_LOCAL_PORT_MAX - STUN_LOCAL_PORT_MIN + 1
+                start = secrets.randbelow(span)
+                new_port = 0
+                for offset in range(span):
+                    candidate = STUN_LOCAL_PORT_MIN + ((start + offset) % span)
+                    if candidate not in used:
+                        new_port = candidate
+                        break
+                if not new_port:
+                    raise RuntimeError("STUN 本地端口池已耗尽")
+                rule["listenPort"] = new_port
+                rule["updatedAt"] = time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime())
+                migrated_any = True
+            occupied.add(int(rule.get("listenPort") or 0))
+            migrated_rows.append(rule)
+        if migrated_any:
+            saved = stun._save_rules(migrated_rows)
+            for rule in migrated_rows:
+                if (
+                    str(rule.get("kind") or "").strip().lower() == "stun"
+                    and bool(rule.get("enabled"))
+                ):
+                    stun.queue("upsert", {"rule": rule}, revision=saved["revision"])
+            hub.LOGGER.info(
+                "STUN local channel ports migrated to random stable pool %s-%s",
+                STUN_LOCAL_PORT_MIN,
+                STUN_LOCAL_PORT_MAX,
+            )
+        stun._labprobe_port_pool_v2 = True
 
     def clean(value: Any) -> str:
         return hub.clean_saved_value(value)
