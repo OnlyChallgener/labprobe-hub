@@ -485,10 +485,11 @@ dependencies = [
 
 [[package]]
 name = "labrelay"
-version = "0.2.40"
+version = "0.2.41"
 dependencies = [
  "anyhow",
  "futures-util",
+ "libc",
  "reqwest",
  "serde",
  "serde_json",

@@ -38,7 +38,7 @@ COPY final_stability_patch.py /app/final_stability_patch.py
 COPY labrelay_sync_patch.py /app/labrelay_sync_patch.py
 COPY lab_ddns.py /app/lab_ddns.py
 COPY lab_ddns_providers.py /app/lab_ddns_providers.py
-COPY agent/install.sh /app/agent/install.sh
+COPY scripts/labprobe-install.sh /app/agent/install.sh
 COPY agent_presence_patch.py /app/agent_presence_patch.py
 COPY device_history_patch.py /app/device_history_patch.py
 COPY portmap_persistence_patch.py /app/portmap_persistence_patch.py

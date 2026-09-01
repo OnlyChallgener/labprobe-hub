@@ -6,6 +6,7 @@ use socket2::SockRef;
 use std::collections::VecDeque;
 use std::fs;
 use std::net::SocketAddr;
+use std::path::Path;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
@@ -24,6 +25,9 @@ const LOOP_INTERVAL: Duration = Duration::from_millis(100);
 const CPU_HIGH_SAMPLE_PERCENT: f64 = 99.0;
 const CPU_RECOVERY_PERCENT: f64 = 94.0;
 const CPU_HIGH_SAMPLE_LIMIT: u8 = 3;
+const IP_LOCAL_PORT_RANGE_PATH: &str = "/proc/sys/net/ipv4/ip_local_port_range";
+const EXTREME_PORT_RANGE_BACKUP: &str = "/tmp/labprobe/tcp-peak-port-range.original";
+const EXTREME_PORT_RANGE: &str = "1024 65535\n";
 
 #[derive(Debug, Clone, Deserialize)]
 #[serde(default, rename_all = "camelCase")]
@@ -35,6 +39,7 @@ struct TcpSessionConfig {
     cps: u64,
     connect_timeout_ms: u64,
     max_duration_seconds: u64,
+    extreme_mode: bool,
 }
 
 impl Default for TcpSessionConfig {
@@ -47,6 +52,7 @@ impl Default for TcpSessionConfig {
             cps: 500,
             connect_timeout_ms: 1_500,
             max_duration_seconds: 180,
+            extreme_mode: false,
         }
     }
 }
@@ -75,8 +81,78 @@ impl TcpSessionConfig {
         self.cps = self.cps.clamp(1, 10_000);
         self.connect_timeout_ms = self.connect_timeout_ms.clamp(300, 10_000);
         self.max_duration_seconds = self.max_duration_seconds.clamp(10, 300);
+        if self.extreme_mode && fd_soft_limit().unwrap_or(0) < 65_536 {
+            bail!("极限模式不可用：Relay FD 软上限低于 65536");
+        }
         Ok(self)
     }
+}
+
+struct ExtremePortRangeGuard {
+    original: String,
+    active: bool,
+}
+
+impl ExtremePortRangeGuard {
+    fn activate() -> Result<Self> {
+        restore_stale_extreme_port_range()?;
+        let original = fs::read_to_string(IP_LOCAL_PORT_RANGE_PATH)
+            .context("读取临时源端口范围失败")?;
+        let current: Vec<&str> = original.split_whitespace().collect();
+        if current == ["1024", "65535"] {
+            return Ok(Self {
+                original,
+                active: false,
+            });
+        }
+        if let Some(parent) = Path::new(EXTREME_PORT_RANGE_BACKUP).parent() {
+            fs::create_dir_all(parent).context("创建极限模式状态目录失败")?;
+        }
+        fs::write(EXTREME_PORT_RANGE_BACKUP, &original)
+            .context("保存原临时源端口范围失败")?;
+        if let Err(error) = fs::write(IP_LOCAL_PORT_RANGE_PATH, EXTREME_PORT_RANGE) {
+            let _ = fs::remove_file(EXTREME_PORT_RANGE_BACKUP);
+            return Err(error).context("启用极限模式临时源端口范围失败");
+        }
+        let (first, last) = source_port_range();
+        if first > 1024 || last < 65535 {
+            let _ = fs::write(IP_LOCAL_PORT_RANGE_PATH, &original);
+            let _ = fs::remove_file(EXTREME_PORT_RANGE_BACKUP);
+            bail!("极限模式临时源端口范围未生效");
+        }
+        Ok(Self {
+            original,
+            active: true,
+        })
+    }
+
+    fn restore(&mut self) -> Result<()> {
+        if !self.active {
+            return Ok(());
+        }
+        fs::write(IP_LOCAL_PORT_RANGE_PATH, &self.original)
+            .context("恢复原临时源端口范围失败")?;
+        let _ = fs::remove_file(EXTREME_PORT_RANGE_BACKUP);
+        self.active = false;
+        Ok(())
+    }
+}
+
+impl Drop for ExtremePortRangeGuard {
+    fn drop(&mut self) {
+        let _ = self.restore();
+    }
+}
+
+pub(crate) fn restore_stale_extreme_port_range() -> Result<()> {
+    let backup = Path::new(EXTREME_PORT_RANGE_BACKUP);
+    if !backup.exists() {
+        return Ok(());
+    }
+    let original = fs::read_to_string(backup).context("读取极限模式恢复信息失败")?;
+    fs::write(IP_LOCAL_PORT_RANGE_PATH, original).context("恢复遗留临时源端口范围失败")?;
+    fs::remove_file(backup).context("清理极限模式恢复信息失败")?;
+    Ok(())
 }
 
 #[derive(Debug, Clone, Serialize)]
@@ -255,6 +331,42 @@ impl TcpSessionTestManager {
     }
 
     async fn run_task(&self, config: TcpSessionConfig, control: Arc<ActiveControl>) {
+        let mut extreme_port_guard = if config.extreme_mode {
+            match ExtremePortRangeGuard::activate() {
+                Ok(guard) => {
+                    self.update(&control.task_id, |snapshot| {
+                        push_log(
+                            snapshot,
+                            "极限模式已启用：临时源端口范围 1024-65535，测试结束自动恢复".into(),
+                        );
+                    })
+                    .await;
+                    Some(guard)
+                }
+                Err(error) => {
+                    let reason = format!("极限模式准备失败：{error:#}");
+                    self.update(&control.task_id, |snapshot| {
+                        snapshot.state = "failed".into();
+                        snapshot.status = "极限模式准备失败".into();
+                        snapshot.finish_reason = reason.clone();
+                        snapshot.resources_released = true;
+                        snapshot.release_status = "未创建测试连接".into();
+                        snapshot.finished_epoch = now_epoch();
+                        push_log(snapshot, reason.clone());
+                    })
+                    .await;
+                    let mut inner = self.inner.lock().await;
+                    if inner.active.as_ref().map(|value| value.task_id.as_str())
+                        == Some(control.task_id.as_str())
+                    {
+                        inner.active = None;
+                    }
+                    return;
+                }
+            }
+        } else {
+            None
+        };
         let families: Vec<bool> = match config.family.as_str() {
             "ipv4" => vec![false],
             "ipv6" => vec![true],
@@ -275,6 +387,20 @@ impl TcpSessionTestManager {
             }
         }
 
+        if let Some(guard) = extreme_port_guard.as_mut() {
+            match guard.restore() {
+                Ok(()) => {
+                    self.update(&control.task_id, |snapshot| {
+                        push_log(snapshot, "极限模式已恢复原临时源端口范围".into());
+                    })
+                    .await;
+                }
+                Err(error) => {
+                    failed = true;
+                    reasons.push(format!("恢复临时源端口范围失败：{error:#}"));
+                }
+            }
+        }
         let stopped = control.stop.load(Ordering::Acquire);
         let reason = if stopped {
             "用户停止测试".to_string()
@@ -333,7 +459,7 @@ impl TcpSessionTestManager {
         })
         .await;
         let address = resolve_target(&config.host, config.port, ipv6).await?;
-        let plan = resource_plan(config.target_connections);
+        let plan = resource_plan(config.target_connections, config.extreme_mode);
         let safe_target = plan.safe_target;
         let pending_limit = pending_connect_limit(config.cps, safe_target);
         self.update(&control.task_id, |snapshot| {
@@ -873,11 +999,12 @@ struct ResourceSample {
     cpu_counters: Option<CpuCounters>,
 }
 
-fn resource_plan(requested: usize) -> ResourcePlan {
+fn resource_plan(requested: usize, extreme_mode: bool) -> ResourcePlan {
     let baseline_fd = current_fd_count();
     let soft_limit = fd_soft_limit().unwrap_or(ABSOLUTE_CONNECTION_LIMIT + baseline_fd + 2_048);
+    let fd_ceiling_percent = if extreme_mode { 90 } else { 80 };
     let fd_ceiling = soft_limit
-        .saturating_mul(80)
+        .saturating_mul(fd_ceiling_percent)
         .checked_div(100)
         .unwrap_or(soft_limit)
         .max(baseline_fd.saturating_add(1));
@@ -885,7 +1012,7 @@ fn resource_plan(requested: usize) -> ResourcePlan {
 
     let baseline_conntrack = read_number("/proc/sys/net/netfilter/nf_conntrack_count").unwrap_or(0);
     let conntrack_max = read_number("/proc/sys/net/netfilter/nf_conntrack_max").unwrap_or(65_536);
-    let conntrack_ceiling = conntrack_max.saturating_mul(75) / 100;
+    let conntrack_ceiling = conntrack_max.saturating_mul(if extreme_mode { 90 } else { 75 }) / 100;
     let conntrack_budget = conntrack_ceiling.saturating_sub(baseline_conntrack).max(1);
 
     let (memory_total_mb, memory_available_mb) = memory_megabytes();
@@ -899,7 +1026,7 @@ fn resource_plan(requested: usize) -> ResourcePlan {
 
     let (source_first, source_last) = source_port_range();
     let source_port_capacity = source_last.saturating_sub(source_first).saturating_add(1);
-    let source_port_ceiling = source_port_capacity.saturating_mul(90) / 100;
+    let source_port_ceiling = source_port_capacity.saturating_mul(if extreme_mode { 95 } else { 90 }) / 100;
     let baseline_source_ports = source_ports_in_use(source_first, source_last);
     let source_port_budget = source_port_ceiling
         .saturating_sub(baseline_source_ports)

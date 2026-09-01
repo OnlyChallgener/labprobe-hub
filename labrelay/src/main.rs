@@ -1,7 +1,7 @@
 use anyhow::{anyhow, bail, Context, Result};
 use serde::{Deserialize, Serialize};
 use serde_json::{json, Value};
-use socket2::{Domain, Protocol, Socket, Type};
+use socket2::{Domain, Protocol, SockRef, Socket, Type};
 use std::collections::HashMap;
 use std::fs;
 use std::io::{BufRead, BufReader, Read, Write};
@@ -891,6 +891,10 @@ fn prepare_tcp_stun_socket(local_port: u16) -> Result<TcpSocket> {
     socket
         .set_reuseaddr(true)
         .context("设置 STUN TCP 套接字失败")?;
+    #[cfg(unix)]
+    SockRef::from(&socket)
+        .set_reuse_port(true)
+        .context("设置 STUN TCP 端口复用失败")?;
     socket.bind(SocketAddr::V4(SocketAddrV4::new(
         Ipv4Addr::UNSPECIFIED,
         local_port,
@@ -2068,7 +2072,64 @@ fn agent_apply(socket_path: &Path, input_path: &Path) -> Result<Value> {
     Ok(json!({"acks": acks, "appliedAt": now_epoch()}))
 }
 
+fn raise_daemon_nofile_limit(target: u64) -> Result<()> {
+    #[cfg(target_os = "linux")]
+    {
+        let target = target as libc::rlim_t;
+        let mut current = libc::rlimit {
+            rlim_cur: 0,
+            rlim_max: 0,
+        };
+        if unsafe { libc::getrlimit(libc::RLIMIT_NOFILE, &mut current) } != 0 {
+            return Err(anyhow!(
+                "读取 Relay FD 上限失败：{}",
+                std::io::Error::last_os_error()
+            ));
+        }
+        if current.rlim_cur < target || current.rlim_max < target {
+            let requested = libc::rlimit {
+                rlim_cur: target,
+                rlim_max: target,
+            };
+            if unsafe { libc::setrlimit(libc::RLIMIT_NOFILE, &requested) } != 0 {
+                return Err(anyhow!(
+                    "提升 Relay FD 上限失败（当前 soft={} hard={}，目标={}）：{}",
+                    current.rlim_cur,
+                    current.rlim_max,
+                    target,
+                    std::io::Error::last_os_error()
+                ));
+            }
+        }
+        let mut verified = libc::rlimit {
+            rlim_cur: 0,
+            rlim_max: 0,
+        };
+        if unsafe { libc::getrlimit(libc::RLIMIT_NOFILE, &mut verified) } != 0 {
+            return Err(anyhow!(
+                "复核 Relay FD 上限失败：{}",
+                std::io::Error::last_os_error()
+            ));
+        }
+        if verified.rlim_cur < target || verified.rlim_max < target {
+            bail!(
+                "Relay FD 上限未达到要求：soft={} hard={} target={}",
+                verified.rlim_cur,
+                verified.rlim_max,
+                target
+            );
+        }
+    }
+    #[cfg(not(target_os = "linux"))]
+    {
+        let _ = target;
+    }
+    Ok(())
+}
+
 async fn daemon(args: &[String]) -> Result<()> {
+    raise_daemon_nofile_limit(131_072)?;
+    tcp_session_test::restore_stale_extreme_port_range()?;
     let config =
         PathBuf::from(arg_value(args, "--config").unwrap_or_else(|| DEFAULT_CONFIG.to_string()));
     let socket =
@@ -2846,13 +2907,11 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn tcp_stun_connect_keeps_the_same_port_as_the_listener() {
-        // Reserve a port briefly, then release it before the outbound socket
-        // binds. The production path has only the STUN socket on this port;
-        // keeping this helper listener alive would create a false conflict.
-        let inbound = TcpListener::bind("127.0.0.1:0").await.unwrap();
+    async fn tcp_stun_socket_shares_middle_port_with_listener() {
+        // router_self TCP STUN keeps a listener and an outbound STUN flow on
+        // the same local middle port. Both sockets must join SO_REUSEPORT.
+        let inbound = create_ipv4_listener(0).unwrap();
         let source_port = inbound.local_addr().unwrap().port();
-        drop(inbound);
         let server = TcpListener::bind("127.0.0.1:0").await.unwrap();
         let server_addr = server.local_addr().unwrap();
 
