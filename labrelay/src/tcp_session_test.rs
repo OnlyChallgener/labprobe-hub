@@ -1,4 +1,5 @@
 use anyhow::{anyhow, bail, Context, Result};
+use futures_util::{stream::FuturesUnordered, FutureExt, StreamExt};
 use serde::{Deserialize, Serialize};
 use serde_json::{json, Value};
 use socket2::SockRef;
@@ -10,15 +11,18 @@ use std::sync::Arc;
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 use tokio::net::{lookup_host, TcpSocket, TcpStream};
 use tokio::sync::Mutex;
-use tokio::task::JoinSet;
 use tokio::time::{sleep, timeout};
 
 const ABSOLUTE_CONNECTION_LIMIT: usize = 65_535;
-const MAX_PENDING_CONNECTS: usize = 512;
+const MAX_PENDING_CONNECTS: usize = 256;
 const CONSECUTIVE_FAILURE_LIMIT: usize = 200;
 const RECENT_OUTCOME_WINDOW: usize = 200;
 const STATUS_INTERVAL: Duration = Duration::from_secs(1);
-const LOOP_INTERVAL: Duration = Duration::from_millis(50);
+const HEAVY_RESOURCE_SAMPLE_INTERVAL: Duration = Duration::from_secs(5);
+const LOOP_INTERVAL: Duration = Duration::from_millis(100);
+const CPU_HIGH_SAMPLE_PERCENT: f64 = 95.0;
+const CPU_RECOVERY_PERCENT: f64 = 90.0;
+const CPU_HIGH_SAMPLE_LIMIT: u8 = 3;
 
 #[derive(Debug, Clone, Deserialize)]
 #[serde(default, rename_all = "camelCase")]
@@ -354,9 +358,10 @@ impl TcpSessionTestManager {
         let mut last_report = Instant::now();
         let mut last_report_success = 0u64;
         let mut last_growth = Instant::now();
+        let mut last_heavy_resource_sample = Instant::now();
         let mut credit = 0f64;
         let mut held: Vec<TcpStream> = Vec::with_capacity(safe_target.min(16_384));
-        let mut pending: JoinSet<ConnectResult> = JoinSet::new();
+        let mut pending = FuturesUnordered::new();
         let mut success = 0u64;
         let mut failure = 0u64;
         let mut resource_failures = 0u64;
@@ -367,6 +372,9 @@ impl TcpSessionTestManager {
         let mut recent_outcomes = VecDeque::with_capacity(RECENT_OUTCOME_WINDOW);
         let mut previous_cpu = read_cpu_counters();
         let mut high_cpu_samples = 0u8;
+        let mut cpu_scale = 1.0f64;
+        let mut cached_fd_used = plan.baseline_fd;
+        let mut cached_source_ports = plan.baseline_source_ports;
         let finish_reason: String;
 
         'testing: loop {
@@ -416,9 +424,9 @@ impl TcpSessionTestManager {
                 break;
             }
 
-            while let Some(joined) = pending.try_join_next() {
-                match joined {
-                    Ok(ConnectResult::Connected(stream)) => {
+            while let Some(Some(result)) = pending.next().now_or_never() {
+                match result {
+                    ConnectResult::Connected(stream) => {
                         if control.stop.load(Ordering::Acquire) {
                             drop(stream);
                         } else {
@@ -429,7 +437,7 @@ impl TcpSessionTestManager {
                             last_growth = Instant::now();
                         }
                     }
-                    Ok(ConnectResult::Failed(kind)) => {
+                    ConnectResult::Failed(kind) => {
                         failure += 1;
                         consecutive_failures = consecutive_failures.saturating_add(1);
                         record_recent_outcome(&mut recent_outcomes, false);
@@ -451,53 +459,73 @@ impl TcpSessionTestManager {
                             break 'testing;
                         }
                     }
-                    Err(_) => {
-                        failure += 1;
-                        consecutive_failures = consecutive_failures.saturating_add(1);
-                        record_recent_outcome(&mut recent_outcomes, false);
-                        if let Some(reason) = connection_quality_stop_reason(
-                            &recent_outcomes,
-                            consecutive_failures,
-                            last_growth.elapsed(),
-                        ) {
-                            finish_reason = reason.into();
-                            break 'testing;
-                        }
-                    }
                 }
             }
 
             let tick_seconds = now.duration_since(last_tick).as_secs_f64();
             last_tick = now;
             let load = (held.len() + pending.len()) as f64 / safe_target.max(1) as f64;
-            let rate_scale = if load >= 0.95 {
+            let load_scale = if load >= 0.95 {
                 0.20
             } else if load >= 0.80 {
                 0.50
             } else {
                 1.0
             };
-            credit += config.cps as f64 * rate_scale * tick_seconds;
+            let rate_scale = load_scale.min(cpu_scale);
+            if rate_scale <= f64::EPSILON {
+                credit = 0.0;
+            } else {
+                credit = (credit + config.cps as f64 * rate_scale * tick_seconds)
+                    .min(MAX_PENDING_CONNECTS as f64);
+            }
             let available = safe_target.saturating_sub(held.len() + pending.len());
-            let launches = (credit.floor() as usize)
-                .min(available)
-                .min(MAX_PENDING_CONNECTS.saturating_sub(pending.len()))
-                .min(
-                    CONSECUTIVE_FAILURE_LIMIT
-                        .saturating_sub(consecutive_failures.saturating_add(pending.len())),
-                );
+            let launches = if rate_scale <= f64::EPSILON {
+                0
+            } else {
+                (credit.floor() as usize)
+                    .min(available)
+                    .min(MAX_PENDING_CONNECTS.saturating_sub(pending.len()))
+                    .min(
+                        CONSECUTIVE_FAILURE_LIMIT
+                            .saturating_sub(consecutive_failures.saturating_add(pending.len())),
+                    )
+            };
             credit -= launches as f64;
             for _ in 0..launches {
                 let timeout_duration = Duration::from_millis(config.connect_timeout_ms);
-                pending.spawn(connect_once(address, timeout_duration));
+                pending.push(connect_once(address, timeout_duration));
             }
 
             if now.duration_since(last_report) >= STATUS_INTERVAL {
-                let sample = sample_resources(previous_cpu);
+                let approximate_fd = plan
+                    .baseline_fd
+                    .saturating_add(held.len())
+                    .saturating_add(pending.len());
+                let approximate_source_ports = plan
+                    .baseline_source_ports
+                    .saturating_add(held.len())
+                    .saturating_add(pending.len());
+                let near_fd_limit = approximate_fd >= plan.fd_ceiling.saturating_mul(8) / 10;
+                let near_source_limit = approximate_source_ports
+                    >= plan.source_port_ceiling.saturating_mul(8) / 10;
+                if last_heavy_resource_sample.elapsed() >= HEAVY_RESOURCE_SAMPLE_INTERVAL
+                    || near_fd_limit
+                    || near_source_limit
+                {
+                    cached_fd_used = current_fd_count();
+                    let (source_first, source_last) = source_port_range();
+                    cached_source_ports = source_ports_in_use(source_first, source_last);
+                    last_heavy_resource_sample = Instant::now();
+                }
+                let effective_fd = cached_fd_used.max(approximate_fd);
+                let effective_source_ports = cached_source_ports.max(approximate_source_ports);
+                let sample = sample_resources(previous_cpu, effective_fd, effective_source_ports);
                 previous_cpu = sample.cpu_counters;
-                if sample.cpu_percent >= 92.0 {
+                cpu_scale = cpu_rate_scale(sample.cpu_percent);
+                if sample.cpu_percent >= CPU_HIGH_SAMPLE_PERCENT {
                     high_cpu_samples = high_cpu_samples.saturating_add(1);
-                } else {
+                } else if sample.cpu_percent < CPU_RECOVERY_PERCENT {
                     high_cpu_samples = 0;
                 }
                 self.publish_resources(&control.task_id, &sample).await;
@@ -506,8 +534,7 @@ impl TcpSessionTestManager {
                         push_log(snapshot, format!("系统保护停止新增连接：{}", reason));
                     })
                     .await;
-                    pending.abort_all();
-                    while pending.join_next().await.is_some() {}
+                    drop(pending);
                     let peak = held.len();
                     self.update(&control.task_id, |snapshot| {
                         snapshot.state = "releasing".into();
@@ -566,8 +593,7 @@ impl TcpSessionTestManager {
             snapshot.release_status = "正在取消连接并回收测试资源".into();
         })
         .await;
-        pending.abort_all();
-        while pending.join_next().await.is_some() {}
+        drop(pending);
         let peak = held.len();
         for stream in &held {
             let _ = SockRef::from(stream).set_linger(Some(Duration::ZERO));
@@ -649,8 +675,13 @@ impl TcpSessionTestManager {
         maximum_wait: Duration,
     ) -> bool {
         let started = Instant::now();
+        let (source_first, source_last) = source_port_range();
         loop {
-            let sample = sample_resources(None);
+            let sample = sample_resources(
+                None,
+                current_fd_count(),
+                source_ports_in_use(source_first, source_last),
+            );
             self.publish_resources(task_id, &sample).await;
             let fd_released = sample.fd_used <= plan.baseline_fd.saturating_add(16);
             let source_released = sample.source_ports_used
@@ -673,7 +704,7 @@ impl TcpSessionTestManager {
                 .await;
                 return false;
             }
-            sleep(Duration::from_millis(500)).await;
+            sleep(Duration::from_secs(1)).await;
         }
     }
 
@@ -754,6 +785,20 @@ fn connection_quality_stop_reason(
         }
     }
     None
+}
+
+fn cpu_rate_scale(cpu_percent: f64) -> f64 {
+    if cpu_percent >= 90.0 {
+        0.0
+    } else if cpu_percent >= 85.0 {
+        0.15
+    } else if cpu_percent >= 75.0 {
+        0.40
+    } else if cpu_percent >= 65.0 {
+        0.70
+    } else {
+        1.0
+    }
 }
 
 async fn connect_once(address: SocketAddr, connect_timeout: Duration) -> ConnectResult {
@@ -840,7 +885,9 @@ fn resource_plan(requested: usize) -> ResourcePlan {
     let conntrack_budget = conntrack_ceiling.saturating_sub(baseline_conntrack).max(1);
 
     let (memory_total_mb, memory_available_mb) = memory_megabytes();
-    let memory_floor_mb = (memory_total_mb / 5).max(192).min(memory_available_mb.saturating_sub(1));
+    let memory_floor_mb = (memory_total_mb / 5)
+        .max(192)
+        .min(memory_available_mb.saturating_sub(1));
     let memory_budget = memory_available_mb
         .saturating_sub(memory_floor_mb)
         .saturating_mul(128)
@@ -892,30 +939,37 @@ fn health_stop_reason(
         Some("Relay 内存已达到安全阈值".into())
     } else if sample.source_ports_used >= plan.source_port_ceiling {
         Some("单目标临时源端口已达到安全阈值".into())
-    } else if high_cpu_samples >= 2 {
+    } else if high_cpu_samples >= CPU_HIGH_SAMPLE_LIMIT {
         Some("CPU 持续高负载，已触发系统保护".into())
     } else {
         None
     }
 }
 
-fn sample_resources(previous_cpu: Option<CpuCounters>) -> ResourceSample {
+fn sample_resources(
+    previous_cpu: Option<CpuCounters>,
+    fd_used: usize,
+    source_ports_used: usize,
+) -> ResourceSample {
     let counters = read_cpu_counters();
     let cpu_percent = match (previous_cpu, counters) {
         (Some(previous), Some(current)) => {
             let total = current.total.saturating_sub(previous.total);
             let idle = current.idle.saturating_sub(previous.idle);
-            if total == 0 { 0.0 } else { 100.0 * (total - idle) as f64 / total as f64 }
+            if total == 0 {
+                0.0
+            } else {
+                100.0 * (total - idle) as f64 / total as f64
+            }
         }
         _ => 0.0,
     };
     let (_, memory_available_mb) = memory_megabytes();
-    let (source_first, source_last) = source_port_range();
     ResourceSample {
-        fd_used: current_fd_count(),
+        fd_used,
         conntrack: read_number("/proc/sys/net/netfilter/nf_conntrack_count").unwrap_or(0),
         memory_available_mb,
-        source_ports_used: source_ports_in_use(source_first, source_last),
+        source_ports_used,
         cpu_percent,
         cpu_counters: counters,
     }
@@ -928,13 +982,14 @@ fn current_fd_count() -> usize {
 }
 
 fn fd_soft_limit() -> Option<usize> {
-    fs::read_to_string("/proc/self/limits")
-        .ok()
-        .and_then(|text| {
-            text.lines()
-                .find(|line| line.starts_with("Max open files"))
-                .and_then(|line| line.split_whitespace().find_map(|part| part.parse::<usize>().ok()))
-        })
+    fs::read_to_string("/proc/self/limits").ok().and_then(|text| {
+        text.lines()
+            .find(|line| line.starts_with("Max open files"))
+            .and_then(|line| {
+                line.split_whitespace()
+                    .find_map(|part| part.parse::<usize>().ok())
+            })
+    })
 }
 
 fn memory_megabytes() -> (usize, usize) {
@@ -946,7 +1001,10 @@ fn memory_megabytes() -> (usize, usize) {
             .and_then(|value| value.parse::<usize>().ok())
             .unwrap_or(0)
     };
-    (read_kib("MemTotal:") / 1024, read_kib("MemAvailable:") / 1024)
+    (
+        read_kib("MemTotal:") / 1024,
+        read_kib("MemAvailable:") / 1024,
+    )
 }
 
 fn read_number(path: &str) -> Option<usize> {
@@ -956,7 +1014,11 @@ fn read_number(path: &str) -> Option<usize> {
 fn source_port_range() -> (usize, usize) {
     let values: Vec<usize> = fs::read_to_string("/proc/sys/net/ipv4/ip_local_port_range")
         .ok()
-        .map(|text| text.split_whitespace().filter_map(|value| value.parse().ok()).collect())
+        .map(|text| {
+            text.split_whitespace()
+                .filter_map(|value| value.parse().ok())
+                .collect()
+        })
         .unwrap_or_default();
     match values.as_slice() {
         [first, last, ..] if first < last => (*first, *last),
@@ -965,18 +1027,26 @@ fn source_port_range() -> (usize, usize) {
 }
 
 fn source_ports_in_use(first: usize, last: usize) -> usize {
-    ["/proc/net/tcp", "/proc/net/tcp6"]
-        .iter()
-        .filter_map(|path| fs::read_to_string(path).ok())
-        .flat_map(|text| text.lines().skip(1).map(str::to_string).collect::<Vec<_>>())
-        .filter_map(|line| {
-            line.split_whitespace()
+    let mut count = 0usize;
+    for path in ["/proc/net/tcp", "/proc/net/tcp6"] {
+        let Ok(text) = fs::read_to_string(path) else {
+            continue;
+        };
+        for line in text.lines().skip(1) {
+            let Some(port) = line
+                .split_whitespace()
                 .nth(1)
                 .and_then(|address| address.rsplit(':').next())
                 .and_then(|port| usize::from_str_radix(port, 16).ok())
-        })
-        .filter(|port| (*port >= first) && (*port <= last))
-        .count()
+            else {
+                continue;
+            };
+            if port >= first && port <= last {
+                count = count.saturating_add(1);
+            }
+        }
+    }
+    count
 }
 
 fn read_cpu_counters() -> Option<CpuCounters> {
@@ -996,7 +1066,11 @@ fn read_cpu_counters() -> Option<CpuCounters> {
 }
 
 fn family_label(ipv6: bool) -> &'static str {
-    if ipv6 { "IPv6" } else { "IPv4" }
+    if ipv6 {
+        "IPv6"
+    } else {
+        "IPv4"
+    }
 }
 
 fn family_metric(snapshot: &mut TcpSessionSnapshot, ipv6: bool) -> &mut FamilyMetric {
@@ -1056,5 +1130,15 @@ mod tests {
             connection_quality_stop_reason(&outcomes, 50, Duration::from_millis(2_999)),
             None
         );
+    }
+
+    #[test]
+    fn cpu_rate_scale_throttles_before_system_protection() {
+        assert_eq!(cpu_rate_scale(50.0), 1.0);
+        assert_eq!(cpu_rate_scale(65.0), 0.70);
+        assert_eq!(cpu_rate_scale(75.0), 0.40);
+        assert_eq!(cpu_rate_scale(85.0), 0.15);
+        assert_eq!(cpu_rate_scale(90.0), 0.0);
+        assert_eq!(cpu_rate_scale(99.0), 0.0);
     }
 }
