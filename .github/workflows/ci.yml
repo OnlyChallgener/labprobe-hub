@@ -73,12 +73,17 @@ jobs:
           grep -q '/api/realtime/ws' hub_realtime_ws.py
           test ! -e assistant/wechat.py
           ! git grep -qi -E 'wechat|clawbot|openclaw' -- '*.py' '*.md' '*.env*' 'Dockerfile'
-          grep -q 'version = "0.2.37"' labrelay/Cargo.toml
+          grep -q 'version = "0.2.38"' labrelay/Cargo.toml
+          grep -q 'PORTMAP_PORT_MAX = 29999' labrelay_sync_patch.py
+          grep -q 'STUN_LOCAL_PORT_MIN = 30000' labrelay_sync_patch.py
+          grep -q 'STUN_LOCAL_PORT_MAX = 32767' labrelay_sync_patch.py
           sh -n agent/install.sh
           sh -n scripts/labprobe-install.sh
           grep -q 'procd_set_param limits nofile="131072 131072"' agent/install.sh
           grep -q "ulimit -n 131072; exec /usr/bin/labrelay daemon" agent/install.sh
+          grep -q -- '--port-max 32767' agent/install.sh
           grep -q 'procd_set_param limits nofile="131072 131072"' scripts/labprobe-install.sh
+          grep -q -- '--port-max 32767' scripts/labprobe-install.sh
 
       - name: Test and build LabRelay
         working-directory: labrelay
