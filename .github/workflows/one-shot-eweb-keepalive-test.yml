@@ -38,90 +38,59 @@ jobs:
           path = Path('router_ws_patch.py')
           text = path.read_text(encoding='utf-8')
 
-          constants_old = '''FAST_START_GRACE_SECONDS = 8.0
-          FAST_STALL_SECONDS = 8.0
-          FAST_SOCKET_POLL_SECONDS = 1.0
-          MAX_ROUTER_RETRY_SECONDS = 2.0
-          '''.replace('          ', '')
-          constants_new = '''FAST_START_GRACE_SECONDS = 8.0
-          FAST_STALL_SECONDS = 8.0
-          FAST_SOCKET_POLL_SECONDS = 1.0
-          ROUTER_WS_KEEPALIVE_SECONDS = 5.0
-          MAX_ROUTER_RETRY_SECONDS = 2.0
-          '''.replace('          ', '')
           if 'ROUTER_WS_KEEPALIVE_SECONDS' not in text:
-              if constants_old not in text:
+              anchor = 'FAST_SOCKET_POLL_SECONDS = 1.0\nMAX_ROUTER_RETRY_SECONDS = 2.0\n'
+              replacement = 'FAST_SOCKET_POLL_SECONDS = 1.0\nROUTER_WS_KEEPALIVE_SECONDS = 5.0\nMAX_ROUTER_RETRY_SECONDS = 2.0\n'
+              if anchor not in text:
                   raise SystemExit('router websocket constants anchor not found')
-              text = text.replace(constants_old, constants_new, 1)
+              text = text.replace(anchor, replacement, 1)
 
-          keepalive_old = '''    def _keepalive_loop(self, ws: websocket.WebSocket, stop: threading.Event) -> None:
-              while not self._stop.wait(10.0) and not stop.is_set():
-                  try:
-                      self._send(ws, "keepalive")
-                  except Exception:
-                      stop.set()
-                      try:
-                          ws.close()
-                      except Exception:
-                          pass
-                      return
-          '''.replace('          ', '')
-          keepalive_new = '''    def _keepalive_loop(self, ws: websocket.WebSocket, stop: threading.Event) -> None:
-              while not self._stop.is_set() and not stop.wait(ROUTER_WS_KEEPALIVE_SECONDS):
-                  try:
-                      self._send(ws, "keepalive")
-                  except Exception:
-                      stop.set()
-                      try:
-                          ws.close()
-                      except Exception:
-                          pass
-                      return
-          '''.replace('          ', '')
-          if keepalive_new not in text:
-              if keepalive_old not in text:
-                  raise SystemExit('router websocket keepalive anchor not found')
-              text = text.replace(keepalive_old, keepalive_new, 1)
+          old_wait = '        while not self._stop.wait(10.0) and not stop.is_set():\n'
+          new_wait = '        while not self._stop.is_set() and not stop.wait(ROUTER_WS_KEEPALIVE_SECONDS):\n'
+          if new_wait not in text:
+              if old_wait not in text:
+                  raise SystemExit('router websocket keepalive wait anchor not found')
+              text = text.replace(old_wait, new_wait, 1)
 
-          start_old = '''        connected_at = time.time()
-                  self._set_connected(True, ws_url)
-                  try:
-          '''.replace('          ', '')
-          start_new = '''        connected_at = time.time()
-                  self._set_connected(True, ws_url)
-                  keepalive_stop = threading.Event()
-                  keepalive_thread = threading.Thread(
-                      target=self._keepalive_loop,
-                      args=(ws, keepalive_stop),
-                      name="router-eweb-ws-keepalive",
-                      daemon=True,
-                  )
-                  keepalive_thread.start()
-                  try:
-          '''.replace('          ', '')
+          start_old = '        connected_at = time.time()\n        self._set_connected(True, ws_url)\n        try:\n'
+          start_new = (
+              '        connected_at = time.time()\n'
+              '        self._set_connected(True, ws_url)\n'
+              '        keepalive_stop = threading.Event()\n'
+              '        keepalive_thread = threading.Thread(\n'
+              '            target=self._keepalive_loop,\n'
+              '            args=(ws, keepalive_stop),\n'
+              '            name="router-eweb-ws-keepalive",\n'
+              '            daemon=True,\n'
+              '        )\n'
+              '        keepalive_thread.start()\n'
+              '        try:\n'
+          )
           if start_new not in text:
               if start_old not in text:
                   raise SystemExit('router websocket connection-start anchor not found')
               text = text.replace(start_old, start_new, 1)
 
-          finish_old = '''        finally:
-                  try:
-                      ws.close()
-                  except Exception:
-                      pass
-          
-              def _loop(self) -> None:
-          '''.replace('          ', '')
-          finish_new = '''        finally:
-                  keepalive_stop.set()
-                  try:
-                      ws.close()
-                  except Exception:
-                      pass
-                  keepalive_thread.join(timeout=1.0)
-          
-              def _loop(self) -> None:
-          '''.replace('          ', '')
+          finish_old = (
+              '        finally:\n'
+              '            try:\n'
+              '                ws.close()\n'
+              '            except Exception:\n'
+              '                pass\n'
+              '\n'
+              '    def _loop(self) -> None:\n'
+          )
+          finish_new = (
+              '        finally:\n'
+              '            keepalive_stop.set()\n'
+              '            try:\n'
+              '                ws.close()\n'
+              '            except Exception:\n'
+              '                pass\n'
+              '            keepalive_thread.join(timeout=1.0)\n'
+              '\n'
+              '    def _loop(self) -> None:\n'
+          )
           if finish_new not in text:
               if finish_old not in text:
                   raise SystemExit('router websocket connection-finally anchor not found')
@@ -132,77 +101,78 @@ jobs:
           test_path = Path('tests/test_router_ws_patch.py')
           tests = test_path.read_text(encoding='utf-8')
           old_import = 'from router_ws_patch import _config_poll_seconds, _first_ssid, _merge_wireless, _normalized_ports\n'
-          new_import = '''import json
-          import logging
-          import threading
-          
-          import pytest
-          
-          import router_ws_patch
-          from router_ws_patch import RouterWebSocketMonitor, _config_poll_seconds, _first_ssid, _merge_wireless, _normalized_ports
-          '''.replace('          ', '')
+          new_import = (
+              'import json\n'
+              'import logging\n'
+              'import threading\n'
+              '\n'
+              'import pytest\n'
+              '\n'
+              'import router_ws_patch\n'
+              'from router_ws_patch import RouterWebSocketMonitor, _config_poll_seconds, _first_ssid, _merge_wireless, _normalized_ports\n'
+          )
           if 'import router_ws_patch' not in tests:
               if old_import not in tests:
                   raise SystemExit('router websocket test import anchor not found')
               tests = tests.replace(old_import, new_import, 1)
 
-          test_name = 'test_eweb_connection_starts_keepalive_sender'
-          if test_name not in tests:
+          if 'test_eweb_connection_starts_keepalive_sender' not in tests:
               tests += '''
-          
-          def test_eweb_connection_starts_keepalive_sender(monkeypatch):
-              sent = []
-              keepalive_sent = threading.Event()
-          
-              class FakeSocket:
-                  def __init__(self):
-                      self.closed = False
-          
-                  def settimeout(self, _value):
-                      return None
-          
-                  def recv(self):
-                      if keepalive_sent.wait(0.5):
-                          return ""
-                      raise AssertionError("keepalive was not sent while websocket recv was idle")
-          
-                  def send(self, payload):
-                      sent.append(json.loads(payload))
-                      keepalive_sent.set()
-          
-                  def close(self):
-                      self.closed = True
-          
-              fake_socket = FakeSocket()
-              monkeypatch.setattr(router_ws_patch, "ROUTER_WS_KEEPALIVE_SECONDS", 0.01)
-              monkeypatch.setattr(router_ws_patch.websocket, "create_connection", lambda *args, **kwargs: fake_socket)
-          
-              monitor = object.__new__(RouterWebSocketMonitor)
-              monitor.logger = logging.getLogger("router-ws-keepalive-test")
-              monitor._lock = threading.RLock()
-              monitor._stop = threading.Event()
-              monitor._last_fast_at = 0.0
-              monitor._connected = False
-              monitor._url = ""
-              monitor._last_error = ""
-              monitor._connected_at = 0.0
-          
-              with pytest.raises(RuntimeError, match="router websocket closed"):
-                  monitor._run_connection(
-                      "ws://router/ws?auth=test",
-                      "http://router",
-                      "sid=test",
-                      False,
-                      "router",
-                  )
-          
-              assert sent[0] == {"action": "keepalive"}
-              assert fake_socket.closed is True
-          
-          
-          def test_eweb_keepalive_interval_stays_below_ten_second_idle_window():
-              assert 0 < router_ws_patch.ROUTER_WS_KEEPALIVE_SECONDS < 10.0
-          '''.replace('          ', '')
+
+
+def test_eweb_connection_starts_keepalive_sender(monkeypatch):
+    sent = []
+    keepalive_sent = threading.Event()
+
+    class FakeSocket:
+        def __init__(self):
+            self.closed = False
+
+        def settimeout(self, _value):
+            return None
+
+        def recv(self):
+            if keepalive_sent.wait(0.5):
+                return ""
+            raise AssertionError("keepalive was not sent while websocket recv was idle")
+
+        def send(self, payload):
+            sent.append(json.loads(payload))
+            keepalive_sent.set()
+
+        def close(self):
+            self.closed = True
+
+    fake_socket = FakeSocket()
+    monkeypatch.setattr(router_ws_patch, "ROUTER_WS_KEEPALIVE_SECONDS", 0.01)
+    monkeypatch.setattr(router_ws_patch.websocket, "create_connection", lambda *args, **kwargs: fake_socket)
+
+    monitor = object.__new__(RouterWebSocketMonitor)
+    monitor.logger = logging.getLogger("router-ws-keepalive-test")
+    monitor._lock = threading.RLock()
+    monitor._stop = threading.Event()
+    monitor._last_fast_at = 0.0
+    monitor._connected = False
+    monitor._url = ""
+    monitor._last_error = ""
+    monitor._connected_at = 0.0
+
+    with pytest.raises(RuntimeError, match="router websocket closed"):
+        monitor._run_connection(
+            "ws://router/ws?auth=test",
+            "http://router",
+            "sid=test",
+            False,
+            "router",
+        )
+
+    assert sent[0] == {"action": "keepalive"}
+    assert fake_socket.closed is True
+
+
+def test_eweb_keepalive_interval_stays_below_ten_second_idle_window():
+    assert 0 < router_ws_patch.ROUTER_WS_KEEPALIVE_SECONDS < 10.0
+'''
 
           test_path.write_text(tests, encoding='utf-8')
           PY
