@@ -13,6 +13,8 @@ INIT_SCRIPT="/etc/init.d/labprobe"
 TMP_BIN="/tmp/labrelay.new"
 TMP_SUM="/tmp/labrelay.new.sha256"
 LOCAL_BINARY="${LABRELAY_BINARY:-}"
+LOCAL_BINARY_SOURCE=""
+[ -n "$LOCAL_BINARY" ] && LOCAL_BINARY_SOURCE="LABRELAY_BINARY"
 UPDATE_ROOT="${LABPROBE_UPDATE_ROOT:-https://lab.net86.dynv6.net:27772}"
 case "${LABPROBE_AGENT_BASE:-$UPDATE_ROOT}" in
   */releases/download/*) AGENT_BASE="${LABPROBE_AGENT_BASE:-${UPDATE_ROOT%/}}" ;;
@@ -163,11 +165,41 @@ download_binary() {
   chmod 0755 "$TMP_BIN"
 }
 
+resolve_local_binary() {
+  [ -n "$LOCAL_BINARY" ] && return 0
+
+  script_dir="$(CDPATH= cd "$(dirname "$0")" 2>/dev/null && pwd || echo /tmp)"
+  for candidate in \
+    "$script_dir/labrelay-linux-$ARCH" \
+    "$script_dir/labrelay-$ARCH-musl" \
+    "$script_dir/labrelay-aarch64-musl" \
+    "$script_dir/labrelay-linux-aarch64" \
+    "/tmp/labrelay-linux-$ARCH" \
+    "/tmp/labrelay-$ARCH-musl" \
+    "/tmp/labrelay-aarch64-musl" \
+    "/tmp/labrelay-linux-aarch64"; do
+    [ -f "$candidate" ] || continue
+    [ -s "$candidate" ] || continue
+    chmod 0755 "$candidate" 2>/dev/null || continue
+    candidate_version="$("$candidate" version 2>/dev/null || "$candidate" --version 2>/dev/null || true)"
+    [ -n "$candidate_version" ] || continue
+
+    LOCAL_BINARY="$candidate"
+    case "$candidate" in
+      "$script_dir"/*) LOCAL_BINARY_SOURCE="安装脚本同目录" ;;
+      /tmp/*) LOCAL_BINARY_SOURCE="/tmp 本地安装包" ;;
+      *) LOCAL_BINARY_SOURCE="本地安装包" ;;
+    esac
+    say "发现本地 Rust Agent：$candidate（$candidate_version）"
+    return 0
+  done
+}
+
 prepare_binary() {
   if [ -n "$LOCAL_BINARY" ]; then
     [ -f "$LOCAL_BINARY" ] || fail "指定的本地 Rust Agent 不存在：$LOCAL_BINARY"
     [ -s "$LOCAL_BINARY" ] || fail "指定的本地 Rust Agent 为空：$LOCAL_BINARY"
-    say "使用本地 Rust Agent：$LOCAL_BINARY"
+    say "使用本地 Rust Agent：$LOCAL_BINARY（来源：${LOCAL_BINARY_SOURCE:-本地文件}）"
     rm -f "$TMP_BIN" "$TMP_SUM"
     cp "$LOCAL_BINARY" "$TMP_BIN" || fail "复制本地 Rust Agent 失败：$LOCAL_BINARY"
     chmod 0755 "$TMP_BIN"
@@ -361,23 +393,41 @@ uninstall_agent() {
 
 [ "$ACTION" = "uninstall" ] && uninstall_agent
 need_root
-ask_yes "是否安装 LabProbe Rust Agent？[Y/n]" Y || exit 0
 detect_arch
+resolve_local_binary
 check_router
-discover_hub
-say "自动发现 Hub：$HUB_URL"
-ask_yes "自动发现的 Hub 是否正确？[Y/n]" Y || fail "已取消；请设置 HUB_URL 后重试"
 
 HOOK_TOKEN_INPUT="${HOOK_TOKEN:-}"
-if [ "$ACTION" = "install" ] || [ "$ACTION" = "configure" ] || ! grep -q '"hookToken"[[:space:]]*:' "$CONFIG" 2>/dev/null; then
-  if [ -z "$HOOK_TOKEN_INPUT" ]; then
-    printf "请输入 Hub HOOK_TOKEN："; read HOOK_TOKEN_INPUT || HOOK_TOKEN_INPUT=""
-  fi
-  [ -n "$HOOK_TOKEN_INPUT" ] || fail "HOOK_TOKEN 不能为空"
-fi
+if [ "$ACTION" = "upgrade" ]; then
+  [ -s "$CONFIG" ] || fail "upgrade 需要现有 $CONFIG；首次安装请使用 install"
+  [ -x "$BIN" ] || fail "upgrade 需要现有 $BIN；首次安装请使用 install"
+  SAVED_HUB_URL="$(sed -n 's/.*"hubUrl"[[:space:]]*:[[:space:]]*"\([^"]*\)".*//p' "$CONFIG" | head -n1)"
+  HUB_URL="${HUB_URL:-$SAVED_HUB_URL}"
+  [ -n "$HUB_URL" ] || fail "现有 Agent 配置缺少 hubUrl，无法执行就地升级"
+  case "$HUB_URL" in
+    http://*|https://*) ;;
+    *) fail "现有 Agent hubUrl 无效：$HUB_URL" ;;
+  esac
+  # Upgrade is intentionally non-destructive: keep the existing Agent config
+  # and only replace the binary/service definition, then run health checks.
+  HOOK_TOKEN_INPUT=""
+  say "升级模式：保留现有 Agent 配置，不重新注册；Hub=$HUB_URL"
+else
+  ask_yes "是否安装 LabProbe Rust Agent？[Y/n]" Y || exit 0
+  discover_hub
+  say "自动发现 Hub：$HUB_URL"
+  ask_yes "自动发现的 Hub 是否正确？[Y/n]" Y || fail "已取消；请设置 HUB_URL 后重试"
 
-say "架构=$ARCH，Hub=$HUB_URL，将安装采集、事件、IPv6、端口映射、重试、日志和开机自启"
-ask_yes "确认安装？[Y/n]" Y || exit 0
+  if [ "$ACTION" = "install" ] || [ "$ACTION" = "configure" ] || ! grep -q '"hookToken"[[:space:]]*:' "$CONFIG" 2>/dev/null; then
+    if [ -z "$HOOK_TOKEN_INPUT" ]; then
+      printf "请输入 Hub HOOK_TOKEN："; read HOOK_TOKEN_INPUT || HOOK_TOKEN_INPUT=""
+    fi
+    [ -n "$HOOK_TOKEN_INPUT" ] || fail "HOOK_TOKEN 不能为空"
+  fi
+
+  say "架构=$ARCH，Hub=$HUB_URL，将安装采集、事件、IPv6、端口映射、重试、日志和开机自启"
+  ask_yes "确认安装？[Y/n]" Y || exit 0
+fi
 
 mkdir -p "$INSTALL_DIR/backups" /tmp/labprobe
 INSTALL_STAGE="备份现有 Agent"
@@ -387,6 +437,7 @@ if [ -n "$LOCAL_BINARY" ]; then
   INSTALL_STAGE="校验本地 ARM64 Agent"
 else
   INSTALL_STAGE="下载并校验 ARM64 Agent"
+  say "未发现可用本地安装包，改用更新仓库：$AGENT_BASE"
 fi
 prepare_binary
 [ -x "$INIT_SCRIPT" ] && "$INIT_SCRIPT" stop >/dev/null 2>&1 || true
@@ -423,7 +474,11 @@ if [ "$0" != "$INSTALL_DIR/labprobe-install.sh" ]; then
   cp "$0" "$INSTALL_DIR/labprobe-install.sh" || rollback
 fi
 chmod 0755 "$INSTALL_DIR/labprobe-install.sh"
-say "安装完成"
+if [ "$ACTION" = "upgrade" ]; then
+  say "升级完成"
+else
+  say "安装完成"
+fi
 "$BIN" status --config "$CONFIG"
 say "诊断：labrelay doctor / status / test-hub"
 command_ack "completed" "Agent 已升级并通过 Relay 与 Hub 校验"
