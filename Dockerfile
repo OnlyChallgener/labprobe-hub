@@ -25,6 +25,7 @@ RUN pip install --no-cache-dir -r /app/requirements.txt \
 
 COPY hub.py /app/hub.py
 COPY hub_entry.py /app/hub_entry.py
+COPY ipv6_neighbor_archive_patch.py /app/ipv6_neighbor_archive_patch.py
 COPY stun_service.py /app/stun_service.py
 COPY stun_port_config_patch.py /app/stun_port_config_patch.py
 COPY wireguard_service.py /app/wireguard_service.py
@@ -72,6 +73,7 @@ COPY scripts/repair_storage.py /app/scripts/repair_storage.py
 RUN python -m py_compile \
         /app/hub.py \
         /app/hub_entry.py \
+        /app/ipv6_neighbor_archive_patch.py \
         /app/stun_service.py \
         /app/stun_port_config_patch.py \
         /app/wireguard_service.py \
@@ -138,7 +140,7 @@ RUN python -m py_compile \
         /app/router_core/service/router_service.py \
         /app/router_core/service/blueprint.py \
         /app/labprobe_storage.py \
-    && python -c "import hub0934_fixes, hub0935_sync_fix, followup_stability_patch, final_stability_patch, labrelay_sync_patch, lab_ddns, lab_ddns_providers, agent_presence_patch, device_history_patch, portmap_persistence_patch, portmap_firewall, stun_port_config_patch, tcp_session_service, router_lite_realtime_patch, router_device_live_sync_patch, router_fast_watchdog_patch, router_build024_fix, router_slow_cache_patch, router_control_scheduler_patch, router_control_actor_patch, router_task_manager_patch, router_config_sync_patch, router.ipv6, hub_realtime_ws, assistant, router_core, router_core.driver.reyee_session, router_core.driver.reyee_rpc, router_core.driver.reyee, router_core.cache.router_cache, router_core.realtime.router_realtime, router_core.service.router_service, router_core.service.blueprint" \
+    && python -c "import hub0934_fixes, hub0935_sync_fix, followup_stability_patch, final_stability_patch, labrelay_sync_patch, lab_ddns, lab_ddns_providers, agent_presence_patch, device_history_patch, portmap_persistence_patch, portmap_firewall, stun_port_config_patch, tcp_session_service, router_lite_realtime_patch, router_device_live_sync_patch, router_fast_watchdog_patch, router_build024_fix, router_slow_cache_patch, router_control_scheduler_patch, router_control_actor_patch, router_task_manager_patch, router_config_sync_patch, ipv6_neighbor_archive_patch, router.ipv6, hub_realtime_ws, assistant, router_core, router_core.driver.reyee_session, router_core.driver.reyee_rpc, router_core.driver.reyee, router_core.cache.router_cache, router_core.realtime.router_realtime, router_core.service.router_service, router_core.service.blueprint" \
     && mkdir -p /app/data /app/config /app/backups /app/logs /app/scripts /app/update-repository/agent \
     && chmod 755 /app/scripts/repair_storage.py /app/agent/install.sh
 
