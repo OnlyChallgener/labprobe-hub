@@ -1,0 +1,101 @@
+name: One-shot installer upgrade fix
+
+on:
+  push:
+    branches:
+      - fix/hub-push-installer-upgrade
+    paths:
+      - .github/workflows/one-shot-installer-upgrade-fix.yml
+
+permissions:
+  contents: write
+
+jobs:
+  patch-validate-commit:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          ref: fix/hub-push-installer-upgrade
+          fetch-depth: 0
+
+      - name: Apply true upgrade and local bundle priority
+        shell: bash
+        env:
+          PATCH_B64: CmZyb20gcGF0aGxpYiBpbXBvcnQgUGF0aAoKcGF0aCA9IFBhdGgoInNjcmlwdHMvbGFicHJvYmUtaW5zdGFsbC5zaCIpCnRleHQgPSBwYXRoLnJlYWRfdGV4dChlbmNvZGluZz0idXRmLTgiKQoKb2xkID0gJ0xPQ0FMX0JJTkFSWT0iJHtMQUJSRUxBWV9CSU5BUlk6LX0iXG5VUERBVEVfUk9PVD0nCm5ldyA9ICdMT0NBTF9CSU5BUlk9IiR7TEFCUkVMQVlfQklOQVJZOi19IlxuTE9DQUxfQklOQVJZX1NPVVJDRT0iIlxuWyAtbiAiJExPQ0FMX0JJTkFSWSIgXSAmJiBMT0NBTF9CSU5BUllfU09VUkNFPSJMQUJSRUxBWV9CSU5BUlkiXG5VUERBVEVfUk9PVD0nCmlmIG9sZCBub3QgaW4gdGV4dDoKICAgIHJhaXNlIFN5c3RlbUV4aXQoIkxPQ0FMX0JJTkFSWSBtYXJrZXIgbm90IGZvdW5kIikKdGV4dCA9IHRleHQucmVwbGFjZShvbGQsIG5ldywgMSkKCm1hcmtlciA9ICcnJ3ByZXBhcmVfYmluYXJ5KCkgewogIGlmIFsgLW4gIiRMT0NBTF9CSU5BUlkiIF07IHRoZW4KJycnCmlmIG1hcmtlciBub3QgaW4gdGV4dDoKICAgIHJhaXNlIFN5c3RlbUV4aXQoInByZXBhcmVfYmluYXJ5IG1hcmtlciBub3QgZm91bmQiKQoKcmVzb2x2ZXIgPSByJycncmVzb2x2ZV9sb2NhbF9iaW5hcnkoKSB7CiAgWyAtbiAiJExPQ0FMX0JJTkFSWSIgXSAmJiByZXR1cm4gMAoKICBzY3JpcHRfZGlyPSIkKENEUEFUSD0gY2QgLS0gIiQoZGlybmFtZSAtLSAiJDAiKSIgMj4vZGV2L251bGwgJiYgcHdkIHx8IGVjaG8gL3RtcCkiCiAgZm9yIGNhbmRpZGF0ZSBpbiBcCiAgICAiJHNjcmlwdF9kaXIvbGFicmVsYXktbGludXgtJEFSQ0giIFwKICAgICIkc2NyaXB0X2Rpci9sYWJyZWxheS0kQVJDSC1tdXNsIiBcCiAgICAiJHNjcmlwdF9kaXIvbGFicmVsYXktYWFyY2g2NC1tdXNsIiBcCiAgICAiJHNjcmlwdF9kaXIvbGFicmVsYXktbGludXgtYWFyY2g2NCIgXAogICAgIi90bXAvbGFicmVsYXktbGludXgtJEFSQ0giIFwKICAgICIv dG1wL2xhYnJlbGF5LSRBUkNILW11c2wiIFwKICAgICIv dG1wL2xhYnJlbGF5LWFhcmNoNjQtbXVzbCIgXAogICAgIi90bXAvbGFicmVsYXktbGludXgtYWFyY2g2NCI7IGRvCiAgICBbIC1mICIkY2FuZGlkYXRlIiBdIHx8IGNvbnRpbnVlCiAgICBbIC1zICIkY2FuZGlkYXRlIiBdIHx8IGNvbnRpbnVlCiAgICBjaG1vZCAwNzU1ICIkY2FuZGlkYXRlIiAyPi9kZXYvbnVsbCB8fCBjb250aW51ZQogICAgY2FuZGlkYXRlX3ZlcnNpb249IiQoIiRjYW5kaWRhdGUiIHZlcnNpb24gMj4vZGV2L251bGwgfHwgIiRjYW5kaWRhdGUiIC0tdmVyc2lvbiAyPi9kZXYvbnVsbCB8fCB0cnVlKSIKICAgIFsgLW4gIiRjYW5kaWRhdGVfdmVyc2lvbiIgXSB8fCBjb250aW51ZQogICAgTE9DQUxfQklOQVJZPSIkY2FuZGlkYXRlIgogICAgaWYgWyAiJGNhbmRpZGF0ZSIgPSAiJHNjcmlwdF9kaXIvJChiYXNlbmFtZSAiJGNhbmRpZGF0ZSIpIiBdOyB0aGVuCiAgICAgIExPQ0FMX0JJTkFSWV9TT1VSQ0U9IuWuieijmuiEmuacrOWQjOebruW9lSIKICAgIGVsc2UKICAgICAgTE9DQUxfQklOQVJZX1NPVVJDRT0iL3RtcCDmnKzlnLDlronoo4XljIUiCiAgICBmaQogICAgc2F5ICLlj5HnjrDmnKzlnLAgUnVzdCBBZ2VudO+8miRjYW5kaWRhdGXvvIjjJGNhbmRpZGF0ZV92ZXJzaW9u77yJIgoKICAgIHJldHVybiAwCiAgZG9uZQp9CgonJycKIyBmaXggYWNjaWRlbnRhbCBzcGFjZXMgaW4gL3RtcCBwYXRocyBmcm9tIHRoZSBleHBsaWNpdCBwYXRjaCBsaXRlcmFsLgpyZXNvbHZlciA9IHJlc29sdmVyLnJlcGxhY2UoJyIvIHRtcC8nLCAnIi90bXAvJykKdGV4dCA9IHRleHQucmVwbGFjZShtYXJrZXIsIHJlc29sdmVyICsgbWFya2VyLCAxKQoKb2xkX2xvY2FsX2xvZyA9ICcgICAgc2F5ICLkvb/nlKjmnKzlnLAgUnVzdCBBZ2VudO+8miRMT0NBTF9CSU5BUlkiXG4nCm5l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 Agent p configuration missing hubUrl, unable to perform in-place upgrade"
+  case "$HUB_URL" in
+    http://*|https://*) ;;
+    *) fail "现有 Agent hubUrl 无效：$HUB_URL" ;;
+  esac
+  # Upgrade is intentionally non-destructive: keep the existing Agent config
+  # and only replace the binary/service definition, then run health checks.
+  HOOK_TOKEN_INPUT=""
+  say "升级模式：保留现有 Agent 配置，不重新注册；Hub=$HUB_URL"
+else
+  ask_yes "是否安装 LabProbe Rust Agent？[Y/n]" Y || exit 0
+  discover_hub
+  say "自动发现 Hub：$HUB_URL"
+  ask_yes "自动发现的 Hub 是否正确？[Y/n]" Y || fail "已取消；请设置 HUB_URL 后重试"
+
+  if [ "$ACTION" = "install" ] || [ "$ACTION" = "configure" ] || ! grep -q '"hookToken"[[:space:]]*:' "$CONFIG" 2>/dev/null; then
+    if [ -z "$HOOK_TOKEN_INPUT" ]; then
+      printf "请输入 Hub HOOK_TOKEN："; read HOOK_TOKEN_INPUT || HOOK_TOKEN_INPUT=""
+    fi
+    [ -n "$HOOK_TOKEN_INPUT" ] || fail "HOOK_TOKEN 不能为空"
+  fi
+
+  say "架构=$ARCH，Hub=$HUB_URL，将安装采集、事件、IPv6、端口映射、重试、日志和开机自启"
+  ask_yes "确认安装？[Y/n]" Y || exit 0
+fi
+
+mkdir -p "$INSTALL_DIR/backups" /tmp/labprobe
+'''
+if main_start not in text:
+    raise SystemExit("main install/upgrade flow marker not found")
+text = text.replace(main_start, main_new, 1)
+
+old_prepare = '''backup_old
+prune_backups
+if [ -n "$LOCAL_BINARY" ]; then
+  INSTALL_STAGE="校验本地 ARM64 Agent"
+else
+  INSTALL_STAGE="下载并校验 ARM64 Agent"
+fi
+prepare_binary
+'''
+new_prepare = '''backup_old
+prune_backups
+resolve_local_binary
+if [ -n "$LOCAL_BINARY" ]; then
+  INSTALL_STAGE="校验本地 ARM64 Agent"
+else
+  INSTALL_STAGE="下载并校验 ARM64 Agent"
+  say "未发现可用本地安装包，改用更新仓库：$AGENT_BASE"
+fi
+prepare_binary
+'''
+if old_prepare not in text:
+    raise SystemExit("prepare flow marker not found")
+text = text.replace(old_prepare, new_prepare, 1)
+
+old_finish = '''chmod 0755 "$INSTALL_DIR/labprobe-install.sh"
+say "安装完成"
+"$BIN" status --config "$CONFIG"
+say "诊断：labrelay doctor / status / test-hub"
+command_ack "completed" "Agent 已升级并通过 Relay 与 Hub 校验"
+'''
+new_finish = '''chmod 0755 "$INSTALL_DIR/labprobe-install.sh"
+if [ "$ACTION" = "upgrade" ]; then
+  say "升级完成"
+else
+  say "安装完成"
+fi
+"$BIN" status --config "$CONFIG"
+say "诊断：labrelay doctor / status / test-hub"
+command_ack "completed" "Agent 已升级并通过 Relay 与 Hub 校验"
+'''
+if old_finish not in text:
+    raise SystemExit("finish marker not found")
+text = text.replace(old_finish, new_finish, 1)
+
+path.write_text(text, encoding="utf-8")
