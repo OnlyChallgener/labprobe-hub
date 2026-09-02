@@ -26,6 +26,7 @@ WS_MESSAGE_TYPES = {"static", "slow", "fast", "recent_wan", "daily_wan", "ping"}
 FAST_START_GRACE_SECONDS = 8.0
 FAST_STALL_SECONDS = 8.0
 FAST_SOCKET_POLL_SECONDS = 1.0
+ROUTER_WS_KEEPALIVE_SECONDS = 5.0
 MAX_ROUTER_RETRY_SECONDS = 2.0
 _MISSING = object()
 
@@ -468,7 +469,7 @@ class RouterWebSocketMonitor:
         return 0
 
     def _keepalive_loop(self, ws: websocket.WebSocket, stop: threading.Event) -> None:
-        while not self._stop.wait(10.0) and not stop.is_set():
+        while not self._stop.is_set() and not stop.wait(ROUTER_WS_KEEPALIVE_SECONDS):
             try:
                 self._send(ws, "keepalive")
             except Exception:
@@ -495,6 +496,14 @@ class RouterWebSocketMonitor:
         ws.settimeout(FAST_SOCKET_POLL_SECONDS)
         connected_at = time.time()
         self._set_connected(True, ws_url)
+        keepalive_stop = threading.Event()
+        keepalive_thread = threading.Thread(
+            target=self._keepalive_loop,
+            args=(ws, keepalive_stop),
+            name="router-eweb-ws-keepalive",
+            daemon=True,
+        )
+        keepalive_thread.start()
         try:
             while not self._stop.is_set():
                 try:
@@ -523,10 +532,12 @@ class RouterWebSocketMonitor:
                 if isinstance(message, dict):
                     self._dispatch_message(message)
         finally:
+            keepalive_stop.set()
             try:
                 ws.close()
             except Exception:
                 pass
+            keepalive_thread.join(timeout=1.0)
 
     def _loop(self) -> None:
         retry = 1.0
