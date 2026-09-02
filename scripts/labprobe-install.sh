@@ -401,7 +401,7 @@ HOOK_TOKEN_INPUT="${HOOK_TOKEN:-}"
 if [ "$ACTION" = "upgrade" ]; then
   [ -s "$CONFIG" ] || fail "upgrade 需要现有 $CONFIG；首次安装请使用 install"
   [ -x "$BIN" ] || fail "upgrade 需要现有 $BIN；首次安装请使用 install"
-  SAVED_HUB_URL="$(sed -n 's/.*"hubUrl"[[:space:]]*:[[:space:]]*"\([^"]*\)".*//p' "$CONFIG" | head -n1)"
+  SAVED_HUB_URL="$(sed -n 's/.*"hubUrl"[[:space:]]*:[[:space:]]*"\([^"]*\)".*/\1/p' "$CONFIG" | head -n1)"
   HUB_URL="${HUB_URL:-$SAVED_HUB_URL}"
   [ -n "$HUB_URL" ] || fail "现有 Agent 配置缺少 hubUrl，无法执行就地升级"
   case "$HUB_URL" in
