@@ -1,0 +1,263 @@
+name: One-shot eWeb keepalive test 20260902
+
+on:
+  push:
+    branches:
+      - fix/hub-push-installer-upgrade
+    paths:
+      - .github/workflows/one-shot-eweb-keepalive-test.yml
+
+permissions:
+  contents: write
+
+jobs:
+  patch-test-publish:
+    runs-on: ubuntu-latest
+    env:
+      PYTHONPATH: ${{ github.workspace }}
+      TEST_TAG: test-bundle/20260902-eweb-keepalive
+      TEST_IMAGE_TAG: test-20260902-eweb-keepalive
+
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          ref: fix/hub-push-installer-upgrade
+          fetch-depth: 0
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.12'
+
+      - name: Patch eWeb websocket keepalive
+        shell: bash
+        run: |
+          set -euo pipefail
+          python3 - <<'PY'
+          from pathlib import Path
+
+          path = Path('router_ws_patch.py')
+          text = path.read_text(encoding='utf-8')
+
+          constants_old = '''FAST_START_GRACE_SECONDS = 8.0
+          FAST_STALL_SECONDS = 8.0
+          FAST_SOCKET_POLL_SECONDS = 1.0
+          MAX_ROUTER_RETRY_SECONDS = 2.0
+          '''.replace('          ', '')
+          constants_new = '''FAST_START_GRACE_SECONDS = 8.0
+          FAST_STALL_SECONDS = 8.0
+          FAST_SOCKET_POLL_SECONDS = 1.0
+          ROUTER_WS_KEEPALIVE_SECONDS = 5.0
+          MAX_ROUTER_RETRY_SECONDS = 2.0
+          '''.replace('          ', '')
+          if 'ROUTER_WS_KEEPALIVE_SECONDS' not in text:
+              if constants_old not in text:
+                  raise SystemExit('router websocket constants anchor not found')
+              text = text.replace(constants_old, constants_new, 1)
+
+          keepalive_old = '''    def _keepalive_loop(self, ws: websocket.WebSocket, stop: threading.Event) -> None:
+              while not self._stop.wait(10.0) and not stop.is_set():
+                  try:
+                      self._send(ws, "keepalive")
+                  except Exception:
+                      stop.set()
+                      try:
+                          ws.close()
+                      except Exception:
+                          pass
+                      return
+          '''.replace('          ', '')
+          keepalive_new = '''    def _keepalive_loop(self, ws: websocket.WebSocket, stop: threading.Event) -> None:
+              while not self._stop.is_set() and not stop.wait(ROUTER_WS_KEEPALIVE_SECONDS):
+                  try:
+                      self._send(ws, "keepalive")
+                  except Exception:
+                      stop.set()
+                      try:
+                          ws.close()
+                      except Exception:
+                          pass
+                      return
+          '''.replace('          ', '')
+          if keepalive_new not in text:
+              if keepalive_old not in text:
+                  raise SystemExit('router websocket keepalive anchor not found')
+              text = text.replace(keepalive_old, keepalive_new, 1)
+
+          start_old = '''        connected_at = time.time()
+                  self._set_connected(True, ws_url)
+                  try:
+          '''.replace('          ', '')
+          start_new = '''        connected_at = time.time()
+                  self._set_connected(True, ws_url)
+                  keepalive_stop = threading.Event()
+                  keepalive_thread = threading.Thread(
+                      target=self._keepalive_loop,
+                      args=(ws, keepalive_stop),
+                      name="router-eweb-ws-keepalive",
+                      daemon=True,
+                  )
+                  keepalive_thread.start()
+                  try:
+          '''.replace('          ', '')
+          if start_new not in text:
+              if start_old not in text:
+                  raise SystemExit('router websocket connection-start anchor not found')
+              text = text.replace(start_old, start_new, 1)
+
+          finish_old = '''        finally:
+                  try:
+                      ws.close()
+                  except Exception:
+                      pass
+          
+              def _loop(self) -> None:
+          '''.replace('          ', '')
+          finish_new = '''        finally:
+                  keepalive_stop.set()
+                  try:
+                      ws.close()
+                  except Exception:
+                      pass
+                  keepalive_thread.join(timeout=1.0)
+          
+              def _loop(self) -> None:
+          '''.replace('          ', '')
+          if finish_new not in text:
+              if finish_old not in text:
+                  raise SystemExit('router websocket connection-finally anchor not found')
+              text = text.replace(finish_old, finish_new, 1)
+
+          path.write_text(text, encoding='utf-8')
+
+          test_path = Path('tests/test_router_ws_patch.py')
+          tests = test_path.read_text(encoding='utf-8')
+          old_import = 'from router_ws_patch import _config_poll_seconds, _first_ssid, _merge_wireless, _normalized_ports\n'
+          new_import = '''import json
+          import logging
+          import threading
+          
+          import pytest
+          
+          import router_ws_patch
+          from router_ws_patch import RouterWebSocketMonitor, _config_poll_seconds, _first_ssid, _merge_wireless, _normalized_ports
+          '''.replace('          ', '')
+          if 'import router_ws_patch' not in tests:
+              if old_import not in tests:
+                  raise SystemExit('router websocket test import anchor not found')
+              tests = tests.replace(old_import, new_import, 1)
+
+          test_name = 'test_eweb_connection_starts_keepalive_sender'
+          if test_name not in tests:
+              tests += '''
+          
+          def test_eweb_connection_starts_keepalive_sender(monkeypatch):
+              sent = []
+              keepalive_sent = threading.Event()
+          
+              class FakeSocket:
+                  def __init__(self):
+                      self.closed = False
+          
+                  def settimeout(self, _value):
+                      return None
+          
+                  def recv(self):
+                      if keepalive_sent.wait(0.5):
+                          return ""
+                      raise AssertionError("keepalive was not sent while websocket recv was idle")
+          
+                  def send(self, payload):
+                      sent.append(json.loads(payload))
+                      keepalive_sent.set()
+          
+                  def close(self):
+                      self.closed = True
+          
+              fake_socket = FakeSocket()
+              monkeypatch.setattr(router_ws_patch, "ROUTER_WS_KEEPALIVE_SECONDS", 0.01)
+              monkeypatch.setattr(router_ws_patch.websocket, "create_connection", lambda *args, **kwargs: fake_socket)
+          
+              monitor = object.__new__(RouterWebSocketMonitor)
+              monitor.logger = logging.getLogger("router-ws-keepalive-test")
+              monitor._lock = threading.RLock()
+              monitor._stop = threading.Event()
+              monitor._last_fast_at = 0.0
+              monitor._connected = False
+              monitor._url = ""
+              monitor._last_error = ""
+              monitor._connected_at = 0.0
+          
+              with pytest.raises(RuntimeError, match="router websocket closed"):
+                  monitor._run_connection(
+                      "ws://router/ws?auth=test",
+                      "http://router",
+                      "sid=test",
+                      False,
+                      "router",
+                  )
+          
+              assert sent[0] == {"action": "keepalive"}
+              assert fake_socket.closed is True
+          
+          
+          def test_eweb_keepalive_interval_stays_below_ten_second_idle_window():
+              assert 0 < router_ws_patch.ROUTER_WS_KEEPALIVE_SECONDS < 10.0
+          '''.replace('          ', '')
+
+          test_path.write_text(tests, encoding='utf-8')
+          PY
+          git diff --check
+
+      - name: Test Hub websocket fix
+        shell: bash
+        run: |
+          set -euo pipefail
+          python -m pip install --upgrade pip
+          python -m pip install -r requirements.txt pytest
+          python -m py_compile router_ws_patch.py hub_entry.py
+          python -m pytest -q
+
+      - name: Commit fix and remove one-shot workflow
+        shell: bash
+        run: |
+          set -euo pipefail
+          git config user.name "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+          git rm .github/workflows/one-shot-eweb-keepalive-test.yml
+          git add router_ws_patch.py tests/test_router_ws_patch.py
+          git diff --cached --check
+          git commit -m "fix(router-ws): keep eWeb websocket alive"
+          git push origin HEAD:fix/hub-push-installer-upgrade
+
+      - uses: docker/setup-qemu-action@v3
+
+      - uses: docker/setup-buildx-action@v3
+
+      - uses: docker/login-action@v3
+        with:
+          username: ${{ secrets.DOCKERHUB_USERNAME }}
+          password: ${{ secrets.DOCKERHUB_TOKEN }}
+
+      - name: Build and push Hub test image
+        uses: docker/build-push-action@v6
+        with:
+          context: .
+          file: ./Dockerfile
+          push: true
+          platforms: linux/amd64,linux/arm64
+          tags: ${{ secrets.DOCKERHUB_USERNAME }}/labprobe-hub:${{ env.TEST_IMAGE_TAG }}
+
+      - name: Publish Hub test prerelease note
+        env:
+          GH_TOKEN: ${{ github.token }}
+          DOCKERHUB_USERNAME: ${{ secrets.DOCKERHUB_USERNAME }}
+        shell: bash
+        run: |
+          set -euo pipefail
+          FIX_SHA="$(git rev-parse HEAD)"
+          NOTES="Hub eWeb /ws keepalive test build.\n\nFix: start a 5-second keepalive sender for each authenticated router websocket connection; stop it with the connection; retain the existing fast-stream stall watchdog and auth recovery.\n\nHub image: ${DOCKERHUB_USERNAME}/labprobe-hub:${TEST_IMAGE_TAG}\nHub commit: ${FIX_SHA}\nRelay: unchanged."
+          if gh release view "$TEST_TAG" >/dev/null 2>&1; then
+            gh release edit "$TEST_TAG" --title "eWeb keepalive test ${TEST_TAG}" --notes "$NOTES" --prerelease
+          else
+            gh release create "$TEST_TAG" --target "$FIX_SHA" --title "eWeb keepalive test ${TEST_TAG}" --notes "$NOTES" --prerelease
+          fi
