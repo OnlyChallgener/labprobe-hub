@@ -1,0 +1,99 @@
+name: One-shot Hub IPv6 neighbor merge test release
+
+on:
+  push:
+    branches:
+      - fix/hub-neighbor-merge-20260902
+    paths:
+      - .github/workflows/one-shot-hub-neighbor-merge.yml
+
+permissions:
+  contents: write
+
+jobs:
+  patch-test-release:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          ref: fix/hub-neighbor-merge-20260902
+          fetch-depth: 0
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.12'
+
+      - name: Apply focused Hub patch
+        shell: bash
+        run: |
+          set -euo pipefail
+          python3 .github/scripts/restore_ipv6_neighbor_merge.py
+          python3 -m py_compile hub.py
+          python3 - <<'PY'
+          import ast
+          from pathlib import Path
+          tree = ast.parse(Path('hub.py').read_text(encoding='utf-8'))
+          defs = {n.name for n in tree.body if isinstance(n, (ast.FunctionDef, ast.AsyncFunctionDef))}
+          calls = [n for n in ast.walk(tree) if isinstance(n, ast.Call) and isinstance(n.func, ast.Name) and n.func.id == 'merge_ipv6_neighbors_to_archive']
+          assert 'merge_ipv6_neighbors_to_archive' in defs
+          assert calls
+          PY
+          git diff --check
+
+      - name: Test Hub runtime
+        shell: bash
+        run: |
+          set -euo pipefail
+          python -m pip install --upgrade pip
+          python -m pip install -r requirements.txt pytest
+          python -m pytest -q
+
+      - name: Commit clean source tree
+        shell: bash
+        run: |
+          set -euo pipefail
+          git config user.name "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+          git rm -f .github/workflows/one-shot-hub-neighbor-merge.yml .github/scripts/restore_ipv6_neighbor_merge.py
+          git add hub.py
+          git commit -m "fix(hub): restore IPv6 neighbor archive merge helper"
+          git push origin HEAD:fix/hub-neighbor-merge-20260902
+
+      - name: Set up QEMU
+        uses: docker/setup-qemu-action@v3
+
+      - name: Set up Docker Buildx
+        uses: docker/setup-buildx-action@v3
+
+      - name: Login to Docker Hub
+        uses: docker/login-action@v3
+        with:
+          username: ${{ secrets.DOCKERHUB_USERNAME }}
+          password: ${{ secrets.DOCKERHUB_TOKEN }}
+
+      - name: Build and push Hub image
+        uses: docker/build-push-action@v6
+        with:
+          context: .
+          file: ./Dockerfile
+          push: true
+          platforms: linux/amd64,linux/arm64
+          tags: |
+            ${{ secrets.DOCKERHUB_USERNAME }}/labprobe-hub:test-20260902-15
+
+      - name: Publish Hub prerelease
+        env:
+          GH_TOKEN: ${{ github.token }}
+        shell: bash
+        run: |
+          set -euo pipefail
+          TAG='test-bundle/20260902-15'
+          cat > "$RUNNER_TEMP/notes.md" <<'EOF'
+          Hub image: onlychallgener/labprobe-hub:test-20260902-15
+
+          修复：
+          - 恢复 merge_ipv6_neighbors_to_archive()，解决 /api/router/push 携带 IPv6 邻居时的 NameError / HTTP 500。
+          - 保留 test-20260902-14 的 IPv6 地址优选与 installer 就地升级修复。
+          - LabRelay/installer 本轮未改，继续使用 0.2.41。
+          EOF
+          gh release create "$TAG" --target "$(git rev-parse HEAD)" --title "Test bundle test-bundle/20260902-15" --notes-file "$RUNNER_TEMP/notes.md" --prerelease
