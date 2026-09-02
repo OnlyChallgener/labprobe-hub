@@ -1,4 +1,4 @@
-name: One-shot installer local binary fix
+name: One-shot installer rollback legacy fix
 
 on:
   push:
@@ -19,21 +19,21 @@ jobs:
           ref: fix/relay-nofile-upgrade-0.2.33-v2
           fetch-depth: 0
 
-      - name: Apply installer fix
-        run: python3 scripts/one_shot_installer_local_binary_fix.py
+      - name: Apply rollback fix
+        run: python3 scripts/one_shot_installer_rollback_legacy_fix.py
 
       - name: Verify installer
         run: |
           sh -n scripts/labprobe-install.sh
+          grep -q 'Never resurrect legacy' scripts/labprobe-install.sh
+          grep -q 'HAD_OLD_INIT' scripts/labprobe-install.sh
           grep -q 'LOCAL_BINARY="${LABRELAY_BINARY:-}"' scripts/labprobe-install.sh
-          grep -q '使用本地 Rust Agent' scripts/labprobe-install.sh
-          grep -q '^prepare_binary$\|^prepare_binary' scripts/labprobe-install.sh
 
-      - name: Commit installer fix
+      - name: Commit rollback fix
         run: |
           git config user.name 'github-actions[bot]'
           git config user.email '41898282+github-actions[bot]@users.noreply.github.com'
           git add scripts/labprobe-install.sh
           git diff --cached --check
-          git commit -m 'fix(installer): honor local LabRelay binary override'
+          git commit -m 'fix(installer): do not resurrect legacy split services on rollback'
           git push origin HEAD:fix/relay-nofile-upgrade-0.2.33-v2
