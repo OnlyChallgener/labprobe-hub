@@ -1785,6 +1785,21 @@ def local_hub_ipv6_records() -> List[Dict[str, Any]]:
         dedup[row["ip"]] = row
     return list(dedup.values())[:24]
 
+
+def configured_nas_macs() -> set:
+    vals: List[str] = []
+    env_raw = host_mac()
+    if env_raw:
+        vals.extend(re.split(r"[\s,;]+", env_raw))
+    for key in ["nas.mac", "nas.macs", "nas.device_mac"]:
+        raw = cfg_get(key, None)
+        if isinstance(raw, list):
+            vals.extend(str(x) for x in raw)
+        elif raw:
+            vals.extend(re.split(r"[\s,;]+", str(raw)))
+
+    return {norm_mac(x) for x in vals if norm_mac(x)}
+
 def attach_hub_local_ipv6_to_nas_devices(devices: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
     """Attach Hub-host IPv6 as the authoritative primary on the NAS device."""
     if not devices:
