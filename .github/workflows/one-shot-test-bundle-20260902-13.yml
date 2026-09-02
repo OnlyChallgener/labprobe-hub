@@ -1,0 +1,187 @@
+name: One-shot Hub and Relay test bundle 20260902-13
+
+on:
+  push:
+    branches:
+      - fix/configured-nas-macs-nameerror
+    paths:
+      - .github/workflows/one-shot-test-bundle-20260902-13.yml
+
+permissions:
+  contents: write
+
+concurrency:
+  group: test-bundle-20260902-13
+  cancel-in-progress: false
+
+env:
+  TEST_ID: 20260902-13
+  TEST_IMAGE_TAG: test-20260902-13
+  TEST_RELEASE_TAG: test-bundle/20260902-13
+
+jobs:
+  hub-docker:
+    if: github.actor != 'github-actions[bot]'
+    runs-on: ubuntu-latest
+    env:
+      PYTHONPATH: ${{ github.workspace }}
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          ref: fix/configured-nas-macs-nameerror
+          fetch-depth: 0
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.12'
+
+      - name: Validate Hub
+        run: |
+          set -euo pipefail
+          python -m pip install --upgrade pip
+          python -m pip install -r requirements.txt pytest
+          python -m py_compile hub.py
+          python -m pytest -q
+
+      - uses: docker/setup-qemu-action@v3
+      - uses: docker/setup-buildx-action@v6
+
+      - name: Login to Docker Hub
+        uses: docker/login-action@v3
+        with:
+          username: ${{ secrets.DOCKERHUB_USERNAME }}
+          password: ${{ secrets.DOCKERHUB_TOKEN }}
+
+      - name: Build and push Hub test image
+        uses: docker/build-push-action@v6
+        with:
+          context: .
+          file: ./Dockerfile
+          push: true
+          platforms: linux/amd64,linux/arm64
+          tags: ${{ secrets.DOCKERHUB_USERNAME }}/labprobe-hub:${{ env.TEST_IMAGE_TAG }}
+
+  labrelay:
+    if: github.actor != 'github-actions[bot]'
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          ref: fix/configured-nas-macs-nameerror
+          fetch-depth: 0
+
+      - name: Read LabRelay version
+        id: version
+        shell: bash
+        run: |
+          set -euo pipefail
+          VERSION="$(sed -n 's/^version = "\([^"]*\)"/\1/p' labrelay/Cargo.toml | head -n 1)"
+          test -n "$VERSION"
+          echo "version=$VERSION" >> "$GITHUB_OUTPUT"
+
+      - name: Test LabRelay
+        run: cargo test --manifest-path labrelay/Cargo.toml --all-targets
+
+      - name: Install cross and QEMU
+        run: |
+          cargo install cross --locked
+          sudo apt-get update
+          sudo apt-get install -y qemu-user-static
+
+      - name: Build static ARM64 router binary
+        env:
+          CARGO_TARGET_DIR: ${{ runner.temp }}/labrelay-cross-target
+        run: cross build --manifest-path labrelay/Cargo.toml --release --target aarch64-unknown-linux-musl
+
+      - name: Verify binary version
+        env:
+          VERSION: ${{ steps.version.outputs.version }}
+        run: |
+          set -euo pipefail
+          BINARY="$RUNNER_TEMP/labrelay-cross-target/aarch64-unknown-linux-musl/release/labrelay"
+          test -x "$BINARY"
+          OUTPUT="$(qemu-aarch64-static "$BINARY" version)"
+          echo "$OUTPUT"
+          test "$OUTPUT" = "labrelay $VERSION"
+
+      - name: Assemble test router bundle
+        env:
+          VERSION: ${{ steps.version.outputs.version }}
+          RELEASE_TAG: ${{ env.TEST_RELEASE_TAG }}
+        run: |
+          set -euo pipefail
+          OUT="$RUNNER_TEMP/agent"
+          BINARY="$RUNNER_TEMP/labrelay-cross-target/aarch64-unknown-linux-musl/release/labrelay"
+          mkdir -p "$OUT"
+          cp "$BINARY" "$OUT/labrelay-linux-arm64"
+          cp scripts/labprobe-install.sh "$OUT/install.sh"
+          chmod 755 "$OUT/labrelay-linux-arm64" "$OUT/install.sh"
+          python3 - <<'PY'
+          import hashlib, json, os
+          from pathlib import Path
+          from urllib.parse import quote
+
+          out = Path(os.environ['RUNNER_TEMP']) / 'agent'
+          version = os.environ['VERSION']
+          tag = os.environ['RELEASE_TAG']
+          encoded_tag = quote(tag, safe='')
+          release_root = f'https://github.com/OnlyChallgener/labprobe-hub/releases/download/{encoded_tag}'
+
+          def item(name):
+              data = (out / name).read_bytes()
+              return {
+                  'url': f'{release_root}/{name}',
+                  'sha256': hashlib.sha256(data).hexdigest(),
+                  'sizeBytes': len(data),
+              }
+
+          manifest = {
+              'schemaVersion': 1,
+              'versionName': version,
+              'channel': 'test',
+              'testBundle': tag,
+              'changelog': 'Hub/Relay test bundle 20260902-13.',
+              'installUrl': f'{release_root}/install.sh',
+              'checksumsUrl': f'{release_root}/checksums.txt',
+              'installer': item('install.sh'),
+              'binaries': {'arm64': item('labrelay-linux-arm64')},
+          }
+          (out / 'latest.json').write_text(json.dumps(manifest, ensure_ascii=False, indent=2) + '\n', encoding='utf-8')
+          names = ['labrelay-linux-arm64', 'install.sh', 'latest.json']
+          (out / 'checksums.txt').write_text('\n'.join(
+              f"{hashlib.sha256((out / n).read_bytes()).hexdigest()}  {n}" for n in names
+          ) + '\n', encoding='utf-8')
+          PY
+          (cd "$OUT" && sha256sum -c checksums.txt)
+          tar -C "$RUNNER_TEMP" -czf "$RUNNER_TEMP/labrelay-test-arm64-v$VERSION.tar.gz" agent
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: labrelay-test-arm64-v${{ steps.version.outputs.version }}-20260902-13
+          path: |
+            ${{ runner.temp }}/agent/**
+            ${{ runner.temp }}/labrelay-test-arm64-v${{ steps.version.outputs.version }}.tar.gz
+          retention-days: 14
+
+      - name: Publish Relay test prerelease
+        env:
+          GH_TOKEN: ${{ github.token }}
+          VERSION: ${{ steps.version.outputs.version }}
+        shell: bash
+        run: |
+          set -euo pipefail
+          OUT="$RUNNER_TEMP/agent"
+          TAG="$TEST_RELEASE_TAG"
+          if gh release view "$TAG" >/dev/null 2>&1; then
+            gh release upload "$TAG" \
+              "$OUT/labrelay-linux-arm64" "$OUT/install.sh" "$OUT/latest.json" "$OUT/checksums.txt" \
+              "$RUNNER_TEMP/labrelay-test-arm64-v$VERSION.tar.gz" --clobber
+          else
+            gh release create "$TAG" \
+              "$OUT/labrelay-linux-arm64" "$OUT/install.sh" "$OUT/latest.json" "$OUT/checksums.txt" \
+              "$RUNNER_TEMP/labrelay-test-arm64-v$VERSION.tar.gz" \
+              --target "$GITHUB_SHA" \
+              --title "LabProbe Hub / LabRelay 测试包 20260902-13" \
+              --notes "测试版：Hub Docker test-20260902-13；LabRelay v$VERSION；包含 configured_nas_macs 修复与当前统一 Agent/Relay 修复基线。不会更新正式 latest。" \
+              --prerelease
+          fi
