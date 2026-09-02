@@ -1,0 +1,34 @@
+name: One-shot IPv6 neighbor archive fix check
+
+on:
+  push:
+    branches:
+      - fix/hub-push-installer-upgrade
+
+permissions:
+  contents: read
+
+jobs:
+  validate:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.12'
+
+      - name: Install test dependencies
+        run: pip install --disable-pip-version-check pytest
+
+      - name: Validate compatibility helper
+        run: |
+          python -m py_compile ipv6_neighbor_archive_patch.py hub_entry.py
+          pytest -q tests/test_ipv6_neighbor_archive_patch.py
+
+      - name: Validate Docker image wiring
+        run: |
+          grep -q 'COPY ipv6_neighbor_archive_patch.py /app/ipv6_neighbor_archive_patch.py' Dockerfile
+          grep -q '/app/ipv6_neighbor_archive_patch.py' Dockerfile
+          grep -q 'install_ipv6_neighbor_archive_patch(hub)' hub_entry.py
+          docker build --pull=false -t labprobe-hub-ipv6-fix-check .
