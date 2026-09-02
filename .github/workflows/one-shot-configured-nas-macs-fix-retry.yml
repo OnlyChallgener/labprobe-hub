@@ -35,23 +35,22 @@ jobs:
           if marker not in text:
               raise SystemExit('attach_hub_local_ipv6_to_nas_devices marker not found')
 
-          helper = r'''
-
-
-def configured_nas_macs() -> set:
-    vals: List[str] = []
-    env_raw = host_mac()
-    if env_raw:
-        vals.extend(re.split(r"[\s,;]+", env_raw))
-    for key in ["nas.mac", "nas.macs", "nas.device_mac"]:
-        raw = cfg_get(key, None)
-        if isinstance(raw, list):
-            vals.extend(str(x) for x in raw)
-        elif raw:
-            vals.extend(re.split(r"[\s,;]+", str(raw)))
-
-    return {norm_mac(x) for x in vals if norm_mac(x)}
-'''
+          helper = (
+              '\n\n'
+              'def configured_nas_macs() -> set:\n'
+              '    vals: List[str] = []\n'
+              '    env_raw = host_mac()\n'
+              '    if env_raw:\n'
+              '        vals.extend(re.split(r"[\\s,;]+", env_raw))\n'
+              '    for key in ["nas.mac", "nas.macs", "nas.device_mac"]:\n'
+              '        raw = cfg_get(key, None)\n'
+              '        if isinstance(raw, list):\n'
+              '            vals.extend(str(x) for x in raw)\n'
+              '        elif raw:\n'
+              '            vals.extend(re.split(r"[\\s,;]+", str(raw)))\n'
+              '\n'
+              '    return {norm_mac(x) for x in vals if norm_mac(x)}\n'
+          )
           path.write_text(text.replace(marker, helper + marker, 1), encoding='utf-8')
           PY
 
