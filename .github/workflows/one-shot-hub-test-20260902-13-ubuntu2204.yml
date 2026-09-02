@@ -15,7 +15,7 @@ jobs:
         with:
           ref: fix/configured-nas-macs-nameerror
       - uses: docker/setup-qemu-action@v3
-      - uses: docker/setup-buildx-action@v6
+      - uses: docker/setup-buildx-action@v3
       - uses: docker/login-action@v3
         with:
           username: ${{ secrets.DOCKERHUB_USERNAME }}
