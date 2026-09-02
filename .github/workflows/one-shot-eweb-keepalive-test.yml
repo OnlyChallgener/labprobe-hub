@@ -97,84 +97,6 @@ jobs:
               text = text.replace(finish_old, finish_new, 1)
 
           path.write_text(text, encoding='utf-8')
-
-          test_path = Path('tests/test_router_ws_patch.py')
-          tests = test_path.read_text(encoding='utf-8')
-          old_import = 'from router_ws_patch import _config_poll_seconds, _first_ssid, _merge_wireless, _normalized_ports\n'
-          new_import = (
-              'import json\n'
-              'import logging\n'
-              'import threading\n'
-              '\n'
-              'import pytest\n'
-              '\n'
-              'import router_ws_patch\n'
-              'from router_ws_patch import RouterWebSocketMonitor, _config_poll_seconds, _first_ssid, _merge_wireless, _normalized_ports\n'
-          )
-          if 'import router_ws_patch' not in tests:
-              if old_import not in tests:
-                  raise SystemExit('router websocket test import anchor not found')
-              tests = tests.replace(old_import, new_import, 1)
-
-          if 'test_eweb_connection_starts_keepalive_sender' not in tests:
-              tests += '''
-
-
-def test_eweb_connection_starts_keepalive_sender(monkeypatch):
-    sent = []
-    keepalive_sent = threading.Event()
-
-    class FakeSocket:
-        def __init__(self):
-            self.closed = False
-
-        def settimeout(self, _value):
-            return None
-
-        def recv(self):
-            if keepalive_sent.wait(0.5):
-                return ""
-            raise AssertionError("keepalive was not sent while websocket recv was idle")
-
-        def send(self, payload):
-            sent.append(json.loads(payload))
-            keepalive_sent.set()
-
-        def close(self):
-            self.closed = True
-
-    fake_socket = FakeSocket()
-    monkeypatch.setattr(router_ws_patch, "ROUTER_WS_KEEPALIVE_SECONDS", 0.01)
-    monkeypatch.setattr(router_ws_patch.websocket, "create_connection", lambda *args, **kwargs: fake_socket)
-
-    monitor = object.__new__(RouterWebSocketMonitor)
-    monitor.logger = logging.getLogger("router-ws-keepalive-test")
-    monitor._lock = threading.RLock()
-    monitor._stop = threading.Event()
-    monitor._last_fast_at = 0.0
-    monitor._connected = False
-    monitor._url = ""
-    monitor._last_error = ""
-    monitor._connected_at = 0.0
-
-    with pytest.raises(RuntimeError, match="router websocket closed"):
-        monitor._run_connection(
-            "ws://router/ws?auth=test",
-            "http://router",
-            "sid=test",
-            False,
-            "router",
-        )
-
-    assert sent[0] == {"action": "keepalive"}
-    assert fake_socket.closed is True
-
-
-def test_eweb_keepalive_interval_stays_below_ten_second_idle_window():
-    assert 0 < router_ws_patch.ROUTER_WS_KEEPALIVE_SECONDS < 10.0
-'''
-
-          test_path.write_text(tests, encoding='utf-8')
           PY
           git diff --check
 
@@ -186,6 +108,61 @@ def test_eweb_keepalive_interval_stays_below_ten_second_idle_window():
           python -m pip install -r requirements.txt pytest
           python -m py_compile router_ws_patch.py hub_entry.py
           python -m pytest -q
+          python3 - <<'PY'
+          import json
+          import logging
+          import threading
+          from unittest.mock import patch
+
+          import router_ws_patch
+          from router_ws_patch import RouterWebSocketMonitor
+
+          assert 0 < router_ws_patch.ROUTER_WS_KEEPALIVE_SECONDS < 10.0
+          sent = []
+          keepalive_sent = threading.Event()
+
+          class FakeSocket:
+              def __init__(self):
+                  self.closed = False
+              def settimeout(self, _value):
+                  return None
+              def recv(self):
+                  if keepalive_sent.wait(0.5):
+                      return ''
+                  raise AssertionError('keepalive was not sent while websocket recv was idle')
+              def send(self, payload):
+                  sent.append(json.loads(payload))
+                  keepalive_sent.set()
+              def close(self):
+                  self.closed = True
+
+          fake_socket = FakeSocket()
+          monitor = object.__new__(RouterWebSocketMonitor)
+          monitor.logger = logging.getLogger('router-ws-keepalive-smoke')
+          monitor._lock = threading.RLock()
+          monitor._stop = threading.Event()
+          monitor._last_fast_at = 0.0
+          monitor._connected = False
+          monitor._url = ''
+          monitor._last_error = ''
+          monitor._connected_at = 0.0
+
+          old_interval = router_ws_patch.ROUTER_WS_KEEPALIVE_SECONDS
+          router_ws_patch.ROUTER_WS_KEEPALIVE_SECONDS = 0.01
+          try:
+              with patch.object(router_ws_patch.websocket, 'create_connection', return_value=fake_socket):
+                  try:
+                      monitor._run_connection('ws://router/ws?auth=test', 'http://router', 'sid=test', False, 'router')
+                  except RuntimeError as exc:
+                      assert 'router websocket closed' in str(exc)
+                  else:
+                      raise AssertionError('connection did not exit after fake socket closed')
+          finally:
+              router_ws_patch.ROUTER_WS_KEEPALIVE_SECONDS = old_interval
+
+          assert sent and sent[0] == {'action': 'keepalive'}
+          assert fake_socket.closed
+          PY
 
       - name: Commit fix and remove one-shot workflow
         shell: bash
@@ -194,7 +171,7 @@ def test_eweb_keepalive_interval_stays_below_ten_second_idle_window():
           git config user.name "github-actions[bot]"
           git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
           git rm .github/workflows/one-shot-eweb-keepalive-test.yml
-          git add router_ws_patch.py tests/test_router_ws_patch.py
+          git add router_ws_patch.py
           git diff --cached --check
           git commit -m "fix(router-ws): keep eWeb websocket alive"
           git push origin HEAD:fix/hub-push-installer-upgrade
