@@ -14,6 +14,7 @@ from hub0935_sync_fix import (
     install_hub0935_device_sync_fix,
 )
 from hub_realtime_ws import install_hub_realtime_ws
+from ipv6_neighbor_archive_patch import install_ipv6_neighbor_archive_patch
 from labrelay_sync_patch import install_labrelay_sync_patch
 from lab_ddns import install_lab_ddns
 from portmap_firewall import install_portmap_firewall
@@ -51,6 +52,7 @@ from router_core.service.blueprint import create_router_blueprint_v1
 PREVIOUS_HUB_VERSION = "0.12.1"
 HUB_VERSION = "0.12.2"
 hub.APP_VERSION = HUB_VERSION
+install_ipv6_neighbor_archive_patch(hub)
 
 # Initialize Router Core Single-Source-of-Truth
 router_config_store = EncryptedRouterConfigStore(Path(hub.CONFIG_DIR))
