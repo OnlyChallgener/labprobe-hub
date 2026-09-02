@@ -21,95 +21,20 @@ jobs:
 
       - name: Restore IPv6 neighbor parser from stable baseline
         shell: bash
+        env:
+          HELPER_B64: CgpkZWYgcGFyc2VfaXB2Nl9uZWlnaGJvcl90ZXh0KHRleHQ6IHN0cikgLT4gTGlzdFtEaWN0W3N0ciwgQW55XV06CiAgICAiIiJQYXJzZSBgaXAgLTYgbmVpZ2ggc2hvd2AgdGV4dCBsaW5lcyBmcm9tIHJvdXRlciBhZ2VudC4iIiIKICAgIG91dDogTGlzdFtEaWN0W3N0ciwgQW55XV0gPSBbXQogICAgZm9yIGxpbmUgaW4gc3RyKHRleHQgb3IgIiIpLnNwbGl0bGluZXMoKToKICAgICAgICByYXcgPSBsaW5lLnN0cmlwKCkKICAgICAgICBpZiBub3QgcmF3OgogICAgICAgICAgICBjb250aW51ZQogICAgICAgIG0gPSByZS5zZWFyY2gociIoP1A8aXA+WzAtOWEtZkEtRjpdezMsfSkoPzovXGQrKT9ccytkZXZccysoP1A8ZGV2PlxTKykuKj9sbGFkZHJccysoP1A8bWFjPlswLTlhLWZBLUY6XXsyfSg/OjpbMC05YS1mQS1GOl17Mn0pezV9KSg/OlxzKyg/UDxzdGF0ZT5bQS1aX10rKSk/IiwgcmF3KQogICAgICAgIGlmIG5vdCBtOgogICAgICAgICAgICBjb250aW51ZQogICAgICAgIG1hYyA9IG5vcm1fbWFjKG0uZ3JvdXAoIm1hYyIpKQogICAgICAgIGlwcyA9IG5vcm1hbGl6ZV9pcHY2X2xpc3QoW20uZ3JvdXAoImlwIildKQogICAgICAgIGlmIG1hYyBhbmQgaXBzOgogICAgICAgICAgICBvdXQuYXBwZW5kKHsibWFjIjogbWFjLCAiaXAiOiBpcHNbMF0sICJzdGF0ZSI6IGNsZWFuX3NhdmVkX3ZhbHVlKG0uZ3JvdXAoInN0YXRlIikpLCAiZGV2IjogY2xlYW5fc2F2ZWRfdmFsdWUobS5ncm91cCgiZGV2IikpLCAic2VlbkF0Ijogbm93X3N0cigpLCAic291cmNlIjogInJvdXRlcl9uZHAifSkKICAgIHJldHVybiBvdXQKCgpkZWYgcGFyc2VfaXB2Nl9uZWlnaGJvcnMocGF5bG9hZDogQW55KSAtPiBMaXN0W0RpY3Rbc3RyLCBBbnldXToKICAgIGlmIG5vdCBpc2luc3RhbmNlKHBheWxvYWQsIGRpY3QpOgogICAgICAgIHJldHVybiBbXQogICAgaXRlbXMgPSBwYXlsb2FkLmdldCgiaXB2Nl9uZWlnaGJvcnMiKSBvciBwYXlsb2FkLmdldCgiaXB2Nk5laWdoYm9ycyIpIG9yIHBheWxvYWQuZ2V0KCJuZHAiKSBvciBwYXlsb2FkLmdldCgibmVpZ2hib3JzIikKICAgIGxlYXNlcyA9IHBheWxvYWQuZ2V0KCJkaGNwdjZfbGVhc2VzIikgb3IgcGF5bG9hZC5nZXQoImRoY3B2NkxlYXNlcyIpIG9yIHBheWxvYWQuZ2V0KCJsZWFzZXMiKSBvciBbXQogICAgdGV4dCA9IHBheWxvYWQuZ2V0KCJpcHY2X25laWdoYm9yc190ZXh0Iikgb3IgcGF5bG9hZC5nZXQoImlwdjZOZWlnaGJvcnNUZXh0Iikgb3IgcGF5bG9hZC5nZXQoImlwNl9uZWlnaCIpIG9yIHBheWxvYWQuZ2V0KCJpcDZOZWlnaCIpIG9yIHBheWxvYWQuZ2V0KCJuZHBUZXh0IikKCiAgICBvdXQ6IExpc3RbRGljdFtzdHIsIEFueV1dID0gW10KICAgIGlmIGlzaW5zdGFuY2UoaXRlbXMsIHN0cik6CiAgICAgICAgb3V0ICs9IHBhcnNlX2lwdjZfbmVpZ2hib3JfdGV4dChpdGVtcykKICAgICAgICBpdGVtcyA9IFtdCiAgICBpZiBpc2luc3RhbmNlKHRleHQsIHN0cik6CiAgICAgICAgb3V0ICs9IHBhcnNlX2lwdjZfbmVpZ2hib3JfdGV4dCh0ZXh0KQogICAgaWYgbm90IGlzaW5zdGFuY2UoaXRlbXMsIGxpc3QpOgogICAgICAgIGl0ZW1zID0gW10KCiAgICBmb3IgaXRlbSBpbiBpdGVtczoKICAgICAgICBpZiBub3QgaXNpbnN0YW5jZShpdGVtLCBkaWN0KToKICAgICAgICAgICAgY29udGludWUKICAgICAgICBtYWMgPSBub3JtX21hYyhpdGVtLmdldCgibWFjIikgb3IgaXRlbS5nZXQoImxsYWRkciIpIG9yIGl0ZW0uZ2V0KCJsaW5rTGF5ZXJBZGRyZXNzIikpCiAgICAgICAgaXAgPSBjbGVhbl9zYXZlZF92YWx1ZShpdGVtLmdldCgiaXAiKSBvciBpdGVtLmdldCgiaXB2NiIpIG9yIGl0ZW0uZ2V0KCJhZGRyZXNzIikgb3IgaXRlbS5nZXQoImFkZHIiKSkKICAgICAgICBpcHMgPSBub3JtYWxpemVfaXB2Nl9saXN0KFtpcF0pCiAgICAgICAgaWYgbWFjIGFuZCBpcHM6CiAgICAgICAgICAgIG91dC5hcHBlbmQoewogICAgICAgICAgICAgICAgIm1hYyI6IG1hYywKICAgICAgICAgICAgICAgICJpcCI6IGlwc1swXSwKICAgICAgICAgICAgICAgICJzdGF0ZSI6IGNsZWFuX3NhdmVkX3ZhbHVlKGl0ZW0uZ2V0KCJzdGF0ZSIpKSwKICAgICAgICAgICAgICAgICJkZXYiOiBjbGVhbl9zYXZlZF92YWx1ZShpdGVtLmdldCgiZGV2Iikgb3IgaXRlbS5nZXQoImlmYWNlIikgb3IgaXRlbS5nZXQoImlmbmFtZSIpKSwKICAgICAgICAgICAgICAgICJzZWVuQXQiOiBjbGVhbl9zYXZlZF92YWx1ZShpdGVtLmdldCgic2VlbkF0Iikgb3IgaXRlbS5nZXQoImNvbGxlY3RlZEF0IikpIG9yIG5vd19zdHIoKSwKICAgICAgICAgICAgICAgICJzb3VyY2UiOiBjbGVhbl9zYXZlZF92YWx1ZShpdGVtLmdldCgic291cmNlIikpIG9yICJyb3V0ZXJfbmRwIiwKICAgICAgICAgICAgfSkKCiAgICBpZiBpc2luc3RhbmNlKGxlYXNlcywgbGlzdCk6CiAgICAgICAgZm9yIGl0ZW0gaW4gbGVhc2VzOgogICAgICAgICAgICBpZiBub3QgaXNpbnN0YW5jZShpdGVtLCBkaWN0KToKICAgICAgICAgICAgICAgIGNvbnRpbnVlCiAgICAgICAgICAgIG1hYyA9IG5vcm1fbWFjKGl0ZW0uZ2V0KCJtYWMiKSBvciBpdGVtLmdldCgiZHVpZE1hYyIpIG9yIGl0ZW0uZ2V0KCJsbGFkZHIiKSkKICAgICAgICAgICAgaXAgPSBjbGVhbl9zYXZlZF92YWx1ZShpdGVtLmdldCgiaXAiKSBvciBpdGVtLmdldCgiaXB2NiIpIG9yIGl0ZW0uZ2V0KCJhZGRyZXNzIikgb3IgaXRlbS5nZXQoImFkZHIiKSkKICAgICAgICAgICAgaXBzID0gbm9ybWFsaXplX2lwdjZfbGlzdChbaXBdKQogICAgICAgICAgICBpZiBtYWMgYW5kIGlwczoKICAgICAgICAgICAgICAgIG91dC5hcHBlbmQoewogICAgICAgICAgICAgICAgICAgICJtYWMiOiBtYWMsCiAgICAgICAgICAgICAgICAgICAgImlwIjogaXBzWzBdLAogICAgICAgICAgICAgICAgICAgICJzdGF0ZSI6IGNsZWFuX3NhdmVkX3ZhbHVlKGl0ZW0uZ2V0KCJzdGF0ZSIpKSBvciAiTEVBU0VEIiwKICAgICAgICAgICAgICAgICAgICAiZGV2IjogY2xlYW5fc2F2ZWRfdmFsdWUoaXRlbS5nZXQoImRldiIpIG9yIGl0ZW0uZ2V0KCJpZmFjZSIpIG9yIGl0ZW0uZ2V0KCJpZm5hbWUiKSkgb3IgImRoY3B2NiIsCiAgICAgICAgICAgICAgICAgICAgInNlZW5BdCI6IGNsZWFuX3NhdmVkX3ZhbHVlKGl0ZW0uZ2V0KCJzZWVuQXQiKSBvciBpdGVtLmdldCgiY29sbGVjdGVkQXQiKSkgb3Igbm93X3N0cigpLAogICAgICAgICAgICAgICAgICAgICJzb3VyY2UiOiAiZGhjcHY2X2xlYXNlIiwKICAgICAgICAgICAgICAgIH0pCgogICAgZGVkdXA6IERpY3Rbc3RyLCBEaWN0W3N0ciwgQW55XV0gPSB7fQogICAgZm9yIG4gaW4gb3V0OgogICAgICAgIGtleSA9IGYie25vcm1fbWFjKG4uZ2V0KCdtYWMnKSl9fHtjbGVhbl9zYXZlZF92YWx1ZShuLmdldCgnaXAnKSl9IgogICAgICAgIGlmIGtleS5zdHJpcCgifCIpOgogICAgICAgICAgICBkZWR1cFtrZXldID0gbgogICAgcmV0dXJuIGxpc3QoZGVkdXAudmFsdWVzKCkpCg==
         run: |
           python3 - <<'PY'
+          import base64, os
           from pathlib import Path
-
           path = Path('hub.py')
           text = path.read_text(encoding='utf-8')
           if 'def parse_ipv6_neighbors(' in text:
               raise SystemExit('parse_ipv6_neighbors already exists; refusing duplicate patch')
-
           marker = '\ndef attach_hub_local_ipv6_to_nas_devices(devices: List[Dict[str, Any]]) -> List[Dict[str, Any]]:'
           if marker not in text:
               raise SystemExit('attach_hub_local_ipv6_to_nas_devices marker not found')
-
-          helper = r'''
-
-
-def parse_ipv6_neighbor_text(text: str) -> List[Dict[str, Any]]:
-    """Parse `ip -6 neigh show` text lines from router agent."""
-    out: List[Dict[str, Any]] = []
-    for line in str(text or "").splitlines():
-        raw = line.strip()
-        if not raw:
-            continue
-        m = re.search(r"(?P<ip>[0-9a-fA-F:]{3,})(?:/\d+)?\s+dev\s+(?P<dev>\S+).*?lladdr\s+(?P<mac>[0-9a-fA-F:]{2}(?::[0-9a-fA-F:]{2}){5})(?:\s+(?P<state>[A-Z_]+))?", raw)
-        if not m:
-            continue
-        mac = norm_mac(m.group("mac"))
-        ips = normalize_ipv6_list([m.group("ip")])
-        if mac and ips:
-            out.append({"mac": mac, "ip": ips[0], "state": clean_saved_value(m.group("state")), "dev": clean_saved_value(m.group("dev")), "seenAt": now_str(), "source": "router_ndp"})
-    return out
-
-
-def parse_ipv6_neighbors(payload: Any) -> List[Dict[str, Any]]:
-    if not isinstance(payload, dict):
-        return []
-    items = payload.get("ipv6_neighbors") or payload.get("ipv6Neighbors") or payload.get("ndp") or payload.get("neighbors")
-    leases = payload.get("dhcpv6_leases") or payload.get("dhcpv6Leases") or payload.get("leases") or []
-    text = payload.get("ipv6_neighbors_text") or payload.get("ipv6NeighborsText") or payload.get("ip6_neigh") or payload.get("ip6Neigh") or payload.get("ndpText")
-
-    out: List[Dict[str, Any]] = []
-    if isinstance(items, str):
-        out += parse_ipv6_neighbor_text(items)
-        items = []
-    if isinstance(text, str):
-        out += parse_ipv6_neighbor_text(text)
-    if not isinstance(items, list):
-        items = []
-
-    for item in items:
-        if not isinstance(item, dict):
-            continue
-        mac = norm_mac(item.get("mac") or item.get("lladdr") or item.get("linkLayerAddress"))
-        ip = clean_saved_value(item.get("ip") or item.get("ipv6") or item.get("address") or item.get("addr"))
-        ips = normalize_ipv6_list([ip])
-        if mac and ips:
-            out.append({
-                "mac": mac,
-                "ip": ips[0],
-                "state": clean_saved_value(item.get("state")),
-                "dev": clean_saved_value(item.get("dev") or item.get("iface") or item.get("ifname")),
-                "seenAt": clean_saved_value(item.get("seenAt") or item.get("collectedAt")) or now_str(),
-                "source": clean_saved_value(item.get("source")) or "router_ndp",
-            })
-
-    if isinstance(leases, list):
-        for item in leases:
-            if not isinstance(item, dict):
-                continue
-            mac = norm_mac(item.get("mac") or item.get("duidMac") or item.get("lladdr"))
-            ip = clean_saved_value(item.get("ip") or item.get("ipv6") or item.get("address") or item.get("addr"))
-            ips = normalize_ipv6_list([ip])
-            if mac and ips:
-                out.append({
-                    "mac": mac,
-                    "ip": ips[0],
-                    "state": clean_saved_value(item.get("state")) or "LEASED",
-                    "dev": clean_saved_value(item.get("dev") or item.get("iface") or item.get("ifname")) or "dhcpv6",
-                    "seenAt": clean_saved_value(item.get("seenAt") or item.get("collectedAt")) or now_str(),
-                    "source": "dhcpv6_lease",
-                })
-
-    dedup: Dict[str, Dict[str, Any]] = {}
-    for n in out:
-        key = f"{norm_mac(n.get('mac'))}|{clean_saved_value(n.get('ip'))}"
-        if key.strip("|"):
-            dedup[key] = n
-    return list(dedup.values())
-'''
+          helper = base64.b64decode(os.environ['HELPER_B64']).decode('utf-8')
           path.write_text(text.replace(marker, helper + marker, 1), encoding='utf-8')
           PY
 
