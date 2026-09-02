@@ -1800,6 +1800,80 @@ def configured_nas_macs() -> set:
 
     return {norm_mac(x) for x in vals if norm_mac(x)}
 
+
+def parse_ipv6_neighbor_text(text: str) -> List[Dict[str, Any]]:
+    """Parse `ip -6 neigh show` text lines from router agent."""
+    out: List[Dict[str, Any]] = []
+    for line in str(text or "").splitlines():
+        raw = line.strip()
+        if not raw:
+            continue
+        m = re.search(r"(?P<ip>[0-9a-fA-F:]{3,})(?:/\d+)?\s+dev\s+(?P<dev>\S+).*?lladdr\s+(?P<mac>[0-9a-fA-F:]{2}(?::[0-9a-fA-F:]{2}){5})(?:\s+(?P<state>[A-Z_]+))?", raw)
+        if not m:
+            continue
+        mac = norm_mac(m.group("mac"))
+        ips = normalize_ipv6_list([m.group("ip")])
+        if mac and ips:
+            out.append({"mac": mac, "ip": ips[0], "state": clean_saved_value(m.group("state")), "dev": clean_saved_value(m.group("dev")), "seenAt": now_str(), "source": "router_ndp"})
+    return out
+
+
+def parse_ipv6_neighbors(payload: Any) -> List[Dict[str, Any]]:
+    if not isinstance(payload, dict):
+        return []
+    items = payload.get("ipv6_neighbors") or payload.get("ipv6Neighbors") or payload.get("ndp") or payload.get("neighbors")
+    leases = payload.get("dhcpv6_leases") or payload.get("dhcpv6Leases") or payload.get("leases") or []
+    text = payload.get("ipv6_neighbors_text") or payload.get("ipv6NeighborsText") or payload.get("ip6_neigh") or payload.get("ip6Neigh") or payload.get("ndpText")
+
+    out: List[Dict[str, Any]] = []
+    if isinstance(items, str):
+        out += parse_ipv6_neighbor_text(items)
+        items = []
+    if isinstance(text, str):
+        out += parse_ipv6_neighbor_text(text)
+    if not isinstance(items, list):
+        items = []
+
+    for item in items:
+        if not isinstance(item, dict):
+            continue
+        mac = norm_mac(item.get("mac") or item.get("lladdr") or item.get("linkLayerAddress"))
+        ip = clean_saved_value(item.get("ip") or item.get("ipv6") or item.get("address") or item.get("addr"))
+        ips = normalize_ipv6_list([ip])
+        if mac and ips:
+            out.append({
+                "mac": mac,
+                "ip": ips[0],
+                "state": clean_saved_value(item.get("state")),
+                "dev": clean_saved_value(item.get("dev") or item.get("iface") or item.get("ifname")),
+                "seenAt": clean_saved_value(item.get("seenAt") or item.get("collectedAt")) or now_str(),
+                "source": clean_saved_value(item.get("source")) or "router_ndp",
+            })
+
+    if isinstance(leases, list):
+        for item in leases:
+            if not isinstance(item, dict):
+                continue
+            mac = norm_mac(item.get("mac") or item.get("duidMac") or item.get("lladdr"))
+            ip = clean_saved_value(item.get("ip") or item.get("ipv6") or item.get("address") or item.get("addr"))
+            ips = normalize_ipv6_list([ip])
+            if mac and ips:
+                out.append({
+                    "mac": mac,
+                    "ip": ips[0],
+                    "state": clean_saved_value(item.get("state")) or "LEASED",
+                    "dev": clean_saved_value(item.get("dev") or item.get("iface") or item.get("ifname")) or "dhcpv6",
+                    "seenAt": clean_saved_value(item.get("seenAt") or item.get("collectedAt")) or now_str(),
+                    "source": "dhcpv6_lease",
+                })
+
+    dedup: Dict[str, Dict[str, Any]] = {}
+    for n in out:
+        key = f"{norm_mac(n.get('mac'))}|{clean_saved_value(n.get('ip'))}"
+        if key.strip("|"):
+            dedup[key] = n
+    return list(dedup.values())
+
 def attach_hub_local_ipv6_to_nas_devices(devices: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
     """Attach Hub-host IPv6 as the authoritative primary on the NAS device."""
     if not devices:
