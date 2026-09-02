@@ -1,0 +1,150 @@
+name: One-shot publish Hub and Relay test bundle 20260902-16
+
+on:
+  push:
+    branches:
+      - fix/hub-push-installer-upgrade
+    paths:
+      - .github/workflows/one-shot-publish-test-20260902-16.yml
+
+permissions:
+  contents: write
+
+jobs:
+  hub-docker:
+    runs-on: ubuntu-latest
+    env:
+      PYTHONPATH: ${{ github.workspace }}
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.12'
+
+      - name: Validate Hub fix
+        run: |
+          set -euo pipefail
+          python -m pip install --upgrade pip
+          python -m pip install -r requirements.txt pytest
+          python -m pytest -q tests/test_ipv6_neighbor_archive_patch.py tests/test_hub_sync.py
+          python -m py_compile hub.py hub_entry.py ipv6_neighbor_archive_patch.py
+          sh -n scripts/labprobe-install.sh
+          grep -q 'install_ipv6_neighbor_archive_patch(hub)' hub_entry.py
+          grep -q 'COPY ipv6_neighbor_archive_patch.py /app/ipv6_neighbor_archive_patch.py' Dockerfile
+
+      - uses: docker/setup-qemu-action@v3
+
+      - uses: docker/setup-buildx-action@v3
+
+      - uses: docker/login-action@v3
+        with:
+          username: ${{ secrets.DOCKERHUB_USERNAME }}
+          password: ${{ secrets.DOCKERHUB_TOKEN }}
+
+      - name: Build and push Hub test image
+        uses: docker/build-push-action@v6
+        with:
+          context: .
+          file: ./Dockerfile
+          push: true
+          platforms: linux/amd64,linux/arm64
+          tags: ${{ secrets.DOCKERHUB_USERNAME }}/labprobe-hub:test-20260902-16
+
+  labrelay-publish:
+    needs: hub-docker
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Verify LabRelay and installer
+        shell: bash
+        run: |
+          set -euo pipefail
+          VERSION="$(sed -n 's/^version = "\([^"]*\)"/\1/p' labrelay/Cargo.toml | head -n1)"
+          test "$VERSION" = '0.2.41'
+          sh -n scripts/labprobe-install.sh
+          echo "VERSION=$VERSION" >> "$GITHUB_ENV"
+
+      - name: Test LabRelay
+        run: cargo test --manifest-path labrelay/Cargo.toml --all-targets
+
+      - name: Install cross and QEMU
+        run: |
+          cargo install cross --locked
+          sudo apt-get update
+          sudo apt-get install -y qemu-user-static
+
+      - name: Build static ARM64 router binary
+        env:
+          CARGO_TARGET_DIR: ${{ runner.temp }}/labrelay-cross-target
+        run: cross build --manifest-path labrelay/Cargo.toml --release --target aarch64-unknown-linux-musl
+
+      - name: Verify binary self-reported version
+        shell: bash
+        run: |
+          set -euo pipefail
+          BINARY="$RUNNER_TEMP/labrelay-cross-target/aarch64-unknown-linux-musl/release/labrelay"
+          test -x "$BINARY"
+          OUTPUT="$(qemu-aarch64-static "$BINARY" version)"
+          printf '%s\n' "$OUTPUT"
+          test "$OUTPUT" = "labrelay $VERSION"
+
+      - name: Assemble test bundle
+        shell: bash
+        run: |
+          set -euo pipefail
+          OUT="$RUNNER_TEMP/agent"
+          BINARY="$RUNNER_TEMP/labrelay-cross-target/aarch64-unknown-linux-musl/release/labrelay"
+          mkdir -p "$OUT"
+          cp "$BINARY" "$OUT/labrelay-linux-arm64"
+          cp scripts/labprobe-install.sh "$OUT/install.sh"
+          chmod 755 "$OUT/labrelay-linux-arm64" "$OUT/install.sh"
+          RELEASE_TAG='test-bundle/20260902-16'
+          export RELEASE_TAG VERSION OUT
+          python3 - <<'PY'
+          import hashlib, json, os
+          from pathlib import Path
+          out = Path(os.environ['OUT'])
+          version = os.environ['VERSION']
+          release_tag = os.environ['RELEASE_TAG']
+          release_root = f'https://github.com/OnlyChallgener/labprobe-hub/releases/download/{release_tag}'
+          public_root = 'https://lab.net86.dynv6.net:27772/agent'
+          def metadata(name):
+              data = (out / name).read_bytes()
+              return {'url': f'{release_root}/{name}', 'fallbackUrl': f'{public_root}/{name}', 'sha256': hashlib.sha256(data).hexdigest(), 'sizeBytes': len(data)}
+          manifest = {
+              'schemaVersion': 1,
+              'versionName': version,
+              'changelog': 'Test bundle 20260902-16: restore Hub IPv6 neighbor archive helper used by /api/router/push; keep Relay 0.2.41 and installer unchanged.',
+              'installUrl': f'{release_root}/install.sh',
+              'checksumsUrl': f'{release_root}/checksums.txt',
+              'installer': metadata('install.sh'),
+              'binaries': {'arm64': metadata('labrelay-linux-arm64')},
+          }
+          (out / 'latest.json').write_text(json.dumps(manifest, ensure_ascii=False, indent=2) + '\n', encoding='utf-8')
+          names = ['labrelay-linux-arm64', 'install.sh', 'latest.json']
+          (out / 'checksums.txt').write_text('\n'.join(f"{hashlib.sha256((out / name).read_bytes()).hexdigest()}  {name}" for name in names) + '\n', encoding='utf-8')
+          PY
+          (cd "$OUT" && sha256sum -c checksums.txt)
+          tar -C "$RUNNER_TEMP" -czf "$RUNNER_TEMP/labrelay-test-arm64-v$VERSION.tar.gz" agent
+
+      - name: Publish prerelease
+        env:
+          GH_TOKEN: ${{ github.token }}
+          DOCKERHUB_USERNAME: ${{ secrets.DOCKERHUB_USERNAME }}
+        shell: bash
+        run: |
+          set -euo pipefail
+          TAG='test-bundle/20260902-16'
+          gh release create "$TAG" \
+            "$RUNNER_TEMP/agent/labrelay-linux-arm64#LabRelay ARM64 v$VERSION" \
+            "$RUNNER_TEMP/agent/install.sh#LabProbe installer" \
+            "$RUNNER_TEMP/agent/latest.json#Agent manifest" \
+            "$RUNNER_TEMP/agent/checksums.txt#Checksums" \
+            "$RUNNER_TEMP/labrelay-test-arm64-v$VERSION.tar.gz#LabRelay test bundle" \
+            --repo "$GITHUB_REPOSITORY" \
+            --target "$GITHUB_SHA" \
+            --title 'Test bundle test-bundle/20260902-16' \
+            --notes "Hub image: ${DOCKERHUB_USERNAME}/labprobe-hub:test-20260902-16\nHub fix: /api/router/push no longer crashes when IPv6 neighbor telemetry arrives.\nLabRelay: 0.2.41 (unchanged).\nInstaller: unchanged." \
+            --prerelease
