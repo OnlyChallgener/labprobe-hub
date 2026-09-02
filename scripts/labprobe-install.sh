@@ -12,6 +12,7 @@ RELAY_CONFIG="$INSTALL_DIR/relay.json"
 INIT_SCRIPT="/etc/init.d/labprobe"
 TMP_BIN="/tmp/labrelay.new"
 TMP_SUM="/tmp/labrelay.new.sha256"
+LOCAL_BINARY="${LABRELAY_BINARY:-}"
 UPDATE_ROOT="${LABPROBE_UPDATE_ROOT:-https://lab.net86.dynv6.net:27772}"
 case "${LABPROBE_AGENT_BASE:-$UPDATE_ROOT}" in
   */releases/download/*) AGENT_BASE="${LABPROBE_AGENT_BASE:-${UPDATE_ROOT%/}}" ;;
@@ -160,6 +161,24 @@ download_binary() {
   [ -n "$expected" ] && [ "$expected" = "$actual" ] || fail "SHA256校验失败：下载文件可能不完整或已被修改"
   say "SHA256校验通过：$actual"
   chmod 0755 "$TMP_BIN"
+}
+
+prepare_binary() {
+  if [ -n "$LOCAL_BINARY" ]; then
+    [ -f "$LOCAL_BINARY" ] || fail "指定的本地 Rust Agent 不存在：$LOCAL_BINARY"
+    [ -s "$LOCAL_BINARY" ] || fail "指定的本地 Rust Agent 为空：$LOCAL_BINARY"
+    say "使用本地 Rust Agent：$LOCAL_BINARY"
+    rm -f "$TMP_BIN" "$TMP_SUM"
+    cp "$LOCAL_BINARY" "$TMP_BIN" || fail "复制本地 Rust Agent 失败：$LOCAL_BINARY"
+    chmod 0755 "$TMP_BIN"
+    local_version="$("$TMP_BIN" version 2>/dev/null || "$TMP_BIN" --version 2>/dev/null || true)"
+    [ -n "$local_version" ] || fail "指定的本地文件不是可运行的 LabRelay：$LOCAL_BINARY"
+    actual="$(sha256sum "$TMP_BIN" | awk '{print $1}')"
+    say "本地 Rust Agent 已校验：$local_version"
+    say "本地 Rust Agent SHA256：$actual"
+    return 0
+  fi
+  download_binary
 }
 
 backup_old() {
@@ -355,8 +374,12 @@ mkdir -p "$INSTALL_DIR/backups" /tmp/labprobe
 INSTALL_STAGE="备份现有 Agent"
 backup_old
 prune_backups
-INSTALL_STAGE="下载并校验 ARM64 Agent"
-download_binary
+if [ -n "$LOCAL_BINARY" ]; then
+  INSTALL_STAGE="校验本地 ARM64 Agent"
+else
+  INSTALL_STAGE="下载并校验 ARM64 Agent"
+fi
+prepare_binary
 [ -x "$INIT_SCRIPT" ] && "$INIT_SCRIPT" stop >/dev/null 2>&1 || true
 INSTALL_STAGE="替换 Agent 程序"
 cp "$TMP_BIN" "$BIN" || rollback
