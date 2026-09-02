@@ -1,0 +1,47 @@
+name: One-shot Relay 0.2.42 hotfix
+
+on:
+  push:
+    branches:
+      - fix/relay-nofile-upgrade-0.2.33-v2
+    paths:
+      - .github/workflows/one-shot-relay-0242-hotfix.yml
+
+permissions:
+  contents: write
+
+jobs:
+  patch:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          ref: fix/relay-nofile-upgrade-0.2.33-v2
+          fetch-depth: 0
+
+      - name: Apply focused hotfix
+        run: python3 scripts/one_shot_relay_0242_hotfix.py
+
+      - name: Test LabRelay
+        run: cargo test --manifest-path labrelay/Cargo.toml --all-targets
+
+      - name: Test Hub update and relay contracts
+        run: |
+          python3 -m pip install -q -r requirements.txt pytest
+          python3 -m pytest -q tests/test_tcp_session_service.py tests/test_stun_service.py tests/test_stun_middle_port_wiring.py tests/test_agent_release_fallback.py
+
+      - name: Verify installer regression guard
+        run: |
+          sh -n scripts/labprobe-install.sh
+          grep -q 'WARNING: Relay FD 上限低于 65536' scripts/labprobe-install.sh
+          ! grep -q 'verify_relay_nofile ||.*rollback' scripts/labprobe-install.sh
+          grep -q 'AGENT_GITHUB_MANIFEST_URL, AGENT_MANIFEST_URL' hub.py
+
+      - name: Commit hotfix
+        run: |
+          git config user.name 'github-actions[bot]'
+          git config user.email '41898282+github-actions[bot]@users.noreply.github.com'
+          git add hub.py scripts/labprobe-install.sh labrelay/Cargo.toml labrelay/Cargo.lock labrelay/src/main.rs
+          git diff --cached --check
+          git commit -m 'fix(relay): keep daemon online when nofile raise fails'
+          git push origin HEAD:fix/relay-nofile-upgrade-0.2.33-v2
