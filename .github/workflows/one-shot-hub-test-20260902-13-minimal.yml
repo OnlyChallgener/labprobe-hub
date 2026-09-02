@@ -1,0 +1,29 @@
+name: One-shot minimal Hub test image 20260902-13
+
+on:
+  push:
+    branches:
+      - fix/configured-nas-macs-nameerror
+    paths:
+      - .github/workflows/one-shot-hub-test-20260902-13-minimal.yml
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          ref: fix/configured-nas-macs-nameerror
+      - uses: docker/setup-qemu-action@v3
+      - uses: docker/setup-buildx-action@v6
+      - uses: docker/login-action@v3
+        with:
+          username: ${{ secrets.DOCKERHUB_USERNAME }}
+          password: ${{ secrets.DOCKERHUB_TOKEN }}
+      - uses: docker/build-push-action@v6
+        with:
+          context: .
+          file: ./Dockerfile
+          push: true
+          platforms: linux/amd64,linux/arm64
+          tags: ${{ secrets.DOCKERHUB_USERNAME }}/labprobe-hub:test-20260902-13
