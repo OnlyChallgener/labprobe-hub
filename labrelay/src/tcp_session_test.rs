@@ -19,7 +19,7 @@ const EXTREME_CONNECTION_TARGET: usize = 64_000;
 const EXTREME_FD_RESERVE: usize = 256;
 const EXTREME_CONNTRACK_RESERVE: usize = 512;
 const EXTREME_SOURCE_PORT_RESERVE: usize = 64;
-const EXTREME_MEMORY_FLOOR_MB: usize = 96;
+const EXTREME_MEMORY_FLOOR_MB: usize = 150;
 const EXTREME_CONNTRACK_MAX: usize = 131_072;
 const MIN_PENDING_CONNECTS: usize = 256;
 const MAX_PENDING_CONNECTS: usize = 1_024;
@@ -255,6 +255,63 @@ pub(crate) fn restore_stale_extreme_port_range() -> Result<()> {
     fs::remove_file(backup).context("清理极限模式恢复信息失败")?;
     Ok(())
 }
+
+struct ExtremeNoTrackGuard {
+    target: SocketAddr,
+    active: bool,
+}
+
+impl ExtremeNoTrackGuard {
+    fn activate(target: SocketAddr) -> Self {
+        let ip = target.ip().to_string();
+        let port = target.port().to_string();
+        let cmd = if target.is_ipv6() { "ip6tables" } else { "iptables" };
+
+        let _ = std::process::Command::new(cmd)
+            .args(["-t", "raw", "-D", "OUTPUT", "-p", "tcp", "-d", &ip, "--dport", &port, "-j", "NOTRACK", "-m", "comment", "--comment", "labprobe-peak"])
+            .output();
+        let _ = std::process::Command::new(cmd)
+            .args(["-t", "raw", "-D", "PREROUTING", "-p", "tcp", "-s", &ip, "--sport", &port, "-j", "NOTRACK", "-m", "comment", "--comment", "labprobe-peak"])
+            .output();
+
+        let out_res = std::process::Command::new(cmd)
+            .args(["-t", "raw", "-I", "OUTPUT", "-p", "tcp", "-d", &ip, "--dport", &port, "-j", "NOTRACK", "-m", "comment", "--comment", "labprobe-peak"])
+            .output();
+        let pre_res = std::process::Command::new(cmd)
+            .args(["-t", "raw", "-I", "PREROUTING", "-p", "tcp", "-s", &ip, "--sport", &port, "-j", "NOTRACK", "-m", "comment", "--comment", "labprobe-peak"])
+            .output();
+
+        let active = match (out_res, pre_res) {
+            (Ok(o), Ok(p)) => o.status.success() && p.status.success(),
+            _ => false,
+        };
+
+        Self { target, active }
+    }
+
+    fn restore(&mut self) {
+        if !self.active {
+            return;
+        }
+        let ip = self.target.ip().to_string();
+        let port = self.target.port().to_string();
+        let cmd = if self.target.is_ipv6() { "ip6tables" } else { "iptables" };
+        let _ = std::process::Command::new(cmd)
+            .args(["-t", "raw", "-D", "OUTPUT", "-p", "tcp", "-d", &ip, "--dport", &port, "-j", "NOTRACK", "-m", "comment", "--comment", "labprobe-peak"])
+            .output();
+        let _ = std::process::Command::new(cmd)
+            .args(["-t", "raw", "-D", "PREROUTING", "-p", "tcp", "-s", &ip, "--sport", &port, "-j", "NOTRACK", "-m", "comment", "--comment", "labprobe-peak"])
+            .output();
+        self.active = false;
+    }
+}
+
+impl Drop for ExtremeNoTrackGuard {
+    fn drop(&mut self) {
+        self.restore();
+    }
+}
+
 
 #[derive(Debug, Clone, Serialize)]
 #[serde(rename_all = "camelCase")]
@@ -559,6 +616,21 @@ impl TcpSessionTestManager {
         })
         .await;
         let address = resolve_target(&config.host, config.port, ipv6).await?;
+        let _notrack_guard = if config.extreme_mode {
+            let guard = ExtremeNoTrackGuard::activate(address);
+            if guard.active {
+                self.update(&control.task_id, |snapshot| {
+                    push_log(
+                        snapshot,
+                        format!("{} 极限模式：已启用目标 NOTRACK 防火墙免跟踪保护", label),
+                    );
+                })
+                .await;
+            }
+            Some(guard)
+        } else {
+            None
+        };
         let plan = resource_plan(config.target_connections, config.extreme_mode);
         let safe_target = plan.safe_target;
         let pending_limit = pending_connect_limit(config.cps, safe_target, config.extreme_mode);
@@ -1123,6 +1195,8 @@ async fn connect_once(
         Ok(value) => value,
         Err(error) => return ConnectResult::Failed(classify_connect_error(&error)),
     };
+    let _ = socket.set_recv_buffer_size(2048);
+    let _ = socket.set_send_buffer_size(2048);
     if let Some(port) = source_port {
         let source = if address.is_ipv4() {
             SocketAddr::from((Ipv4Addr::UNSPECIFIED, port))
@@ -1135,7 +1209,10 @@ async fn connect_once(
     }
     match timeout(connect_timeout, socket.connect(address)).await {
         Ok(Ok(stream)) => match stream.into_std() {
-            Ok(stream) => ConnectResult::Connected(stream),
+            Ok(stream) => {
+                let _ = SockRef::from(&stream).set_linger(Some(Duration::ZERO));
+                ConnectResult::Connected(stream)
+            }
             Err(error) => ConnectResult::Failed(classify_connect_error(&error)),
         },
         Ok(Err(error)) => ConnectResult::Failed(classify_connect_error(&error)),
@@ -1301,7 +1378,7 @@ fn health_stop_reason(
     } else if sample.conntrack >= plan.conntrack_ceiling {
         Some("Conntrack 已达到安全阈值".into())
     } else if sample.memory_available_mb <= plan.memory_floor_mb {
-        Some("Relay 内存已达到安全阈值".into())
+        Some("Relay 内存余量已触及安全保护底线 (150MB)".into())
     } else if sample.source_ports_used >= plan.source_port_ceiling {
         Some("单目标临时源端口已达到安全阈值".into())
     } else if !plan.extreme_mode && high_cpu_samples >= CPU_HIGH_SAMPLE_LIMIT {
@@ -1422,8 +1499,11 @@ fn source_ports_in_use(first: usize, last: usize) -> usize {
 }
 
 fn available_source_ports(first: usize, last: usize) -> VecDeque<u16> {
-    let used = source_ports_used_set(first, last);
-    (first..=last)
+    // Preserve lower ports (1024-1500) and upper ports (65000-65535) for router daemons & services
+    let safe_first = first.max(1500);
+    let safe_last = last.min(64999);
+    let used = source_ports_used_set(safe_first, safe_last);
+    (safe_first..=safe_last)
         .filter_map(|port| u16::try_from(port).ok())
         .filter(|port| !used.contains(port))
         .collect()
@@ -1538,4 +1618,16 @@ mod tests {
         assert_eq!(extreme_cpu_rate_scale(99.0), 0.50);
         assert_eq!(extreme_cpu_rate_scale(99.8), 0.10);
     }
+
+    #[test]
+    fn available_source_ports_preserves_system_reserved_ranges() {
+        let ports = available_source_ports(1024, 65535);
+        if let Some(first) = ports.front() {
+            assert!(*first >= 1500, "first port should be >= 1500 to preserve system daemons");
+        }
+        if let Some(last) = ports.back() {
+            assert!(*last <= 64999, "last port should be <= 64999 to preserve high ephemeral range");
+        }
+    }
 }
+
