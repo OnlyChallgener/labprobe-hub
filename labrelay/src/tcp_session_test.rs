@@ -14,8 +14,8 @@ use tokio::net::{lookup_host, TcpSocket};
 use tokio::sync::Mutex;
 use tokio::time::{sleep, timeout};
 
-const ABSOLUTE_CONNECTION_LIMIT: usize = 65_535;
-const EXTREME_CONNECTION_TARGET: usize = 64_000;
+const ABSOLUTE_CONNECTION_LIMIT: usize = 131_072;
+const EXTREME_CONNECTION_TARGET: usize = 131_072;
 const EXTREME_FD_RESERVE: usize = 256;
 const EXTREME_CONNTRACK_RESERVE: usize = 512;
 const EXTREME_SOURCE_PORT_RESERVE: usize = 64;
@@ -615,23 +615,30 @@ impl TcpSessionTestManager {
             push_log(snapshot, format!("开始 {} TCP 测试", label));
         })
         .await;
-        let address = resolve_target(&config.host, config.port, ipv6).await?;
-        let _notrack_guard = if config.extreme_mode {
-            let guard = ExtremeNoTrackGuard::activate(address);
-            if guard.active {
+        let targets = resolve_targets(&config.host, config.port, ipv6).await?;
+        let _notrack_guards: Vec<ExtremeNoTrackGuard> = if config.extreme_mode {
+            let guards: Vec<ExtremeNoTrackGuard> = targets
+                .iter()
+                .map(|&addr| ExtremeNoTrackGuard::activate(addr))
+                .collect();
+            let active_count = guards.iter().filter(|g| g.active).count();
+            if active_count > 0 {
                 self.update(&control.task_id, |snapshot| {
                     push_log(
                         snapshot,
-                        format!("{} 极限模式：已启用目标 NOTRACK 防火墙免跟踪保护", label),
+                        format!(
+                            "{} 极限模式：已启用 {} 个目标的 NOTRACK 防火墙免跟踪保护",
+                            label, active_count
+                        ),
                     );
                 })
                 .await;
             }
-            Some(guard)
+            guards
         } else {
-            None
+            Vec::new()
         };
-        let plan = resource_plan(config.target_connections, config.extreme_mode);
+        let plan = resource_plan(config.target_connections, config.extreme_mode, targets.len());
         let safe_target = plan.safe_target;
         let pending_limit = pending_connect_limit(config.cps, safe_target, config.extreme_mode);
         self.update(&control.task_id, |snapshot| {
@@ -658,20 +665,24 @@ impl TcpSessionTestManager {
         let mut credit = 0f64;
         let mut held: Vec<StdTcpStream> = Vec::with_capacity(safe_target);
         let mut pending = FuturesUnordered::new();
-        let mut source_port_pool = if config.extreme_mode {
+        let mut source_port_pools: Vec<VecDeque<u16>> = if config.extreme_mode {
             let (first, last) = source_port_range();
-            available_source_ports(first, last)
+            (0..targets.len())
+                .map(|_| available_source_ports(first, last))
+                .collect()
         } else {
-            VecDeque::new()
+            vec![VecDeque::new(); targets.len()]
         };
+        let total_ports: usize = source_port_pools.iter().map(|p| p.len()).sum();
         if config.extreme_mode {
             self.update(&control.task_id, |snapshot| {
                 push_log(
                     snapshot,
                     format!(
-                        "{} 极限建连器：显式源端口池 {} 个，5ms 平滑调度，pending 上限 {}",
+                        "{} 极限建连器：{} 个目标，显式源端口池总计 {} 个，5ms 平滑调度，pending 上限 {}",
                         label,
-                        source_port_pool.len(),
+                        targets.len(),
+                        total_ports,
                         pending_limit
                     ),
                 );
@@ -691,6 +702,7 @@ impl TcpSessionTestManager {
         let mut cpu_scale = 1.0f64;
         let mut cached_fd_used = plan.baseline_fd;
         let mut cached_source_ports = plan.baseline_source_ports;
+        let mut launch_cursor = 0usize;
         let finish_reason: String;
 
         'testing: loop {
@@ -809,19 +821,30 @@ impl TcpSessionTestManager {
             };
             credit -= launches as f64;
             for _ in 0..launches {
-                let source_port = if config.extreme_mode {
-                    match source_port_pool.pop_front() {
-                        Some(port) => Some(port),
+                let (target_addr, source_port) = if config.extreme_mode {
+                    let mut chosen = None;
+                    for i in 0..targets.len() {
+                        let idx = (launch_cursor + i) % targets.len();
+                        if let Some(port) = source_port_pools[idx].pop_front() {
+                            chosen = Some((targets[idx], port));
+                            launch_cursor = (idx + 1) % targets.len();
+                            break;
+                        }
+                    }
+                    match chosen {
+                        Some((addr, port)) => (addr, Some(port)),
                         None => {
                             finish_reason = "显式源端口池已耗尽".into();
                             break 'testing;
                         }
                     }
                 } else {
-                    None
+                    let addr = targets[launch_cursor % targets.len()];
+                    launch_cursor = (launch_cursor + 1) % targets.len();
+                    (addr, None)
                 };
                 let timeout_duration = Duration::from_millis(config.connect_timeout_ms);
-                pending.push(connect_once(address, timeout_duration, source_port));
+                pending.push(connect_once(target_addr, timeout_duration, source_port));
             }
 
             if now.duration_since(last_report) >= STATUS_INTERVAL {
@@ -1220,13 +1243,27 @@ async fn connect_once(
     }
 }
 
-async fn resolve_target(host: &str, port: u16, ipv6: bool) -> Result<SocketAddr> {
-    timeout(Duration::from_secs(8), lookup_host((host, port)))
-        .await
-        .map_err(|_| anyhow!("目标地址解析超时"))?
-        .context("目标地址解析失败")?
-        .find(|address| address.is_ipv6() == ipv6)
-        .ok_or_else(|| anyhow!("目标没有可用的 {} 地址", family_label(ipv6)))
+async fn resolve_targets(host: &str, port: u16, ipv6: bool) -> Result<Vec<SocketAddr>> {
+    let mut addrs = Vec::new();
+    for item in host.split(',') {
+        let trimmed = item.trim().trim_start_matches('[').trim_end_matches(']');
+        if trimmed.is_empty() {
+            continue;
+        }
+        let resolved = timeout(Duration::from_secs(8), lookup_host((trimmed, port)))
+            .await
+            .map_err(|_| anyhow!("目标地址解析超时: {}", trimmed))?
+            .context(format!("目标地址解析失败: {}", trimmed))?;
+        for addr in resolved {
+            if addr.is_ipv6() == ipv6 && !addrs.contains(&addr) {
+                addrs.push(addr);
+            }
+        }
+    }
+    if addrs.is_empty() {
+        bail!("目标没有可用的 {} 地址", family_label(ipv6));
+    }
+    Ok(addrs)
 }
 
 fn classify_connect_error(error: &std::io::Error) -> FailureKind {
@@ -1276,7 +1313,8 @@ struct ResourceSample {
     cpu_counters: Option<CpuCounters>,
 }
 
-fn resource_plan(requested: usize, extreme_mode: bool) -> ResourcePlan {
+fn resource_plan(requested: usize, extreme_mode: bool, target_count: usize) -> ResourcePlan {
+    let target_multiplier = target_count.max(1);
     let baseline_fd = current_fd_count();
     let soft_limit = fd_soft_limit().unwrap_or(ABSOLUTE_CONNECTION_LIMIT + baseline_fd + 2_048);
     let fd_ceiling = if extreme_mode {
@@ -1317,18 +1355,20 @@ fn resource_plan(requested: usize, extreme_mode: bool) -> ResourcePlan {
         .max(1);
 
     let (source_first, source_last) = source_port_range();
-    let source_port_capacity = source_last.saturating_sub(source_first).saturating_add(1);
+    let single_capacity = source_last.saturating_sub(source_first).saturating_add(1);
     let baseline_source_ports = source_ports_in_use(source_first, source_last);
-    let source_port_ceiling = if extreme_mode {
-        source_port_capacity
+    let single_ceiling = if extreme_mode {
+        single_capacity
             .saturating_sub(EXTREME_SOURCE_PORT_RESERVE)
             .max(baseline_source_ports.saturating_add(1))
     } else {
-        source_port_capacity.saturating_mul(90) / 100
+        single_capacity.saturating_mul(90) / 100
     };
-    let source_port_budget = source_port_ceiling
+    let single_budget = single_ceiling
         .saturating_sub(baseline_source_ports)
         .max(1);
+    let source_port_ceiling = single_ceiling.saturating_mul(target_multiplier);
+    let source_port_budget = single_budget.saturating_mul(target_multiplier);
 
     let requested_limit = requested.min(if extreme_mode {
         EXTREME_CONNECTION_TARGET
@@ -1336,15 +1376,20 @@ fn resource_plan(requested: usize, extreme_mode: bool) -> ResourcePlan {
         ABSOLUTE_CONNECTION_LIMIT
     });
     let requested_reason = if extreme_mode && requested >= EXTREME_CONNECTION_TARGET {
-        "达到极限模式 64000 连接目标"
+        "达到极限模式连接目标"
     } else {
         "达到设定连接数"
+    };
+    let source_port_limiting_reason = if target_multiplier > 1 {
+        "多目标临时源端口已达到实际余量边界"
+    } else {
+        "单目标临时源端口已达到实际余量边界"
     };
     let mut candidates = vec![
         (requested_limit, requested_reason),
         (fd_budget, "Relay 进程 FD 已达到实际上限"),
         (conntrack_budget, "Conntrack 已达到实际余量边界"),
-        (source_port_budget, "单目标临时源端口已达到实际余量边界"),
+        (source_port_budget, source_port_limiting_reason),
     ];
     if !extreme_mode {
         candidates.push((memory_budget, "Relay 内存已达到安全阈值"));
@@ -1628,6 +1673,13 @@ mod tests {
         if let Some(last) = ports.back() {
             assert!(*last <= 64999, "last port should be <= 64999 to preserve high ephemeral range");
         }
+    }
+
+    #[test]
+    fn resource_plan_scales_budget_with_multiple_targets() {
+        let single = resource_plan(100_000, true, 1);
+        let double = resource_plan(100_000, true, 2);
+        assert!(double.safe_target >= single.safe_target);
     }
 }
 

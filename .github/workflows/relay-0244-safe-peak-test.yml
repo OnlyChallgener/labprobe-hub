@@ -32,9 +32,10 @@ jobs:
           cargo fmt --manifest-path labrelay/Cargo.toml -- --check || cargo fmt --manifest-path labrelay/Cargo.toml
           cargo check --manifest-path labrelay/Cargo.toml --all-targets
           cargo test --manifest-path labrelay/Cargo.toml --all-targets
-          grep -q 'version = "0.2.44"' labrelay/Cargo.toml
+          grep -q 'version = "0.2.45"' labrelay/Cargo.toml
           grep -q 'socket.set_recv_buffer_size(2048)' labrelay/src/tcp_session_test.rs
           grep -q 'ExtremeNoTrackGuard' labrelay/src/tcp_session_test.rs
+          grep -q 'resolve_targets' labrelay/src/tcp_session_test.rs
           grep -q 'first.max(1500)' labrelay/src/tcp_session_test.rs
 
       - name: Install cross and QEMU
@@ -51,10 +52,10 @@ jobs:
       - name: Verify and Package Release
         env:
           CARGO_TARGET_DIR: ${{ runner.temp }}/relay-target
-          RELEASE_TAG: test-bundle/20260903-relay-0244-safe-peak
+          RELEASE_TAG: test-bundle/20260903-relay-0245-multi-target
         run: |
           set -euo pipefail
-          VERSION=0.2.44
+          VERSION=0.2.45
           BINARY="$CARGO_TARGET_DIR/aarch64-unknown-linux-musl/release/labrelay"
           test -x "$BINARY"
           test "$(qemu-aarch64-static "$BINARY" version)" = "labrelay $VERSION"
@@ -74,8 +75,8 @@ jobs:
               return {'url': f'{root}/{name}', 'sha256': hashlib.sha256(data).hexdigest(), 'sizeBytes': len(data)}
           manifest={
               'schemaVersion': 1,
-              'versionName': '0.2.44',
-              'changelog': 'Safe extreme TCP peak test: target NOTRACK firewall bypass, 2KB socket buffer clamping, system reserved port ranges (1024-1500, 65000-65535), 150MB memory floor, SO_LINGER=0 instant teardown, up to 16k in-flight pending window.',
+              'versionName': '0.2.45',
+              'changelog': 'Multi-target extreme TCP peak test: supports comma-separated targets and multi-IP resolution up to 131k connections, target NOTRACK firewall bypass, 2KB socket buffer clamping, system reserved port ranges (1024-1500, 65000-65535), 150MB memory floor, SO_LINGER=0 instant teardown, up to 16k in-flight pending window.',
               'installUrl': f'{root}/install.sh',
               'binaries': {'arm64': meta('labrelay-linux-arm64')},
               'installer': meta('install.sh'),
@@ -85,39 +86,39 @@ jobs:
           (out/'checksums.txt').write_text('\n'.join(f"{hashlib.sha256((out/n).read_bytes()).hexdigest()}  {n}" for n in names)+'\n', encoding='utf-8')
           PY
           (cd "$OUT" && sha256sum -c checksums.txt)
-          tar -C "$RUNNER_TEMP" -czf "$RUNNER_TEMP/labrelay-test-arm64-v0.2.44.tar.gz" agent
+          tar -C "$RUNNER_TEMP" -czf "$RUNNER_TEMP/labrelay-test-arm64-v0.2.45.tar.gz" agent
 
       - name: Upload artifact
         uses: actions/upload-artifact@v4
         with:
-          name: labrelay-test-arm64-v0.2.44
+          name: labrelay-test-arm64-v0.2.45
           path: |
             ${{ runner.temp }}/agent/**
-            ${{ runner.temp }}/labrelay-test-arm64-v0.2.44.tar.gz
+            ${{ runner.temp }}/labrelay-test-arm64-v0.2.45.tar.gz
 
       - name: Release test prerelease
         uses: softprops/action-gh-release@v2
         with:
-          tag_name: test-bundle/20260903-relay-0244-safe-peak
+          tag_name: test-bundle/20260903-relay-0245-multi-target
           target_commitish: fix/relay-0243-throughput
-          name: LabRelay 0.2.44 safe peak throughput test
+          name: LabRelay 0.2.45 multi-target safe peak test
           prerelease: true
           make_latest: false
           body: |
-            LabRelay 0.2.44 benchmark-oriented safe peak test build for BE72 (MT7988DV).
+            LabRelay 0.2.45 benchmark-oriented multi-target safe peak test build for BE72 (MT7988DV).
 
-            Target: ~4,000 CPS and up to ~64,000 connections on external IPv6/IPv4 services without causing router/network outage.
+            Target: ~4,000 CPS, up to ~64,000 connections on single target, and up to ~128,000 connections across multiple targets without causing router/network outage.
 
-            Safety & Performance features:
-            - **NOTRACK Firewall Bypass**: Excludes test traffic from Netfilter Conntrack, preventing LAN internet disruption;
-            - **2KB Socket Buffer Clamping**: Limits kernel buffer memory per socket so 64k connections only consume ~256MB RAM;
+            Features:
+            - **Multi-Target Scaling**: Supports comma-separated targets (`host1,host2`) and multiple DNS resolved IPs, interleaving connections across separate port pools;
+            - **NOTRACK Firewall Bypass**: Excludes test traffic from Netfilter Conntrack for all targets;
+            - **2KB Socket Buffer Clamping**: Limits kernel buffer memory per socket so 100k+ connections stay safely within 1GB RAM;
             - **Router System Port Reservation**: Reserves ports 1024-1500 and 65000-65535 for router local services (DNS, SSH, NTP);
             - **150MB Memory Floor**: Hard memory tripwire halting new connections if available RAM drops below 150MB;
-            - **SO_LINGER=0 Instant Teardown**: Sockets freed immediately without lingering in TIME_WAIT;
-            - **In-flight Pipeline Scaling**: Pending window expands up to 16,384 to absorb public WAN RTT latencies.
+            - **SO_LINGER=0 Instant Teardown**: Sockets freed immediately without lingering in TIME_WAIT.
           files: |
             ${{ runner.temp }}/agent/labrelay-linux-arm64
             ${{ runner.temp }}/agent/install.sh
             ${{ runner.temp }}/agent/latest.json
             ${{ runner.temp }}/agent/checksums.txt
-            ${{ runner.temp }}/labrelay-test-arm64-v0.2.44.tar.gz
+            ${{ runner.temp }}/labrelay-test-arm64-v0.2.45.tar.gz
