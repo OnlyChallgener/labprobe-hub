@@ -5,13 +5,13 @@ def test_cargo_toml_version():
     cargo_path = Path("labrelay/Cargo.toml")
     assert cargo_path.exists(), "Cargo.toml must exist"
     text = cargo_path.read_text(encoding="utf-8")
-    assert 'version = "0.2.45"' in text, "Cargo.toml must specify version 0.2.45"
+    assert 'version = "0.2.46"' in text, "Cargo.toml must specify version 0.2.46"
 
 def test_cargo_lock_version():
     lock_path = Path("labrelay/Cargo.lock")
     assert lock_path.exists(), "Cargo.lock must exist"
     text = lock_path.read_text(encoding="utf-8")
-    assert 'name = "labrelay"\nversion = "0.2.45"' in text, "Cargo.lock must record version 0.2.45"
+    assert 'name = "labrelay"\nversion = "0.2.46"' in text, "Cargo.lock must record version 0.2.46"
 
 def test_tcp_session_test_safety_guards():
     rs_path = Path("labrelay/src/tcp_session_test.rs")
@@ -40,6 +40,8 @@ def test_tcp_session_test_safety_guards():
     # 5. Multi-target resolution & scaling
     assert 'async fn resolve_targets(' in content, "resolve_targets must support multi-target resolution"
     assert 'resource_plan_scales_budget_with_multiple_targets' in content, "Multi-target scaling test must be present"
+    assert 'socket.set_reuseaddr(true)' in content, "SO_REUSEADDR must be enabled for multi-target binding"
+    assert 'set_reuse_port(true)' in content, "SO_REUSEPORT must be enabled for multi-target binding"
 
 if __name__ == "__main__":
     test_cargo_toml_version()

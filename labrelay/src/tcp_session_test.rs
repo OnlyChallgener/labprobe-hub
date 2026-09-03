@@ -1220,6 +1220,9 @@ async fn connect_once(
     };
     let _ = socket.set_recv_buffer_size(2048);
     let _ = socket.set_send_buffer_size(2048);
+    let _ = socket.set_reuseaddr(true);
+    #[cfg(unix)]
+    let _ = SockRef::from(&socket).set_reuse_port(true);
     if let Some(port) = source_port {
         let source = if address.is_ipv4() {
             SocketAddr::from((Ipv4Addr::UNSPECIFIED, port))
@@ -1254,8 +1257,8 @@ async fn resolve_targets(host: &str, port: u16, ipv6: bool) -> Result<Vec<Socket
             .await
             .map_err(|_| anyhow!("目标地址解析超时: {}", trimmed))?
             .context(format!("目标地址解析失败: {}", trimmed))?;
-        for addr in resolved {
-            if addr.is_ipv6() == ipv6 && !addrs.contains(&addr) {
+        if let Some(addr) = resolved.into_iter().find(|a| a.is_ipv6() == ipv6) {
+            if !addrs.contains(&addr) {
                 addrs.push(addr);
             }
         }
