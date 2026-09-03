@@ -1021,6 +1021,18 @@ def test_router_network_self_check_intent_maps_to_router_diagnostic(tmp_path, mo
     assert diagnostic_tool_intent("查询设备列表") is None
 
 
+def test_fast_path_tool_intent(tmp_path, monkeypatch):
+    from assistant.api import fast_path_tool_intent
+
+    assert fast_path_tool_intent("Agent 在线吗") == "agent.status"
+    assert fast_path_tool_intent("Agent在线吗") == "agent.status"
+    assert fast_path_tool_intent("Relay 状态") == "agent.status"
+    assert fast_path_tool_intent("查看当前 APP 设置") == "app.settings.get"
+    assert fast_path_tool_intent("TCP 峰值连接数状态") == "tcp.peak.status"
+    assert fast_path_tool_intent("当前固件版本") == "router.firmware.status"
+    assert fast_path_tool_intent("打开 Agent 设置页面") is None
+
+
 def test_nat_forced_chat_polls_task_and_returns_readable_result(tmp_path, monkeypatch):
     hub = fake_hub(tmp_path)
     polls = {"count": 0}
@@ -1045,6 +1057,29 @@ def test_nat_forced_chat_polls_task_and_returns_readable_result(tmp_path, monkey
     assert "公网映射地址：1.2.3.4:4500" in content
     assert "{" not in content.split("\n")[0]
     assert response.json["usageKnown"] is False
+
+
+def test_agent_status_fast_path_chat_returns_instant_readable_result(tmp_path, monkeypatch):
+    hub = fake_hub(tmp_path)
+    hub.agent_presence_snapshot = lambda: {
+        "router": "BE72",
+        "agentOnline": True,
+        "agentState": "online",
+        "agentAgeSeconds": 4,
+        "agentVersion": "0.2.46",
+        "agentArchitecture": "aarch64",
+        "agentLastSeenAt": "2026-09-03 14:50:00",
+    }
+    client = make_client(tmp_path, monkeypatch, hub_runtime=hub)
+    response = client.post("/api/ai/chat", json={"message": "Agent 在线吗"})
+    assert response.status_code == 200
+    content = response.json["message"]["content"]
+    assert "Agent **在线**" in content
+    assert "BE72" in content
+    assert "0.2.46" in content
+    assert "aarch64" in content
+    assert response.json["usageKnown"] is False
+    assert response.json["toolExecutions"] == [{"toolId": "agent.status", "status": "completed"}]
 
 
 def test_nat_result_query_reuses_existing_task_without_restart(tmp_path, monkeypatch):

@@ -27,10 +27,10 @@ from .tools import ToolError, ToolExecutor
 DEFAULT_BASE_URL = "https://api.deepseek.com"
 DEFAULT_MODEL = "deepseek-v4-flash"
 TENCENT_HUNYUAN_BASE_URL = "https://tokenhub.tencentmaas.com/v1"
-MAX_MESSAGES = 30
-MAX_MESSAGE_CHARS = 16_000
-MAX_REQUEST_CHARS = 40_000
-MAX_REPLAY_CHARS = 10_000
+MAX_MESSAGES = 80
+MAX_MESSAGE_CHARS = 32_000
+MAX_REQUEST_CHARS = 80_000
+MAX_REPLAY_CHARS = 24_000
 TOOL_SYSTEM_PROMPT = (
     "你是极客网探 Hub 助手，可以查看和控制整个网络：设备、事件、Agent/Relay、STUN 穿透、"
     "WireGuard、路由器端口映射、IPv6、每日记录、防火墙（转发/入站/出站规则的查询、启停、"
@@ -97,6 +97,28 @@ def diagnostic_tool_intent(text: str) -> str | None:
         return "navigate.tool_nat"
     if "自检" in normalized:
         return "router.diagnostic" if "路由" in normalized else "network.self_check"
+    return None
+
+
+def fast_path_tool_intent(text: str) -> str | None:
+    diag = diagnostic_tool_intent(text)
+    if diag:
+        return diag
+    normalized = "".join(str(text or "").lower().split())
+    if any(word in normalized for word in ("打开", "进入", "跳转", "页面", "新建", "添加", "删除", "修改", "重启", "升级")):
+        return None
+    if ("agent" in normalized or "relay" in normalized) and any(
+        w in normalized for w in ("在线", "状态", "上报", "连接", "心跳", "存活")
+    ):
+        return "agent.status"
+    if "设置" in normalized and any(w in normalized for w in ("app", "客户端", "当前")):
+        return "app.settings.get"
+    if ("tcp" in normalized or "峰值" in normalized) and any(
+        w in normalized for w in ("状态", "进度", "结果", "跑完", "跑得怎么样")
+    ):
+        return "tcp.peak.status"
+    if "固件" in normalized and any(w in normalized for w in ("版本", "状态", "当前")):
+        return "router.firmware.status"
     return None
 
 
@@ -1270,6 +1292,10 @@ def create_ai_blueprint(*, check_app_token: Callable[[], bool], db_path, logger,
         def sse_done(payload: Dict[str, Any]) -> Response:
             def emit():
                 yield ": connected\n\n"
+                msg = payload.get("message")
+                content = str(msg.get("content") or "") if isinstance(msg, dict) else ""
+                if content:
+                    yield stream_event({"type": "delta", "content": content})
                 yield stream_event({"type": "done", **payload})
             return sse_response(emit())
 
@@ -1294,7 +1320,7 @@ def create_ai_blueprint(*, check_app_token: Callable[[], bool], db_path, logger,
                 return sse_response(emit())
             return jsonify(payload), status_code
 
-        forced_tool_id = diagnostic_tool_intent(latest_user_text)
+        forced_tool_id = fast_path_tool_intent(latest_user_text)
         if forced_tool_id == "navigate.tool_nat" and executor is not None:
             content = (
                 "已打开工具箱页的「NAT 检测」。\n"
@@ -1310,6 +1336,115 @@ def create_ai_blueprint(*, check_app_token: Callable[[], bool], db_path, logger,
                 "usageKnown": False,
                 "toolExecutions": [],
                 "clientActions": [{"type": "navigate", "route": "nat"}],
+            }
+            return sse_done(payload) if wants_stream else jsonify(payload)
+        if forced_tool_id == "agent.status" and executor is not None:
+            try:
+                tool_result = executor.execute("agent.status", {}, client_context)
+            except ToolError as exc:
+                return post_persist_failure(exc, exc.status_code)
+            except Exception:
+                return post_persist_failure("工具执行失败", 500)
+            agent = tool_result.get("agent") if isinstance(tool_result.get("agent"), dict) else {}
+            online = bool(agent.get("agentOnline") or agent.get("online"))
+            router = agent.get("router") or "路由器"
+            version = agent.get("agentVersion") or agent.get("version") or ""
+            arch = agent.get("agentArchitecture") or agent.get("architecture") or ""
+            age = agent.get("agentAgeSeconds")
+            last_seen = agent.get("agentLastSeenAt") or agent.get("lastSeenAt") or ""
+            if online:
+                age_desc = f"{age} 秒前刚上报过" if isinstance(age, int) and age >= 0 else "当前通信正常"
+                ver_desc = f"，版本 **{version}**" if version else ""
+                arch_desc = f" ({arch})" if arch else ""
+                content = (
+                    f"Agent **在线**。路由器 **{router}** 上的 LabRelay Agent 状态为 **online**，"
+                    f"{age_desc}{ver_desc}{arch_desc}。\n"
+                    f"• 运行状态：**在线 (Online)**\n"
+                    f"• 最近通信：**{last_seen or '刚刚'}**"
+                )
+            else:
+                state = str(agent.get("agentState") or "offline")
+                state_zh = "状态稍旧 (Stale)" if state == "stale" else "未连接 / 离线"
+                content = (
+                    f"Agent 当前处于 **{state_zh}** 状态。\n"
+                    f"• 目标路由器：**{router}**\n"
+                    f"• 上次上报时间：**{last_seen or '无记录'}**\n"
+                    f"• 建议检查路由器 LabRelay 进程是否正常运行。"
+                )
+            message_id = store.add_message(conversation_id, "assistant", content)
+            payload = {
+                "conversationId": conversation_id,
+                "message": {"role": "assistant", "content": content},
+                "messageId": message_id,
+                "userMessageId": user_message_id,
+                "usage": {},
+                "usageKnown": False,
+                "toolExecutions": [{"toolId": "agent.status", "status": "completed"}],
+                "clientActions": [],
+            }
+            return sse_done(payload) if wants_stream else jsonify(payload)
+        if forced_tool_id == "app.settings.get" and executor is not None:
+            try:
+                tool_result = executor.execute("app.settings.get", {}, client_context)
+            except Exception:
+                tool_result = {}
+            settings = tool_result.get("settings") if isinstance(tool_result, dict) else {}
+            settings = settings if isinstance(settings, dict) else {}
+            privacy = "已开启" if settings.get("privacyMode") else "已关闭"
+            mode = settings.get("favoriteNetworkMode") or "自动"
+            name = settings.get("routerDisplayName") or "默认"
+            content = (
+                "【当前 APP 设置】\n"
+                f"• 隐私模式：**{privacy}**\n"
+                f"• 快捷访问网络偏好：**{mode}**\n"
+                f"• 路由器显示名称：**{name}**"
+            )
+            message_id = store.add_message(conversation_id, "assistant", content)
+            payload = {
+                "conversationId": conversation_id,
+                "message": {"role": "assistant", "content": content},
+                "messageId": message_id,
+                "userMessageId": user_message_id,
+                "usage": {},
+                "usageKnown": False,
+                "toolExecutions": [{"toolId": "app.settings.get", "status": "completed"}],
+                "clientActions": [],
+            }
+            return sse_done(payload) if wants_stream else jsonify(payload)
+        if forced_tool_id == "tcp.peak.status" and executor is not None:
+            try:
+                tool_result = executor.execute("tcp.peak.status", {"side": "relay"}, client_context)
+            except Exception:
+                tool_result = {}
+            content = tool_result.get("content") or tool_result.get("message") or "暂无 TCP 峰值连接数测试记录。"
+            message_id = store.add_message(conversation_id, "assistant", content)
+            payload = {
+                "conversationId": conversation_id,
+                "message": {"role": "assistant", "content": content},
+                "messageId": message_id,
+                "userMessageId": user_message_id,
+                "usage": {},
+                "usageKnown": False,
+                "toolExecutions": [{"toolId": "tcp.peak.status", "status": "completed"}],
+                "clientActions": [],
+            }
+            return sse_done(payload) if wants_stream else jsonify(payload)
+        if forced_tool_id == "router.firmware.status" and executor is not None:
+            try:
+                tool_result = executor.execute("router.firmware.status", {}, client_context)
+            except Exception:
+                tool_result = {}
+            content = tool_result.get("content") or tool_result.get("message") or "暂未获取到固件版本信息。"
+            message_id = store.add_message(conversation_id, "assistant", content)
+            payload = {
+                "conversationId": conversation_id,
+                "message": {"role": "assistant", "content": content},
+                "messageId": message_id,
+                "userMessageId": user_message_id,
+                "usage": {},
+                "usageKnown": False,
+                "toolExecutions": [{"toolId": "router.firmware.status", "status": "completed"}],
+                "clientActions": [],
             }
             return sse_done(payload) if wants_stream else jsonify(payload)
         if forced_tool_id and executor is not None:
