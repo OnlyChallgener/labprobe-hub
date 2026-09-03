@@ -48,7 +48,7 @@ TOOL_SYSTEM_PROMPT = (
     "告知，禁止凭对话记忆声称“仍在等待确认”。"
     "用户说‘网络自检’时调用 network.self_check；说‘路由网络自检/路由器自检’时调用 router.diagnostic；"
     "说‘NAT检测’时调用 router.nat.diagnostic。检测和自检绝不能调用 app.navigate，只有明确要求打开/进入/跳转页面时才允许导航。"
-    "TCP 峰值连接数测试必须调用 tcp.peak.start、tcp.peak.stop 或 tcp.peak.status；65535 只是量程上限，"
+    "TCP 峰值连接数测试必须调用 tcp.peak.start、tcp.peak.stop 或 tcp.peak.status；量程最高支持 131072（极限模式/多目标），"
     "不得把停止原因笼统描述为宽带最大连接数，也不得输出原始 JSON。"
     "回答使用简洁中文。"
 )
