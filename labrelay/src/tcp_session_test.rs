@@ -3,14 +3,14 @@ use futures_util::{stream::FuturesUnordered, FutureExt, StreamExt};
 use serde::{Deserialize, Serialize};
 use serde_json::{json, Value};
 use socket2::SockRef;
-use std::collections::VecDeque;
+use std::collections::{HashSet, VecDeque};
 use std::fs;
-use std::net::{SocketAddr, TcpStream as StdTcpStream};
+use std::net::{Ipv4Addr, Ipv6Addr, SocketAddr, TcpStream as StdTcpStream};
 use std::path::Path;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
-use tokio::net::{lookup_host, TcpSocket, TcpStream};
+use tokio::net::{lookup_host, TcpSocket};
 use tokio::sync::Mutex;
 use tokio::time::{sleep, timeout};
 
@@ -21,14 +21,15 @@ const EXTREME_CONNTRACK_RESERVE: usize = 512;
 const EXTREME_SOURCE_PORT_RESERVE: usize = 64;
 const EXTREME_MEMORY_FLOOR_MB: usize = 96;
 const EXTREME_CONNTRACK_MAX: usize = 131_072;
-const EXTREME_SOCKET_BUFFER_BYTES: u32 = 4 * 1024;
 const MIN_PENDING_CONNECTS: usize = 256;
 const MAX_PENDING_CONNECTS: usize = 1_024;
+const EXTREME_MIN_PENDING_CONNECTS: usize = 2_048;
+const EXTREME_MAX_PENDING_CONNECTS: usize = 16_384;
 const CONSECUTIVE_FAILURE_LIMIT: usize = 200;
 const RECENT_OUTCOME_WINDOW: usize = 200;
 const STATUS_INTERVAL: Duration = Duration::from_secs(1);
 const HEAVY_RESOURCE_SAMPLE_INTERVAL: Duration = Duration::from_secs(10);
-const LOOP_INTERVAL: Duration = Duration::from_millis(100);
+const LOOP_INTERVAL: Duration = Duration::from_millis(5);
 const CPU_HIGH_SAMPLE_PERCENT: f64 = 99.0;
 const CPU_RECOVERY_PERCENT: f64 = 94.0;
 const CPU_HIGH_SAMPLE_LIMIT: u8 = 3;
@@ -560,7 +561,7 @@ impl TcpSessionTestManager {
         let address = resolve_target(&config.host, config.port, ipv6).await?;
         let plan = resource_plan(config.target_connections, config.extreme_mode);
         let safe_target = plan.safe_target;
-        let pending_limit = pending_connect_limit(config.cps, safe_target);
+        let pending_limit = pending_connect_limit(config.cps, safe_target, config.extreme_mode);
         self.update(&control.task_id, |snapshot| {
             snapshot.status = format!("{} 正在建立连接", label);
             snapshot.resources_released = false;
@@ -585,6 +586,26 @@ impl TcpSessionTestManager {
         let mut credit = 0f64;
         let mut held: Vec<StdTcpStream> = Vec::with_capacity(safe_target);
         let mut pending = FuturesUnordered::new();
+        let mut source_port_pool = if config.extreme_mode {
+            let (first, last) = source_port_range();
+            available_source_ports(first, last)
+        } else {
+            VecDeque::new()
+        };
+        if config.extreme_mode {
+            self.update(&control.task_id, |snapshot| {
+                push_log(
+                    snapshot,
+                    format!(
+                        "{} 极限建连器：显式源端口池 {} 个，5ms 平滑调度，pending 上限 {}",
+                        label,
+                        source_port_pool.len(),
+                        pending_limit
+                    ),
+                );
+            })
+            .await;
+        }
         let mut success = 0u64;
         let mut failure = 0u64;
         let mut resource_failures = 0u64;
@@ -660,12 +681,17 @@ impl TcpSessionTestManager {
                             last_growth = Instant::now();
                         }
                     }
+                    ConnectResult::Failed(FailureKind::SourcePortBusy) => {
+                        // Explicit source-port allocation may race with unrelated router traffic.
+                        // Skip that port without poisoning connection-quality heuristics.
+                    }
                     ConnectResult::Failed(kind) => {
                         failure += 1;
                         consecutive_failures = consecutive_failures.saturating_add(1);
                         record_recent_outcome(&mut recent_outcomes, false);
                         match kind {
                             FailureKind::SourcePort => source_port_failures += 1,
+                            FailureKind::SourcePortBusy => {}
                             FailureKind::FileDescriptor => fd_failures += 1,
                             FailureKind::Memory => memory_failures += 1,
                             FailureKind::Other => {}
@@ -711,8 +737,19 @@ impl TcpSessionTestManager {
             };
             credit -= launches as f64;
             for _ in 0..launches {
+                let source_port = if config.extreme_mode {
+                    match source_port_pool.pop_front() {
+                        Some(port) => Some(port),
+                        None => {
+                            finish_reason = "显式源端口池已耗尽".into();
+                            break 'testing;
+                        }
+                    }
+                } else {
+                    None
+                };
                 let timeout_duration = Duration::from_millis(config.connect_timeout_ms);
-                pending.push(connect_once(address, timeout_duration, config.extreme_mode));
+                pending.push(connect_once(address, timeout_duration, source_port));
             }
 
             if now.duration_since(last_report) >= STATUS_INTERVAL {
@@ -980,6 +1017,7 @@ enum ConnectResult {
 #[derive(Clone, Copy, PartialEq, Eq)]
 enum FailureKind {
     SourcePort,
+    SourcePortBusy,
     FileDescriptor,
     Memory,
     Other,
@@ -1012,8 +1050,14 @@ fn connection_quality_stop_reason(
     None
 }
 
-fn pending_connect_limit(cps: u64, safe_target: usize) -> usize {
-    let desired = (cps as usize / 4).clamp(MIN_PENDING_CONNECTS, MAX_PENDING_CONNECTS);
+fn pending_connect_limit(cps: u64, safe_target: usize, extreme_mode: bool) -> usize {
+    let desired = if extreme_mode {
+        (cps as usize)
+            .saturating_mul(2)
+            .clamp(EXTREME_MIN_PENDING_CONNECTS, EXTREME_MAX_PENDING_CONNECTS)
+    } else {
+        (cps as usize / 4).clamp(MIN_PENDING_CONNECTS, MAX_PENDING_CONNECTS)
+    };
     desired.min(safe_target.max(1))
 }
 
@@ -1042,12 +1086,10 @@ fn connection_quality_launch_budget(
 }
 
 fn extreme_cpu_rate_scale(cpu_percent: f64) -> f64 {
-    if cpu_percent >= 99.5 {
+    if cpu_percent >= 99.8 {
         0.10
-    } else if cpu_percent >= 98.0 {
-        0.25
-    } else if cpu_percent >= 95.0 {
-        0.75
+    } else if cpu_percent >= 99.0 {
+        0.50
     } else {
         1.0
     }
@@ -1070,7 +1112,7 @@ fn cpu_rate_scale(cpu_percent: f64) -> f64 {
 async fn connect_once(
     address: SocketAddr,
     connect_timeout: Duration,
-    extreme_mode: bool,
+    source_port: Option<u16>,
 ) -> ConnectResult {
     let socket = if address.is_ipv4() {
         TcpSocket::new_v4()
@@ -1081,9 +1123,15 @@ async fn connect_once(
         Ok(value) => value,
         Err(error) => return ConnectResult::Failed(classify_connect_error(&error)),
     };
-    if extreme_mode {
-        let _ = socket.set_recv_buffer_size(EXTREME_SOCKET_BUFFER_BYTES);
-        let _ = socket.set_send_buffer_size(EXTREME_SOCKET_BUFFER_BYTES);
+    if let Some(port) = source_port {
+        let source = if address.is_ipv4() {
+            SocketAddr::from((Ipv4Addr::UNSPECIFIED, port))
+        } else {
+            SocketAddr::from((Ipv6Addr::UNSPECIFIED, port))
+        };
+        if let Err(error) = socket.bind(source) {
+            return ConnectResult::Failed(classify_connect_error(&error));
+        }
     }
     match timeout(connect_timeout, socket.connect(address)).await {
         Ok(Ok(stream)) => match stream.into_std() {
@@ -1106,6 +1154,7 @@ async fn resolve_target(host: &str, port: u16, ipv6: bool) -> Result<SocketAddr>
 
 fn classify_connect_error(error: &std::io::Error) -> FailureKind {
     match error.raw_os_error() {
+        Some(98) => FailureKind::SourcePortBusy,
         Some(99) => FailureKind::SourcePort,
         Some(23) | Some(24) => FailureKind::FileDescriptor,
         Some(12) | Some(105) => FailureKind::Memory,
@@ -1344,8 +1393,8 @@ fn source_port_range() -> (usize, usize) {
     }
 }
 
-fn source_ports_in_use(first: usize, last: usize) -> usize {
-    let mut count = 0usize;
+fn source_ports_used_set(first: usize, last: usize) -> HashSet<u16> {
+    let mut ports = HashSet::new();
     for path in ["/proc/net/tcp", "/proc/net/tcp6"] {
         let Ok(text) = fs::read_to_string(path) else {
             continue;
@@ -1355,16 +1404,29 @@ fn source_ports_in_use(first: usize, last: usize) -> usize {
                 .split_whitespace()
                 .nth(1)
                 .and_then(|address| address.rsplit(':').next())
-                .and_then(|port| usize::from_str_radix(port, 16).ok())
+                .and_then(|port| u16::from_str_radix(port, 16).ok())
             else {
                 continue;
             };
-            if port >= first && port <= last {
-                count = count.saturating_add(1);
+            let value = port as usize;
+            if value >= first && value <= last {
+                ports.insert(port);
             }
         }
     }
-    count
+    ports
+}
+
+fn source_ports_in_use(first: usize, last: usize) -> usize {
+    source_ports_used_set(first, last).len()
+}
+
+fn available_source_ports(first: usize, last: usize) -> VecDeque<u16> {
+    let used = source_ports_used_set(first, last);
+    (first..=last)
+        .filter_map(|port| u16::try_from(port).ok())
+        .filter(|port| !used.contains(port))
+        .collect()
 }
 
 fn read_cpu_counters() -> Option<CpuCounters> {
@@ -1457,9 +1519,9 @@ mod tests {
         assert_eq!(cpu_rate_scale(90.0), 0.40);
         assert_eq!(cpu_rate_scale(95.0), 0.15);
         assert_eq!(cpu_rate_scale(98.0), 0.0);
-        assert_eq!(pending_connect_limit(500, 65_535), 256);
-        assert_eq!(pending_connect_limit(4_000, 65_535), 1_000);
-        assert_eq!(pending_connect_limit(10_000, 65_535), 1_024);
+        assert_eq!(pending_connect_limit(500, 65_535, false), 256);
+        assert_eq!(pending_connect_limit(4_000, 65_535, false), 1_000);
+        assert_eq!(pending_connect_limit(10_000, 65_535, false), 1_024);
         assert_eq!(cpu_rate_scale(99.0), 0.0);
     }
 
@@ -1469,9 +1531,11 @@ mod tests {
         assert_eq!(load_rate_scale(0.99, true), 1.0);
         assert_eq!(connection_quality_launch_budget(true, 0, 1_024), usize::MAX);
         assert_eq!(connection_quality_launch_budget(false, 0, 200), 0);
-        assert_eq!(extreme_cpu_rate_scale(94.0), 1.0);
-        assert_eq!(extreme_cpu_rate_scale(95.0), 0.75);
-        assert_eq!(extreme_cpu_rate_scale(98.0), 0.25);
-        assert_eq!(extreme_cpu_rate_scale(99.5), 0.10);
+        assert_eq!(pending_connect_limit(1_000, 65_535, true), 2_048);
+        assert_eq!(pending_connect_limit(4_000, 65_535, true), 8_000);
+        assert_eq!(pending_connect_limit(10_000, 65_535, true), 16_384);
+        assert_eq!(extreme_cpu_rate_scale(98.9), 1.0);
+        assert_eq!(extreme_cpu_rate_scale(99.0), 0.50);
+        assert_eq!(extreme_cpu_rate_scale(99.8), 0.10);
     }
 }
