@@ -16,7 +16,9 @@ jobs:
           ref: fix/relay-0243-throughput
           fetch-depth: 0
       - name: Apply patch
-        run: python3 scripts/patch_relay_0243_throughput.py
+        run: |
+          python3 scripts/patch_relay_0243_throughput.py
+          python3 scripts/patch_relay_0243_fix1.py
       - name: Test
         run: |
           set -euo pipefail
