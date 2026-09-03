@@ -1,0 +1,83 @@
+name: Relay 0243 throughput test
+on:
+  push:
+    branches:
+      - fix/relay-0243-throughput
+    paths:
+      - .github/workflows/relay-0243-throughput-test.yml
+permissions:
+  contents: write
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          ref: fix/relay-0243-throughput
+          fetch-depth: 0
+      - name: Apply patch
+        run: python3 scripts/patch_relay_0243_throughput.py
+      - name: Test
+        run: |
+          set -euo pipefail
+          cargo fmt --manifest-path labrelay/Cargo.toml
+          cargo check --manifest-path labrelay/Cargo.toml --all-targets
+          cargo test --manifest-path labrelay/Cargo.toml --all-targets
+          grep -q 'version = "0.2.43"' labrelay/Cargo.toml
+          grep -q 'Duration::from_millis(5)' labrelay/src/tcp_session_test.rs
+          grep -q 'socket.bind(source)' labrelay/src/tcp_session_test.rs
+          grep -q 'EXTREME_MAX_PENDING_CONNECTS: usize = 16_384' labrelay/src/tcp_session_test.rs
+      - name: Commit source
+        run: |
+          set -euo pipefail
+          git config user.name 'github-actions[bot]'
+          git config user.email '41898282+github-actions[bot]@users.noreply.github.com'
+          git add labrelay/Cargo.toml labrelay/Cargo.lock labrelay/src/tcp_session_test.rs
+          git diff --cached --check
+          git commit -m 'fix(relay): prioritize extreme TCP throughput'
+          git push origin HEAD:fix/relay-0243-throughput
+      - name: Install cross
+        run: |
+          cargo install cross --locked
+          sudo apt-get update
+          sudo apt-get install -y qemu-user-static
+      - name: Build ARM64
+        env:
+          CARGO_TARGET_DIR: ${{ runner.temp }}/relay-target
+        run: cross build --manifest-path labrelay/Cargo.toml --release --target aarch64-unknown-linux-musl
+      - name: Package
+        env:
+          CARGO_TARGET_DIR: ${{ runner.temp }}/relay-target
+        run: |
+          set -euo pipefail
+          BINARY="$CARGO_TARGET_DIR/aarch64-unknown-linux-musl/release/labrelay"
+          test "$(qemu-aarch64-static "$BINARY" version)" = 'labrelay 0.2.43'
+          mkdir -p "$RUNNER_TEMP/agent"
+          cp "$BINARY" "$RUNNER_TEMP/agent/labrelay-linux-arm64"
+          cp scripts/labprobe-install.sh "$RUNNER_TEMP/agent/install.sh"
+          chmod 755 "$RUNNER_TEMP/agent/labrelay-linux-arm64" "$RUNNER_TEMP/agent/install.sh"
+          sha256sum "$RUNNER_TEMP/agent/labrelay-linux-arm64" "$RUNNER_TEMP/agent/install.sh" > "$RUNNER_TEMP/agent/checksums.txt"
+          tar -C "$RUNNER_TEMP" -czf "$RUNNER_TEMP/labrelay-test-arm64-v0.2.43.tar.gz" agent
+      - name: Upload artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: labrelay-test-arm64-v0.2.43
+          path: |
+            ${{ runner.temp }}/agent/**
+            ${{ runner.temp }}/labrelay-test-arm64-v0.2.43.tar.gz
+      - name: Release test
+        uses: softprops/action-gh-release@v2
+        with:
+          tag_name: test-bundle/20260903-relay-0243-throughput
+          target_commitish: fix/relay-0243-throughput
+          name: LabRelay 0.2.43 throughput test
+          prerelease: true
+          make_latest: false
+          body: |
+            Benchmark-oriented LabRelay 0.2.43 test build.
+            Explicit source-port allocation, 5ms pacing, larger pending window, and no extreme CPU throttle below 99%.
+          files: |
+            ${{ runner.temp }}/agent/labrelay-linux-arm64
+            ${{ runner.temp }}/agent/install.sh
+            ${{ runner.temp }}/agent/checksums.txt
+            ${{ runner.temp }}/labrelay-test-arm64-v0.2.43.tar.gz
