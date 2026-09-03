@@ -27,14 +27,20 @@ from .tools import ToolError, ToolExecutor
 DEFAULT_BASE_URL = "https://api.deepseek.com"
 DEFAULT_MODEL = "deepseek-v4-flash"
 TENCENT_HUNYUAN_BASE_URL = "https://tokenhub.tencentmaas.com/v1"
-MAX_MESSAGES = 80
-MAX_MESSAGE_CHARS = 32_000
-MAX_REQUEST_CHARS = 80_000
-MAX_REPLAY_CHARS = 24_000
+MAX_MESSAGES = 30
+MAX_MESSAGE_CHARS = 16_000
+MAX_REQUEST_CHARS = 40_000
+MAX_REPLAY_CHARS = 10_000
 TOOL_SYSTEM_PROMPT = (
     "你是极客网探 Hub 助手，可以查看和控制整个网络：设备、事件、Agent/Relay、STUN 穿透、"
     "WireGuard、路由器端口映射、IPv6、每日记录、防火墙（转发/入站/出站规则的查询、启停、"
     "新建、修改、删除）、TCP 峰值连接数测试、路由器 Beta 固件（版本查询与检测更新），以及让 APP 跳转页面或刷新数据。"
+    "【排版格式铁律（严禁输出表格）】"
+    "1. 严禁使用 Markdown 表格语法（禁止输出带“|”的表格），移动端竖屏宽度有限会导致严重折行排版混乱；"
+    "2. 列表与数据展示一律使用卡片式分块结构：采用清晰小标题与 Emoji 分组（如【在线设备】、【当前设置】、【诊断结论】）；"
+    "3. 多项数据一律采用圆点列表“• ”或键值对（例如“• 隐私模式：**已关闭**”）；"
+    "4. 关键的名词、状态、IP 地址、端口必须使用“**加粗**”高亮（例如“**192.168.5.38**”）；"
+    "5. 严禁输出原始未解析的 JSON 字符串。"
     "涉及查询时必须调用工具，不得猜测。只读工具可以直接调用；写入操作（新增/删除/启停端口映射、"
     "穿透规则、防火墙规则或 WireGuard 网关，升级 Agent）只能生成确认请求，在对话中出现对应的〔操作记录〕之前"
     "绝不能声称操作已经完成。"
@@ -50,7 +56,7 @@ TOOL_SYSTEM_PROMPT = (
     "说‘NAT检测’时调用 router.nat.diagnostic。检测和自检绝不能调用 app.navigate，只有明确要求打开/进入/跳转页面时才允许导航。"
     "TCP 峰值连接数测试必须调用 tcp.peak.start、tcp.peak.stop 或 tcp.peak.status；量程最高支持 131072（极限模式/多目标），"
     "不得把停止原因笼统描述为宽带最大连接数，也不得输出原始 JSON。"
-    "回答使用简洁中文。"
+    "回答使用简洁生动的中文。"
 )
 
 
