@@ -1,0 +1,458 @@
+from pathlib import Path
+import re
+
+path = Path("labrelay/src/tcp_session_test.rs")
+text = path.read_text(encoding="utf-8")
+
+
+def once(old: str, new: str, label: str) -> None:
+    global text
+    count = text.count(old)
+    if count != 1:
+        raise SystemExit(f"{label}: expected exactly one match, got {count}")
+    text = text.replace(old, new, 1)
+
+
+once(
+    "use std::net::SocketAddr;",
+    "use std::net::{SocketAddr, TcpStream as StdTcpStream};",
+    "std tcp stream import",
+)
+
+once(
+    "const ABSOLUTE_CONNECTION_LIMIT: usize = 65_535;\n",
+    """const ABSOLUTE_CONNECTION_LIMIT: usize = 65_535;
+const EXTREME_CONNECTION_TARGET: usize = 64_000;
+const EXTREME_FD_RESERVE: usize = 256;
+const EXTREME_CONNTRACK_RESERVE: usize = 512;
+const EXTREME_SOURCE_PORT_RESERVE: usize = 64;
+const EXTREME_MEMORY_FLOOR_MB: usize = 96;
+const EXTREME_CONNTRACK_MAX: usize = 131_072;
+const EXTREME_SOCKET_BUFFER_BYTES: u32 = 4 * 1024;
+""",
+    "extreme constants",
+)
+
+once(
+    'const IP_LOCAL_PORT_RANGE_PATH: &str = "/proc/sys/net/ipv4/ip_local_port_range";\n'
+    'const EXTREME_PORT_RANGE_BACKUP: &str = "/tmp/labprobe/tcp-peak-port-range.original";\n',
+    'const IP_LOCAL_PORT_RANGE_PATH: &str = "/proc/sys/net/ipv4/ip_local_port_range";\n'
+    'const NF_CONNTRACK_MAX_PATH: &str = "/proc/sys/net/netfilter/nf_conntrack_max";\n'
+    'const EXTREME_PORT_RANGE_BACKUP: &str = "/tmp/labprobe/tcp-peak-port-range.original";\n'
+    'const EXTREME_CONNTRACK_BACKUP: &str = "/tmp/labprobe/tcp-peak-conntrack-max.original";\n',
+    "sysctl paths",
+)
+
+marker = "pub(crate) fn restore_stale_extreme_port_range() -> Result<()> {"
+if text.count(marker) != 1:
+    raise SystemExit("restore marker missing or duplicated")
+
+guard_code = r'''
+struct ExtremeConntrackGuard {
+    original: usize,
+    active: bool,
+}
+
+impl ExtremeConntrackGuard {
+    fn activate() -> Result<Self> {
+        restore_stale_extreme_conntrack_max()?;
+        let original = read_number(NF_CONNTRACK_MAX_PATH)
+            .context("读取 Conntrack 上限失败")?;
+        if original >= EXTREME_CONNTRACK_MAX {
+            return Ok(Self {
+                original,
+                active: false,
+            });
+        }
+        if let Some(parent) = Path::new(EXTREME_CONNTRACK_BACKUP).parent() {
+            fs::create_dir_all(parent).context("创建极限模式状态目录失败")?;
+        }
+        fs::write(EXTREME_CONNTRACK_BACKUP, format!("{}\n", original))
+            .context("保存原 Conntrack 上限失败")?;
+        if let Err(error) = fs::write(NF_CONNTRACK_MAX_PATH, format!("{}\n", EXTREME_CONNTRACK_MAX)) {
+            let _ = fs::remove_file(EXTREME_CONNTRACK_BACKUP);
+            return Err(error).context("提升 Conntrack 上限失败");
+        }
+        let applied = read_number(NF_CONNTRACK_MAX_PATH).unwrap_or(0);
+        if applied < EXTREME_CONNTRACK_MAX {
+            let _ = fs::write(NF_CONNTRACK_MAX_PATH, format!("{}\n", original));
+            let _ = fs::remove_file(EXTREME_CONNTRACK_BACKUP);
+            bail!("极限模式 Conntrack 上限未生效");
+        }
+        Ok(Self {
+            original,
+            active: true,
+        })
+    }
+
+    fn restore(&mut self) -> Result<()> {
+        if !self.active {
+            return Ok(());
+        }
+        fs::write(NF_CONNTRACK_MAX_PATH, format!("{}\n", self.original))
+            .context("恢复原 Conntrack 上限失败")?;
+        let _ = fs::remove_file(EXTREME_CONNTRACK_BACKUP);
+        self.active = false;
+        Ok(())
+    }
+}
+
+impl Drop for ExtremeConntrackGuard {
+    fn drop(&mut self) {
+        let _ = self.restore();
+    }
+}
+
+struct ExtremeModeGuard {
+    port_range: ExtremePortRangeGuard,
+    conntrack: ExtremeConntrackGuard,
+}
+
+impl ExtremeModeGuard {
+    fn activate() -> Result<Self> {
+        let port_range = ExtremePortRangeGuard::activate()?;
+        let conntrack = ExtremeConntrackGuard::activate()?;
+        Ok(Self {
+            port_range,
+            conntrack,
+        })
+    }
+
+    fn restore(&mut self) -> Result<()> {
+        let conntrack_result = self.conntrack.restore();
+        let port_result = self.port_range.restore();
+        conntrack_result?;
+        port_result?;
+        Ok(())
+    }
+}
+
+fn restore_stale_extreme_conntrack_max() -> Result<()> {
+    let backup = Path::new(EXTREME_CONNTRACK_BACKUP);
+    if !backup.exists() {
+        return Ok(());
+    }
+    let original = fs::read_to_string(backup)
+        .context("读取极限模式 Conntrack 恢复信息失败")?;
+    fs::write(NF_CONNTRACK_MAX_PATH, original)
+        .context("恢复遗留 Conntrack 上限失败")?;
+    fs::remove_file(backup).context("清理 Conntrack 恢复信息失败")?;
+    Ok(())
+}
+
+'''
+text = text.replace(marker, guard_code + marker, 1)
+once(
+    marker + "\n",
+    marker + "\n    restore_stale_extreme_conntrack_max()?;\n",
+    "restore stale conntrack on daemon start",
+)
+
+once(
+    "let mut extreme_port_guard = if config.extreme_mode {",
+    "let mut extreme_guard = if config.extreme_mode {",
+    "extreme guard variable",
+)
+once(
+    "match ExtremePortRangeGuard::activate() {",
+    "match ExtremeModeGuard::activate() {",
+    "extreme guard activation",
+)
+once(
+    '"极限模式已启用：临时源端口范围 1024-65535，测试结束自动恢复".into(),',
+    '"极限模式已启用：目标 64000 连接，临时源端口 1024-65535、Conntrack 上限 131072，测试结束自动恢复".into(),',
+    "extreme start log",
+)
+once(
+    "if let Some(guard) = extreme_port_guard.as_mut() {",
+    "if let Some(guard) = extreme_guard.as_mut() {",
+    "extreme restore variable",
+)
+once(
+    'push_log(snapshot, "极限模式已恢复原临时源端口范围".into());',
+    'push_log(snapshot, "极限模式已恢复原临时源端口范围与 Conntrack 上限".into());',
+    "extreme restore log",
+)
+
+once(
+    "let mut held: Vec<TcpStream> = Vec::with_capacity(safe_target);",
+    "let mut held: Vec<StdTcpStream> = Vec::with_capacity(safe_target);",
+    "held stream type",
+)
+
+old_load = """            let load = (held.len() + pending.len()) as f64 / safe_target.max(1) as f64;
+            let load_scale: f64 = if load >= 0.95 {
+                0.20
+            } else if load >= 0.80 {
+                0.50
+            } else {
+                1.0
+            };
+            let rate_scale = load_scale.min(cpu_scale);
+"""
+new_load = """            let load = (held.len() + pending.len()) as f64 / safe_target.max(1) as f64;
+            let load_scale = load_rate_scale(load, config.extreme_mode);
+            let rate_scale = load_scale.min(cpu_scale);
+"""
+once(old_load, new_load, "load scaling")
+
+old_launch = """                    .min(
+                        CONSECUTIVE_FAILURE_LIMIT
+                            .saturating_sub(consecutive_failures.saturating_add(pending.len())),
+                    )
+"""
+new_launch = """                    .min(connection_quality_launch_budget(
+                        config.extreme_mode,
+                        consecutive_failures,
+                        pending.len(),
+                    ))
+"""
+once(old_launch, new_launch, "pending failure budget")
+
+once(
+    "pending.push(connect_once(address, timeout_duration));",
+    "pending.push(connect_once(address, timeout_duration, config.extreme_mode));",
+    "connect extreme flag",
+)
+
+once(
+    "if last_heavy_resource_sample.elapsed() >= HEAVY_RESOURCE_SAMPLE_INTERVAL {",
+    "if !config.extreme_mode\n                    && last_heavy_resource_sample.elapsed() >= HEAVY_RESOURCE_SAMPLE_INTERVAL\n                {",
+    "skip proc scans in extreme mode",
+)
+
+once(
+    "cpu_scale = cpu_rate_scale(sample.cpu_percent);",
+    "cpu_scale = if config.extreme_mode {\n                    extreme_cpu_rate_scale(sample.cpu_percent)\n                } else {\n                    cpu_rate_scale(sample.cpu_percent)\n                };",
+    "extreme cpu scaling",
+)
+
+once(
+    "Connected(TcpStream),",
+    "Connected(StdTcpStream),",
+    "connected stream type",
+)
+
+helper_marker = "fn cpu_rate_scale(cpu_percent: f64) -> f64 {"
+helpers = r'''fn load_rate_scale(load: f64, extreme_mode: bool) -> f64 {
+    if extreme_mode {
+        1.0
+    } else if load >= 0.95 {
+        0.20
+    } else if load >= 0.80 {
+        0.50
+    } else {
+        1.0
+    }
+}
+
+fn connection_quality_launch_budget(
+    extreme_mode: bool,
+    consecutive_failures: usize,
+    pending: usize,
+) -> usize {
+    if extreme_mode {
+        usize::MAX
+    } else {
+        CONSECUTIVE_FAILURE_LIMIT
+            .saturating_sub(consecutive_failures.saturating_add(pending))
+    }
+}
+
+fn extreme_cpu_rate_scale(cpu_percent: f64) -> f64 {
+    if cpu_percent >= 99.5 {
+        0.10
+    } else if cpu_percent >= 98.0 {
+        0.25
+    } else if cpu_percent >= 95.0 {
+        0.75
+    } else {
+        1.0
+    }
+}
+
+'''
+if text.count(helper_marker) != 1:
+    raise SystemExit("cpu helper marker missing")
+text = text.replace(helper_marker, helpers + helper_marker, 1)
+
+connect_pattern = re.compile(
+    r"async fn connect_once\(address: SocketAddr, connect_timeout: Duration\) -> ConnectResult \{.*?\n\}\n\nasync fn resolve_target",
+    re.S,
+)
+connect_replacement = r'''async fn connect_once(
+    address: SocketAddr,
+    connect_timeout: Duration,
+    extreme_mode: bool,
+) -> ConnectResult {
+    let socket = if address.is_ipv4() {
+        TcpSocket::new_v4()
+    } else {
+        TcpSocket::new_v6()
+    };
+    let socket = match socket {
+        Ok(value) => value,
+        Err(error) => return ConnectResult::Failed(classify_connect_error(&error)),
+    };
+    if extreme_mode {
+        let _ = socket.set_recv_buffer_size(EXTREME_SOCKET_BUFFER_BYTES);
+        let _ = socket.set_send_buffer_size(EXTREME_SOCKET_BUFFER_BYTES);
+    }
+    match timeout(connect_timeout, socket.connect(address)).await {
+        Ok(Ok(stream)) => match stream.into_std() {
+            Ok(stream) => ConnectResult::Connected(stream),
+            Err(error) => ConnectResult::Failed(classify_connect_error(&error)),
+        },
+        Ok(Err(error)) => ConnectResult::Failed(classify_connect_error(&error)),
+        Err(_) => ConnectResult::Failed(FailureKind::Other),
+    }
+}
+
+async fn resolve_target'''
+text, count = connect_pattern.subn(connect_replacement, text, count=1)
+if count != 1:
+    raise SystemExit(f"connect_once replacement count={count}")
+
+once(
+    "    source_port_ceiling: usize,\n}",
+    "    source_port_ceiling: usize,\n    extreme_mode: bool,\n}",
+    "resource plan extreme flag",
+)
+
+resource_pattern = re.compile(
+    r"fn resource_plan\(requested: usize, extreme_mode: bool\) -> ResourcePlan \{.*?\n\}\n\nfn health_stop_reason",
+    re.S,
+)
+resource_replacement = r'''fn resource_plan(requested: usize, extreme_mode: bool) -> ResourcePlan {
+    let baseline_fd = current_fd_count();
+    let soft_limit = fd_soft_limit().unwrap_or(ABSOLUTE_CONNECTION_LIMIT + baseline_fd + 2_048);
+    let fd_ceiling = if extreme_mode {
+        soft_limit
+            .saturating_sub(EXTREME_FD_RESERVE)
+            .max(baseline_fd.saturating_add(1))
+    } else {
+        soft_limit
+            .saturating_mul(80)
+            .checked_div(100)
+            .unwrap_or(soft_limit)
+            .max(baseline_fd.saturating_add(1))
+    };
+    let fd_budget = fd_ceiling.saturating_sub(baseline_fd).max(1);
+
+    let baseline_conntrack = read_number("/proc/sys/net/netfilter/nf_conntrack_count").unwrap_or(0);
+    let conntrack_max = read_number(NF_CONNTRACK_MAX_PATH).unwrap_or(65_536);
+    let conntrack_ceiling = if extreme_mode {
+        conntrack_max
+            .saturating_sub(EXTREME_CONNTRACK_RESERVE)
+            .max(baseline_conntrack.saturating_add(1))
+    } else {
+        conntrack_max.saturating_mul(75) / 100
+    };
+    let conntrack_budget = conntrack_ceiling.saturating_sub(baseline_conntrack).max(1);
+
+    let (memory_total_mb, memory_available_mb) = memory_megabytes();
+    let memory_floor_mb = if extreme_mode {
+        EXTREME_MEMORY_FLOOR_MB
+    } else {
+        (memory_total_mb / 5)
+            .max(192)
+            .min(memory_available_mb.saturating_sub(1))
+    };
+    let memory_budget = memory_available_mb
+        .saturating_sub(memory_floor_mb)
+        .saturating_mul(128)
+        .max(1);
+
+    let (source_first, source_last) = source_port_range();
+    let source_port_capacity = source_last.saturating_sub(source_first).saturating_add(1);
+    let baseline_source_ports = source_ports_in_use(source_first, source_last);
+    let source_port_ceiling = if extreme_mode {
+        source_port_capacity
+            .saturating_sub(EXTREME_SOURCE_PORT_RESERVE)
+            .max(baseline_source_ports.saturating_add(1))
+    } else {
+        source_port_capacity.saturating_mul(90) / 100
+    };
+    let source_port_budget = source_port_ceiling
+        .saturating_sub(baseline_source_ports)
+        .max(1);
+
+    let requested_limit = requested.min(if extreme_mode {
+        EXTREME_CONNECTION_TARGET
+    } else {
+        ABSOLUTE_CONNECTION_LIMIT
+    });
+    let requested_reason = if extreme_mode && requested >= EXTREME_CONNECTION_TARGET {
+        "达到极限模式 64000 连接目标"
+    } else {
+        "达到设定连接数"
+    };
+    let mut candidates = vec![
+        (requested_limit, requested_reason),
+        (fd_budget, "Relay 进程 FD 已达到实际上限"),
+        (conntrack_budget, "Conntrack 已达到实际余量边界"),
+        (source_port_budget, "单目标临时源端口已达到实际余量边界"),
+    ];
+    if !extreme_mode {
+        candidates.push((memory_budget, "Relay 内存已达到安全阈值"));
+    }
+    let (safe_target, limiting_reason) = candidates
+        .into_iter()
+        .min_by_key(|(value, _)| *value)
+        .unwrap_or((1, "系统资源边界"));
+    ResourcePlan {
+        safe_target: safe_target.clamp(1, ABSOLUTE_CONNECTION_LIMIT),
+        limiting_reason: limiting_reason.into(),
+        baseline_fd,
+        fd_soft_limit: soft_limit,
+        fd_ceiling,
+        baseline_conntrack,
+        conntrack_ceiling,
+        memory_floor_mb,
+        baseline_source_ports,
+        source_port_ceiling,
+        extreme_mode,
+    }
+}
+
+fn health_stop_reason'''
+text, count = resource_pattern.subn(resource_replacement, text, count=1)
+if count != 1:
+    raise SystemExit(f"resource_plan replacement count={count}")
+
+once(
+    '    } else if high_cpu_samples >= CPU_HIGH_SAMPLE_LIMIT {\n        Some("CPU 持续高负载，已触发系统保护".into())\n',
+    '    } else if !plan.extreme_mode && high_cpu_samples >= CPU_HIGH_SAMPLE_LIMIT {\n        Some("CPU 持续高负载，已触发系统保护".into())\n',
+    "extreme cpu hard stop",
+)
+
+test_marker = """        assert_eq!(cpu_rate_scale(99.0), 0.0);
+    }
+}"""
+test_replacement = """        assert_eq!(cpu_rate_scale(99.0), 0.0);
+    }
+
+    #[test]
+    fn extreme_mode_keeps_driving_toward_64k() {
+        assert_eq!(load_rate_scale(0.80, true), 1.0);
+        assert_eq!(load_rate_scale(0.99, true), 1.0);
+        assert_eq!(connection_quality_launch_budget(true, 0, 1_024), usize::MAX);
+        assert_eq!(connection_quality_launch_budget(false, 0, 200), 0);
+        assert_eq!(extreme_cpu_rate_scale(94.0), 1.0);
+        assert_eq!(extreme_cpu_rate_scale(95.0), 0.75);
+        assert_eq!(extreme_cpu_rate_scale(98.0), 0.25);
+        assert_eq!(extreme_cpu_rate_scale(99.5), 0.10);
+    }
+}"""
+once(test_marker, test_replacement, "extreme tests")
+
+path.write_text(text, encoding="utf-8")
+
+cargo = Path("labrelay/Cargo.toml")
+cargo_text = cargo.read_text(encoding="utf-8")
+if cargo_text.count('version = "0.2.41"') != 1:
+    raise SystemExit("unexpected Cargo.toml version")
+cargo.write_text(
+    cargo_text.replace('version = "0.2.41"', 'version = "0.2.42"', 1),
+    encoding="utf-8",
+)
