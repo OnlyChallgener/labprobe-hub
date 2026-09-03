@@ -73,19 +73,17 @@ def merge_usage(total: Dict[str, int], usage: Dict[str, int]) -> Dict[str, int]:
 def update_usage_snapshot(current: Dict[str, int], usage: Dict[str, int]) -> Dict[str, int]:
     """Keep the latest cumulative usage snapshot for one provider request.
 
-    Non-stream replies provide one final usage block.
-    Typed SSE streams emit multiple usage-bearing snapshots; the last non-empty
-    object should win without accumulating duplicate tokens across snapshots.
+    OpenAI-compatible streaming usage frames are cumulative snapshots, not
+    deltas. Summing repeated frames can multiply a single task's tokens. Tool
+    rounds are still added together later with ``merge_usage``.
     """
-    cleaned: Dict[str, int] = {}
     for key in (
         "prompt_tokens", "completion_tokens", "total_tokens",
         "cache_hit_tokens", "cache_miss_tokens", "cache_reported_input_tokens",
     ):
-        raw = usage.get(key)
-        if isinstance(raw, int) and raw >= 0:
-            cleaned[key] = raw
-    return cleaned or dict(current)
+        if key in usage:
+            current[key] = int(usage[key])
+    return current
 
 
 def diagnostic_tool_intent(text: str) -> str | None:
