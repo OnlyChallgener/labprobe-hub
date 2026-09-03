@@ -165,8 +165,10 @@ class TcpSessionService:
         config = self._config(payload)
         with self.lock:
             current = self._materialized(self._state())
-            if _text(current.get("state")) in ACTIVE_STATES:
-                raise RuntimeError("已有 TCP 峰值连接数测试正在运行")
+            cur_state = _text(current.get("state"))
+            if cur_state in ACTIVE_STATES:
+                status_desc = current.get("status") or cur_state
+                raise RuntimeError(f"已有 TCP 峰值连接数测试正在运行（状态：{status_desc}），请等待完成或点击停止")
             now = _now()
             task_id = f"tcp-{uuid.uuid4().hex[:16]}"
             task = {
