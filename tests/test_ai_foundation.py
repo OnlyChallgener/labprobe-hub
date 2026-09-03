@@ -1029,6 +1029,9 @@ def test_fast_path_tool_intent(tmp_path, monkeypatch):
     assert fast_path_tool_intent("Relay 状态") == "agent.status"
     assert fast_path_tool_intent("查看当前 APP 设置") == "app.settings.get"
     assert fast_path_tool_intent("TCP 峰值连接数状态") == "tcp.peak.status"
+    assert fast_path_tool_intent("测试一下路由器的 TCP 峰值连接数") == "navigate.tool_tcp_peak"
+    assert fast_path_tool_intent("测试 TCP 峰值连接数") == "navigate.tool_tcp_peak"
+    assert fast_path_tool_intent("测一下峰值连接数") == "navigate.tool_tcp_peak"
     assert fast_path_tool_intent("当前固件版本") == "router.firmware.status"
     assert fast_path_tool_intent("打开 Agent 设置页面") is None
 
@@ -1080,6 +1083,16 @@ def test_agent_status_fast_path_chat_returns_instant_readable_result(tmp_path, m
     assert "aarch64" in content
     assert response.json["usageKnown"] is False
     assert response.json["toolExecutions"] == [{"toolId": "agent.status", "status": "completed"}]
+
+
+def test_tcp_peak_navigate_fast_reply(tmp_path, monkeypatch):
+    hub = fake_hub(tmp_path)
+    client = make_client(tmp_path, monkeypatch, hub_runtime=hub)
+    response = client.post("/api/ai/chat", json={"message": "测试一下路由器的 TCP 峰值连接数"})
+    assert response.status_code == 200
+    content = response.json["message"]["content"]
+    assert "已打开「TCP 峰值连接数」测试页" in content
+    assert response.json["clientActions"] == [{"type": "navigate", "route": "tcp_peak"}]
 
 
 def test_nat_result_query_reuses_existing_task_without_restart(tmp_path, monkeypatch):

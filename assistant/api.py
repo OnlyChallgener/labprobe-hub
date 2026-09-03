@@ -54,8 +54,8 @@ TOOL_SYSTEM_PROMPT = (
     "告知，禁止凭对话记忆声称“仍在等待确认”。"
     "用户说‘网络自检’时调用 network.self_check；说‘路由网络自检/路由器自检’时调用 router.diagnostic；"
     "说‘NAT检测’时调用 router.nat.diagnostic。检测和自检绝不能调用 app.navigate，只有明确要求打开/进入/跳转页面时才允许导航。"
-    "TCP 峰值连接数测试必须调用 tcp.peak.start、tcp.peak.stop 或 tcp.peak.status；量程最高支持 131072（极限模式/多目标），"
-    "不得把停止原因笼统描述为宽带最大连接数，也不得输出原始 JSON。"
+    "用户请求进行 TCP 峰值连接数测试时（如‘测试TCP峰值’、‘测一下峰值连接数’等），一律调用 app.navigate 导航至 tcp_peak，"
+    "引导用户进入 APP 的测试页面配置与实时观测走势，不要直接下发后台测试指令；仅在用户查询测试进度/状态时调用 tcp.peak.status。"
     "回答使用简洁生动的中文。"
 )
 
@@ -73,38 +73,48 @@ def merge_usage(total: Dict[str, int], usage: Dict[str, int]) -> Dict[str, int]:
 def update_usage_snapshot(current: Dict[str, int], usage: Dict[str, int]) -> Dict[str, int]:
     """Keep the latest cumulative usage snapshot for one provider request.
 
-    OpenAI-compatible streaming usage frames are cumulative snapshots, not
-    deltas. Summing repeated frames can multiply a single task's tokens. Tool
-    rounds are still added together later with ``merge_usage``.
+    Non-stream replies provide one final usage block.
+    Typed SSE streams emit multiple usage-bearing snapshots; the last non-empty
+    object should win without accumulating duplicate tokens across snapshots.
     """
+    cleaned: Dict[str, int] = {}
     for key in (
         "prompt_tokens", "completion_tokens", "total_tokens",
         "cache_hit_tokens", "cache_miss_tokens", "cache_reported_input_tokens",
     ):
-        if key in usage:
-            current[key] = int(usage[key])
-    return current
+        raw = usage.get(key)
+        if isinstance(raw, int) and raw >= 0:
+            cleaned[key] = raw
+    return cleaned or dict(current)
 
 
 def diagnostic_tool_intent(text: str) -> str | None:
     normalized = "".join(str(text or "").lower().split())
     if any(word in normalized for word in ("打开", "进入", "跳转", "页面")):
+        if any(word in normalized for word in ("nat检测", "nat测试", "nat诊断")):
+            return "navigate.tool_nat"
         return None
+    if "路由" in normalized and ("自检" in normalized or ("网络" in normalized and "检测" in normalized)):
+        return "router.diagnostic"
+    if "自检" in normalized or ("网络" in normalized and "检测" in normalized):
+        return "network.self_check"
     if "nat" in normalized:
-        wants_result = any(word in normalized for word in ("结果", "状态", "进度"))
-        if "路由" in normalized or wants_result:
+        if "路由" in normalized or "结果" in normalized or "状态" in normalized or "类型" in normalized:
             return "router.nat.diagnostic"
         return "navigate.tool_nat"
-    if "自检" in normalized:
-        return "router.diagnostic" if "路由" in normalized else "network.self_check"
     return None
 
 
 def fast_path_tool_intent(text: str) -> str | None:
+    normalized = "".join(str(text or "").lower().split())
+    if "tcp" in normalized or "峰值" in normalized:
+        if any(w in normalized for w in ("测试", "测", "压测", "跑一下", "开始", "启动", "发起", "页面", "界面", "打开", "进入")):
+            return "navigate.tool_tcp_peak"
+        if any(w in normalized for w in ("状态", "进度", "结果", "跑完", "跑得怎么样")):
+            return "tcp.peak.status"
     diag = diagnostic_tool_intent(text)
     if diag:
         return diag
-    normalized = "".join(str(text or "").lower().split())
     if any(word in normalized for word in ("打开", "进入", "跳转", "页面", "新建", "添加", "删除", "修改", "重启", "升级")):
         return None
     if ("agent" in normalized or "relay" in normalized) and any(
@@ -113,10 +123,6 @@ def fast_path_tool_intent(text: str) -> str | None:
         return "agent.status"
     if "设置" in normalized and any(w in normalized for w in ("app", "客户端", "当前")):
         return "app.settings.get"
-    if ("tcp" in normalized or "峰值" in normalized) and any(
-        w in normalized for w in ("状态", "进度", "结果", "跑完", "跑得怎么样")
-    ):
-        return "tcp.peak.status"
     if "固件" in normalized and any(w in normalized for w in ("版本", "状态", "当前")):
         return "router.firmware.status"
     return None
@@ -1336,6 +1342,23 @@ def create_ai_blueprint(*, check_app_token: Callable[[], bool], db_path, logger,
                 "usageKnown": False,
                 "toolExecutions": [],
                 "clientActions": [{"type": "navigate", "route": "nat"}],
+            }
+            return sse_done(payload) if wants_stream else jsonify(payload)
+        if forced_tool_id == "navigate.tool_tcp_peak" and executor is not None:
+            content = (
+                "已打开「TCP 峰值连接数」测试页。\n"
+                "你可以在测试页面选择【本机 APP】或【Relay 宿主机】，配置目标域名/IP与量程，实时观察活动连接数走势图与系统资源占用。"
+            )
+            message_id = store.add_message(conversation_id, "assistant", content)
+            payload = {
+                "conversationId": conversation_id,
+                "message": {"role": "assistant", "content": content},
+                "messageId": message_id,
+                "userMessageId": user_message_id,
+                "usage": {},
+                "usageKnown": False,
+                "toolExecutions": [],
+                "clientActions": [{"type": "navigate", "route": "tcp_peak"}],
             }
             return sse_done(payload) if wants_stream else jsonify(payload)
         if forced_tool_id == "agent.status" and executor is not None:
