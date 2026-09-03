@@ -129,7 +129,7 @@ class TcpSessionService:
             "host": host,
             "port": port,
             "family": family,
-            "targetConnections": max(1, min(65535, _integer(payload.get("targetConnections"), 65535))),
+            "targetConnections": max(1, min(131072, _integer(payload.get("targetConnections"), 131072))),
             "cps": max(1, min(10000, _integer(payload.get("cps"), 500))),
             "extremeMode": payload.get("extremeMode") is True,
             "connectTimeoutMs": max(300, min(10000, _integer(payload.get("connectTimeoutMs"), 1500))),

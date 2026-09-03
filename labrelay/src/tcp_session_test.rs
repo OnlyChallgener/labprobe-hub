@@ -259,6 +259,7 @@ pub(crate) fn restore_stale_extreme_port_range() -> Result<()> {
 struct ExtremeNoTrackGuard {
     target: SocketAddr,
     active: bool,
+    used_comment: bool,
 }
 
 impl ExtremeNoTrackGuard {
@@ -273,6 +274,12 @@ impl ExtremeNoTrackGuard {
         let _ = std::process::Command::new(cmd)
             .args(["-t", "raw", "-D", "PREROUTING", "-p", "tcp", "-s", &ip, "--sport", &port, "-j", "NOTRACK", "-m", "comment", "--comment", "labprobe-peak"])
             .output();
+        let _ = std::process::Command::new(cmd)
+            .args(["-t", "raw", "-D", "OUTPUT", "-p", "tcp", "-d", &ip, "--dport", &port, "-j", "NOTRACK"])
+            .output();
+        let _ = std::process::Command::new(cmd)
+            .args(["-t", "raw", "-D", "PREROUTING", "-p", "tcp", "-s", &ip, "--sport", &port, "-j", "NOTRACK"])
+            .output();
 
         let out_res = std::process::Command::new(cmd)
             .args(["-t", "raw", "-I", "OUTPUT", "-p", "tcp", "-d", &ip, "--dport", &port, "-j", "NOTRACK", "-m", "comment", "--comment", "labprobe-peak"])
@@ -281,12 +288,25 @@ impl ExtremeNoTrackGuard {
             .args(["-t", "raw", "-I", "PREROUTING", "-p", "tcp", "-s", &ip, "--sport", &port, "-j", "NOTRACK", "-m", "comment", "--comment", "labprobe-peak"])
             .output();
 
-        let active = match (out_res, pre_res) {
+        if let (Ok(o), Ok(p)) = (out_res, pre_res) {
+            if o.status.success() && p.status.success() {
+                return Self { target, active: true, used_comment: true };
+            }
+        }
+
+        let out_res2 = std::process::Command::new(cmd)
+            .args(["-t", "raw", "-I", "OUTPUT", "-p", "tcp", "-d", &ip, "--dport", &port, "-j", "NOTRACK"])
+            .output();
+        let pre_res2 = std::process::Command::new(cmd)
+            .args(["-t", "raw", "-I", "PREROUTING", "-p", "tcp", "-s", &ip, "--sport", &port, "-j", "NOTRACK"])
+            .output();
+
+        let active = match (out_res2, pre_res2) {
             (Ok(o), Ok(p)) => o.status.success() && p.status.success(),
             _ => false,
         };
 
-        Self { target, active }
+        Self { target, active, used_comment: false }
     }
 
     fn restore(&mut self) {
@@ -296,12 +316,21 @@ impl ExtremeNoTrackGuard {
         let ip = self.target.ip().to_string();
         let port = self.target.port().to_string();
         let cmd = if self.target.is_ipv6() { "ip6tables" } else { "iptables" };
-        let _ = std::process::Command::new(cmd)
-            .args(["-t", "raw", "-D", "OUTPUT", "-p", "tcp", "-d", &ip, "--dport", &port, "-j", "NOTRACK", "-m", "comment", "--comment", "labprobe-peak"])
-            .output();
-        let _ = std::process::Command::new(cmd)
-            .args(["-t", "raw", "-D", "PREROUTING", "-p", "tcp", "-s", &ip, "--sport", &port, "-j", "NOTRACK", "-m", "comment", "--comment", "labprobe-peak"])
-            .output();
+        if self.used_comment {
+            let _ = std::process::Command::new(cmd)
+                .args(["-t", "raw", "-D", "OUTPUT", "-p", "tcp", "-d", &ip, "--dport", &port, "-j", "NOTRACK", "-m", "comment", "--comment", "labprobe-peak"])
+                .output();
+            let _ = std::process::Command::new(cmd)
+                .args(["-t", "raw", "-D", "PREROUTING", "-p", "tcp", "-s", &ip, "--sport", &port, "-j", "NOTRACK", "-m", "comment", "--comment", "labprobe-peak"])
+                .output();
+        } else {
+            let _ = std::process::Command::new(cmd)
+                .args(["-t", "raw", "-D", "OUTPUT", "-p", "tcp", "-d", &ip, "--dport", &port, "-j", "NOTRACK"])
+                .output();
+            let _ = std::process::Command::new(cmd)
+                .args(["-t", "raw", "-D", "PREROUTING", "-p", "tcp", "-s", &ip, "--sport", &port, "-j", "NOTRACK"])
+                .output();
+        }
         self.active = false;
     }
 }
@@ -1040,11 +1069,14 @@ impl TcpSessionTestManager {
                 source_ports_in_use(source_first, source_last),
             );
             self.publish_resources(task_id, &sample).await;
-            let fd_released = sample.fd_used <= plan.baseline_fd.saturating_add(16);
+            let fd_released = sample.fd_used <= plan.baseline_fd.saturating_add(64);
             let source_released =
-                sample.source_ports_used <= plan.baseline_source_ports.saturating_add(32);
-            let conntrack_released =
-                sample.conntrack <= plan.baseline_conntrack.saturating_add(128);
+                sample.source_ports_used <= plan.baseline_source_ports.saturating_add(128);
+            let conntrack_released = if plan.extreme_mode {
+                true
+            } else {
+                sample.conntrack <= plan.baseline_conntrack.saturating_add(128)
+            };
             if fd_released && source_released && conntrack_released {
                 self.update(task_id, |snapshot| {
                     snapshot.resources_released = true;

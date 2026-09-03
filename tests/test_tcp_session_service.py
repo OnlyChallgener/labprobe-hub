@@ -63,7 +63,7 @@ def test_start_is_bounded_and_rejects_duplicate(tmp_path):
     task = client.post("/api/tcp-session-test/start", json=start_payload(targetConnections=999999, cps=99999, extremeMode=True)).get_json()["task"]
 
     assert task["state"] == "queued"
-    assert task["config"]["targetConnections"] == 65535
+    assert task["config"]["targetConnections"] == 131072
     assert task["config"]["cps"] == 10000
     assert task["config"]["extremeMode"] is True
     duplicate = client.post("/api/tcp-session-test/start", json=start_payload())
