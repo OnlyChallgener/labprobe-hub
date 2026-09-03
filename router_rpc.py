@@ -107,12 +107,42 @@ def _deep_strip_runtime_fields(value: Any) -> Any:
 class EncryptedRouterConfigStore:
     """Persist the router password encrypted at rest with AES-GCM."""
 
+    # Historic key material used before per-install keys existed. Kept for
+    # decrypt-only migration so existing deployments keep their saved router
+    # password across the upgrade; save() re-encrypts it under the current key.
+    LEGACY_CONSTANT_KEY = "labprobe-router-config"
+
     def __init__(self, config_dir: Path):
         self.path = config_dir / "router_eweb.json"
         self.path.parent.mkdir(parents=True, exist_ok=True)
-        source = (os.environ.get("ROUTER_CONFIG_KEY") or os.environ.get("APP_TOKEN") or "labprobe-router-config").encode("utf-8")
-        self.key = hashlib.sha256(source).digest()
+        self.key = self._resolve_key(config_dir)
+        self._legacy_key = hashlib.sha256(self.LEGACY_CONSTANT_KEY.encode("utf-8")).digest()
         self._lock = threading.RLock()
+
+    @staticmethod
+    def _resolve_key(config_dir: Path) -> bytes:
+        configured = os.environ.get("ROUTER_CONFIG_KEY") or os.environ.get("APP_TOKEN")
+        if configured:
+            return hashlib.sha256(configured.encode("utf-8")).digest()
+        # No key material in the environment: derive the at-rest key from a
+        # random per-install key file instead of a public constant, so a leaked
+        # router_eweb.json alone stays undecryptable.
+        key_path = config_dir / "router_config.key"
+        try:
+            raw = key_path.read_bytes().strip() if key_path.exists() else b""
+            if len(raw) < 32:
+                raw = secrets.token_hex(32).encode("ascii")
+                key_path.write_bytes(raw)
+                try:
+                    os.chmod(key_path, 0o600)
+                except OSError:
+                    pass
+            return hashlib.sha256(raw).digest()
+        except OSError:
+            # Unusable key file: a per-process random key makes saved
+            # ciphertext undecryptable after restart (load() already treats
+            # that as "no password"), which is safer than a public constant.
+            return hashlib.sha256(secrets.token_bytes(32)).digest()
 
     def _encrypt(self, plain: str) -> Dict[str, str]:
         cipher = AES.new(self.key, AES.MODE_GCM)
@@ -124,8 +154,16 @@ class EncryptedRouterConfigStore:
         }
 
     def _decrypt(self, payload: Dict[str, Any]) -> str:
-        cipher = AES.new(self.key, AES.MODE_GCM, nonce=base64.b64decode(payload["nonce"]))
-        return cipher.decrypt_and_verify(base64.b64decode(payload["ciphertext"]), base64.b64decode(payload["tag"])).decode("utf-8")
+        last_error: Exception = ValueError("empty ciphertext payload")
+        for key in (self.key, self._legacy_key):
+            try:
+                cipher = AES.new(key, AES.MODE_GCM, nonce=base64.b64decode(payload["nonce"]))
+                return cipher.decrypt_and_verify(
+                    base64.b64decode(payload["ciphertext"]), base64.b64decode(payload["tag"])
+                ).decode("utf-8")
+            except Exception as error:  # try the next key source
+                last_error = error
+        raise last_error
 
     def load(self) -> Dict[str, Any]:
         with self._lock:
@@ -135,26 +173,59 @@ class EncryptedRouterConfigStore:
                     saved = json.loads(self.path.read_text(encoding="utf-8"))
                 except Exception:
                     saved = {}
-            address = _clean_url(os.environ.get("ROUTER_EWEB_URL") or saved.get("address") or DEFAULT_ROUTER_URL)
-            session_seconds = _safe_int(os.environ.get("ROUTER_SESSION_TIME") or saved.get("sessionSeconds"), 3600, 600, 7200)
-            password = os.environ.get("ROUTER_EWEB_PASSWORD", "")
+            managed = bool(saved.get("managed", False))
+            address = _clean_url(
+                (saved.get("address") if managed else os.environ.get("ROUTER_EWEB_URL"))
+                or saved.get("address")
+                or os.environ.get("ROUTER_EWEB_URL")
+                or DEFAULT_ROUTER_URL
+            )
+            session_seconds = _safe_int(
+                (saved.get("sessionSeconds") if managed else os.environ.get("ROUTER_SESSION_TIME"))
+                or saved.get("sessionSeconds")
+                or os.environ.get("ROUTER_SESSION_TIME"),
+                3600,
+                600,
+                7200,
+            )
+            password = "" if managed else os.environ.get("ROUTER_EWEB_PASSWORD", "")
             if not password and isinstance(saved.get("passwordEncrypted"), dict):
                 try:
                     password = self._decrypt(saved["passwordEncrypted"])
                 except Exception:
                     password = ""
+            verify_tls_value = (
+                saved.get("verifyTls", False)
+                if managed
+                else os.environ.get("ROUTER_VERIFY_TLS", saved.get("verifyTls", False))
+            )
             return {
+                "name": str(saved.get("name") or os.environ.get("PRIMARY_ROUTER_NAME") or "").strip(),
+                "username": str(saved.get("username") or os.environ.get("ROUTER_USERNAME") or "admin").strip(),
                 "address": address,
                 "password": password,
                 "sessionSeconds": session_seconds,
-                "verifyTls": str(os.environ.get("ROUTER_VERIFY_TLS") or saved.get("verifyTls") or "false").lower() == "true",
+                "verifyTls": str(verify_tls_value).lower() == "true",
+                "managed": managed,
             }
 
-    def save(self, address: str, password: Optional[str], session_seconds: int, verify_tls: bool = False) -> Dict[str, Any]:
+    def save(
+        self,
+        address: str,
+        password: Optional[str],
+        session_seconds: int,
+        verify_tls: bool = False,
+        *,
+        username: Optional[str] = None,
+        name: Optional[str] = None,
+    ) -> Dict[str, Any]:
         with self._lock:
             old = self.load()
             actual_password = old.get("password", "") if password is None else password
             payload = {
+                "managed": True,
+                "name": str(old.get("name", "") if name is None else name).strip(),
+                "username": str(old.get("username", "admin") if username is None else username).strip() or "admin",
                 "address": _clean_url(address),
                 "sessionSeconds": _safe_int(session_seconds, 3600, 600, 7200),
                 "verifyTls": bool(verify_tls),

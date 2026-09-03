@@ -1,4 +1,5 @@
 import os
+import copy
 import json
 import socket
 import subprocess
@@ -13,6 +14,7 @@ import platform
 import sys
 from logging.handlers import TimedRotatingFileHandler
 from datetime import datetime, date
+from zoneinfo import ZoneInfo
 from pathlib import Path
 from typing import Any, Dict, List, Optional, Tuple
 
@@ -23,7 +25,8 @@ import paho.mqtt.client as mqtt
 from flask import Flask, request, jsonify, g
 from labprobe_storage import SQLiteStore
 
-APP_VERSION = "0.10.12"
+BEIJING_TZ = ZoneInfo("Asia/Shanghai")
+APP_VERSION = "0.12.2"
 PORT = int(os.environ.get("PORT", "58443"))
 BASE_DIR = Path(os.environ.get("LABPROBE_BASE_DIR", ".")).resolve()
 CONFIG_DIR = Path(os.environ.get("CONFIG_DIR", str(BASE_DIR / "config"))).resolve()
@@ -59,6 +62,7 @@ app = Flask(__name__)
 DATA_LOCK = threading.RLock()
 ROUTER_DASHBOARD_LOCK = threading.RLock()
 REFRESH_LOCK = threading.RLock()
+PORTMAP_MUTATION_LOCK = threading.RLock()
 REFRESH_RUNNING = False
 STATUS_REFRESH_TTL_SEC = int(os.environ.get("STATUS_REFRESH_TTL_SEC", "180"))
 STORE = SQLiteStore(DATA_DIR, BACKUPS_DIR, DB_PATH)
@@ -178,7 +182,7 @@ class MqttRevisionPublisher:
     def _timestamp() -> str:
         # This publisher starts while the module is still loading, so avoid
         # depending on helpers declared later in the file from callback threads.
-        return datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+        return datetime.now(BEIJING_TZ).strftime("%Y-%m-%d %H:%M:%S")
 
     def __init__(self):
         self.enabled = bool(MQTT_PUBLIC_URL and MQTT_INTERNAL_HOST and MQTT_USERNAME and MQTT_PASSWORD)
@@ -386,23 +390,16 @@ def unlock_request_data(_error=None):
 
 
 def now_str() -> str:
-    return datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+    return datetime.now(BEIJING_TZ).strftime("%Y-%m-%d %H:%M:%S")
 
 
 def today_str() -> str:
-    return date.today().isoformat()
+    return datetime.now(BEIJING_TZ).date().isoformat()
 
 
 def time_to_epoch(v: Any) -> float:
-    if not v:
-        return 0.0
-    text = str(v).strip()
-    for fmt in ["%Y-%m-%d %H:%M:%S", "%Y-%m-%dT%H:%M:%S"]:
-        try:
-            return datetime.strptime(text[:19], fmt).timestamp()
-        except Exception:
-            pass
-    return 0.0
+    parsed = parse_time_safe(v)
+    return parsed.replace(tzinfo=BEIJING_TZ).timestamp() if parsed else 0.0
 
 
 def load_json(path: Path, default: Any) -> Any:
@@ -482,6 +479,9 @@ def hub_name() -> str:
 
 
 def primary_router_name() -> str:
+    runtime_name = str(globals().get("ROUTER_RUNTIME_NAME", "") or "").strip()
+    if runtime_name:
+        return runtime_name
     return env_compat(
         "PRIMARY_ROUTER_NAME", "PORTMAP_ROUTER_NAME",
         default=str(cfg_get("router.name", "")),
@@ -502,6 +502,24 @@ def host_mac() -> str:
 
 def advertise_url() -> str:
     return env_compat("HUB_ADVERTISE_URL", default=f"http://127.0.0.1:{PORT}").rstrip("/")
+
+
+_QUERY_TOKEN_WARNED: set = set()
+
+
+def _warn_query_string_token() -> None:
+    """Tokens in URLs leak through reverse-proxy access logs; headers are the
+    supported form. Query tokens stay accepted for third-party senders that
+    cannot set headers, but each affected route is surfaced once per process."""
+    route = request.path
+    if route in _QUERY_TOKEN_WARNED or len(_QUERY_TOKEN_WARNED) >= 64:
+        return
+    _QUERY_TOKEN_WARNED.add(route)
+    app.logger.warning(
+        "auth: %s received a token via query string; switch to 'Authorization: Bearer <token>' "
+        "or the X-LabProbe-Token header (query tokens will be rejected in a future release)",
+        route,
+    )
 
 
 def _auth_tokens_from_request() -> List[str]:
@@ -536,6 +554,7 @@ def _auth_tokens_from_request() -> List[str]:
     for arg in ["token", "app_token", "appToken", "hook_token", "hookToken", "key"]:
         v = request.args.get(arg, "").strip()
         if v:
+            _warn_query_string_token()
             tokens.append(v)
 
     return [t for t in tokens if t]
@@ -558,19 +577,90 @@ def _token_matches(candidate: Any, expected: Any) -> bool:
         return False
 
 
+def get_app_tokens() -> List[str]:
+    """Tokens accepted for APP-authenticated calls.
+
+    ``APP_TOKEN_PREVIOUS`` keeps rotation zero-downtime: set it to the old
+    token, restart, update every client, then remove it and restart again.
+    """
+    tokens = [get_app_token(), get_hook_token()]
+    previous = str(os.environ.get("APP_TOKEN_PREVIOUS", "") or "").strip()
+    if previous:
+        tokens.append(previous)
+    return [t for t in tokens if t]
+
+
+def get_hook_tokens() -> List[str]:
+    tokens = [get_hook_token(), get_app_token()]
+    previous = str(os.environ.get("HOOK_TOKEN_PREVIOUS", "") or "").strip()
+    if previous:
+        tokens.append(previous)
+    return [t for t in tokens if t]
+
+
+_AUTH_FAILURE_WINDOW_SEC = 600
+_AUTH_FAILURE_LIMIT = 15
+_AUTH_BLOCK_SEC = 600
+_AUTH_FAILURES: Dict[str, List[float]] = {}
+_AUTH_BLOCKED: Dict[str, float] = {}
+_AUTH_FAILURE_LOCK = threading.Lock()
+
+
+def _auth_throttled() -> bool:
+    """Bounded brute-force guard for token auth. Thresholds are generous so a
+    shared NAT or the local reverse proxy never locks out normal clients."""
+    ip = request.remote_addr or "unknown"
+    now = time.time()
+    with _AUTH_FAILURE_LOCK:
+        blocked_until = _AUTH_BLOCKED.get(ip, 0.0)
+        if blocked_until:
+            if now < blocked_until:
+                return True
+            _AUTH_BLOCKED.pop(ip, None)
+        if len(_AUTH_FAILURES) > 4096:
+            stale = [key for key, hits in _AUTH_FAILURES.items()
+                     if not hits or now - hits[-1] > _AUTH_FAILURE_WINDOW_SEC]
+            for key in stale:
+                _AUTH_FAILURES.pop(key, None)
+    return False
+
+
+def _register_auth_failure() -> None:
+    ip = request.remote_addr or "unknown"
+    now = time.time()
+    with _AUTH_FAILURE_LOCK:
+        hits = [t for t in _AUTH_FAILURES.get(ip, []) if now - t < _AUTH_FAILURE_WINDOW_SEC]
+        hits.append(now)
+        if len(hits) >= _AUTH_FAILURE_LIMIT:
+            _AUTH_BLOCKED[ip] = now + _AUTH_BLOCK_SEC
+            hits = []
+            LOGGER.warning("auth: %s temporarily blocked after %s failed token attempts", ip, _AUTH_FAILURE_LIMIT)
+        _AUTH_FAILURES[ip] = hits
+
+
+def _authorized(allowed: List[str]) -> bool:
+    if _auth_throttled():
+        return False
+    provided = _auth_tokens_from_request()
+    ok = any(any(_token_matches(t, token) for token in allowed if token) for t in provided)
+    if ok:
+        with _AUTH_FAILURE_LOCK:
+            _AUTH_FAILURES.pop(request.remote_addr or "unknown", None)
+    else:
+        _register_auth_failure()
+    return ok
+
+
 def check_app_token() -> bool:
-    app_token = get_app_token()
-    return any(_token_matches(t, app_token) for t in _auth_tokens_from_request())
+    return _authorized(get_app_tokens())
 
 
 def check_hook_token() -> bool:
-    hook_token = get_hook_token()
-    return any(_token_matches(t, hook_token) for t in _auth_tokens_from_request())
+    return _authorized(get_hook_tokens())
 
 
 def check_read_token() -> bool:
-    allowed = {get_app_token(), get_hook_token()}
-    return any(any(_token_matches(t, token) for token in allowed) for t in _auth_tokens_from_request())
+    return _authorized(get_app_tokens())
 
 
 def add_event(event: Dict[str, Any]) -> Dict[str, Any]:
@@ -755,7 +845,9 @@ def today_online_seconds_from_item(item: Dict[str, Any], now: Optional[datetime]
     leave both empty, so their real daily duration is maintained separately by
     update_daily_online_durations().
     """
-    now = now or datetime.now()
+    now = now or datetime.now(BEIJING_TZ).replace(tzinfo=None)
+    if now.tzinfo is not None:
+        now = now.astimezone(BEIJING_TZ).replace(tzinfo=None)
     midnight = datetime.combine(now.date(), datetime.min.time())
     seconds_since_midnight = max(0, int((now - midnight).total_seconds()))
 
@@ -778,9 +870,11 @@ def update_daily_online_durations(devices: List[Dict[str, Any]], now: Optional[d
     onlinetime/activeTime remains a useful lower-bound seed; wired devices are
     tracked entirely by Hub snapshots.
     """
-    now = now or datetime.now()
+    now = now or datetime.now(BEIJING_TZ).replace(tzinfo=None)
+    if now.tzinfo is not None:
+        now = now.astimezone(BEIJING_TZ).replace(tzinfo=None)
     day = now.date().isoformat()
-    now_epoch = int(now.timestamp())
+    now_epoch = int(now.replace(tzinfo=BEIJING_TZ).timestamp())
     state = load_json(DAILY_ONLINE_FILE, {})
     if not isinstance(state, dict) or state.get("date") != day:
         state = {"date": day, "devices": {}, "updatedAt": now_str()}
@@ -1251,11 +1345,13 @@ def parse_time_safe(v: Any) -> Optional[datetime]:
     if not v:
         return None
     text = str(v).strip()
-    for fmt in ["%Y-%m-%d %H:%M:%S", "%Y-%m-%dT%H:%M:%S"]:
-        try:
-            return datetime.strptime(text[:19], fmt)
-        except Exception:
-            pass
+    try:
+        parsed = datetime.fromisoformat(text.replace("Z", "+00:00"))
+        if parsed.tzinfo is None:
+            parsed = parsed.replace(tzinfo=BEIJING_TZ)
+        return parsed.astimezone(BEIJING_TZ).replace(tzinfo=None)
+    except (TypeError, ValueError):
+        pass
     return None
 
 
@@ -2191,7 +2287,9 @@ def api_router_push():
     payload = request.get_json(silent=True) or {}
     typ = str(payload.get("type") or "snapshot").strip()
     ts = payload.get("ts")
-    event_time = datetime.fromtimestamp(float(ts)).strftime("%Y-%m-%d %H:%M:%S") if ts else now_str()
+    # Router timestamps are epoch seconds; always render them in the same
+    # Beijing calendar used by /api/daily and the assistant tool.
+    event_time = datetime.fromtimestamp(float(ts), tz=BEIJING_TZ).strftime("%Y-%m-%d %H:%M:%S") if ts else now_str()
 
     if typ == "snapshot":
         state = load_json(STATE_FILE, {})
@@ -2518,6 +2616,16 @@ def latest_agent_command(router: str, action: str = "update") -> Dict[str, Any]:
     )
 
 
+def notify_agent_commands_changed() -> None:
+    cond = globals().get("_AGENT_COMMAND_CONDITION")
+    if cond is not None:
+        try:
+            with cond:
+                cond.notify_all()
+        except Exception:
+            pass
+
+
 def agent_command_by_id(command_id: str, router: str = "", action: str = "") -> Dict[str, Any]:
     data = load_json(AGENT_UPDATE_COMMANDS_FILE, {"commands": []})
     rows = data.get("commands", []) if isinstance(data, dict) else []
@@ -2527,7 +2635,6 @@ def agent_command_by_id(command_id: str, router: str = "", action: str = "") -> 
             for row in reversed(rows)
             if isinstance(row, dict)
             and row.get("id") == command_id
-            and (not router or row.get("router") == router)
             and (not action or row.get("action") == action)
         ),
         {},
@@ -2587,6 +2694,7 @@ def api_agent_update_request():
     commands = data.get("commands", []) if isinstance(data, dict) else []
     commands.append(command)
     save_json(AGENT_UPDATE_COMMANDS_FILE, {"commands": commands[-100:]})
+    notify_agent_commands_changed()
     return jsonify({"ok": True, "commandId": command["id"], "targetVersion": target, "message": "Rust Agent 更新指令已发送"})
 
 
@@ -2623,6 +2731,7 @@ def api_agent_cleanup_request():
     commands = data.get("commands", []) if isinstance(data, dict) else []
     commands.append(command)
     save_json(AGENT_UPDATE_COMMANDS_FILE, {"commands": commands[-100:]})
+    notify_agent_commands_changed()
     return jsonify({
         "ok": True,
         "commandId": command["id"],
@@ -2668,7 +2777,26 @@ def api_router_agent_commands():
     router = clean_saved_value(request.args.get("router")) or primary_router_name()
     data = load_json(AGENT_UPDATE_COMMANDS_FILE, {"commands": []})
     commands = data.get("commands", []) if isinstance(data, dict) else []
-    pending = [row for row in commands if isinstance(row, dict) and row.get("router") == router and row.get("state") == "pending"][:5]
+
+    def matches_router(cmd_router: str) -> bool:
+        cmd_r = clean_saved_value(cmd_router)
+        if not cmd_r or cmd_r in ("router", "default"):
+            return True
+        if not router or router in ("router", "default"):
+            return True
+        primary = primary_router_name()
+        return (
+            cmd_r.lower() == router.lower()
+            or (primary and cmd_r.lower() == primary.lower())
+            or (primary and router.lower() == primary.lower())
+        )
+
+    pending = [
+        row for row in commands
+        if isinstance(row, dict)
+        and matches_router(row.get("router", ""))
+        and row.get("state") == "pending"
+    ][:5]
     return jsonify({"ok": True, "commands": pending, "time": now_str()})
 
 
@@ -2698,6 +2826,7 @@ def api_router_agent_ack():
             break
     if changed:
         save_json(AGENT_UPDATE_COMMANDS_FILE, {"commands": commands})
+        notify_agent_commands_changed()
     return jsonify({"ok": True, "acknowledged": changed})
 
 
@@ -2970,14 +3099,12 @@ def api_router_dashboard_push():
     })
 
 
-@app.route("/api/router/dashboard", methods=["GET"])
 def api_router_dashboard():
     if not check_read_token():
         return jsonify({"ok": False, "error": "unauthorized"}), 401
     return jsonify(_router_dashboard_public())
 
 
-@app.route("/api/router/dashboard/refresh", methods=["POST"])
 def api_router_dashboard_refresh():
     global ROUTER_DASHBOARD_REFRESH_NONCE
     if not check_app_token():
@@ -3436,6 +3563,22 @@ def _portmap_router_name() -> str:
     )
 
 
+def _canonical_portmap_router(value: Any = "") -> str:
+    """Return the shared canonical identity for PortMap command/state traffic.
+
+    Legacy agents use the literal ``router`` while Hub stores the configured
+    primary name (for example ``BE72``).  Only those two aliases collapse; a
+    genuinely different router name remains distinct.
+    """
+    canonical = clean_saved_value(primary_router_name()) or _portmap_router_name()
+    candidate = clean_saved_value(value) or canonical or "router"
+    if candidate.casefold() == "router" or (
+        canonical and candidate.casefold() == canonical.casefold()
+    ):
+        return canonical or "router"
+    return candidate
+
+
 def _portmap_rule_id(value: Any = None) -> str:
     raw = re.sub(r"[^a-zA-Z0-9_-]+", "-", str(value or "").strip()).strip("-").lower()
     return raw[:48] or f"pm-{int(time.time())}-{secrets.token_hex(3)}"
@@ -3472,7 +3615,10 @@ def _portmap_time_epoch(value: Any) -> Optional[int]:
     if not raw:
         return None
     try:
-        return int(datetime.strptime(raw, "%Y-%m-%d %H:%M:%S").timestamp())
+        local = datetime.strptime(raw, "%Y-%m-%d %H:%M:%S").replace(
+            tzinfo=ZoneInfo("Asia/Shanghai")
+        )
+        return int(local.timestamp())
     except Exception:
         return None
 
@@ -3520,6 +3666,15 @@ def _clean_portmap_rule(payload: Dict[str, Any], existing: Optional[Dict[str, An
     if transport_protocol not in ["TCP", "UDP"]:
         raise ValueError("传输协议只能是 TCP 或 UDP")
 
+    target_type = clean_saved_value(src.get("targetType")).lower()
+    if not target_type:
+        legacy_target = clean_saved_value(src.get("targetIpv4") or src.get("targetIpv6")).strip("[]")
+        try:
+            target_type = "router_self" if legacy_target and ipaddress.ip_address(legacy_target).is_loopback else "manual"
+        except ValueError:
+            target_type = "manual"
+    if target_type not in ["router_self", "device", "manual"]:
+        raise ValueError("目标类型只能是路由器本机、内网设备或手动目标")
     target_mode = clean_saved_value(src.get("targetMode")).lower()
     target_ipv4 = clean_saved_value(src.get("targetIpv4"))
     target_ipv6 = clean_saved_value(src.get("targetIpv6")).strip("[]")
@@ -3530,6 +3685,8 @@ def _clean_portmap_rule(payload: Dict[str, Any], existing: Optional[Dict[str, An
         raise ValueError("目标 MAC 格式无效")
     if mode == "6to4":
         target_mode = "ipv4"
+        if target_type == "router_self":
+            target_ipv4 = "127.0.0.1"
         ip = ipaddress.ip_address(target_ipv4)
         if ip.version != 4 or not (ip.is_private or ip.is_loopback or ip.is_link_local):
             raise ValueError("6to4 目标必须是内网 IPv4")
@@ -3537,12 +3694,18 @@ def _clean_portmap_rule(payload: Dict[str, Any], existing: Optional[Dict[str, An
         target_ipv6_snapshot = ""
         target_suffix = ""
     else:
+        if target_type == "router_self":
+            target_mode = "ipv6_full"
+            target_ipv6 = "::1"
+            target_ipv6_snapshot = "::1"
+            target_suffix = ""
+            target_mac = ""
         if target_mode not in ["ipv6_full", "ipv6_suffix"]:
             target_mode = "ipv6_suffix"
         target_ipv4 = ""
         if target_mode == "ipv6_full":
             ip = ipaddress.ip_address(target_ipv6)
-            if ip.version != 6 or ip.is_link_local or ip.is_multicast or ip.is_loopback or ip.is_unspecified:
+            if ip.version != 6 or ip.is_link_local or ip.is_multicast or (ip.is_loopback and target_type != "router_self") or ip.is_unspecified:
                 raise ValueError("目标 IPv6 无效")
             target_ipv6 = str(ip)
             target_ipv6_snapshot = target_ipv6
@@ -3560,7 +3723,10 @@ def _clean_portmap_rule(payload: Dict[str, Any], existing: Optional[Dict[str, An
 
     max_connections = max(1, min(256, to_int(src.get("maxConnections"), 32) or 32))
     idle_timeout = max(30, min(3600, to_int(src.get("idleTimeoutSec"), 300) or 300))
-    expires_at = _portmap_epoch(src.get("expiresAt"))
+    raw_expires_at = src.get("expiresAt")
+    expires_at = _portmap_epoch(raw_expires_at)
+    if raw_expires_at not in [None, "", 0, "0"] and expires_at is None:
+        raise ValueError("expiresAt 必须是 Unix Epoch 秒、毫秒或 null")
     lease_seconds = _portmap_lease_seconds(src, old, expires_at)
     if expires_at is None:
         lease_seconds = 0
@@ -3571,6 +3737,7 @@ def _clean_portmap_rule(payload: Dict[str, Any], existing: Optional[Dict[str, An
         "enabled": bool(src.get("enabled", False)),
         "mode": mode,
         "listenPort": listen_port,
+        "targetType": target_type,
         "targetMode": target_mode,
         "targetIpv4": target_ipv4,
         "targetIpv6": target_ipv6,
@@ -3588,6 +3755,71 @@ def _clean_portmap_rule(payload: Dict[str, Any], existing: Optional[Dict[str, An
         "createdAt": old.get("createdAt") or now,
         "updatedAt": now,
     }
+
+
+def _portmap_firewall_service():
+    service = globals().get("PORTMAP_FIREWALL_SERVICE")
+    return service if service is not None else None
+
+
+def _portmap_firewall_status(rule: Dict[str, Any]) -> Dict[str, Any]:
+    if not bool(rule.get("enabled")):
+        return {"state": "not_required", "message": "", "owner": "labprobe-portmap"}
+    service = _portmap_firewall_service()
+    if service is None:
+        return {"state": "unavailable", "message": "端口映射防火墙服务未加载", "owner": "labprobe-portmap"}
+    return service.cached(clean_saved_value(rule.get("id")))
+
+
+def _require_portmap_firewall(rule: Dict[str, Any]) -> Dict[str, Any]:
+    service = _portmap_firewall_service()
+    if service is None:
+        # Compatibility for direct hub.py test/dev entrypoints. Production
+        # hub_entry installs the ownership service before accepting requests.
+        return {"state": "unavailable"}
+    result = service.ensure(rule)
+    if clean_saved_value(result.get("state")) != "ready":
+        raise RuntimeError(clean_saved_value(result.get("message")) or "端口映射入站规则未就绪")
+    return result
+
+
+def _remove_portmap_firewall(rule_id: str) -> None:
+    service = _portmap_firewall_service()
+    if service is not None:
+        service.remove(rule_id)
+
+
+def _mutate_portmap(rule_id: str, operation):
+    """Compensate PortMap desired/command/firewall state on mutation failure.
+
+    This lock is local to explicit PortMap writes. Agent status, Router realtime,
+    Devices realtime and WSS first-frame delivery never acquire it.
+    """
+    with PORTMAP_MUTATION_LOCK:
+        desired_before = copy.deepcopy(load_json(PORTMAP_RULES_FILE, {"revision": 0, "rules": []}))
+        commands_before = copy.deepcopy(load_json(PORTMAP_COMMANDS_FILE, {"commands": []}))
+        service = _portmap_firewall_service()
+        firewall_before = service.snapshot(rule_id) if service is not None else None
+        try:
+            return operation()
+        except Exception as error:
+            rollback_errors = []
+            if service is not None and firewall_before is not None:
+                try:
+                    service.restore(rule_id, firewall_before)
+                except Exception as rollback_error:
+                    rollback_errors.append(f"防火墙：{rollback_error}")
+            for label, path, value in (
+                ("期望规则", PORTMAP_RULES_FILE, desired_before),
+                ("命令队列", PORTMAP_COMMANDS_FILE, commands_before),
+            ):
+                try:
+                    save_json(path, copy.deepcopy(value))
+                except Exception as rollback_error:
+                    rollback_errors.append(f"{label}：{rollback_error}")
+            if rollback_errors:
+                raise RuntimeError(f"{error}；端口映射回滚失败：{'；'.join(rollback_errors)}") from error
+            raise
 
 
 def _load_portmap_rules_document() -> tuple[Dict[str, Any], bool]:
@@ -3649,24 +3881,55 @@ def _portmap_command_rule_id(action: str, payload: Dict[str, Any]) -> str:
     return clean_saved_value(payload.get("id"))
 
 
-def _queue_portmap_command(action: str, payload: Dict[str, Any], router: Optional[str] = None) -> Dict[str, Any]:
+def _reset_portmap_command_delivery(command: Dict[str, Any], payload: Dict[str, Any], now_epoch: int) -> None:
+    command["payload"] = payload
+    command["status"] = "pending"
+    command["attempts"] = 0
+    command["updatedAt"] = now_str()
+    command["updatedEpoch"] = now_epoch
+    for key in (
+        "deliveredAt", "deliveredEpoch", "finishedAt", "finishedEpoch",
+        "retryAt", "retryEpoch", "retryState", "timeout", "error",
+        "lastError", "result",
+    ):
+        command.pop(key, None)
+
+
+def _queue_portmap_command(
+    action: str,
+    payload: Dict[str, Any],
+    router: Optional[str] = None,
+    *,
+    reactivate: bool = False,
+) -> Dict[str, Any]:
     data = load_json(PORTMAP_COMMANDS_FILE, {"commands": []})
     commands = data.get("commands", []) if isinstance(data, dict) else []
     now_epoch = int(time.time())
     commands = [c for c in commands if isinstance(c, dict) and not (
         c.get("status") in ["done", "failed"] and now_epoch - to_int(c.get("finishedEpoch"), now_epoch) > 86400
     )][-500:]
-    target_router = router or _portmap_router_name()
+    target_router = _canonical_portmap_router(router)
     rule_id = _portmap_command_rule_id(action, payload)
     for existing in reversed(commands):
-        if existing.get("router") != target_router or existing.get("status") not in ["pending", "delivered"]:
+        if _canonical_portmap_router(existing.get("router")) != target_router:
             continue
         if existing.get("action") == action and _portmap_command_rule_id(action, existing.get("payload") or {}) == rule_id:
-            existing["payload"] = payload
-            existing["status"] = "pending"
-            existing["updatedAt"] = now_str()
-            save_json(PORTMAP_COMMANDS_FILE, {"commands": commands})
-            return existing
+            status = clean_saved_value(existing.get("status"))
+            if status in {"pending", "delivered"}:
+                if reactivate:
+                    _reset_portmap_command_delivery(existing, payload, now_epoch)
+                elif existing.get("payload") != payload:
+                    existing["payload"] = payload
+                    existing["updatedAt"] = now_str()
+                    existing["updatedEpoch"] = now_epoch
+                save_json(PORTMAP_COMMANDS_FILE, {"commands": commands})
+                return existing
+            if not reactivate and status in {"done", "failed"} and existing.get("payload") == payload:
+                # Reconciliation must not turn a terminal delivery into an
+                # endless sequence of fresh commands. A user action explicitly
+                # opts into a new command lifecycle with a new id below.
+                return existing
+            break
     command = {
         "id": f"cmd-{int(time.time() * 1000)}-{secrets.token_hex(3)}",
         "router": target_router,
@@ -3688,7 +3951,7 @@ def _portmap_command_sync_states(router: str) -> Dict[str, str]:
     commands = data.get("commands", []) if isinstance(data, dict) else []
     states: Dict[str, str] = {}
     for command in reversed(commands if isinstance(commands, list) else []):
-        if not isinstance(command, dict) or command.get("router") != router:
+        if not isinstance(command, dict) or _canonical_portmap_router(command.get("router")) != _canonical_portmap_router(router):
             continue
         rule_id = _portmap_command_rule_id(clean_saved_value(command.get("action")), command.get("payload") or {})
         if not rule_id or rule_id in states:
@@ -3758,14 +4021,24 @@ def _append_portmap_history(status_payload: Dict[str, Any]) -> None:
 def api_portmaps():
     if request.method == "GET":
         if not check_read_token():
-            return jsonify({"ok": False, "error": "unauthorized"}), 401
+            return jsonify({"ok": False, "error": "未授权"}), 401
         document, rules_loaded = _load_portmap_rules_document()
         rules = document["rules"]
         router_status = load_json(PORTMAP_ROUTER_STATUS_FILE, {})
         runtime = _portmap_runtime_map(router_status)
         router = router_status.get("router", _portmap_router_name()) if isinstance(router_status, dict) else _portmap_router_name()
         sync_states = _portmap_command_sync_states(router)
-        rows = [{**r, "runtime": runtime.get(r.get("id"), {}), "syncState": sync_states.get(r.get("id"), "synced")} for r in rules]
+        rows = []
+        for rule in rules:
+            firewall = _portmap_firewall_status(rule)
+            rows.append({
+                **rule,
+                "runtime": runtime.get(rule.get("id"), {}),
+                "syncState": sync_states.get(rule.get("id"), "synced"),
+                "firewallState": firewall.get("state", ""),
+                "firewallMessage": firewall.get("message", ""),
+                "firewallOwner": firewall.get("owner", "labprobe-portmap"),
+            })
         received_epoch = to_int(router_status.get("receivedEpoch"), 0) if isinstance(router_status, dict) else 0
         agent_online = bool(received_epoch and time.time() - received_epoch <= 35)
         return jsonify({
@@ -3781,16 +4054,26 @@ def api_portmaps():
             "agentLastSeenAt": router_status.get("receivedAt", "") if isinstance(router_status, dict) else "",
         })
 
+    with PORTMAP_MUTATION_LOCK:
+        return _api_portmaps_create()
+
+
+def _api_portmaps_create():
     if not check_app_token():
-        return jsonify({"ok": False, "error": "unauthorized"}), 401
+        return jsonify({"ok": False, "error": "未授权"}), 401
     try:
         payload = request.get_json(silent=True) or {}
         rule = _clean_portmap_rule(payload)
         rows = _load_portmap_rules()
         _portmap_check_conflict(rows, rule)
-        rows.append(rule)
-        _save_portmap_rules(rows)
-        _queue_portmap_command("upsert", {"rule": rule})
+        def create_operation():
+            if rule["enabled"]:
+                _require_portmap_firewall(rule)
+            rows.append(rule)
+            _save_portmap_rules(rows)
+            _queue_portmap_command("upsert", {"rule": rule}, reactivate=True)
+
+        _mutate_portmap(rule["id"], create_operation)
         add_event({"type": "portmap_created", "title": f"端口映射已创建：{rule['name']}", "name": rule["name"], "newValue": f"IPv6:{rule['listenPort']}"})
         return jsonify({"ok": True, "rule": rule}), 201
     except Exception as e:
@@ -3799,15 +4082,27 @@ def api_portmaps():
 
 @app.route("/api/portmaps/<rule_id>", methods=["PUT", "DELETE"])
 def api_portmap_item(rule_id: str):
+    with PORTMAP_MUTATION_LOCK:
+        return _api_portmap_item_locked(rule_id)
+
+
+def _api_portmap_item_locked(rule_id: str):
     if not check_app_token():
-        return jsonify({"ok": False, "error": "unauthorized"}), 401
+        return jsonify({"ok": False, "error": "未授权"}), 401
     rows = _load_portmap_rules()
     old = next((x for x in rows if x.get("id") == rule_id), None)
     if not old:
-        return jsonify({"ok": False, "error": "rule not found"}), 404
+        return jsonify({"ok": False, "error": "未找到端口映射规则"}), 404
     if request.method == "DELETE":
-        _save_portmap_rules([x for x in rows if x.get("id") != rule_id])
-        _queue_portmap_command("delete", {"id": rule_id})
+        def delete_operation():
+            _remove_portmap_firewall(rule_id)
+            _save_portmap_rules([x for x in rows if x.get("id") != rule_id])
+            _queue_portmap_command("delete", {"id": rule_id}, reactivate=True)
+
+        try:
+            _mutate_portmap(rule_id, delete_operation)
+        except Exception as error:
+            return jsonify({"ok": False, "error": str(error)}), 409
         add_event({"type": "portmap_deleted", "title": f"端口映射已删除：{old.get('name')}", "name": old.get("name"), "oldValue": str(old.get("listenPort"))})
         return jsonify({"ok": True, "deleted": True, "id": rule_id})
     try:
@@ -3815,9 +4110,17 @@ def api_portmap_item(rule_id: str):
         payload["id"] = rule_id
         rule = _clean_portmap_rule(payload, old)
         _portmap_check_conflict(rows, rule)
-        rows = [rule if x.get("id") == rule_id else x for x in rows]
-        _save_portmap_rules(rows)
-        _queue_portmap_command("upsert", {"rule": rule})
+        replacement = [rule if x.get("id") == rule_id else x for x in rows]
+
+        def update_operation():
+            if rule["enabled"]:
+                _require_portmap_firewall(rule)
+            else:
+                _remove_portmap_firewall(rule_id)
+            _save_portmap_rules(replacement)
+            _queue_portmap_command("upsert", {"rule": rule}, reactivate=True)
+
+        _mutate_portmap(rule_id, update_operation)
         return jsonify({"ok": True, "rule": rule})
     except Exception as e:
         return jsonify({"ok": False, "error": str(e)}), 400
@@ -3825,14 +4128,19 @@ def api_portmap_item(rule_id: str):
 
 @app.route("/api/portmaps/<rule_id>/<action>", methods=["POST"])
 def api_portmap_action(rule_id: str, action: str):
+    with PORTMAP_MUTATION_LOCK:
+        return _api_portmap_action_locked(rule_id, action)
+
+
+def _api_portmap_action_locked(rule_id: str, action: str):
     if not check_app_token():
-        return jsonify({"ok": False, "error": "unauthorized"}), 401
+        return jsonify({"ok": False, "error": "未授权"}), 401
     if action not in ["start", "stop"]:
-        return jsonify({"ok": False, "error": "invalid action"}), 400
+        return jsonify({"ok": False, "error": "不支持的操作"}), 400
     rows = _load_portmap_rules()
     rule = next((x for x in rows if x.get("id") == rule_id), None)
     if not rule:
-        return jsonify({"ok": False, "error": "rule not found"}), 404
+        return jsonify({"ok": False, "error": "未找到端口映射规则"}), 404
     rule = dict(rule)
     rule["enabled"] = action == "start"
     if action == "start":
@@ -3847,9 +4155,24 @@ def api_portmap_action(rule_id: str, action: str):
                 return jsonify({"ok": False, "error": "旧规则缺少有效期时长，请编辑并重新选择有效期"}), 400
             rule["expiresAt"] = now_epoch + lease_seconds
     rule["updatedAt"] = now_str()
-    rows = [rule if x.get("id") == rule_id else x for x in rows]
-    _save_portmap_rules(rows)
-    _queue_portmap_command("upsert" if action == "start" else "stop", {"rule": rule} if action == "start" else {"id": rule_id})
+    replacement = [rule if x.get("id") == rule_id else x for x in rows]
+
+    def action_operation():
+        if action == "start":
+            _require_portmap_firewall(rule)
+        else:
+            _remove_portmap_firewall(rule_id)
+        _save_portmap_rules(replacement)
+        _queue_portmap_command(
+            "upsert" if action == "start" else "stop",
+            {"rule": rule} if action == "start" else {"id": rule_id},
+            reactivate=True,
+        )
+
+    try:
+        _mutate_portmap(rule_id, action_operation)
+    except Exception as error:
+        return jsonify({"ok": False, "error": str(error)}), 409
     return jsonify({"ok": True, "rule": rule, "action": action})
 
 
@@ -3868,7 +4191,7 @@ def api_portmap_history(rule_id: str):
 def api_router_portmap_commands():
     if not check_hook_token():
         return jsonify({"ok": False, "error": "bad hook token"}), 401
-    router = clean_saved_value(request.args.get("router")) or _portmap_router_name()
+    router = _canonical_portmap_router(request.args.get("router"))
     limit = max(1, min(50, to_int(request.args.get("limit"), 20) or 20))
     data = load_json(PORTMAP_COMMANDS_FILE, {"commands": []})
     commands = data.get("commands", []) if isinstance(data, dict) else []
@@ -3876,9 +4199,24 @@ def api_router_portmap_commands():
     selected = []
     changed = False
     for command in commands:
-        if not isinstance(command, dict) or command.get("router") != router:
+        if not isinstance(command, dict) or _canonical_portmap_router(command.get("router")) != router:
             continue
-        retry_due = command.get("status") == "delivered" and now_epoch - to_int(command.get("deliveredEpoch"), 0) >= 15 and to_int(command.get("attempts"), 0) < 5
+        attempts = to_int(command.get("attempts"), 0)
+        delivery_age = now_epoch - to_int(command.get("deliveredEpoch"), 0)
+        retry_due = command.get("status") == "delivered" and delivery_age >= 15 and attempts < 5
+        if command.get("status") == "delivered" and delivery_age >= 15 and attempts >= 5:
+            error = "delivery timeout after 5 attempts"
+            command.update({
+                "status": "failed",
+                "finishedAt": now_str(),
+                "finishedEpoch": now_epoch,
+                "retryState": "exhausted",
+                "timeout": True,
+                "error": error,
+                "result": {"ok": False, "errorCode": "delivery_timeout", "error": error},
+            })
+            changed = True
+            continue
         if command.get("status") == "pending" or retry_due:
             command["status"] = "delivered"
             command["deliveredAt"] = now_str()
@@ -3890,7 +4228,7 @@ def api_router_portmap_commands():
                 break
     if changed:
         save_json(PORTMAP_COMMANDS_FILE, {"commands": commands})
-    return jsonify({"ok": True, "commands": selected, "time": now_str()})
+    return jsonify({"ok": True, "commands": selected, "time": now_str(), "serverEpoch": now_epoch})
 
 
 @app.route("/api/router/portmaps/ack", methods=["POST"])
@@ -3898,19 +4236,30 @@ def api_router_portmap_ack():
     if not check_hook_token():
         return jsonify({"ok": False, "error": "bad hook token"}), 401
     payload = request.get_json(silent=True) or {}
+    router = _canonical_portmap_router(request.args.get("router") or payload.get("router"))
     acks = payload.get("acks", []) if isinstance(payload.get("acks"), list) else []
     data = load_json(PORTMAP_COMMANDS_FILE, {"commands": []})
     commands = data.get("commands", []) if isinstance(data, dict) else []
     ack_map = {clean_saved_value(x.get("id")): x for x in acks if isinstance(x, dict)}
     changed = 0
     for command in commands:
-        ack = ack_map.get(clean_saved_value(command.get("id")))
-        if not ack:
+        if not isinstance(command, dict) or _canonical_portmap_router(command.get("router")) != router:
             continue
-        command["status"] = "done" if bool(ack.get("ok")) else "failed"
+        ack = ack_map.get(clean_saved_value(command.get("id")))
+        if not ack or clean_saved_value(command.get("status")) not in {"pending", "delivered"}:
+            continue
+        ok = bool(ack.get("ok"))
+        command["status"] = "done" if ok else "failed"
         command["result"] = ack.get("result")
         command["finishedAt"] = now_str()
         command["finishedEpoch"] = int(time.time())
+        command["retryState"] = "completed" if ok else "agent_failed"
+        if ok:
+            command.pop("error", None)
+            command.pop("timeout", None)
+        else:
+            result = ack.get("result") if isinstance(ack.get("result"), dict) else {}
+            command["error"] = clean_saved_value(ack.get("error") or result.get("error")) or "agent reported failure"
         changed += 1
     if changed:
         save_json(PORTMAP_COMMANDS_FILE, {"commands": commands})
@@ -3922,7 +4271,7 @@ def api_router_portmap_status():
     if not check_hook_token():
         return jsonify({"ok": False, "error": "bad hook token"}), 401
     payload = request.get_json(silent=True) or {}
-    router = clean_saved_value(request.args.get("router")) or _portmap_router_name()
+    router = _canonical_portmap_router(request.args.get("router"))
     record = {
         "router": router,
         "receivedAt": now_str(),
@@ -3945,7 +4294,7 @@ def api_router_portmap_status():
         rid = clean_saved_value(local_rule.get("id") or (row.get("runtime") or {}).get("id"))
         if rid:
             local[rid] = local_rule
-    compare_keys = ["enabled", "mode", "listenPort", "targetMode", "targetIpv4", "targetIpv6", "targetIpv6Suffix", "targetMac", "targetPort", "transportProtocol", "expiresAt", "leaseSeconds", "maxConnections", "idleTimeoutSec"]
+    compare_keys = ["enabled", "mode", "listenPort", "targetType", "targetMode", "targetIpv4", "targetIpv6", "targetIpv6Suffix", "targetMac", "targetPort", "transportProtocol", "expiresAt", "leaseSeconds", "maxConnections", "idleTimeoutSec"]
     for rid, rule in desired.items():
         local_rule = local.get(rid)
         if not local_rule or any(local_rule.get(k) != rule.get(k) for k in compare_keys):
@@ -3956,7 +4305,7 @@ def api_router_portmap_status():
     else:
         LOGGER.warning("Port-map rules document unavailable; skip destructive router reconciliation")
 
-    return jsonify({"ok": True, "receivedAt": record["receivedAt"]})
+    return jsonify({"ok": True, "receivedAt": record["receivedAt"], "serverEpoch": record["receivedEpoch"]})
 
 
 @app.route("/api/status", methods=["GET"])
@@ -3985,16 +4334,12 @@ def build_magic_packet(mac: str) -> bytes:
     return b"\xff" * 6 + parts * 16
 
 
-@app.route("/api/wol", methods=["POST"])
-def api_wol():
-    if not check_app_token():
-        return jsonify({"ok": False, "error": "unauthorized"}), 401
-    payload = request.get_json(silent=True) or {}
-    mac = norm_mac(payload.get("mac"))
-    if not mac:
-        return jsonify({"ok": False, "error": "invalid mac"}), 400
-    port = to_int(payload.get("port"), 9) or 9
-    packet = build_magic_packet(mac)
+def send_wol(mac: str, port: int = 9) -> Dict[str, Any]:
+    """Send WOL for trusted callers after they have resolved and confirmed a device."""
+    normalized = norm_mac(mac)
+    if not normalized:
+        raise ValueError("invalid mac")
+    packet = build_magic_packet(normalized)
     targets = cfg_get("wol.broadcasts", []) or ["255.255.255.255"]
     if isinstance(targets, str):
         targets = [targets]
@@ -4005,18 +4350,32 @@ def api_wol():
         sock.setsockopt(socket.SOL_SOCKET, socket.SO_BROADCAST, 1)
         sock.settimeout(1.5)
         for host in targets:
-            for p in [port, 9, 7]:
+            for target_port in [int(port), 9, 7]:
                 try:
-                    sock.sendto(packet, (str(host), int(p)))
+                    sock.sendto(packet, (str(host), target_port))
                     sent += 1
-                except Exception as e:
-                    errors.append(f"{host}:{p} {e}")
+                except Exception as exc:
+                    errors.append(f"{host}:{target_port} {exc}")
     finally:
         sock.close()
     if sent <= 0:
-        return jsonify({"ok": False, "error": "; ".join(errors[-3:]) or "send failed"}), 500
-    add_event({"type": "wol_sent", "title": "WOL 唤醒", "name": mac, "newValue": f"sent {sent}", "mac": mac})
-    return jsonify({"ok": True, "message": f"Hub 已发送 WOL · {sent} 个广播包", "mac": mac, "sent": sent, "time": now_str()})
+        raise OSError("; ".join(errors[-3:]) or "send failed")
+    add_event({"type": "wol_sent", "title": "WOL 唤醒", "name": normalized, "newValue": f"sent {sent}", "mac": normalized})
+    return {"ok": True, "message": f"Hub 已发送 WOL · {sent} 个广播包", "mac": normalized, "sent": sent, "time": now_str()}
+
+
+@app.route("/api/wol", methods=["POST"])
+def api_wol():
+    if not check_app_token():
+        return jsonify({"ok": False, "error": "unauthorized"}), 401
+    payload = request.get_json(silent=True) or {}
+    mac = norm_mac(payload.get("mac"))
+    if not mac:
+        return jsonify({"ok": False, "error": "invalid mac"}), 400
+    try:
+        return jsonify(send_wol(mac, to_int(payload.get("port"), 9) or 9))
+    except (ValueError, OSError) as exc:
+        return jsonify({"ok": False, "error": str(exc)}), 500
 
 
 @app.route("/api/devices", methods=["GET"])
@@ -4206,8 +4565,25 @@ def normalize_device_events_for_daily(events: List[Dict[str, Any]]) -> List[Dict
         kept.append(e)
     return kept
 
+def event_beijing_day(value: Any) -> str:
+    """Normalize an event timestamp to the Hub's Beijing calendar date."""
+    text = str(value or "").strip()
+    if not text:
+        return ""
+    try:
+        parsed = datetime.fromisoformat(text.replace("Z", "+00:00"))
+        if parsed.tzinfo is None:
+            parsed = parsed.replace(tzinfo=BEIJING_TZ)
+        return parsed.astimezone(BEIJING_TZ).date().isoformat()
+    except (TypeError, ValueError):
+        return text[:10]
+
+
 def aggregate_daily(day: str) -> Dict[str, Any]:
-    events = normalize_device_events_for_daily([e for e in load_json(EVENTS_FILE, []) if not e.get("deleted") and event_timestamp(e).startswith(day)])
+    events = normalize_device_events_for_daily([
+        e for e in load_json(EVENTS_FILE, [])
+        if not e.get("deleted") and event_beijing_day(event_timestamp(e)) == str(day)
+    ])
     devices: Dict[str, Dict[str, Any]] = {}
     vpn_items: List[Dict[str, Any]] = []
     network_items: List[Dict[str, Any]] = []
@@ -4306,6 +4682,15 @@ def aggregate_daily(day: str) -> Dict[str, Any]:
         })
 
     note = get_daily_note(day)
+    try:
+        from assistant.storage import AIStore
+        ai_usage = AIStore(DB_PATH).usage_for_date(day)
+    except Exception:
+        # Daily records remain available before the optional AI tables exist.
+        ai_usage = {
+            "requests": 0, "prompt_tokens": 0, "completion_tokens": 0,
+            "total_tokens": 0, "unknown_usage_requests": 0,
+        }
     summary = {
         "deviceChanges": device_online_count + device_offline_count,
         "deviceOnline": device_online_count,
@@ -4318,11 +4703,11 @@ def aggregate_daily(day: str) -> Dict[str, Any]:
     }
     sections = {"devices": device_list, "vpn": vpn_items, "network": network_items, "ddns": ddns_items}
     sections = {k: v for k, v in sections.items() if v}
-    return {"date": day, "summary": summary, "sections": sections, "note": note}
+    return {"date": day, "summary": summary, "sections": sections, "note": note, "aiUsage": ai_usage}
 
 def recent_dates(days: int = 7) -> List[str]:
     from datetime import timedelta
-    today = date.today()
+    today = datetime.now(BEIJING_TZ).date()
     return [(today - timedelta(days=i)).isoformat() for i in range(days)]
 
 
@@ -4393,7 +4778,9 @@ def command_line() -> int:
         LOGGER.warning("configuration: %s", warning)
     for error in report["errors"]:
         LOGGER.error("configuration: %s", error)
-    app.run(host="0.0.0.0", port=PORT)
+    # Flask 3 enables threaded serving by default. Keep it explicit because
+    # notification SSE and slow router diagnostics require concurrent requests.
+    app.run(host="0.0.0.0", port=PORT, threaded=True)
     return 0
 
 

@@ -1,4 +1,4 @@
-# LabProbe Hub 0.9.7
+# LabProbe Hub 0.11.5
 
 LabProbe Hub 可部署在任意 Linux AMD64/ARM64 宿主机，包括服务器、小主机、NAS 和软路由。Hub 使用 SQLite 保存数据；已适配锐捷路由器上的 Rust Agent 继续以 `dev_sta/user_list` 为核心数据源。
 
@@ -87,6 +87,10 @@ Hub 使用两个必须自行设置的独立令牌：
 
 在 `.env` 或 `config/config.yaml` 中填写强随机值，重启 Hub 后，APP 只填写相同的 `APP_TOKEN`；安装 LabRelay 时填写相同的 `HOOK_TOKEN`。
 
+推荐一律使用请求头传递 Token：APP 使用 `Authorization: Bearer <APP_TOKEN>`，Agent 与脚本使用 `X-LabProbe-Token`。URL 查询参数形式仅作兼容保留，命中时 Hub 会在日志记录弃用告警，后续版本将移除；新增接入请勿使用。
+
+轮换 Token 可零停机：把旧值填入 `APP_TOKEN_PREVIOUS`（或 `HOOK_TOKEN_PREVIOUS`），带新值重启 Hub，更新所有客户端后再删除 PREVIOUS 变量并重启。Hub 对连续 Token 认证失败有防爆破限流（同一来源 10 分钟内失败 15 次将临时拒绝 10 分钟），正常客户端不受影响。
+
 ## 同步协议
 
 旧 API 不变，新 APP 使用：
@@ -96,6 +100,19 @@ Hub 使用两个必须自行设置的独立令牌：
 - `GET /api/sync/revision`：轻量 revision 校准。
 
 设备、事件和状态与 revision 在同一 SQLite 事务中写入。APP首次、重连、前台恢复、网络切换和每 5 分钟完整校准，其余刷新仅应用增量。
+
+## AI 助手
+
+AI API Key 由 Hub 加密托管，APP 不保存原文。首次配置时若没有单独设置 `LABPROBE_AI_MASTER_KEY`，Hub 会基于必填的 `APP_TOKEN` 安全派生凭证加密密钥，因此不会再因缺少额外环境变量拒绝 DeepSeek 配置。轮换 `APP_TOKEN` 时先把旧值临时放入 `APP_TOKEN_PREVIOUS`；Hub 在读取或使用 AI 配置时会自动用新 Token 重加密，确认配置显示可用后即可移除旧值并重启。DeepSeek 默认使用官方兼容地址 `https://api.deepseek.com` 与模型 `deepseek-v4-flash`。`GET /api/ai/usage` 同时返回今日、累计和最近单次任务 Token 明细；每次对话任务记录模型、输入、输出、总 Token 以及成功/失败状态。
+
+AI 对话、工具确认、每日记录和 Token 统计均由 Hub 提供。APP 不保存 API Key 原文，涉及路由器写入的指令仍需在 APP 内二次确认。
+
+助手能力按域组织，写入操作一律需 APP 确认：
+
+- **relay 域**：查询 Agent 状态、新增/删除 STUN 穿透规则、下发 Agent 升级指令。
+- **router 域**：查询路由器状态与防火墙/端口映射，创建/删除/启停 IPv6 端口映射。
+- **app 域**：让 APP 跳转页面、触发完整同步（以 `clientAction` 返回给 APP 本地执行）。
+- **扩展接口**：新能力域通过 `assistant.extend.register_domain(hub, specs, handlers, previews)` 在 `hub_entry` 安装阶段注册，无需修改 assistant 核心；执行与确认策略与内置工具完全一致。
 
 
 ## 锐捷 Rust Agent
@@ -135,3 +152,23 @@ python scripts/build_update_bundle.py \
 ```
 
 输出固定为 `app/update.json`、版本化 APK、`agent/latest.json`、`agent/install.sh`、ARM64 Agent 程序和 `agent/checksums.txt`。JSON 中 Lucky 为主地址、GitHub Release 为备用地址，SHA256、大小和更新内容保持一致。
+
+
+## 测试发布（test-bundle tag）
+
+三端共用一个专用测试 tag：`test-bundle/<日期-序号>`。同名 tag 同时推送到 `labprobe-hub` 和 `LabProbeApp` 两个仓库，即触发三套测试构建，全部发布为 prerelease，不覆盖正式镜像和正式 Release：
+
+```sh
+TAG=test-bundle/20260828-1
+git tag "$TAG" && git push origin "$TAG"        # 本仓库：Hub 测试镜像 + LabRelay 预发布
+cd ../LabProbeApp
+git tag "$TAG" && git push origin "$TAG"        # APP 测试 APK（同一发布签名）
+```
+
+产出：
+
+- **Hub 测试镜像**：`<DOCKERHUB用户>/labprobe-hub:test-<tag后缀>`（如 `test-20260828-1`），只推该 tag，不动 `latest`。
+- **LabRelay**：本仓库 GitHub prerelease 附 `labrelay-linux-arm64`、`install.sh`、`latest.json`、`checksums.txt` 与完整 tar 包；`latest.json` 内的下载地址指向该测试 Release，安装脚本会校验 SHA256。
+- **APP**：`LabProbeApp` GitHub prerelease 附 `LabProbe-v<版本>-build<码>-test.apk`，与正式版同签名可直接覆盖安装；如需原地升级，先在测试分支把 `versionCode` +1 再打 tag。
+
+测试 tag 可指向任意分支提交（不要求在 main 历史内），也不做正式发布的 tag/版本一致性检查；正式流水线（`v*` 与 `v*-build*` tag）不受影响。

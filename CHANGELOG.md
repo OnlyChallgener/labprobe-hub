@@ -1,5 +1,98 @@
 # LabProbe 变更记录
 
+## 0.12.2 / LabRelay 0.2.32
+
+- **Hub 首帧恢复**：Agent 检查更新改为后台读取外部更新仓，请求立即返回，不再长时间占用 Hub 数据锁并阻塞 WSS 首帧、路由配置与其他接口。
+- **启动减负**：APP v0.10.70 build 225 启动时只读取已有 Agent 版本状态，不再强制刷新外部更新仓。
+- **配置保留**：路由配置读取短暂失败时，APP 继续显示手机内上次成功的名称与管理地址，不再显示为空。
+
+## 0.12.1 / LabRelay 0.2.32
+
+- **Agent 控制链路恢复**：STUN 规则本地应用成功后立即释放 Agent 控制循环；DNS、TCP 连接和 Binding 超时转入运行时后台重试，不再连续阻塞路由状态、版本检查和清理指令。
+- **失败边界保持**：非法配置、监听端口冲突、本地 bind 与持久化失败仍立即拒绝并回滚；远端 STUN 临时失败不会回滚已正常运行的旧配置。
+- **状态稳定性**：沿用最近一次公网地址作为历史信息，但未重新确认时保持非 ready 状态；瞬时失败继续使用既有恢复窗口，避免卡片频繁跳变。
+- **配套 APP**：v0.10.69 build 224 对 Agent 检查/清理的短暂断线进行恢复，相关错误统一中文化，并将设置页两处 DeepSeek 专属文案改为通用 AI 文案。
+
+## 0.12.0 / LabRelay 0.2.30
+
+- **TokenHub 适配**：混元业务迁移至 TokenHub（OpenAI 兼容，`tokenhub.tencentmaas.com/v1`）——SSE 解析全面容错（心跳/注释/杂帧/跨行 JSON 不再打断回复）；混元 preset 模型更新为官方 `hy3`。
+- **模型自由排序**：配置卡片 ↑↓ 调整顺序（另有置顶接口 `POST /config/{id}/promote`），对话固定使用排序后第一个启用的配置。
+- **失败即切换**：模型不可用时对话内出现"切换模型"卡片，选中配置自动置顶并重试刚才的消息。
+- **设备通知增强**：上下线通知带 IP / 信号 / 频段 / SSID / 连接方式 / 在线时长 / 时间，多行中文排版。
+- **用量管理**：任务记录支持单条删除；每个配置的累计用量可校准（插入带符号调整行，历史保留）、额度可直接编辑。
+- **会话多选**：历史面板支持多选批量删除与复制对话内容；消息长按菜单圆角主题化。
+- **Hub 瘫死根治**：`app.run` 补上 `threaded=True`——此前为单线程伺服，通知 SSE 常驻连接会占死唯一的请求线程，导致聊天/设置等所有请求超时 502、设置页误报“没有 API 配置”；通知流另加 240 秒寿命上限，APP 带退避重连。
+- **停用模型自动切换**：对话只使用第一个启用的配置；不可用时向 APP 返回“模型 〈名称〉 不可用：〈真实原因〉。自动切换已停用，请在 AI 设置中更换模型或修复后重试”，由用户手动切换，不再悄悄换下一个烧 Token。
+- **上游错误可见**：Provider 报错时提取上游响应摘要（限流/配额/不支持 stream+tools 等真实原因），进入聊天气泡、SSE error 事件与 `ai_usage` 失败记录，不再只显示“AI provider rejected the request”。
+- **确认单可核实**：新增 `assistant.confirmations.list` 只读工具（等待/成功/失败/已过期）；提示词硬规则——无〔操作记录〕的历史确认请求一律视为已过期，必须先核实实际状态，杜绝“仍在等待确认”式叨叨。
+- **路由器 Beta 固件工具**：新增 `router.firmware.status/check`，检测结果以中文排版返回（当前版本、可用版本、更新内容、大小、下载地址）；不输出 JSON，不把 Agent 版本当固件版本。
+- **单条消息删除**：`DELETE /api/ai/conversations/{id}/messages/{id}`；chat 响应携带 `messageId/userMessageId`；删除不影响已记录的 Token 用量。
+- **回放预算**：每轮对话回放上限 24k 字符（此前随历史无限增长，单轮输入 15-23k Token）；全零 usage 帧按“模型未上报”处理；设备上下线 120 秒抖动降噪。
+- **确认结果回传会话**：工具确认的执行结果以〔操作记录〕写入对话转录，APP 增量模式下模型不再对已完成的操作重复要求确认（此前会导致重复下发 Agent 清理/升级指令）；批量确认与 APP 本机执行结果同样回传。
+- **写操作结果可读**：STUN/端口映射/原生映射/UPnP/防火墙等写工具返回人话 `message`，APP 确认执行后显示具体改动而非统一“操作已完成”。
+- **用量归属修复**：删除并重建 API 配置遗留的孤儿 usage 记录，在启动时与删除配置时按 provider+model 重新归因；模型分布与配置额度两张卡对齐，额度余量不再偏乐观。
+- **防火墙规则工具**：新增 `router.firewall.rule.create/update/remove`（转发/入站/出站、IPv4/IPv6、协议、允许/丢弃、源目的 IP 与端口、出入接口），全部经二次确认执行，直通 Router Core 原生能力，字段与 APP 防火墙编辑器一致。
+- **流式对话（SSE）**：`/api/ai/chat` 流式路径升级为 typed 事件（delta/tool/confirmation/done/error），支持完整工具调用循环与多配置 failover，中断轮次下发 `reset` 信号；强制意图与确认请求在流式下同样可用。
+- **通知 SSE 与任务事件**：新增 `GET /api/ai/notifications/stream`（SSE 推送替代 APP 轮询）；NAT 检测/路由器自检完成后自动进入通知收件箱并推送到 APP。
+- **AI 助手多 API**：新增 `ai_provider_configs` 多配置 CRUD，按顺序自动 failover；腾讯混元默认地址 `https://tokenhub.tencentmaas.com/v1`。
+- **Token 额度与用量**：每配置/每模型额度、已用与剩余百分比；`/api/ai/usage` 返回 14 天北京时间日柱状数据（含输入/输出与缓存分段）与按配置累计用量。
+- **历史对话管理**：对话按北京时间自然日折叠展示，新增 `PATCH /api/ai/conversations/{id}` 重命名接口；消息总存储限额 8 MiB 自动治理。
+- **AI 工具扩展**：Router Core 只读能力（UPnP、原生端口映射、防火墙、DDNS、IPv6、NAT、自检）与需二次确认的写操作（UPnP 启停、映射增删、防火墙规则启停）；网络自检/路由自检/NAT 检测真实执行，不再误触发 APP 导航。
+- **时间语义统一**：Hub 展示时间、自然日与旧时间字符串转 epoch 固定 `Asia/Shanghai`；PortMap 规则继续使用 epoch 并带服务端时钟偏差保护。
+- **PortMap 命令治理**：`router`/主路由 alias 统一到 GET/ACK/reconciliation；命令重试 5 次后转 `failed` 并记录超时/错误，用户重新操作重置重试状态。
+- **Relay 0.2.30**：Agent 对带有效期规则的 PortMap 命令增加 Hub 服务端时钟偏差保护（>120 秒拒绝执行并回报 clock_skew）。
+
+## 0.11.5
+
+- **STUN 规则可靠性**：保留自定义内网目标端口，切换传输协议发生同协议监听冲突时安全重分配监听端口，并正确解析字符串布尔值。
+- **执行状态可见**：向 App 返回 Agent 同步错误与路由器原生映射错误，停止规则不再被旧运行状态误报为已映射。
+- **状态文件治理**：压缩已完成命令记录，删除规则时同步清理地址历史，避免长期运行后状态文件持续膨胀。
+
+## 0.11.4
+
+- **Router Native DDNS 身份修复**：读取时分别保留路由器原生记录 ID（`service`）与服务商名称（`service_name`），返回字段继续兼容现有 App 契约。
+- **Router Native DDNS 开关修复**：写入时将 App 的 `enable` 映射为路由器原生 `enabled` 字段，并保持 `ddnsCfg` RPC envelope 与路由器 Web 管理端一致。
+- **部署固定版本**：Docker Compose 默认镜像更新为 `onlychallgener/labprobe-hub:0.11.4`，发布仅更新 `latest`、`0.11.4` 与 `v0.11.4` 标签。
+
+## 0.11.3
+
+- **Router Native DDNS 解析修复**：修复 Reyee BE72 固件 `devSta.get ddnsCfg` 返回 JSON 数组字符串或列表对象时被误判为非 dict 导致返回空列表的问题；同时输出 `list` 与 `services` 保证对 App 的完全兼容。
+- **部署固定版本**：Docker Compose 默认镜像更新为 `onlychallgener/labprobe-hub:0.11.3`。
+
+## 0.11.2
+
+- **Router Core 数据恢复**：原生 DDNS 正确解包 BE72 的 JSON/嵌套响应；eWeb WebSocket 的 2.4G、5G 温度和存储占用进入 Core realtime 与 Dashboard。
+- **宽带凭据恢复**：重新接入旧 main 已验证的 Hub 直读凭据入口，保留凭据仅驻内存；Relay 只在固件未暴露完整字段时执行原有路由器本地扩展读取。
+- **Agent 运维恢复**：更新命令使用实际解析成功的 GitHub/镜像源地址，过期命令不再阻塞“立即更新”和“一键清理”。
+- **Relay 扩展边界**：继续忽略 Relay 路由遥测，同时保留 LabProbe DDNS 地址与 WireGuard 扩展状态上报。
+- **路由连接设置**：新增受 APP Token 保护的 `GET/PUT /api/router/config`，配置加密落盘并在 Hub 内热切换 Router Core 会话与 WebSocket。
+- **接口验收**：CI 逐项核对 APP 的 76 个 HTTP 契约与 Hub 生产路由表。
+- **部署固定版本**：Docker Compose 默认镜像更新为 `onlychallgener/labprobe-hub:0.11.2`。
+
+## 0.11.1
+
+- **BE72 生产认证**：恢复固件实际使用的 AES 登录载荷、序列号会话 Cookie、SID 校验与签名 CMD 请求。
+- **Router Core 唯一数据源**：Dashboard、路由状态、设备与配置 API 统一由 `ReyeeEWebDriver` 提供，RouterLite 只保留 Relay demand/ack 控制端点且不再接收实时数据。
+- **实时首帧恢复**：BE72 `fast` WebSocket 帧直接进入 `RouterRealtimeEngine`，生产 WSS 输出 APP 契约字段，并在数据流停滞时快速重连。
+- **原生能力接通**：设备、IPv6、端口映射、UPnP、防火墙、DDNS、NAT、自检和 Beta 查询均使用经旧版验证的 eWeb module envelope。
+- **部署固定版本**：Docker Compose 默认镜像固定为 `onlychallgener/labprobe-hub:0.11.1`，保留既有 APP/HOOK Token、MQTT 与 `config.yaml` 配置。
+
+## 0.11.1-rc1
+
+- **Router Core 实时主链路**: Reyee eWeb `fast` 帧直接进入 `RouterRealtimeEngine`，生产 WSS 订阅 Core 引擎并向 APP 推送首帧与后续帧。
+- **APP contract 修复**: 路由实时字段统一为 `uploadBps`、`downloadBps`、`cpuPercent`、`memoryPercent` 与 `sampleEpochMs`。
+- **升级兼容**: Router Core 继续读取既有 `ROUTER_EWEB_*` Compose 变量与加密 `config/router_eweb.json`，保留 APP、HOOK 与 MQTT 配置行为。
+
+## 0.11.0 / LabRelay 0.2.28
+
+- **Router Core v1 架构生产切流**: 生产主干正式由 `RouterService` 与 `create_router_blueprint_v1` 接管，统一承载 30 个原生路由 API 端点；
+- **单一职责实现收口**: 核心鉴权由 `ReyeeSessionManager`（动态 Key 提取 + EVP MD5 AES-256-CBC + 3600s Idle Timeout + Single-Flight 并发防重登录锁）统一收拢；
+- **RPC 与缓存优化**: `ReyeeRpcClient` 原生对接 `/api/cmd?auth=<sid>` Wire 协议并内置断路器；引入 `RouterCache` SWR 引擎降低路由器 CPU 负载；
+- **实时事件规范化**: `RouterRealtimeEngine` 提供 3.0s 空闲心跳广播，严密适配 Android Client 45s 断线看门狗容差；
+- **BE72 Shadow 验证工具链就绪**: 提供 `api/be72_shadow_validation.py`，支持 12 大能力 Dual-Read 字段对比与安全可逆写操作门禁；
+- **LabRelay 自研核心能力 100% 保留**: LabProbe DDNS、6→4/6→6 映射转发、STUN NAT 穿透、WireGuard VPN、Agent 双进程拓扑完整兼容，LabRelay 保持 0.2.28 不变。
+
+
 ## 0.10.12 / LabRelay 0.2.28
 
 - WireGuard 服务端支持 `POST` 别名方法与 `enabled: false/true` 开关控制；

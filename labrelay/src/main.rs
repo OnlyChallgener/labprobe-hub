@@ -20,6 +20,7 @@ use tokio::time::{sleep, timeout};
 
 mod agent;
 mod ddns_address;
+mod tcp_session_test;
 mod wireguard;
 
 const VERSION: &str = env!("CARGO_PKG_VERSION");
@@ -30,6 +31,11 @@ const DEFAULT_PID: &str = "/tmp/labrelay.pid";
 const DEFAULT_UDP_STUN_SERVER: &str = "stun.cloudflare.com:3478";
 const DEFAULT_TCP_STUN_SERVER: &str = "stunserver2025.stunprotocol.org:3478";
 const LEGACY_TCP_STUN_SERVER: &str = DEFAULT_UDP_STUN_SERVER;
+const STUN_TCP_KEEPALIVE_INTERVAL: Duration = Duration::from_secs(10);
+const STUN_MAPPING_FAILURE_GRACE: Duration = Duration::from_secs(90);
+const STUN_FAST_RETRY_LIMIT: u32 = 12;
+const STUN_FAST_RETRY_DELAY: Duration = Duration::from_secs(5);
+const STUN_RECOVERY_PROBE_DELAY: Duration = Duration::from_secs(15);
 
 fn default_true() -> bool {
     true
@@ -63,6 +69,7 @@ struct Rule {
     enabled: bool,
     mode: String,
     listen_port: u16,
+    target_type: String,
     target_mode: String,
     target_ipv4: String,
     target_ipv6: String,
@@ -92,6 +99,7 @@ impl Default for Rule {
             enabled: false,
             mode: "6to4".to_string(),
             listen_port: 0,
+            target_type: "manual".to_string(),
             target_mode: "ipv4".to_string(),
             target_ipv4: String::new(),
             target_ipv6: String::new(),
@@ -234,6 +242,7 @@ struct Manager {
     rules: Arc<RwLock<HashMap<String, Rule>>>,
     runtimes: Arc<Mutex<HashMap<String, RuntimeHandle>>>,
     operation_lock: Arc<Mutex<()>>,
+    tcp_session_tests: tcp_session_test::TcpSessionTestManager,
     last_status: Arc<RwLock<HashMap<String, RuntimeSnapshot>>>,
     config_path: PathBuf,
     state_path: PathBuf,
@@ -256,6 +265,7 @@ impl Manager {
             rules: Arc::new(RwLock::new(rules)),
             runtimes: Arc::new(Mutex::new(HashMap::new())),
             operation_lock: Arc::new(Mutex::new(())),
+            tcp_session_tests: tcp_session_test::TcpSessionTestManager::new(),
             last_status: Arc::new(RwLock::new(HashMap::new())),
             config_path,
             state_path,
@@ -283,9 +293,36 @@ impl Manager {
             .collect();
         for id in ids {
             if let Err(e) = self.start_rule(&id).await {
-                eprintln!("[labrelay] start {} failed: {:#}", id, e);
+                eprintln!("[labrelay] 启动 {} 失败：{:#}", id, e);
             }
         }
+    }
+
+    async fn restore_previous_rule(&self, id: &str, previous: Option<&Rule>) -> Result<()> {
+        match previous {
+            Some(old) => {
+                self.rules
+                    .write()
+                    .await
+                    .insert(id.to_string(), old.clone());
+                self.persist().await.context("保存原有规则失败")?;
+                if old.enabled {
+                    self.start_rule(id)
+                        .await
+                        .context("重启原有运行任务失败")?;
+                } else {
+                    self.stop_runtime(id, true).await;
+                    self.set_cached_state(old, "stopped", "").await;
+                }
+            }
+            None => {
+                self.rules.write().await.remove(id);
+                self.persist().await.context("清理创建失败的新规则时保存失败")?;
+                self.stop_runtime(id, false).await;
+                self.last_status.write().await.remove(id);
+            }
+        }
+        Ok(())
     }
 
     async fn upsert(&self, mut rule: Rule) -> Result<Value> {
@@ -306,26 +343,38 @@ impl Manager {
             }
         }
         self.rules.write().await.insert(id.clone(), rule);
-        self.persist().await?;
+        if let Err(error) = self.persist().await {
+            match previous.as_ref() {
+                Some(old) => {
+                    self.rules.write().await.insert(id.clone(), old.clone());
+                }
+                None => {
+                    self.rules.write().await.remove(&id);
+                }
+            }
+            return Err(error.context("保存新规则失败"));
+        }
         if enabled {
             if let Err(error) = self.start_rule(&id).await {
-                // Do not leave a previously working rule replaced by a failed
-                // rebind. Restore its desired configuration and best-effort
-                // runtime so Hub reconciliation can observe the real state.
-                if let Some(old) = previous {
-                    self.rules.write().await.insert(id.clone(), old.clone());
-                    self.persist().await?;
-                    if old.enabled {
-                        let _ = self.start_rule(&id).await;
+                if let Err(restore_error) = self
+                    .restore_previous_rule(&id, previous.as_ref())
+                    .await
+                {
+                    let combined = format!(
+                        "新运行任务启动失败：{error:#}；原有运行任务恢复失败：{restore_error:#}"
+                    );
+                    if let Some(current) = self.rules.read().await.get(&id).cloned() {
+                        self.set_cached_state(&current, "error", &combined).await;
                     }
-                } else {
-                    self.rules.write().await.remove(&id);
-                    self.persist().await?;
+                    return Err(anyhow!(combined));
                 }
                 return Err(error);
             }
         } else {
-            self.stop_rule(&id, true).await?;
+            self.stop_runtime(&id, true).await;
+            if let Some(current) = self.rules.read().await.get(&id).cloned() {
+                self.set_cached_state(&current, "stopped", "").await;
+            }
         }
         Ok(json!({"ok": true, "id": id}))
     }
@@ -337,13 +386,13 @@ impl Manager {
             .await
             .get(id)
             .cloned()
-            .ok_or_else(|| anyhow!("rule not found"))?;
+            .ok_or_else(|| anyhow!("未找到规则"))?;
         validate_rule(&rule, self.port_min, self.port_max)?;
         self.ensure_port_available(&rule).await?;
         if is_expired(&rule) {
-            self.set_cached_state(&rule, "expired", "rule expired")
+            self.set_cached_state(&rule, "expired", "规则已过期")
                 .await;
-            bail!("rule expired");
+            bail!("规则已过期");
         }
         self.stop_runtime(id, true).await;
 
@@ -358,10 +407,14 @@ impl Manager {
             } else {
                 format!("[::]:{}", rule.listen_port)
             },
-            resolved_target: previous
-                .as_ref()
-                .map(|x| x.resolved_target.clone())
-                .unwrap_or_default(),
+            resolved_target: if rule.kind == "stun" {
+                String::new()
+            } else {
+                previous
+                    .as_ref()
+                    .map(|x| x.resolved_target.clone())
+                    .unwrap_or_default()
+            },
             active_connections: 0,
             active_peers: 0,
             total_upload_bytes: previous.as_ref().map(|x| x.total_upload_bytes).unwrap_or(0),
@@ -381,6 +434,9 @@ impl Manager {
             expires_at: rule.expires_at,
             last_resolved_at: None,
             last_error: String::new(),
+            // A previous STUN endpoint is useful as history while the new
+            // binding is being confirmed.  The state remains `mapping`, so
+            // API consumers must not treat this address as newly ready.
             public_endpoint: previous
                 .as_ref()
                 .map(|x| x.public_endpoint.clone())
@@ -393,10 +449,18 @@ impl Manager {
             mapping_updated_at: previous.as_ref().and_then(|x| x.mapping_updated_at),
         };
         let shared = Arc::new(RuntimeShared::new(snapshot));
-        let target = Arc::new(RwLock::new(
-            resolve_rule_target(&rule, &self.lan_if).await.ok(),
-        ));
-        update_target_status(&shared, &rule, target.read().await.clone(), None).await;
+        let (initial_target, initial_target_error) = match resolve_rule_target(&rule, &self.lan_if).await {
+            Ok(target) => (Some(target), None),
+            Err(error) => (None, Some(error.to_string())),
+        };
+        let target = Arc::new(RwLock::new(initial_target));
+        update_target_status(
+            &shared,
+            &rule,
+            target.read().await.clone(),
+            initial_target_error,
+        )
+        .await;
 
         let (cancel_tx, cancel_rx) = watch::channel(false);
         let shared_task = shared.clone();
@@ -410,8 +474,25 @@ impl Manager {
             // keeps that same channel port alive at the upstream NAT and
             // observes its current public endpoint.
             "TCP" if rule.kind == "stun" && rule.forward_mode == "router_native" => {
+                // Binding the local channel port is an apply-time requirement,
+                // not a transient STUN failure.  Do it before spawning so an
+                // occupied/invalid port still fails the upsert atomically.
+                let initial_socket = match prepare_tcp_stun_socket(rule.listen_port) {
+                    Ok(socket) => socket,
+                    Err(error) => {
+                        self.set_cached_state(&rule, "error", &error.to_string())
+                            .await;
+                        return Err(error);
+                    }
+                };
                 tokio::spawn(async move {
-                    run_tcp_stun_keepalive(rule_task, shared_task, cancel_rx).await;
+                    run_tcp_stun_keepalive(
+                        rule_task,
+                        shared_task,
+                        cancel_rx,
+                        Some(initial_socket),
+                    )
+                    .await;
                 })
             }
             "TCP" => match if rule.kind == "stun" {
@@ -465,6 +546,12 @@ impl Manager {
             },
             _ => unreachable!("validate_rule normalizes transportProtocol"),
         };
+        // Socket/listener creation above is the apply-time boundary: invalid
+        // configuration, an occupied port, or a bind failure still rejects the
+        // command immediately. DNS, remote connect and STUN Binding failures
+        // are transient runtime work and must never hold the Agent's single
+        // command/status loop for the old 30-second confirmation window.
+        let startup_state = if rule.kind == "stun" { "mapping" } else { "running" };
         self.runtimes.lock().await.insert(
             id.to_string(),
             RuntimeHandle {
@@ -473,7 +560,7 @@ impl Manager {
                 shared,
             },
         );
-        Ok(json!({"ok": true, "id": id, "state": "running"}))
+        Ok(json!({"ok": true, "id": id, "state": startup_state}))
     }
 
     async fn ensure_port_available(&self, rule: &Rule) -> Result<()> {
@@ -524,7 +611,7 @@ impl Manager {
     async fn stop_rule(&self, id: &str, update_config: bool) -> Result<Value> {
         if update_config {
             let mut rules = self.rules.write().await;
-            let rule = rules.get_mut(id).ok_or_else(|| anyhow!("rule not found"))?;
+            let rule = rules.get_mut(id).ok_or_else(|| anyhow!("未找到规则"))?;
             rule.enabled = false;
             drop(rules);
             self.persist().await?;
@@ -543,7 +630,7 @@ impl Manager {
     async fn enable_rule(&self, id: &str) -> Result<Value> {
         {
             let mut rules = self.rules.write().await;
-            let rule = rules.get_mut(id).ok_or_else(|| anyhow!("rule not found"))?;
+            let rule = rules.get_mut(id).ok_or_else(|| anyhow!("未找到规则"))?;
             rule.enabled = true;
         }
         self.persist().await?;
@@ -621,7 +708,7 @@ impl Manager {
     async fn write_state(&self) {
         let value = self.status_value(None).await;
         if let Err(e) = atomic_value_write(&self.state_path, &value) {
-            eprintln!("[labrelay] write state failed: {:#}", e);
+            eprintln!("[labrelay] 写入状态失败：{:#}", e);
         }
     }
 }
@@ -700,7 +787,9 @@ fn create_ipv4_udp_listener(port: u16) -> Result<UdpSocket> {
 static STUN_TRANSACTION_COUNTER: AtomicU64 = AtomicU64::new(1);
 const STUN_MAGIC_COOKIE: u32 = 0x2112_A442;
 
-fn stun_binding_request() -> [u8; 20] {
+type StunTransactionId = [u8; 12];
+
+fn stun_binding_request() -> ([u8; 20], StunTransactionId) {
     let mut request = [0u8; 20];
     request[0..2].copy_from_slice(&0x0001u16.to_be_bytes());
     request[2..4].copy_from_slice(&0u16.to_be_bytes());
@@ -712,19 +801,27 @@ fn stun_binding_request() -> [u8; 20] {
         .as_nanos();
     request[8..16].copy_from_slice(&(nanos as u64 ^ counter).to_be_bytes());
     request[16..20].copy_from_slice(&((nanos >> 64) as u32 ^ counter as u32).to_be_bytes());
-    request
+    let mut transaction_id = [0u8; 12];
+    transaction_id.copy_from_slice(&request[8..20]);
+    (request, transaction_id)
 }
 
-fn parse_stun_mapped_address(message: &[u8]) -> Result<SocketAddr> {
+fn parse_stun_mapped_address(
+    message: &[u8],
+    expected_transaction_id: &StunTransactionId,
+) -> Result<SocketAddr> {
     if message.len() < 20
         || u16::from_be_bytes([message[0], message[1]]) != 0x0101
         || u32::from_be_bytes([message[4], message[5], message[6], message[7]]) != STUN_MAGIC_COOKIE
     {
-        bail!("invalid STUN binding response");
+        bail!("STUN 绑定响应无效");
+    }
+    if message[8..20] != expected_transaction_id[..] {
+        bail!("STUN 绑定响应事务不匹配");
     }
     let body_len = u16::from_be_bytes([message[2], message[3]]) as usize;
     if message.len() < 20 + body_len {
-        bail!("truncated STUN binding response");
+        bail!("STUN 绑定响应不完整");
     }
     let mut offset = 20usize;
     while offset + 4 <= 20 + body_len {
@@ -732,7 +829,7 @@ fn parse_stun_mapped_address(message: &[u8]) -> Result<SocketAddr> {
         let len = u16::from_be_bytes([message[offset + 2], message[offset + 3]]) as usize;
         let value = offset + 4;
         if value + len > message.len() {
-            bail!("truncated STUN attribute");
+            bail!("STUN 响应属性不完整");
         }
         if matches!(kind, 0x0001 | 0x0020) && len >= 8 && message[value + 1] == 0x01 {
             let mut port = u16::from_be_bytes([message[value + 2], message[value + 3]]);
@@ -748,7 +845,7 @@ fn parse_stun_mapped_address(message: &[u8]) -> Result<SocketAddr> {
         }
         offset = value + ((len + 3) & !3);
     }
-    bail!("STUN response has no IPv4 mapped address")
+    bail!("STUN 响应未包含 IPv4 映射地址")
 }
 
 async fn mark_stun_mapping(shared: &Arc<RuntimeShared>, endpoint: SocketAddr) {
@@ -761,44 +858,96 @@ async fn mark_stun_mapping(shared: &Arc<RuntimeShared>, endpoint: SocketAddr) {
     base.last_error.clear();
 }
 
+async fn mark_stun_transient_failure(shared: &Arc<RuntimeShared>, message: String) {
+    let mut base = shared.base.write().await;
+    let mapping_is_recent = base.state == "mapped"
+        && !base.public_endpoint.is_empty()
+        && base.mapping_updated_at.is_some_and(|updated_at| {
+            now_epoch().saturating_sub(updated_at) <= STUN_MAPPING_FAILURE_GRACE.as_secs()
+        });
+    if !mapping_is_recent && base.state != "expired" && base.state != "stopped" {
+        // One failed probe does not invalidate a recently confirmed mapping.
+        // Only downgrade after the recovery window has elapsed, which keeps
+        // transient carrier/NAT resets from making the APP card oscillate.
+        base.state = "mapping".to_string();
+    }
+    base.last_error = message;
+}
+
 async fn resolve_stun_server(value: &str) -> Result<SocketAddr> {
     tokio::net::lookup_host(value)
         .await
-        .context("resolve STUN server")?
+        .context("解析 STUN 服务器失败")?
         .find(SocketAddr::is_ipv4)
-        .ok_or_else(|| anyhow!("STUN server has no IPv4 address"))
+        .ok_or_else(|| anyhow!("STUN 服务器没有可用的 IPv4 地址"))
 }
 
-async fn connect_tcp_stun(local_port: u16, server: SocketAddr) -> Result<TcpStream> {
+fn prepare_tcp_stun_socket(local_port: u16) -> Result<TcpSocket> {
     // TcpSocket owns the nonblocking connect state and lets Tokio handle
     // EINPROGRESS/EALREADY consistently on musl/BusyBox routers.  The old
     // socket2 + writable()/SO_ERROR sequence could surface raw errno 115
     // after the initial connect had already been accepted as pending.
-    let socket = TcpSocket::new_v4()?;
-    socket.set_reuseaddr(true)?;
+    let socket = TcpSocket::new_v4().context("创建 STUN TCP 套接字失败")?;
+    socket
+        .set_reuseaddr(true)
+        .context("设置 STUN TCP 套接字失败")?;
     socket.bind(SocketAddr::V4(SocketAddrV4::new(
         Ipv4Addr::UNSPECIFIED,
         local_port,
-    )))?;
+    )))
+    .with_context(|| format!("绑定 STUN TCP 本地端口 {local_port} 失败"))?;
+    Ok(socket)
+}
+
+async fn connect_prepared_tcp_stun(socket: TcpSocket, server: SocketAddr) -> Result<TcpStream> {
     timeout(Duration::from_secs(8), socket.connect(server))
         .await
-        .context("STUN TCP connect timeout")?
-        .context("STUN TCP connect")
+        .context("STUN TCP 连接超时")?
+        .context("STUN TCP 连接失败")
+}
+
+#[cfg(test)]
+async fn connect_tcp_stun(local_port: u16, server: SocketAddr) -> Result<TcpStream> {
+    connect_prepared_tcp_stun(prepare_tcp_stun_socket(local_port)?, server).await
+}
+
+fn stun_retry_delay(consecutive_failures: u32) -> Duration {
+    if consecutive_failures <= STUN_FAST_RETRY_LIMIT {
+        STUN_FAST_RETRY_DELAY
+    } else {
+        STUN_RECOVERY_PROBE_DELAY
+    }
 }
 
 async fn run_tcp_stun_keepalive(
     rule: Rule,
     shared: Arc<RuntimeShared>,
     mut cancel: watch::Receiver<bool>,
+    mut initial_socket: Option<TcpSocket>,
 ) {
+    let mut consecutive_failures = 0u32;
     loop {
         if *cancel.borrow() {
             return;
         }
         let result: Result<()> = async {
             let server = resolve_stun_server(&rule.stun_server).await?;
-            let mut stream = connect_tcp_stun(rule.listen_port, server).await?;
-            let mut tick = tokio::time::interval(Duration::from_secs(20));
+            let socket = match initial_socket.take() {
+                Some(socket) => socket,
+                None => prepare_tcp_stun_socket(rule.listen_port)?,
+            };
+            let mut stream = connect_prepared_tcp_stun(socket, server).await?;
+            // RFC 8489 recommends an abortive close before reopening an idle
+            // TCP STUN flow that has failed.  Linger zero prevents the old
+            // four-tuple from trapping the fixed local channel port in
+            // TIME_WAIT and blocking all later recovery attempts.
+            stream
+                .set_zero_linger()
+                .context("设置 STUN TCP 快速重连失败")?;
+            stream
+                .set_nodelay(true)
+                .context("设置 STUN TCP 低延迟模式失败")?;
+            let mut tick = tokio::time::interval(STUN_TCP_KEEPALIVE_INTERVAL);
             tick.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
             loop {
                 tokio::select! {
@@ -806,32 +955,42 @@ async fn run_tcp_stun_keepalive(
                         if *cancel.borrow() { return Ok(()); }
                     }
                     _ = tick.tick() => {
-                        let request = stun_binding_request();
-                        stream.write_all(&request).await?;
+                        let (request, transaction_id) = stun_binding_request();
+                        stream
+                            .write_all(&request)
+                            .await
+                            .context("发送 STUN TCP 绑定请求失败")?;
                         let mut header = [0u8; 20];
                         timeout(Duration::from_secs(8), stream.read_exact(&mut header))
-                            .await.context("STUN TCP response timeout")??;
+                            .await
+                            .context("STUN TCP 响应超时")?
+                            .context("读取 STUN TCP 响应失败")?;
                         let length = u16::from_be_bytes([header[2], header[3]]) as usize;
                         let mut message = Vec::with_capacity(20 + length);
                         message.extend_from_slice(&header);
                         message.resize(20 + length, 0);
                         timeout(Duration::from_secs(8), stream.read_exact(&mut message[20..]))
-                            .await.context("STUN TCP body timeout")??;
-                        mark_stun_mapping(&shared, parse_stun_mapped_address(&message)?).await;
+                            .await
+                            .context("STUN TCP 响应内容超时")?
+                            .context("读取 STUN TCP 响应内容失败")?;
+                        mark_stun_mapping(
+                            &shared,
+                            parse_stun_mapped_address(&message, &transaction_id)?,
+                        )
+                        .await;
+                        consecutive_failures = 0;
                     }
                 }
             }
         }.await;
         if let Err(error) = result {
-            let mut base = shared.base.write().await;
-            if base.public_endpoint.is_empty() {
-                base.state = "mapping".to_string();
-            }
-            base.last_error = error.to_string();
+            consecutive_failures = consecutive_failures.saturating_add(1);
+            mark_stun_transient_failure(&shared, format!("{error:#}")).await;
         }
+        let retry_delay = stun_retry_delay(consecutive_failures);
         tokio::select! {
             _ = cancel.changed() => if *cancel.borrow() { return; },
-            _ = sleep(Duration::from_secs(5)) => {}
+            _ = sleep(retry_delay) => {}
         }
     }
 }
@@ -849,6 +1008,7 @@ async fn run_tcp_listener(
             rule.clone(),
             shared.clone(),
             cancel.clone(),
+            None,
         )))
     } else {
         None
@@ -865,10 +1025,12 @@ async fn run_tcp_listener(
                 if is_expired(&rule) {
                     let mut base = shared.base.write().await;
                     base.state = "expired".to_string();
-                    base.last_error = "rule expired".to_string();
+                    base.last_error = "规则已过期".to_string();
                     break;
                 }
-                if rule.mode == "6to6" && rule.target_mode == "ipv6_suffix" {
+                if rule.mode == "6to6"
+                    && (rule.target_mode == "ipv6_suffix" || target.read().await.is_none())
+                {
                     match resolve_rule_target(&rule, &lan_if).await {
                         Ok(ip) => {
                             *target.write().await = Some(ip);
@@ -888,7 +1050,7 @@ async fn run_tcp_listener(
                         let Some(target_ip) = target_ip else {
                             let mut base = shared.base.write().await;
                             base.state = "waiting_target".to_string();
-                            base.last_error = "target IPv6 not resolved".to_string();
+                            base.last_error = "未能解析目标 IPv6 地址".to_string();
                             drop(stream);
                             continue;
                         };
@@ -896,7 +1058,7 @@ async fn run_tcp_listener(
                             Ok(p) => p,
                             Err(_) => {
                                 let mut base = shared.base.write().await;
-                                base.last_error = "maximum connections reached".to_string();
+                                base.last_error = "已达到最大连接数".to_string();
                                 drop(stream);
                                 continue;
                             }
@@ -922,7 +1084,7 @@ async fn run_tcp_listener(
                         });
                     }
                     Err(e) => {
-                        shared.base.write().await.last_error = format!("accept failed: {}", e);
+                        shared.base.write().await.last_error = format!("接收连接失败：{}", e);
                         sleep(Duration::from_millis(200)).await;
                     }
                 }
@@ -954,6 +1116,7 @@ async fn run_udp_stun_keepalive(
     let mut stun_tick = tokio::time::interval(Duration::from_secs(20));
     stun_tick.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
     let mut stun_server: Option<SocketAddr> = None;
+    let mut pending_transaction: Option<StunTransactionId> = None;
 
     loop {
         tokio::select! {
@@ -961,27 +1124,44 @@ async fn run_udp_stun_keepalive(
                 if *cancel.borrow() { break; }
             }
             _ = stun_tick.tick() => {
+                if pending_transaction.take().is_some() {
+                    mark_stun_transient_failure(
+                        &shared,
+                        "STUN UDP 响应超时，正在重试".to_string(),
+                    ).await;
+                }
                 match resolve_stun_server(&rule.stun_server).await {
                     Ok(server) => {
                         stun_server = Some(server);
-                        let request = stun_binding_request();
+                        let (request, transaction_id) = stun_binding_request();
                         if let Err(error) = socket.send_to(&request, server).await {
-                            shared.base.write().await.last_error = format!("STUN UDP send failed: {}", error);
+                            mark_stun_transient_failure(
+                                &shared,
+                                format!("STUN UDP 发送失败：{}", error),
+                            ).await;
+                        } else {
+                            pending_transaction = Some(transaction_id);
                         }
                     }
                     Err(error) => {
-                        let mut base = shared.base.write().await;
-                        if base.public_endpoint.is_empty() { base.state = "mapping".to_string(); }
-                        base.last_error = error.to_string();
+                        mark_stun_transient_failure(&shared, error.to_string()).await;
                     }
                 }
             }
             received = socket.recv_from(&mut recv_buffer) => {
                 match received {
                     Ok((size, peer)) if stun_server == Some(peer) => {
-                        match parse_stun_mapped_address(&recv_buffer[..size]) {
-                            Ok(endpoint) => mark_stun_mapping(&shared, endpoint).await,
-                            Err(error) => shared.base.write().await.last_error = error.to_string(),
+                        let expected = pending_transaction;
+                        if let Some(expected) = expected {
+                            match parse_stun_mapped_address(&recv_buffer[..size], &expected) {
+                                Ok(endpoint) => {
+                                    pending_transaction = None;
+                                    mark_stun_mapping(&shared, endpoint).await;
+                                }
+                                Err(error) => {
+                                    mark_stun_transient_failure(&shared, error.to_string()).await;
+                                }
+                            }
                         }
                     }
                     Ok(_) => {
@@ -989,7 +1169,7 @@ async fn run_udp_stun_keepalive(
                         // consume nor account visitor traffic here.
                     }
                     Err(error) => {
-                        shared.base.write().await.last_error = format!("STUN UDP receive failed: {}", error);
+                        shared.base.write().await.last_error = format!("STUN UDP 接收失败：{}", error);
                     }
                 }
             }
@@ -1009,8 +1189,8 @@ async fn udp_upstream_socket(target: SocketAddr) -> Result<UdpSocket> {
     };
     let socket = UdpSocket::bind(bind)
         .await
-        .context("bind UDP upstream socket")?;
-    socket.connect(target).await.context("connect UDP target")?;
+        .context("绑定 UDP 上游套接字失败")?;
+    socket.connect(target).await.context("连接 UDP 目标失败")?;
     Ok(socket)
 }
 
@@ -1040,6 +1220,7 @@ async fn run_udp_listener(
     let mut stun_tick = tokio::time::interval(Duration::from_secs(20));
     stun_tick.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
     let mut stun_server: Option<SocketAddr> = None;
+    let mut pending_transaction: Option<StunTransactionId> = None;
 
     loop {
         tokio::select! {
@@ -1048,18 +1229,27 @@ async fn run_udp_listener(
             }
             _ = peer_tasks.join_next(), if !peer_tasks.is_empty() => {}
             _ = stun_tick.tick(), if rule.kind == "stun" && rule.forward_mode == "relay_proxy" => {
+                if pending_transaction.take().is_some() {
+                    mark_stun_transient_failure(
+                        &shared,
+                        "STUN UDP 响应超时，正在重试".to_string(),
+                    ).await;
+                }
                 match resolve_stun_server(&rule.stun_server).await {
                     Ok(server) => {
                         stun_server = Some(server);
-                        let request = stun_binding_request();
+                        let (request, transaction_id) = stun_binding_request();
                         if let Err(error) = listener.send_to(&request, server).await {
-                            shared.base.write().await.last_error = format!("STUN UDP send failed: {}", error);
+                            mark_stun_transient_failure(
+                                &shared,
+                                format!("STUN UDP 发送失败：{}", error),
+                            ).await;
+                        } else {
+                            pending_transaction = Some(transaction_id);
                         }
                     }
                     Err(error) => {
-                        let mut base = shared.base.write().await;
-                        if base.public_endpoint.is_empty() { base.state = "mapping".to_string(); }
-                        base.last_error = error.to_string();
+                        mark_stun_transient_failure(&shared, error.to_string()).await;
                     }
                 }
             }
@@ -1067,10 +1257,12 @@ async fn run_udp_listener(
                 if is_expired(&rule) {
                     let mut base = shared.base.write().await;
                     base.state = "expired".to_string();
-                    base.last_error = "rule expired".to_string();
+                    base.last_error = "规则已过期".to_string();
                     break;
                 }
-                if rule.mode == "6to6" && rule.target_mode == "ipv6_suffix" {
+                if rule.mode == "6to6"
+                    && (rule.target_mode == "ipv6_suffix" || target.read().await.is_none())
+                {
                     match resolve_rule_target(&rule, &lan_if).await {
                         Ok(ip) => {
                             *target.write().await = Some(ip);
@@ -1087,22 +1279,30 @@ async fn run_udp_listener(
                 let (size, client) = match received {
                     Ok(value) => value,
                     Err(error) => {
-                        shared.base.write().await.last_error = format!("UDP receive failed: {}", error);
+                        shared.base.write().await.last_error = format!("UDP 接收失败：{}", error);
                         sleep(Duration::from_millis(100)).await;
                         continue;
                     }
                 };
                 if rule.kind == "stun" && rule.forward_mode == "relay_proxy" && stun_server == Some(client) {
-                    match parse_stun_mapped_address(&recv_buffer[..size]) {
-                        Ok(endpoint) => mark_stun_mapping(&shared, endpoint).await,
-                        Err(error) => shared.base.write().await.last_error = error.to_string(),
+                    let expected = pending_transaction;
+                    if let Some(expected) = expected {
+                        match parse_stun_mapped_address(&recv_buffer[..size], &expected) {
+                            Ok(endpoint) => {
+                                pending_transaction = None;
+                                mark_stun_mapping(&shared, endpoint).await;
+                            }
+                            Err(error) => {
+                                mark_stun_transient_failure(&shared, error.to_string()).await;
+                            }
+                        }
                     }
                     continue;
                 }
                 let Some(target_ip) = target.read().await.clone() else {
                     let mut base = shared.base.write().await;
                     base.state = "waiting_target".to_string();
-                    base.last_error = "target IPv6 not resolved".to_string();
+                    base.last_error = "未能解析目标 IPv6 地址".to_string();
                     continue;
                 };
                 let now = now_epoch();
@@ -1130,7 +1330,7 @@ async fn run_udp_listener(
                     peer
                 } else {
                     if peers.lock().await.len() >= rule.max_connections as usize {
-                        shared.base.write().await.last_error = "maximum UDP peers reached".to_string();
+                        shared.base.write().await.last_error = "已达到最大 UDP 会话数".to_string();
                         None
                     } else {
                         match udp_upstream_socket(target_addr).await {
@@ -1169,7 +1369,7 @@ async fn run_udp_listener(
                                 Some(peer)
                             }
                             Err(error) => {
-                                shared.base.write().await.last_error = format!("UDP target setup failed: {}", error);
+                                shared.base.write().await.last_error = format!("UDP 目标初始化失败：{}", error);
                                 None
                             }
                         }
@@ -1187,7 +1387,7 @@ async fn run_udp_listener(
                             }
                             base.last_error.clear();
                         }
-                        Err(error) => shared.base.write().await.last_error = format!("UDP target send failed: {}", error),
+                        Err(error) => shared.base.write().await.last_error = format!("UDP 目标发送失败：{}", error),
                     }
                 }
             }
@@ -1236,12 +1436,12 @@ async fn run_udp_peer(
                             shared.download_packets.fetch_add(1, Ordering::Relaxed);
                         }
                         Err(error) => {
-                            shared.base.write().await.last_error = format!("UDP client send failed: {}", error);
+                            shared.base.write().await.last_error = format!("UDP 客户端发送失败：{}", error);
                             break;
                         }
                     },
                     Err(error) => {
-                        shared.base.write().await.last_error = format!("UDP target receive failed: {}", error);
+                        shared.base.write().await.last_error = format!("UDP 目标接收失败：{}", error);
                         break;
                     }
                 }
@@ -1268,7 +1468,7 @@ async fn proxy_connection(
     client.set_nodelay(true).ok();
     let mut upstream = timeout(Duration::from_secs(8), TcpStream::connect(target))
         .await
-        .context("target connect timeout")??;
+        .context("目标连接超时")??;
     upstream.set_nodelay(true).ok();
     {
         let mut base = shared.base.write().await;
@@ -1305,7 +1505,7 @@ async fn proxy_connection(
                 }
             }
             _ = sleep(idle) => {
-                bail!("connection idle timeout");
+                bail!("连接空闲超时");
             }
         }
     }
@@ -1326,11 +1526,18 @@ async fn update_target_status(
         base.last_error.clear();
     } else {
         base.state = "waiting_target".to_string();
-        base.last_error = error.unwrap_or_else(|| "target unavailable".to_string());
+        base.last_error = error.unwrap_or_else(|| "目标当前不可用".to_string());
     }
 }
 
 async fn resolve_rule_target(rule: &Rule, lan_if: &str) -> Result<IpAddr> {
+    if rule.target_type == "router_self" {
+        return Ok(if rule.mode == "6to6" {
+            IpAddr::V6(Ipv6Addr::LOCALHOST)
+        } else {
+            IpAddr::V4(Ipv4Addr::LOCALHOST)
+        });
+    }
     match rule.mode.as_str() {
         "6to4" | "stun" => {
             let ip = IpAddr::V4(Ipv4Addr::from_str(&rule.target_ipv4)?);
@@ -1351,7 +1558,7 @@ async fn resolve_rule_target(rule: &Rule, lan_if: &str) -> Result<IpAddr> {
                 tokio::task::spawn_blocking(move || resolve_ipv6_suffix(&rule, &lan_if)).await??;
             Ok(ip)
         }
-        _ => bail!("unsupported mode/targetMode"),
+        _ => bail!("不支持的模式或目标模式"),
     }
 }
 
@@ -1370,10 +1577,25 @@ fn ensure_target_uses_lan(ip: IpAddr, lan_if: &str) -> Result<()> {
                 fallback.arg("-6");
             }
             fallback.args(["route", "get", text_ip.as_str()]).output()
-        })
-        .context("run ip route get")?;
+        });
+    let output = match output {
+        Ok(output) => output,
+        Err(error) => {
+            if let IpAddr::V6(ipv6) = ip {
+                if ipv6_matches_lan_prefix(ipv6, lan_if) {
+                    return Ok(());
+                }
+            }
+            return Err(error).context("执行目标路由查询失败");
+        }
+    };
     if !output.status.success() {
-        bail!("target route lookup failed");
+        if let IpAddr::V6(ipv6) = ip {
+            if ipv6_matches_lan_prefix(ipv6, lan_if) {
+                return Ok(());
+            }
+        }
+        bail!("目标路由查询失败");
     }
     let text = String::from_utf8_lossy(&output.stdout);
     let fields: Vec<&str> = text.split_whitespace().collect();
@@ -1384,9 +1606,16 @@ fn ensure_target_uses_lan(ip: IpAddr, lan_if: &str) -> Result<()> {
         .copied()
         .unwrap_or("");
     if route_dev != lan_if {
-        bail!("target is not routed through {}", lan_if);
+        bail!("目标未通过 LAN 接口 {} 路由", lan_if);
     }
     Ok(())
+}
+
+fn ipv6_matches_lan_prefix(ip: Ipv6Addr, lan_if: &str) -> bool {
+    let octets = ip.octets();
+    current_lan_prefixes(lan_if)
+        .iter()
+        .any(|prefix| octets[..8] == prefix[..])
 }
 
 fn resolve_ipv6_suffix(rule: &Rule, lan_if: &str) -> Result<IpAddr> {
@@ -1400,9 +1629,9 @@ fn resolve_ipv6_suffix(rule: &Rule, lan_if: &str) -> Result<IpAddr> {
                 .args(["-6", "neigh", "show", "dev", lan_if])
                 .output()
         })
-        .context("run ip -6 neigh")?;
+        .context("执行 IPv6 邻居表查询失败")?;
     if !output.status.success() {
-        bail!("ip -6 neigh failed");
+        bail!("读取 IPv6 邻居表失败");
     }
     let text = String::from_utf8_lossy(&output.stdout);
     let current_prefixes = current_lan_prefixes(lan_if);
@@ -1455,11 +1684,11 @@ fn resolve_ipv6_suffix(rule: &Rule, lan_if: &str) -> Result<IpAddr> {
         candidates.push((score, ip, state));
     }
     if candidates.is_empty() {
-        bail!("no IPv6 neighbor matches suffix/MAC");
+        bail!("没有匹配 IPv6 后缀/MAC 的邻居");
     }
     candidates.sort_by(|a, b| b.0.cmp(&a.0));
     if target_mac.is_empty() && candidates.len() > 1 && candidates[0].0 == candidates[1].0 {
-        bail!("ambiguous suffix: configure target MAC");
+        bail!("IPv6 后缀匹配不唯一，请配置目标 MAC");
     }
     Ok(IpAddr::V6(candidates[0].1))
 }
@@ -1504,11 +1733,11 @@ fn suffix_bytes(raw: &str) -> Result<[u8; 8]> {
     } else {
         format!("::{}", text.trim_start_matches(':'))
     };
-    let ip = Ipv6Addr::from_str(&normalized).context("invalid IPv6 suffix")?;
+    let ip = Ipv6Addr::from_str(&normalized).context("IPv6 后缀格式无效")?;
     let mut out = [0u8; 8];
     out.copy_from_slice(&ip.octets()[8..]);
     if out.iter().all(|b| *b == 0) {
-        bail!("IPv6 suffix must not be all zero");
+        bail!("IPv6 后缀不能全为零");
     }
     Ok(out)
 }
@@ -1521,6 +1750,10 @@ fn normalize_rule(rule: &mut Rule) {
     rule.id = rule.id.trim().to_ascii_lowercase();
     rule.name = rule.name.trim().to_string();
     rule.mode = rule.mode.trim().to_ascii_lowercase();
+    rule.target_type = rule.target_type.trim().to_ascii_lowercase();
+    if rule.target_type.is_empty() {
+        rule.target_type = "manual".to_string();
+    }
     rule.target_mode = rule.target_mode.trim().to_ascii_lowercase();
     rule.target_ipv4 = rule.target_ipv4.trim().to_string();
     rule.target_ipv6 = strip_brackets(&rule.target_ipv6).to_string();
@@ -1530,10 +1763,30 @@ fn normalize_rule(rule: &mut Rule) {
     rule.service_type = rule.service_type.trim().to_string();
     rule.forward_mode = rule.forward_mode.trim().to_ascii_lowercase();
     rule.stun_server = rule.stun_server.trim().to_string();
+    if rule.target_type == "router_self" && rule.kind != "stun" {
+        if rule.mode == "6to6" {
+            rule.target_mode = "ipv6_full".to_string();
+            rule.target_ipv4.clear();
+            rule.target_ipv6 = Ipv6Addr::LOCALHOST.to_string();
+            rule.target_ipv6_suffix.clear();
+            rule.target_mac.clear();
+        } else {
+            rule.target_mode = "ipv4".to_string();
+            rule.target_ipv4 = Ipv4Addr::LOCALHOST.to_string();
+            rule.target_ipv6.clear();
+            rule.target_ipv6_suffix.clear();
+            rule.target_mac.clear();
+        }
+    }
     if rule.kind == "stun" {
         rule.mode = "stun".to_string();
         rule.target_mode = "ipv4".to_string();
-        rule.forward_mode = "router_native".to_string();
+        rule.forward_mode = if rule.target_type == "router_self" {
+            rule.target_ipv4 = Ipv4Addr::LOCALHOST.to_string();
+            "relay_proxy".to_string()
+        } else {
+            "router_native".to_string()
+        };
         if rule.stun_server.is_empty()
             || (rule.transport_protocol == "TCP" && rule.stun_server == LEGACY_TCP_STUN_SERVER)
         {
@@ -1554,10 +1807,13 @@ fn validate_rule(rule: &Rule, port_min: u16, port_max: u16) -> Result<()> {
             .chars()
             .all(|c| c.is_ascii_alphanumeric() || c == '-' || c == '_')
     {
-        bail!("invalid rule id");
+        bail!("规则 ID 无效");
     }
     if rule.name.is_empty() || rule.name.len() > 64 {
-        bail!("invalid rule name");
+        bail!("规则名称无效");
+    }
+    if !matches!(rule.target_type.as_str(), "router_self" | "device" | "manual") {
+        bail!("目标类型只能是路由器本机、内网设备或手动目标");
     }
     if !rule.target_mac.is_empty() {
         let parts: Vec<&str> = rule.target_mac.split(':').collect();
@@ -1566,52 +1822,52 @@ fn validate_rule(rule: &Rule, port_min: u16, port_max: u16) -> Result<()> {
                 .iter()
                 .any(|part| part.len() != 2 || !part.chars().all(|c| c.is_ascii_hexdigit()))
         {
-            bail!("invalid target MAC");
+            bail!("目标 MAC 地址无效");
         }
     }
     if rule.listen_port < port_min || rule.listen_port > port_max {
-        bail!("listenPort outside allowed range {}-{}", port_min, port_max);
+        bail!("监听端口超出允许范围 {}-{}", port_min, port_max);
     }
     if rule.target_port == 0 {
-        bail!("invalid targetPort");
+        bail!("目标端口无效");
     }
     if !matches!(rule.transport_protocol.as_str(), "TCP" | "UDP") {
-        bail!("unsupported transportProtocol: {}", rule.transport_protocol);
+        bail!("不支持的传输协议：{}", rule.transport_protocol);
     }
     if !matches!(rule.kind.as_str(), "portmap" | "stun") {
-        bail!("unsupported rule kind");
+        bail!("不支持的规则类型");
     }
     if rule.kind == "stun" && !rule.stun_server.contains(':') {
-        bail!("invalid STUN server");
+        bail!("STUN 服务器地址无效");
     }
     if rule.kind == "stun" && !matches!(rule.forward_mode.as_str(), "router_native" | "relay_proxy") {
-        bail!("unsupported STUN forwardMode: {}", rule.forward_mode);
+        bail!("不支持的 STUN 转发模式：{}", rule.forward_mode);
     }
     if matches!(rule.mode.as_str(), "6to4" | "stun") {
-        let ip = Ipv4Addr::from_str(&rule.target_ipv4).context("invalid targetIpv4")?;
+        let ip = Ipv4Addr::from_str(&rule.target_ipv4).context("目标 IPv4 地址无效")?;
         if !(ip.is_private() || ip.is_loopback() || ip.is_link_local()) {
-            bail!("target IPv4 must be LAN/private");
+            bail!("目标 IPv4 地址必须是局域网私有地址");
         }
     } else if rule.mode == "6to6" {
         match rule.target_mode.as_str() {
             "ipv6_full" => {
                 let ip = Ipv6Addr::from_str(strip_brackets(&rule.target_ipv6))
-                    .context("invalid targetIpv6")?;
-                if ip.is_loopback()
+                    .context("目标 IPv6 地址无效")?;
+                if (ip.is_loopback() && rule.target_type != "router_self")
                     || ip.is_unspecified()
                     || ip.is_multicast()
                     || ip.is_unicast_link_local()
                 {
-                    bail!("invalid target IPv6 scope");
+                    bail!("目标 IPv6 地址范围无效");
                 }
             }
             "ipv6_suffix" => {
                 suffix_bytes(&rule.target_ipv6_suffix)?;
             }
-            _ => bail!("targetMode must be ipv6_full or ipv6_suffix"),
+            _ => bail!("目标模式必须是完整 IPv6 地址或 IPv6 后缀"),
         }
     } else {
-        bail!("mode must be 6to4, 6to6 or stun");
+        bail!("模式必须是 6→4、6→6 或 STUN");
     }
     Ok(())
 }
@@ -1675,7 +1931,7 @@ fn atomic_value_write(path: &Path, value: &Value) -> Result<()> {
 async fn handle_command_fixed(manager: Manager, raw: &str) -> Value {
     let v: Value = match serde_json::from_str(raw) {
         Ok(v) => v,
-        Err(_) => return json!({"ok": false, "error": "invalid JSON"}),
+        Err(_) => return json!({"ok": false, "error": "JSON 格式无效"}),
     };
     let action = v.get("action").and_then(Value::as_str).unwrap_or("");
     // Dashboard reconciliation can submit the same rule more than once while
@@ -1711,6 +1967,14 @@ async fn handle_command_fixed(manager: Manager, raw: &str) -> Value {
                 .delete_rule(v.get("id").and_then(Value::as_str).unwrap_or(""))
                 .await
         }
+        "tcp_session_start" => manager.tcp_session_tests.start(&v).await,
+        "tcp_session_stop" => {
+            manager
+                .tcp_session_tests
+                .stop(v.get("taskId").and_then(Value::as_str).unwrap_or(""))
+                .await
+        }
+        "tcp_session_status" => Ok(manager.tcp_session_tests.status().await),
         _ => Err(anyhow!("unknown action")),
     };
     result.unwrap_or_else(|e| json!({"ok": false, "error": e.to_string()}))
@@ -1738,7 +2002,7 @@ async fn unix_server_fixed(manager: Manager, socket_path: PathBuf) -> Result<()>
                 }
                 Ok(Ok(_)) => json!({"ok": false, "error": "empty command"}),
                 Ok(Err(e)) => json!({"ok": false, "error": e.to_string()}),
-                Err(_) => json!({"ok": false, "error": "command timeout"}),
+                Err(_) => json!({"ok": false, "error": "命令执行超时"}),
             };
             let _ = write_half
                 .write_all(format!("{}\n", response).as_bytes())
@@ -1747,10 +2011,17 @@ async fn unix_server_fixed(manager: Manager, socket_path: PathBuf) -> Result<()>
     }
 }
 
+fn ctl_read_timeout(request: &Value) -> Duration {
+    let _ = request;
+    // All local control operations are bounded equally. STUN startup now
+    // returns after local apply and performs remote confirmation in runtime.
+    Duration::from_secs(8)
+}
+
 pub(crate) fn ctl_request(socket_path: &Path, request: &Value) -> Result<Value> {
     let mut stream = std::os::unix::net::UnixStream::connect(socket_path)
         .with_context(|| format!("connect {}", socket_path.display()))?;
-    stream.set_read_timeout(Some(Duration::from_secs(8)))?;
+    stream.set_read_timeout(Some(ctl_read_timeout(request)))?;
     stream.set_write_timeout(Some(Duration::from_secs(3)))?;
     stream.write_all(format!("{}\n", request).as_bytes())?;
     let mut line = String::new();
@@ -1806,7 +2077,7 @@ async fn daemon(args: &[String]) -> Result<()> {
         .unwrap_or(20020);
     let lan_if = arg_value(args, "--lan-if").unwrap_or_else(|| "br-lan".to_string());
     if port_min > port_max {
-        bail!("invalid port range");
+        bail!("端口范围无效");
     }
     if let Some(parent) = pid.parent() {
         fs::create_dir_all(parent)?;
@@ -2273,10 +2544,12 @@ mod tests {
 
     #[test]
     fn stun_xor_mapped_address_is_decoded() {
+        let transaction_id = [0x5au8; 12];
         let mut response = vec![0u8; 32];
         response[0..2].copy_from_slice(&0x0101u16.to_be_bytes());
         response[2..4].copy_from_slice(&12u16.to_be_bytes());
         response[4..8].copy_from_slice(&STUN_MAGIC_COOKIE.to_be_bytes());
+        response[8..20].copy_from_slice(&transaction_id);
         response[20..22].copy_from_slice(&0x0020u16.to_be_bytes());
         response[22..24].copy_from_slice(&8u16.to_be_bytes());
         response[25] = 0x01;
@@ -2288,7 +2561,13 @@ mod tests {
         for index in 0..4 {
             response[28 + index] = ip[index] ^ cookie[index];
         }
-        assert_eq!(parse_stun_mapped_address(&response).unwrap().to_string(), "203.0.113.9:34789");
+        assert_eq!(
+            parse_stun_mapped_address(&response, &transaction_id)
+                .unwrap()
+                .to_string(),
+            "203.0.113.9:34789"
+        );
+        assert!(parse_stun_mapped_address(&response, &[0x6bu8; 12]).is_err());
     }
 
     #[test]
@@ -2325,6 +2604,211 @@ mod tests {
         normalize_rule(&mut rule);
         validate_rule(&rule, 20000, 20020).unwrap();
         assert_eq!(rule.forward_mode, "router_native");
+    }
+
+    #[tokio::test]
+    async fn one_transient_stun_failure_keeps_a_recent_mapping_ready() {
+        let rule = Rule {
+            id: "stun-history".into(),
+            name: "STUN history".into(),
+            kind: "stun".into(),
+            ..Rule::default()
+        };
+        let mut snapshot = RuntimeSnapshot::stopped(&rule);
+        snapshot.state = "mapped".into();
+        snapshot.public_endpoint = "198.51.100.8:20001".into();
+        snapshot.public_ip = "198.51.100.8".into();
+        snapshot.public_port = 20001;
+        snapshot.mapping_updated_at = Some(now_epoch());
+        let shared = Arc::new(RuntimeShared::new(snapshot));
+
+        mark_stun_transient_failure(&shared, "STUN TCP 响应超时".into()).await;
+
+        let current = shared.snapshot().await;
+        assert_eq!(current.state, "mapped");
+        assert_eq!(current.public_endpoint, "198.51.100.8:20001");
+        assert_eq!(current.public_ip, "198.51.100.8");
+        assert_eq!(current.public_port, 20001);
+        assert!(current.mapping_updated_at.is_some());
+        assert_eq!(current.last_error, "STUN TCP 响应超时");
+    }
+
+    #[tokio::test]
+    async fn repeated_stun_failure_downgrades_a_stale_mapping() {
+        let rule = Rule {
+            id: "stun-stale".into(),
+            name: "STUN stale".into(),
+            kind: "stun".into(),
+            ..Rule::default()
+        };
+        let mut snapshot = RuntimeSnapshot::stopped(&rule);
+        snapshot.state = "mapped".into();
+        snapshot.public_endpoint = "198.51.100.8:20001".into();
+        snapshot.public_ip = "198.51.100.8".into();
+        snapshot.public_port = 20001;
+        snapshot.mapping_updated_at = Some(
+            now_epoch().saturating_sub(STUN_MAPPING_FAILURE_GRACE.as_secs() + 1),
+        );
+        let shared = Arc::new(RuntimeShared::new(snapshot));
+
+        mark_stun_transient_failure(&shared, "STUN TCP 连接失败".into()).await;
+
+        let current = shared.snapshot().await;
+        assert_eq!(current.state, "mapping");
+        assert_eq!(current.public_endpoint, "198.51.100.8:20001");
+        assert_eq!(current.last_error, "STUN TCP 连接失败");
+    }
+
+    #[test]
+    fn tcp_stun_fast_retries_are_bounded_before_slow_recovery_probes() {
+        assert_eq!(STUN_TCP_KEEPALIVE_INTERVAL, Duration::from_secs(10));
+        assert_eq!(STUN_MAPPING_FAILURE_GRACE, Duration::from_secs(90));
+        assert_eq!(stun_retry_delay(1), Duration::from_secs(5));
+        assert_eq!(stun_retry_delay(STUN_FAST_RETRY_LIMIT), Duration::from_secs(5));
+        assert_eq!(
+            stun_retry_delay(STUN_FAST_RETRY_LIMIT + 1),
+            Duration::from_secs(15)
+        );
+    }
+
+    #[test]
+    fn stun_upsert_uses_the_same_bounded_local_control_timeout() {
+        assert_eq!(
+            ctl_read_timeout(&json!({"action": "upsert", "rule": {"kind": "stun"}})),
+            Duration::from_secs(8)
+        );
+        assert_eq!(
+            ctl_read_timeout(&json!({"action": "upsert", "rule": {"kind": "portmap"}})),
+            Duration::from_secs(8)
+        );
+        assert_eq!(
+            ctl_read_timeout(&json!({"action": "status", "scope": "stun"})),
+            Duration::from_secs(8)
+        );
+    }
+
+    #[tokio::test]
+    async fn stun_upsert_returns_before_remote_binding_confirmation() {
+        let root = std::env::temp_dir().join(format!(
+            "labrelay-stun-nonblocking-{}-{}",
+            std::process::id(),
+            now_epoch()
+        ));
+        fs::create_dir_all(&root).unwrap();
+        let port_probe = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let listen_port = port_probe.local_addr().unwrap().port();
+        drop(port_probe);
+        let manager = Manager {
+            rules: Arc::new(RwLock::new(HashMap::new())),
+            runtimes: Arc::new(Mutex::new(HashMap::new())),
+            operation_lock: Arc::new(Mutex::new(())),
+            tcp_session_tests: tcp_session_test::TcpSessionTestManager::new(),
+            last_status: Arc::new(RwLock::new(HashMap::new())),
+            config_path: root.join("config.json"),
+            state_path: root.join("state.json"),
+            port_min: listen_port,
+            port_max: listen_port,
+            lan_if: "lo".into(),
+        };
+        let rule = Rule {
+            id: "stun-nonblocking".into(),
+            name: "STUN nonblocking".into(),
+            enabled: true,
+            kind: "stun".into(),
+            mode: "stun".into(),
+            listen_port,
+            target_mode: "ipv4".into(),
+            target_ipv4: "127.0.0.1".into(),
+            target_port: 443,
+            transport_protocol: "TCP".into(),
+            forward_mode: "router_native".into(),
+            stun_server: "203.0.113.1:3478".into(),
+            ..Rule::default()
+        };
+
+        timeout(Duration::from_secs(1), manager.upsert(rule))
+            .await
+            .expect("STUN upsert must not wait for remote Binding")
+            .unwrap();
+        let runtime = manager
+            .status_value(Some("stun"))
+            .await
+            .get("rules")
+            .and_then(Value::as_array)
+            .and_then(|rows| rows.first())
+            .and_then(|row| row.get("runtime"))
+            .cloned()
+            .unwrap();
+        let state = runtime.get("state").and_then(Value::as_str);
+        assert!(state == Some("starting") || state == Some("mapping"));
+        manager.stop_runtime("stun-nonblocking", false).await;
+        fs::remove_dir_all(&root).unwrap();
+    }
+
+    #[tokio::test]
+    async fn upsert_persist_failure_restores_previous_rule_in_memory() {
+        let root = std::env::temp_dir().join(format!(
+            "labrelay-stun-persist-{}-{}",
+            std::process::id(),
+            now_epoch()
+        ));
+        fs::create_dir_all(&root).unwrap();
+        let config_path = root.join("config.json");
+        fs::create_dir(&config_path).unwrap();
+        let state_path = root.join("state.json");
+        let previous = Rule {
+            id: "stun-persist".into(),
+            name: "Previous".into(),
+            enabled: false,
+            kind: "stun".into(),
+            mode: "stun".into(),
+            listen_port: 20001,
+            target_mode: "ipv4".into(),
+            target_ipv4: "192.168.5.46".into(),
+            target_port: 443,
+            transport_protocol: "TCP".into(),
+            forward_mode: "router_native".into(),
+            ..Rule::default()
+        };
+        let manager = Manager {
+            rules: Arc::new(RwLock::new(HashMap::from([(
+                previous.id.clone(),
+                previous.clone(),
+            )]))),
+            runtimes: Arc::new(Mutex::new(HashMap::new())),
+            operation_lock: Arc::new(Mutex::new(())),
+            tcp_session_tests: tcp_session_test::TcpSessionTestManager::new(),
+            last_status: Arc::new(RwLock::new(HashMap::new())),
+            config_path,
+            state_path,
+            port_min: 20000,
+            port_max: 20020,
+            lan_if: "lan".into(),
+        };
+        let replacement = Rule {
+            name: "Replacement".into(),
+            target_port: 8443,
+            ..previous.clone()
+        };
+
+        let error = manager.upsert(replacement).await.unwrap_err();
+
+        assert!(format!("{error:#}").contains("保存新规则失败"));
+        assert_eq!(
+            manager.rules.read().await.get("stun-persist").unwrap().name,
+            "Previous"
+        );
+        assert_eq!(
+            manager
+                .rules
+                .read()
+                .await
+                .get("stun-persist")
+                .unwrap()
+                .target_port,
+            443
+        );
+        fs::remove_dir_all(&root).unwrap();
     }
 
     #[tokio::test]

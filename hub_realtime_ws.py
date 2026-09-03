@@ -34,15 +34,17 @@ class _RealtimeClient:
 class HubRealtimeWebSocketService:
     """Fan out compact router/device/config/task/presence messages to APP clients."""
 
-    def __init__(self, hub: Any, realtime_service: Any):
+    def __init__(self, hub: Any, realtime_service: Any, demand_service: Any):
         self.hub = hub
         self.realtime_service = realtime_service
+        self.demand_service = demand_service
         self.logger = hub.LOGGER
         self._clients_lock = threading.RLock()
         self._clients: Dict[str, _RealtimeClient] = {}
         self._sock = Sock()
         self._sock.route("/api/realtime/ws")(self._connect)
         self._sock.init_app(hub.app)
+        self.realtime_service.subscribe(self._fan_out)
 
         @hub.app.before_request
         def _reject_unauthorized_realtime_ws():
@@ -73,14 +75,19 @@ class HubRealtimeWebSocketService:
         except queue.Full:
             return
 
-    def _publish(self, kind: str, payload: Dict[str, Any]) -> None:
-        if not isinstance(payload, dict) or not payload:
+    def _fan_out(self, frame: str) -> None:
+        """Queue one Router Core frame for every connected App socket."""
+        if not isinstance(frame, str) or not frame:
             return
-        frame = self._frame(kind, dict(payload))
         with self._clients_lock:
             clients = tuple(self._clients.values())
         for client in clients:
             self._enqueue(client, frame)
+
+    def _publish(self, kind: str, payload: Dict[str, Any]) -> None:
+        if not isinstance(payload, dict) or not payload:
+            return
+        self.realtime_service.broadcast({"type": kind, "data": dict(payload)})
 
     def publish_router_realtime(self, payload: Dict[str, Any]) -> None:
         self._publish("router", payload)
@@ -101,12 +108,12 @@ class HubRealtimeWebSocketService:
         so LabRelay could remain inside its 55-second long poll. A new foreground
         socket is an explicit demand edge and must wake that poll immediately.
         """
-        condition = getattr(self.realtime_service, "_demand", None)
+        condition = getattr(self.demand_service, "_demand", None)
         if condition is None:
             return
         try:
             with condition:
-                self.realtime_service._demand_sequence += 1
+                self.demand_service._demand_sequence += 1
                 condition.notify_all()
         except Exception:
             self.logger.debug("unable to wake terminal realtime sampler", exc_info=True)
@@ -122,12 +129,12 @@ class HubRealtimeWebSocketService:
     def _renew_client_lease(self, client: _RealtimeClient) -> None:
         # A live APP WSS connection is the terminal realtime demand lease. The
         # router fast lane is independent and never waits for Agent demand.
-        self.realtime_service.set_wss_demand(client.client_id, True)
+        self.demand_service.set_wss_demand(client.client_id, True)
 
     def _unregister(self, client: _RealtimeClient) -> None:
         with self._clients_lock:
             self._clients.pop(client.client_id, None)
-        self.realtime_service.set_wss_demand(client.client_id, False)
+        self.demand_service.set_wss_demand(client.client_id, False)
 
     def _send(self, ws: Any, client: _RealtimeClient, frame: str) -> None:
         ws.send(frame)
@@ -216,11 +223,14 @@ class HubRealtimeWebSocketService:
             self._unregister(client)
 
 
-def install_hub_realtime_ws(hub: Any, realtime_service: Any) -> HubRealtimeWebSocketService:
+def install_hub_realtime_ws(
+    hub: Any,
+    realtime_service: Any,
+    demand_service: Any,
+) -> HubRealtimeWebSocketService:
     existing = getattr(hub, "HUB_REALTIME_WEBSOCKET", None)
     if existing is not None:
         return existing
-    service = HubRealtimeWebSocketService(hub, realtime_service)
-    realtime_service.set_app_realtime_publisher(service)
+    service = HubRealtimeWebSocketService(hub, realtime_service, demand_service)
     hub.HUB_REALTIME_WEBSOCKET = service
     return service

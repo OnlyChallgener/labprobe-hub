@@ -32,6 +32,11 @@ def _number(value: Any, default: float = 0.0) -> float:
         return default
 
 
+def _percent(value: Any, default: float = 0.0) -> float:
+    number = _number(value, default)
+    return number * 100.0 if 0.0 < number <= 1.0 else number
+
+
 def _integer(value: Any, default: int = 0) -> int:
     try:
         return int(float(str(value).strip().rstrip("%")))
@@ -133,18 +138,30 @@ def _select_network_row(network: Any, kind: str) -> Dict[str, Any]:
     return {}
 
 
-def _find_client(app: Any) -> RuijieRouterClient:
-    for endpoint, function in app.view_functions.items():
-        if not endpoint.startswith("router_rpc."):
-            continue
-        for cell in function.__closure__ or ():
-            try:
-                value = cell.cell_contents
-            except ValueError:
+def _find_client(hub_or_app: Any) -> Any:
+    driver = getattr(hub_or_app, "ROUTER_DRIVER", None)
+    if driver is not None:
+        return driver
+    mgr = getattr(hub_or_app, "ROUTER_TASK_MANAGER", None)
+    if mgr is not None and getattr(mgr, "client", None) is not None:
+        return mgr.client
+    app = getattr(hub_or_app, "app", hub_or_app)
+    if hasattr(app, "view_functions"):
+        for endpoint, function in app.view_functions.items():
+            if not endpoint.startswith("router_rpc.") and not endpoint.startswith("router_core_api."):
                 continue
-            if isinstance(value, RuijieRouterClient):
-                return value
-    raise RuntimeError("router RPC client was not found in registered blueprint")
+            for cell in function.__closure__ or ():
+                try:
+                    value = cell.cell_contents
+                except ValueError:
+                    continue
+                if isinstance(value, RuijieRouterClient) or hasattr(value, "get_dashboard") or hasattr(value, "dashboard"):
+                    return value
+    class _EmptyFallbackClient:
+        def dashboard(self, force: bool = False): return {}
+        def devices(self, force: bool = False): return []
+        def get_status(self): return {"state": "checking", "connected": False}
+    return _EmptyFallbackClient()
 
 
 class RouterRpcCompatibilitySync:
@@ -154,7 +171,7 @@ class RouterRpcCompatibilitySync:
         self.logger = hub.LOGGER
         self.dashboard_interval = max(2.0, float(os.environ.get("ROUTER_DASHBOARD_POLL_SEC", "3")))
         self.device_interval = max(3.0, float(os.environ.get("ROUTER_DEVICE_POLL_SEC", "5")))
-        self.primary = str(os.environ.get("ROUTER_RPC_PRIMARY", "true")).lower() not in {"0", "false", "no"}
+        self.primary = str(os.environ.get("ROUTER_RPC_PRIMARY", "true")).lower() in {"1", "true", "yes"}
         self._stop = threading.Event()
         self._refresh_lock = threading.RLock()
         self._thread: Optional[threading.Thread] = None
@@ -299,8 +316,8 @@ class RouterRpcCompatibilitySync:
         model = _clean(ap.get("devModel") or ap.get("deviceType") or ap.get("product") or _first(identity_source, "model", "devModel", "deviceType"))
         serial = _clean(ap.get("serialNumber") or _first(identity_source, "serialNumber", "sn"))
 
-        cpu = _number(_first(fast, "cpu_usage", "cpuUsage", "cpuutil"), _number(_first(slow, "cpu_usage", "cpuUsage", "cpuutil")))
-        memory = _number(_first(fast, "memutil", "memoryPercent", "memory_usage"), _number(_first(slow, "memutil", "memoryPercent", "memory_usage")))
+        cpu = _percent(_first(fast, "cpu_usage", "cpuUsage", "cpuutil"), _percent(_first(slow, "cpu_usage", "cpuUsage", "cpuutil")))
+        memory = _percent(_first(fast, "memutil", "memoryPercent", "memory_usage"), _percent(_first(slow, "memutil", "memoryPercent", "memory_usage")))
         storage_value = _first(slow, "diskutil", "storagePercent", "disk_usage", "overlay_usage", default=None)
         temperature = _number(_first(fast, "temp", "temperature", "temperatureC"), _number(_first(slow, "temp", "temperature", "temperatureC")))
         temperature2g = _number(_first(fast, "temp_2g", "temperature2gC"), _number(_first(slow, "temp_2g", "temperature2gC")))
@@ -391,7 +408,7 @@ class RouterRpcCompatibilitySync:
                 "temperature5gC": temperature5g,
                 "cpuPercent": cpu,
                 "memoryPercent": memory,
-                "storagePercent": None if storage_value in (None, "") else _number(storage_value),
+                "storagePercent": None if storage_value in (None, "") else _percent(storage_value),
                 "uptimeSeconds": uptime,
                 "onlineDeviceCount": self._device_total,
                 "wan": {
@@ -444,23 +461,32 @@ class RouterRpcCompatibilitySync:
         self.hub.MQTT_PUBLISHER.publish_dashboard(public)
         return public
 
-    def refresh_view(self):
-        if not self.hub.check_app_token():
-            return jsonify({"ok": False, "error": "unauthorized"}), 401
-        global_nonce = 0
+    def dashboard_snapshot(self, force: bool = False) -> Dict[str, Any]:
+        """Return the Core-owned cache immediately; force performs a wire refresh."""
+        if force:
+            return self.sync_dashboard(force=True)
+        with self.hub.ROUTER_DASHBOARD_LOCK:
+            return self.hub._router_dashboard_public()
+
+    def refresh_dashboard(self) -> Dict[str, Any]:
         with self.hub.ROUTER_DASHBOARD_LOCK:
             self.hub.ROUTER_DASHBOARD_REFRESH_NONCE += 1
             global_nonce = self.hub.ROUTER_DASHBOARD_REFRESH_NONCE
+        result = self.sync_once(force=True)
+        return {
+            "ok": True,
+            "refreshNonce": global_nonce,
+            "refreshCompletedNonce": global_nonce,
+            "message": "router RPC refresh completed",
+            "dashboard": result["dashboard"],
+            "time": self.hub.now_str(),
+        }
+
+    def refresh_view(self):
+        if not self.hub.check_app_token():
+            return jsonify({"ok": False, "error": "unauthorized"}), 401
         try:
-            result = self.sync_once(force=True)
-            return jsonify({
-                "ok": True,
-                "refreshNonce": global_nonce,
-                "refreshCompletedNonce": global_nonce,
-                "message": "router RPC refresh completed",
-                "dashboard": result["dashboard"],
-                "time": self.hub.now_str(),
-            })
+            return jsonify(self.refresh_dashboard())
         except RouterRpcError as exc:
             return jsonify({"ok": False, "error": exc.code, "message": str(exc)}), exc.http_status
         except Exception as exc:
@@ -470,22 +496,27 @@ class RouterRpcCompatibilitySync:
     def ignored_relay_dashboard_push(self):
         if not self.hub.check_hook_token():
             return jsonify({"ok": False, "error": "bad agent token"}), 401
-        ddns_store = getattr(self.hub, "LAB_DDNS", None)
-        if ddns_store is not None:
-            payload = request.get_json(silent=True) or {}
-            if isinstance(payload, dict):
+        payload = request.get_json(silent=True) or {}
+        if isinstance(payload, dict):
+            ddns_store = getattr(self.hub, "LAB_DDNS", None)
+            if ddns_store is not None:
                 ddns_store.accept_address(payload.get("ddnsAddress"))
+            wireguard = payload.get("wireguard")
+            if isinstance(wireguard, dict):
+                with self.hub.ROUTER_DASHBOARD_LOCK:
+                    self.hub.ROUTER_DASHBOARD_CACHE["wireguard"] = dict(wireguard)
+                self.hub._persist_router_dashboard_if_due(force=False)
         return jsonify({
             "ok": True,
             "ignored": True,
             "source": "router_rpc",
-            "message": "dashboard telemetry is supplied directly by Hub; Relay push is no longer authoritative",
+            "message": "router telemetry is supplied by Router Core; Relay extensions were accepted",
             "time": self.hub.now_str(),
         })
 
 
 def install_router_rpc_compat(hub: Any) -> RouterRpcCompatibilitySync:
-    client = _find_client(hub.app)
+    client = _find_client(hub)
     sync = RouterRpcCompatibilitySync(hub, client)
     if sync.primary:
         if "api_router_dashboard_refresh" in hub.app.view_functions:

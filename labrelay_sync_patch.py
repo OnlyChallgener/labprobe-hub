@@ -30,9 +30,7 @@ def install_labrelay_sync_patch(hub: Any) -> None:
         return max(0, hub.to_int(value, 0))
 
     def router_name(value: Any = "") -> str:
-        # A configured router identity is canonical.  This prevents old agent
-        # configs named router/BE72/BE72Pro from splitting one router's status.
-        return clean(hub.primary_router_name()) or clean(value) or "router"
+        return hub._canonical_portmap_router(value)
 
     def statuses() -> Dict[str, Any]:
         value = hub.load_json(hub.AGENT_STATUS_FILE, {})
@@ -44,11 +42,16 @@ def install_labrelay_sync_patch(hub: Any) -> None:
 
     def presence(router: str = "") -> Dict[str, Any]:
         router = router_name(router)
-        heartbeat = statuses().get(router, {})
-        if not isinstance(heartbeat, dict):
-            heartbeat = {}
+        heartbeat: Dict[str, Any] = {}
+        for candidate_router, candidate in statuses().items():
+            if (
+                isinstance(candidate, dict)
+                and router_name(candidate_router) == router
+                and number(candidate.get("lastSeenEpoch")) >= number(heartbeat.get("lastSeenEpoch"))
+            ):
+                heartbeat = candidate
         runtime = runtime_document()
-        same_router = clean(runtime.get("router")) == router
+        same_router = router_name(runtime.get("router")) == router
         heartbeat_seen = number(heartbeat.get("lastSeenEpoch"))
         runtime_seen = number(runtime.get("receivedEpoch")) if same_router else 0
         seen = max(heartbeat_seen, runtime_seen)
@@ -71,7 +74,18 @@ def install_labrelay_sync_patch(hub: Any) -> None:
         }
 
     def reconcile(payload: Dict[str, Any], router: str) -> None:
-        desired = {clean(row.get("id")): row for row in hub._load_portmap_rules() if clean(row.get("id"))}
+        document, rules_loaded = hub._load_portmap_rules_document()
+        if not rules_loaded:
+            hub.LOGGER.warning(
+                "Port-map rules document unavailable; skip router reconciliation for %s",
+                router,
+            )
+            return
+        desired = {
+            clean(row.get("id")): row
+            for row in document.get("rules", [])
+            if isinstance(row, dict) and clean(row.get("id"))
+        }
         local: Dict[str, Dict[str, Any]] = {}
         for row in payload.get("rules", []) if isinstance(payload.get("rules"), list) else []:
             if not isinstance(row, dict):
@@ -81,7 +95,7 @@ def install_labrelay_sync_patch(hub: Any) -> None:
             rule_id = clean(local_rule.get("id") or runtime.get("id"))
             if rule_id:
                 local[rule_id] = local_rule
-        compare = ("enabled", "mode", "listenPort", "targetMode", "targetIpv4", "targetIpv6", "targetIpv6Suffix", "targetMac", "targetPort", "transportProtocol", "expiresAt", "leaseSeconds", "maxConnections", "idleTimeoutSec")
+        compare = ("enabled", "mode", "listenPort", "targetType", "targetMode", "targetIpv4", "targetIpv6", "targetIpv6Suffix", "targetMac", "targetPort", "transportProtocol", "expiresAt", "leaseSeconds", "maxConnections", "idleTimeoutSec")
 
         def compare_value(row: Dict[str, Any], key: str) -> Any:
             # Rules persisted before UDP support have no transportProtocol and
@@ -99,10 +113,11 @@ def install_labrelay_sync_patch(hub: Any) -> None:
 
     def decorated_rules(rules: List[Dict[str, Any]], router: str) -> tuple[List[Dict[str, Any]], int]:
         document = runtime_document()
-        same_router = clean(document.get("router")) == router
+        same_router = router_name(document.get("router")) == router
         runtime = hub._portmap_runtime_map(document) if same_router else {}
         runtime_revision = number(document.get("runtimeRevision")) if same_router else 0
         agent = presence(router)
+        command_states = hub._portmap_command_sync_states(router)
         now = int(time.time())
         result: List[Dict[str, Any]] = []
         for source in rules:
@@ -115,10 +130,12 @@ def install_labrelay_sync_patch(hub: Any) -> None:
             if expired is not None and expired <= now and desired == "running":
                 actual, sync = "expired", "synced"
                 local["state"] = "expired"
-            elif state == "running" and not error:
-                # New daemon success is authoritative and must erase an old bind error.
+            elif state == "running":
+                # Listener/runtime state is authoritative for synchronization.
+                # A connection-level error (for example, a peer reset) is useful
+                # diagnostic history but must not make an active rule look as if
+                # the Agent is still applying its configuration.
                 actual, sync = "running", "synced"
-                local["lastError"] = ""
             elif state in {"starting", "waiting_target", "draining"}:
                 actual, sync = state, "syncing"
             elif state == "error" and error:
@@ -131,6 +148,14 @@ def install_labrelay_sync_patch(hub: Any) -> None:
                 actual, sync = "waiting_agent", "syncing"
             else:
                 actual, sync = "waiting_agent", "agent_offline"
+            command_sync = command_states.get(clean(row.get("id")))
+            desired_satisfied = (
+                (desired == "running" and state == "running")
+                or (desired == "stopped" and state not in {"running", "starting", "draining"})
+            )
+            if command_sync == "error" and not desired_satisfied:
+                actual, sync = "error", "error"
+                local.setdefault("lastError", "command delivery failed")
             row.update({
                 "desiredState": desired,
                 "actualState": actual,
@@ -147,8 +172,8 @@ def install_labrelay_sync_patch(hub: Any) -> None:
         if not hub.check_read_token():
             return jsonify({"ok": False, "error": "unauthorized"}), 401
         with lock:
-            document = hub.load_json(hub.PORTMAP_RULES_FILE, {})
-            rules = document.get("rules", []) if isinstance(document, dict) else []
+            document, rules_loaded = hub._load_portmap_rules_document()
+            rules = document.get("rules", [])
             rows = [row for row in rules if isinstance(row, dict)]
             router = router_name(request.args.get("router"))
             rows, runtime_revision = decorated_rules(rows, router)
@@ -158,7 +183,7 @@ def install_labrelay_sync_patch(hub: Any) -> None:
                 "ok": True,
                 "router": router,
                 "rules": rows,
-                "rulesLoaded": True,
+                "rulesLoaded": rules_loaded,
                 "rulesRevision": rules_revision,
                 "runtimeRevision": runtime_revision,
                 "revision": max(rules_revision, runtime_revision, number(agent.get("agentRevision"))),
@@ -193,7 +218,7 @@ def install_labrelay_sync_patch(hub: Any) -> None:
             rows = commands.get("commands", []) if isinstance(commands, dict) else []
             changed = False
             for command in rows:
-                if isinstance(command, dict) and command.get("router") == router and command.get("action") == "update" and command.get("state") == "accepted" and hub.version_parts(data[router]["version"]) >= hub.version_parts(command.get("targetVersion")):
+                if isinstance(command, dict) and router_name(command.get("router")) == router and command.get("action") == "update" and command.get("state") == "accepted" and hub.version_parts(data[router]["version"]) >= hub.version_parts(command.get("targetVersion")):
                     command.update({"state": "completed", "message": f"updated to {data[router]['version']}", "updatedAt": hub.now_str()})
                     changed = True
             if changed:

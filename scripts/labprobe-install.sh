@@ -220,6 +220,7 @@ start_service() {
   procd_set_param respawn 3600 5 5
   procd_set_param stdout 1
   procd_set_param stderr 1
+  procd_set_param limits nofile=131072 131072
   procd_close_instance
 
   procd_open_instance agent

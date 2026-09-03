@@ -1,8 +1,10 @@
 import os
 import tempfile
 import unittest
+from datetime import datetime
 from pathlib import Path
 from unittest.mock import patch
+from zoneinfo import ZoneInfo
 
 
 TEST_ROOT = tempfile.mkdtemp(prefix="labprobe-hub-test-")
@@ -22,6 +24,14 @@ class HubSyncApiTests(unittest.TestCase):
     def setUp(self):
         self.client = hub.app.test_client()
         self.headers = {"Authorization": "Bearer test-app-token"}
+        self.command_path = hub.DATA_DIR / "test-portmap-commands.json"
+        self.command_path.unlink(missing_ok=True)
+
+    def _write_commands(self, commands):
+        hub.save_json(self.command_path, {"commands": commands})
+
+    def _read_commands(self):
+        return hub.load_json(self.command_path, {"commands": []})["commands"]
 
     def test_snapshot_delta_and_revision(self):
         hub.save_json(hub.STATE_FILE, {"router": {"name": "Ruijie"}})
@@ -88,6 +98,35 @@ class HubSyncApiTests(unittest.TestCase):
         updated = hub._clean_portmap_rule({"name": "NAS Web"}, created)
         self.assertEqual(created["serviceType"], "HTTPS")
         self.assertEqual(updated["serviceType"], "HTTPS")
+
+    def test_portmap_permanent_expiry_is_null_and_timezone_neutral(self):
+        cleaned = hub._clean_portmap_rule({
+            "id": "permanent", "name": "Permanent", "enabled": True, "mode": "6to4",
+            "listenPort": 20000, "targetIpv4": "192.168.5.46", "targetPort": 443,
+            "expiresAt": None, "leaseSeconds": 0,
+        })
+        self.assertIsNone(cleaned["expiresAt"])
+        self.assertEqual(cleaned["leaseSeconds"], 0)
+
+    def test_portmap_expiry_accepts_epoch_milliseconds_and_normalizes_to_seconds(self):
+        cleaned = hub._clean_portmap_rule({
+            "id": "millis", "name": "Millis", "enabled": True, "mode": "6to4",
+            "listenPort": 20000, "targetIpv4": "192.168.5.46", "targetPort": 443,
+            "expiresAt": 1_787_929_288_000, "leaseSeconds": 3600,
+        })
+        self.assertEqual(cleaned["expiresAt"], 1_787_929_288)
+
+    def test_portmap_invalid_expiry_is_rejected_instead_of_becoming_permanent(self):
+        with self.assertRaisesRegex(ValueError, "Unix Epoch"):
+            hub._clean_portmap_rule({
+                "id": "invalid-expiry", "name": "Invalid", "enabled": True, "mode": "6to4",
+                "listenPort": 20000, "targetIpv4": "192.168.5.46", "targetPort": 443,
+                "expiresAt": "2026-08-29 10:39:44", "leaseSeconds": 3600,
+            })
+
+    def test_legacy_portmap_wall_time_is_explicitly_parsed_as_beijing(self):
+        expected = int(datetime(2026, 8, 29, 10, 39, 44, tzinfo=ZoneInfo("Asia/Shanghai")).timestamp())
+        self.assertEqual(hub._portmap_time_epoch("2026-08-29 10:39:44"), expected)
 
     def test_portmap_transport_defaults_to_tcp_and_retains_ipv6_snapshot(self):
         payload = {
@@ -176,6 +215,142 @@ class HubSyncApiTests(unittest.TestCase):
                 hub.PORTMAP_RULES_FILE.unlink(missing_ok=True)
             else:
                 hub.PORTMAP_RULES_FILE.write_bytes(original)
+
+    def test_portmap_router_aliases_collapse_to_primary_identity(self):
+        with patch.object(hub, "primary_router_name", return_value="BE72"):
+            self.assertEqual(hub._canonical_portmap_router("router"), "BE72")
+            self.assertEqual(hub._canonical_portmap_router("BE72"), "BE72")
+            self.assertEqual(hub._canonical_portmap_router("be72"), "BE72")
+
+    def test_portmap_router_alias_does_not_merge_a_different_router(self):
+        with patch.object(hub, "primary_router_name", return_value="BE72"):
+            self.assertEqual(hub._canonical_portmap_router("Branch-Router"), "Branch-Router")
+
+    def test_portmap_command_get_matches_canonical_command_to_legacy_agent(self):
+        command = {"id": "cmd-be72", "router": "BE72", "action": "delete", "payload": {"id": "r1"}, "status": "pending", "attempts": 0}
+        self._write_commands([command])
+        with patch.object(hub, "PORTMAP_COMMANDS_FILE", self.command_path), patch.object(
+            hub, "check_hook_token", return_value=True
+        ), patch.object(hub, "primary_router_name", return_value="BE72"), hub.app.test_request_context(
+            "/api/router/portmaps/commands?router=router"
+        ):
+            response = hub.api_router_portmap_commands()
+        self.assertEqual([row["id"] for row in response.get_json()["commands"]], ["cmd-be72"])
+        self.assertIsInstance(response.get_json()["serverEpoch"], int)
+
+    def test_portmap_command_get_matches_legacy_command_to_canonical_agent(self):
+        command = {"id": "cmd-router", "router": "router", "action": "delete", "payload": {"id": "r1"}, "status": "pending", "attempts": 0}
+        self._write_commands([command])
+        with patch.object(hub, "PORTMAP_COMMANDS_FILE", self.command_path), patch.object(
+            hub, "check_hook_token", return_value=True
+        ), patch.object(hub, "primary_router_name", return_value="BE72"), hub.app.test_request_context(
+            "/api/router/portmaps/commands?router=BE72"
+        ):
+            response = hub.api_router_portmap_commands()
+        self.assertEqual([row["id"] for row in response.get_json()["commands"]], ["cmd-router"])
+
+    def test_portmap_command_get_does_not_deliver_a_different_router(self):
+        command = {"id": "cmd-other", "router": "Branch-Router", "action": "delete", "payload": {"id": "r1"}, "status": "pending", "attempts": 0}
+        self._write_commands([command])
+        with patch.object(hub, "PORTMAP_COMMANDS_FILE", self.command_path), patch.object(
+            hub, "check_hook_token", return_value=True
+        ), patch.object(hub, "primary_router_name", return_value="BE72"), hub.app.test_request_context(
+            "/api/router/portmaps/commands?router=router"
+        ):
+            response = hub.api_router_portmap_commands()
+        self.assertEqual(response.get_json()["commands"], [])
+
+    def test_portmap_delivery_exhaustion_becomes_failed_with_timeout(self):
+        command = {"id": "cmd-timeout", "router": "BE72", "action": "delete", "payload": {"id": "r1"}, "status": "delivered", "attempts": 5, "deliveredEpoch": 100}
+        self._write_commands([command])
+        with patch.object(hub, "PORTMAP_COMMANDS_FILE", self.command_path), patch.object(
+            hub, "check_hook_token", return_value=True
+        ), patch.object(hub, "primary_router_name", return_value="BE72"), patch.object(
+            hub.time, "time", return_value=116
+        ), hub.app.test_request_context("/api/router/portmaps/commands?router=router"):
+            response = hub.api_router_portmap_commands()
+        saved = self._read_commands()[0]
+        self.assertEqual(response.get_json()["commands"], [])
+        self.assertEqual(saved["status"], "failed")
+        self.assertEqual(saved["finishedEpoch"], 116)
+        self.assertEqual(saved["retryState"], "exhausted")
+        self.assertTrue(saved["timeout"])
+        self.assertIn("timeout", saved["error"])
+
+    def test_portmap_user_reactivation_resets_delivery_and_terminal_fields(self):
+        command = {
+            "id": "cmd-active", "router": "router", "action": "delete", "payload": {"id": "r1"},
+            "status": "delivered", "attempts": 4, "deliveredAt": "old", "deliveredEpoch": 100,
+            "finishedAt": "old", "finishedEpoch": 101, "retryState": "retrying", "timeout": True,
+            "error": "old error", "result": {"ok": False},
+        }
+        self._write_commands([command])
+        with patch.object(hub, "PORTMAP_COMMANDS_FILE", self.command_path), patch.object(
+            hub, "primary_router_name", return_value="BE72"
+        ), patch.object(hub.time, "time", return_value=200):
+            result = hub._queue_portmap_command("delete", {"id": "r1"}, reactivate=True)
+        self.assertEqual(result["id"], "cmd-active")
+        self.assertEqual(result["router"], "router")
+        self.assertEqual(result["status"], "pending")
+        self.assertEqual(result["attempts"], 0)
+        for key in ("deliveredEpoch", "finishedEpoch", "retryState", "timeout", "error", "result"):
+            self.assertNotIn(key, result)
+
+    def test_portmap_reconciliation_does_not_requeue_same_terminal_payload(self):
+        command = {"id": "cmd-failed", "router": "BE72", "action": "delete", "payload": {"id": "r1"}, "status": "failed", "attempts": 5, "finishedEpoch": 150}
+        self._write_commands([command])
+        with patch.object(hub, "PORTMAP_COMMANDS_FILE", self.command_path), patch.object(
+            hub, "primary_router_name", return_value="BE72"
+        ), patch.object(hub.time, "time", return_value=200):
+            result = hub._queue_portmap_command("delete", {"id": "r1"}, "router")
+        self.assertEqual(result["id"], "cmd-failed")
+        self.assertEqual(len(self._read_commands()), 1)
+
+    def test_portmap_user_action_after_terminal_command_starts_clean_lifecycle(self):
+        command = {"id": "cmd-failed", "router": "BE72", "action": "delete", "payload": {"id": "r1"}, "status": "failed", "attempts": 5, "finishedEpoch": 150, "error": "timeout"}
+        self._write_commands([command])
+        with patch.object(hub, "PORTMAP_COMMANDS_FILE", self.command_path), patch.object(
+            hub, "primary_router_name", return_value="BE72"
+        ), patch.object(hub.time, "time", return_value=200):
+            result = hub._queue_portmap_command("delete", {"id": "r1"}, "router", reactivate=True)
+        self.assertNotEqual(result["id"], "cmd-failed")
+        self.assertEqual(result["status"], "pending")
+        self.assertEqual(result["attempts"], 0)
+        self.assertNotIn("error", result)
+
+    def test_portmap_ack_uses_router_alias_and_records_agent_error(self):
+        command = {"id": "cmd-ack", "router": "BE72", "action": "delete", "payload": {"id": "r1"}, "status": "delivered", "attempts": 1}
+        self._write_commands([command])
+        with patch.object(hub, "PORTMAP_COMMANDS_FILE", self.command_path), patch.object(
+            hub, "check_hook_token", return_value=True
+        ), patch.object(hub, "primary_router_name", return_value="BE72"), hub.app.test_request_context(
+            "/api/router/portmaps/ack?router=router", method="POST",
+            json={"acks": [{"id": "cmd-ack", "ok": False, "result": {"error": "bind failed"}}]},
+        ):
+            response = hub.api_router_portmap_ack()
+        saved = self._read_commands()[0]
+        self.assertEqual(response.get_json()["acknowledged"], 1)
+        self.assertEqual(saved["status"], "failed")
+        self.assertEqual(saved["error"], "bind failed")
+
+    def test_portmap_ack_cannot_finish_another_router_or_overwrite_terminal_state(self):
+        commands = [
+            {"id": "cmd-other", "router": "Branch-Router", "action": "delete", "payload": {"id": "r1"}, "status": "delivered", "attempts": 1},
+            {"id": "cmd-old", "router": "BE72", "action": "delete", "payload": {"id": "r2"}, "status": "failed", "attempts": 5, "error": "timeout"},
+        ]
+        self._write_commands(commands)
+        with patch.object(hub, "PORTMAP_COMMANDS_FILE", self.command_path), patch.object(
+            hub, "check_hook_token", return_value=True
+        ), patch.object(hub, "primary_router_name", return_value="BE72"), hub.app.test_request_context(
+            "/api/router/portmaps/ack?router=router", method="POST",
+            json={"acks": [{"id": "cmd-other", "ok": True}, {"id": "cmd-old", "ok": True}]},
+        ):
+            response = hub.api_router_portmap_ack()
+        saved = self._read_commands()
+        self.assertEqual(response.get_json()["acknowledged"], 0)
+        self.assertEqual(saved[0]["status"], "delivered")
+        self.assertEqual(saved[1]["status"], "failed")
+        self.assertEqual(saved[1]["error"], "timeout")
 
 
 if __name__ == "__main__":

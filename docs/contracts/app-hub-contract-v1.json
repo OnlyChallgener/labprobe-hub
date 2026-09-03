@@ -1,0 +1,1816 @@
+{
+  "version": "1.0.0",
+  "extractedAt": "2026-08-24T16:33:00Z",
+  "totalRestEndpoints": 76,
+  "totalWebSocketTypes": 8,
+  "rest": [
+    {
+      "endpoint": "/api/router/capabilities",
+      "method": "GET",
+      "caller": "RouterControlApi.kt",
+      "function": "capabilities()",
+      "queryParams": [],
+      "requestBody": null,
+      "responseFields": {
+        "configured": "Boolean",
+        "features": {
+          "dashboard": "Boolean",
+          "devices": "Boolean",
+          "firewall": "Boolean",
+          "nativePortMapping": "Boolean",
+          "upnp": "Boolean",
+          "ddns": "Boolean",
+          "diagnostic": "Boolean"
+        }
+      }
+    },
+    {
+      "endpoint": "/api/router/status",
+      "method": "GET",
+      "caller": "RouterControlApi.kt",
+      "function": "hubStatus()",
+      "queryParams": [],
+      "requestBody": null,
+      "responseFields": {
+        "state": "String (default 'checking')",
+        "connected": "Boolean (default false)",
+        "sessionConnected": "Boolean",
+        "dataAvailable": "Boolean",
+        "message": "String",
+        "errorCode": "String",
+        "lastSuccessAt": "Long (epoch ms/s)"
+      }
+    },
+    {
+      "endpoint": "/api/router/config",
+      "method": "GET",
+      "caller": "MainActivity.kt",
+      "function": "getRouterConfig()",
+      "queryParams": [],
+      "requestBody": null,
+      "responseFields": {
+        "ok": "Boolean",
+        "name": "String",
+        "username": "String",
+        "address": "String",
+        "passwordConfigured": "Boolean",
+        "sessionSeconds": "Int",
+        "verifyTls": "Boolean",
+        "connected": "Boolean",
+        "state": "String",
+        "message": "String"
+      }
+    },
+    {
+      "endpoint": "/api/router/config",
+      "method": "PUT",
+      "caller": "MainActivity.kt",
+      "function": "putRouterConfig(config)",
+      "queryParams": [],
+      "requestBody": {
+        "name": "String",
+        "username": "String",
+        "address": "String",
+        "password": "String (optional; omitted preserves existing secret)",
+        "test": "Boolean"
+      },
+      "responseFields": {
+        "ok": "Boolean",
+        "name": "String",
+        "username": "String",
+        "address": "String",
+        "passwordConfigured": "Boolean",
+        "connected": "Boolean",
+        "state": "String",
+        "message": "String"
+      }
+    },
+    {
+      "endpoint": "/api/router/port-mapping",
+      "method": "GET",
+      "caller": "RouterControlApi.kt",
+      "function": "nativePortMappings(force)",
+      "queryParams": [
+        "force (optional, 1)"
+      ],
+      "requestBody": null,
+      "responseFields": {
+        "data": {
+          "rules": [
+            {
+              "name": "String",
+              "interface": "String",
+              "proto": "String",
+              "extPort": "Int",
+              "intIp": "String",
+              "intPort": "Int",
+              "enabled": "Boolean"
+            }
+          ]
+        }
+      }
+    },
+    {
+      "endpoint": "/api/router/port-mapping",
+      "method": "POST",
+      "caller": "RouterControlApi.kt",
+      "function": "addNativePortMapping(rule)",
+      "queryParams": [],
+      "requestBody": {
+        "name": "String",
+        "interface": "String (e.g. 'WAN')",
+        "proto": "String (e.g. 'tcp')",
+        "extPort": "Int",
+        "intIp": "String",
+        "intPort": "Int",
+        "enabled": "Boolean"
+      },
+      "responseFields": {
+        "data": {
+          "rules": [
+            "NativePortMapRule"
+          ]
+        }
+      }
+    },
+    {
+      "endpoint": "/api/router/port-mapping/{ruleName}",
+      "method": "PUT",
+      "caller": "RouterControlApi.kt",
+      "function": "updateNativePortMapping(oldName, rule)",
+      "queryParams": [],
+      "requestBody": {
+        "name": "String",
+        "interface": "String",
+        "proto": "String",
+        "extPort": "Int",
+        "intIp": "String",
+        "intPort": "Int",
+        "enabled": "Boolean"
+      },
+      "responseFields": {
+        "data": {
+          "rules": [
+            "NativePortMapRule"
+          ]
+        }
+      }
+    },
+    {
+      "endpoint": "/api/router/port-mapping/{ruleName}",
+      "method": "DELETE",
+      "caller": "RouterControlApi.kt",
+      "function": "deleteNativePortMapping(ruleName)",
+      "queryParams": [],
+      "requestBody": null,
+      "responseFields": {
+        "data": {
+          "rules": [
+            "NativePortMapRule"
+          ]
+        }
+      }
+    },
+    {
+      "endpoint": "/api/router/upnp",
+      "method": "GET",
+      "caller": "RouterControlApi.kt",
+      "function": "upnp(force)",
+      "queryParams": [
+        "force (optional, 1)"
+      ],
+      "requestBody": null,
+      "responseFields": {
+        "data": {
+          "enabled": "Boolean",
+          "wan": "String",
+          "rules": [
+            {
+              "name": "String",
+              "extPort": "Int",
+              "proto": "String",
+              "intIp": "String",
+              "intPort": "Int",
+              "remoteHost": "String"
+            }
+          ]
+        }
+      }
+    },
+    {
+      "endpoint": "/api/router/upnp",
+      "method": "PUT",
+      "caller": "RouterControlApi.kt",
+      "function": "setUpnp(enabled, wan)",
+      "queryParams": [],
+      "requestBody": {
+        "enabled": "Boolean",
+        "wan": "String"
+      },
+      "responseFields": {
+        "data": {
+          "enabled": "Boolean",
+          "wan": "String",
+          "rules": [
+            "UpnpRule"
+          ]
+        }
+      }
+    },
+    {
+      "endpoint": "/api/router/firewall",
+      "method": "GET",
+      "caller": "RouterControlApi.kt",
+      "function": "firewall(force)",
+      "queryParams": [
+        "force (optional, 1)"
+      ],
+      "requestBody": null,
+      "responseFields": {
+        "data": {
+          "wanInboundAllow": "Boolean",
+          "rules": [
+            {
+              "uuid": "String",
+              "scope": "String",
+              "name": "String",
+              "enabled": "Boolean",
+              "action": "String",
+              "proto": "String",
+              "srcIp": "String",
+              "srcPort": "String",
+              "destIp": "String",
+              "destPort": "String",
+              "direction": "String",
+              "time": "String",
+              "editable": "Boolean"
+            }
+          ]
+        }
+      }
+    },
+    {
+      "endpoint": "/api/router/firewall/rules",
+      "method": "POST",
+      "caller": "RouterControlApi.kt",
+      "function": "addFirewallRule(rule)",
+      "queryParams": [],
+      "requestBody": {
+        "scope": "String (e.g. 'wan')",
+        "name": "String",
+        "enabled": "Boolean",
+        "action": "String",
+        "proto": "String",
+        "srcIp": "String",
+        "srcPort": "String",
+        "destIp": "String",
+        "destPort": "String",
+        "direction": "String",
+        "time": "String"
+      },
+      "responseFields": {
+        "data": {
+          "wanInboundAllow": "Boolean",
+          "rules": [
+            "FirewallRule"
+          ]
+        }
+      }
+    },
+    {
+      "endpoint": "/api/router/firewall/rules/{uuid}",
+      "method": "PUT",
+      "caller": "RouterControlApi.kt",
+      "function": "updateFirewallRule(rule)",
+      "queryParams": [],
+      "requestBody": {
+        "uuid": "String",
+        "scope": "String",
+        "name": "String",
+        "enabled": "Boolean",
+        "action": "String",
+        "proto": "String",
+        "srcIp": "String",
+        "srcPort": "String",
+        "destIp": "String",
+        "destPort": "String",
+        "direction": "String",
+        "time": "String"
+      },
+      "responseFields": {
+        "data": {
+          "wanInboundAllow": "Boolean",
+          "rules": [
+            "FirewallRule"
+          ]
+        }
+      }
+    },
+    {
+      "endpoint": "/api/router/firewall/rules/{uuid}/enabled",
+      "method": "PATCH",
+      "caller": "RouterControlApi.kt",
+      "function": "setFirewallEnabled(uuid, enabled)",
+      "queryParams": [],
+      "requestBody": {
+        "enabled": "Boolean"
+      },
+      "responseFields": {
+        "data": {
+          "wanInboundAllow": "Boolean",
+          "rules": [
+            "FirewallRule"
+          ]
+        }
+      }
+    },
+    {
+      "endpoint": "/api/router/firewall/rules/{uuid}",
+      "method": "DELETE",
+      "caller": "RouterControlApi.kt",
+      "function": "deleteFirewallRule(uuid)",
+      "queryParams": [],
+      "requestBody": null,
+      "responseFields": {
+        "data": {
+          "wanInboundAllow": "Boolean",
+          "rules": [
+            "FirewallRule"
+          ]
+        }
+      }
+    },
+    {
+      "endpoint": "/api/router/firewall/reorder",
+      "method": "POST",
+      "caller": "RouterControlApi.kt",
+      "function": "reorderFirewall(scope, uuids)",
+      "queryParams": [],
+      "requestBody": {
+        "scope": "String",
+        "uuids": [
+          "String (array of uuids)"
+        ]
+      },
+      "responseFields": {
+        "data": {
+          "wanInboundAllow": "Boolean",
+          "rules": [
+            "FirewallRule"
+          ]
+        }
+      }
+    },
+    {
+      "endpoint": "/api/router/ddns",
+      "method": "GET",
+      "caller": "RouterControlApi.kt",
+      "function": "ddns(force)",
+      "queryParams": [
+        "force (optional, 1)"
+      ],
+      "requestBody": null,
+      "responseFields": {
+        "data": {
+          "services": [
+            {
+              "serviceId": "String",
+              "provider": "String",
+              "domain": "String",
+              "username": "String",
+              "enabled": "Boolean",
+              "status": "String",
+              "lastUpdate": "String",
+              "ip": "String"
+            }
+          ]
+        }
+      }
+    },
+    {
+      "endpoint": "/api/router/ddns",
+      "method": "POST",
+      "caller": "RouterControlApi.kt",
+      "function": "addDdns(record, password)",
+      "queryParams": [],
+      "requestBody": {
+        "serviceId": "String",
+        "provider": "String",
+        "domain": "String",
+        "username": "String",
+        "password": "String",
+        "enabled": "Boolean"
+      },
+      "responseFields": {
+        "data": {
+          "services": [
+            "DdnsRecord"
+          ]
+        }
+      }
+    },
+    {
+      "endpoint": "/api/router/ddns/{serviceId}",
+      "method": "PUT",
+      "caller": "RouterControlApi.kt",
+      "function": "updateDdns(record, password)",
+      "queryParams": [],
+      "requestBody": {
+        "serviceId": "String",
+        "provider": "String",
+        "domain": "String",
+        "username": "String",
+        "password": "String (optional)",
+        "enabled": "Boolean"
+      },
+      "responseFields": {
+        "data": {
+          "services": [
+            "DdnsRecord"
+          ]
+        }
+      }
+    },
+    {
+      "endpoint": "/api/router/ddns/{serviceId}",
+      "method": "DELETE",
+      "caller": "RouterControlApi.kt",
+      "function": "deleteDdns(serviceId)",
+      "queryParams": [],
+      "requestBody": null,
+      "responseFields": {
+        "data": {
+          "services": [
+            "DdnsRecord"
+          ]
+        }
+      }
+    },
+    {
+      "endpoint": "/api/ddns",
+      "method": "GET",
+      "caller": "RouterControlApi.kt",
+      "function": "labProbeDdns(force)",
+      "queryParams": [
+        "force (optional, 1)"
+      ],
+      "requestBody": null,
+      "responseFields": {
+        "records": [
+          {
+            "id": "String",
+            "domain": "String",
+            "provider": "String",
+            "recordType": "String (A/AAAA/CNAME)",
+            "ipVersion": "String (ipv4/ipv6)",
+            "enabled": "Boolean",
+            "status": "String",
+            "lastIp": "String",
+            "lastUpdate": "Long",
+            "errorMessage": "String",
+            "cnameTarget": "String"
+          }
+        ],
+        "routerWan": {
+          "ipv4": "String",
+          "ipv6": "String",
+          "ipv4State": "String",
+          "ipv6State": "String"
+        }
+      }
+    },
+    {
+      "endpoint": "/api/ddns/providers",
+      "method": "GET",
+      "caller": "RouterControlApi.kt",
+      "function": "labProbeDdnsProviders()",
+      "queryParams": [],
+      "requestBody": null,
+      "responseFields": {
+        "providers": [
+          {
+            "id": "String",
+            "name": "String",
+            "supportedRecordTypes": [
+              "String"
+            ],
+            "requiredCredentials": [
+              {
+                "key": "String",
+                "label": "String",
+                "type": "String",
+                "placeholder": "String"
+              }
+            ]
+          }
+        ]
+      }
+    },
+    {
+      "endpoint": "/api/ddns",
+      "method": "POST",
+      "caller": "RouterControlApi.kt",
+      "function": "addLabProbeDdns(record, credentials)",
+      "queryParams": [],
+      "requestBody": {
+        "id": "String",
+        "domain": "String",
+        "provider": "String",
+        "recordType": "String",
+        "ipVersion": "String",
+        "enabled": "Boolean",
+        "cnameTarget": "String (optional)",
+        "credentials": "Map<String, String>"
+      },
+      "responseFields": {
+        "LabProbeDdnsSnapshot": "object"
+      }
+    },
+    {
+      "endpoint": "/api/ddns/{recordId}",
+      "method": "PUT",
+      "caller": "RouterControlApi.kt",
+      "function": "updateLabProbeDdns(record, credentials)",
+      "queryParams": [],
+      "requestBody": {
+        "id": "String",
+        "domain": "String",
+        "provider": "String",
+        "recordType": "String",
+        "ipVersion": "String",
+        "enabled": "Boolean",
+        "cnameTarget": "String (optional)",
+        "credentials": "Map<String, String>"
+      },
+      "responseFields": {
+        "LabProbeDdnsSnapshot": "object"
+      }
+    },
+    {
+      "endpoint": "/api/ddns/{recordId}",
+      "method": "DELETE",
+      "caller": "RouterControlApi.kt",
+      "function": "deleteLabProbeDdns(recordId)",
+      "queryParams": [],
+      "requestBody": null,
+      "responseFields": {
+        "LabProbeDdnsSnapshot": "object"
+      }
+    },
+    {
+      "endpoint": "/api/ddns/{recordId}/update",
+      "method": "POST",
+      "caller": "RouterControlApi.kt",
+      "function": "updateLabProbeDdnsNow(recordId)",
+      "queryParams": [],
+      "requestBody": {
+        "force": true
+      },
+      "responseFields": {
+        "results": {
+          "recordId": {
+            "success": "Boolean",
+            "errorMessage": "String",
+            "errorCode": "String",
+            "currentIp": "String"
+          }
+        },
+        "message": "String",
+        "error": "String"
+      }
+    },
+    {
+      "endpoint": "/api/router/ipv6/status",
+      "method": "GET",
+      "caller": "RouterControlApi.kt",
+      "function": "ipv6Status()",
+      "queryParams": [],
+      "requestBody": null,
+      "responseFields": {
+        "data": {
+          "enabled": "Boolean",
+          "wanAddress": "String",
+          "wanPrefix": "String",
+          "lanPrefix": "String",
+          "gateway": "String",
+          "primaryDns": "String",
+          "secondaryDns": "String"
+        }
+      }
+    },
+    {
+      "endpoint": "/api/router/ipv6/config",
+      "method": "GET",
+      "caller": "RouterControlApi.kt",
+      "function": "ipv6Config()",
+      "queryParams": [],
+      "requestBody": null,
+      "responseFields": {
+        "data": {
+          "wan": {
+            "proto": "String",
+            "dhcpv6": "Boolean",
+            "autoDns": "Boolean",
+            "dns": [
+              "String"
+            ]
+          },
+          "lan": {
+            "proto": "String",
+            "ip6assign": "String",
+            "dhcpv6": "Boolean"
+          }
+        }
+      }
+    },
+    {
+      "endpoint": "/api/router/ipv6/clients",
+      "method": "GET",
+      "caller": "RouterControlApi.kt",
+      "function": "dhcpv6Clients()",
+      "queryParams": [],
+      "requestBody": null,
+      "responseFields": {
+        "data": {
+          "clients": [
+            {
+              "hostname": "String",
+              "mac": "String",
+              "duid": "String",
+              "ipv6": "String",
+              "iaid": "String",
+              "leaseTime": "Long"
+            }
+          ]
+        }
+      }
+    },
+    {
+      "endpoint": "/api/router/ipv6/config",
+      "method": "PUT",
+      "caller": "RouterControlApi.kt",
+      "function": "saveIpv6Config(body)",
+      "queryParams": [],
+      "requestBody": {
+        "wan": {
+          "proto": "String",
+          "dhcpv6": "Boolean",
+          "autoDns": "Boolean",
+          "dns": [
+            "String"
+          ]
+        },
+        "lan": {
+          "proto": "String",
+          "ip6assign": "String",
+          "dhcpv6": "Boolean"
+        }
+      },
+      "responseFields": {
+        "data": "Ipv6Config"
+      }
+    },
+    {
+      "endpoint": "/api/router/diagnostic",
+      "method": "GET",
+      "caller": "RouterControlApi.kt",
+      "function": "diagnostic()",
+      "queryParams": [],
+      "requestBody": null,
+      "responseFields": {
+        "data": {
+          "process": "String (e.g. '100%')",
+          "error_count": "String / Int",
+          "List": [
+            {
+              "type": "String",
+              "title": "String",
+              "status": "String",
+              "result": "String",
+              "tips": "String",
+              "advise": "String",
+              "children": [
+                {
+                  "item": "String",
+                  "status": "String",
+                  "result": "String",
+                  "tips": "String",
+                  "advise": "String",
+                  "data": {
+                    "port": "String"
+                  }
+                }
+              ]
+            }
+          ]
+        }
+      }
+    },
+    {
+      "endpoint": "/api/router/diagnostic",
+      "method": "POST",
+      "caller": "RouterControlApi.kt",
+      "function": "startDiagnostic()",
+      "queryParams": [],
+      "requestBody": null,
+      "responseFields": {
+        "data": "RouterDiagnostic"
+      }
+    },
+    {
+      "endpoint": "/api/portmaps",
+      "method": "GET",
+      "caller": "PortMapping.kt",
+      "function": "list()",
+      "queryParams": [],
+      "requestBody": null,
+      "responseFields": {
+        "rules": [
+          {
+            "id": "String",
+            "name": "String",
+            "enabled": "Boolean",
+            "mode": "String (6to4/6to6)",
+            "listenPort": "Int",
+            "targetMode": "String (ipv4/ipv6_suffix/ipv6_full)",
+            "targetIpv4": "String",
+            "targetIpv6": "String",
+            "targetIpv6Snapshot": "String",
+            "targetIpv6Suffix": "String",
+            "targetMac": "String",
+            "targetPort": "Int",
+            "serviceType": "String",
+            "transportProtocol": "String",
+            "preferCurrentPrefix": "Boolean",
+            "expiresAt": "Long? / null",
+            "leaseSeconds": "Long",
+            "maxConnections": "Int",
+            "idleTimeoutSec": "Int",
+            "desiredState": "String",
+            "actualState": "String",
+            "syncState": "String",
+            "revision": "Long",
+            "runtime": {
+              "state": "String",
+              "resolvedTarget": "String",
+              "activeConnections": "Long",
+              "activePeers": "Long",
+              "totalUploadBytes": "Long",
+              "totalDownloadBytes": "Long",
+              "totalUploadPackets": "Long",
+              "totalDownloadPackets": "Long",
+              "startedAt": "Long?",
+              "expiresAt": "Long?",
+              "lastResolvedAt": "Long?",
+              "lastError": "String"
+            }
+          }
+        ],
+        "portRange": {
+          "min": "Int",
+          "max": "Int"
+        },
+        "agentOnline": "Boolean",
+        "router": "String",
+        "agentLastSeenAt": "String",
+        "protocolVersion": "String",
+        "hubVersion": "String",
+        "agentVersion": "String",
+        "capabilities": [
+          "String"
+        ],
+        "agentState": "String",
+        "agentAgeSeconds": "Long",
+        "agentLastSeenEpoch": "Long",
+        "agentRevision": "Long",
+        "rulesLoaded": "Boolean",
+        "rulesRevision": "Long",
+        "rulesUpdatedAt": "String",
+        "revision": "Long"
+      }
+    },
+    {
+      "endpoint": "/api/portmaps",
+      "method": "POST",
+      "caller": "PortMapping.kt",
+      "function": "create(draft)",
+      "queryParams": [],
+      "requestBody": {
+        "id": "String (optional)",
+        "name": "String",
+        "enabled": "Boolean",
+        "mode": "String",
+        "listenPort": "Int",
+        "targetMode": "String",
+        "targetIpv4": "String",
+        "targetIpv6": "String",
+        "targetIpv6Snapshot": "String",
+        "targetIpv6Suffix": "String",
+        "targetMac": "String",
+        "targetPort": "Int",
+        "serviceType": "String (optional)",
+        "transportProtocol": "String",
+        "preferCurrentPrefix": "Boolean",
+        "expiresAt": "Long? / null",
+        "leaseSeconds": "Long",
+        "maxConnections": "Int",
+        "idleTimeoutSec": "Int"
+      },
+      "responseFields": {
+        "rule": "PortMapRule",
+        "revision": "Long"
+      }
+    },
+    {
+      "endpoint": "/api/portmaps/{id}",
+      "method": "PUT",
+      "caller": "PortMapping.kt",
+      "function": "update(id, draft)",
+      "queryParams": [],
+      "requestBody": {
+        "id": "String",
+        "name": "String",
+        "enabled": "Boolean",
+        "mode": "String",
+        "listenPort": "Int",
+        "targetMode": "String",
+        "targetIpv4": "String",
+        "targetIpv6": "String",
+        "targetIpv6Snapshot": "String",
+        "targetIpv6Suffix": "String",
+        "targetMac": "String",
+        "targetPort": "Int",
+        "serviceType": "String (optional)",
+        "transportProtocol": "String",
+        "preferCurrentPrefix": "Boolean",
+        "expiresAt": "Long? / null",
+        "leaseSeconds": "Long",
+        "maxConnections": "Int",
+        "idleTimeoutSec": "Int"
+      },
+      "responseFields": {
+        "rule": "PortMapRule",
+        "revision": "Long"
+      }
+    },
+    {
+      "endpoint": "/api/portmaps/{id}",
+      "method": "DELETE",
+      "caller": "PortMapping.kt",
+      "function": "delete(id)",
+      "queryParams": [],
+      "requestBody": null,
+      "responseFields": {
+        "success": "Boolean",
+        "revision": "Long"
+      }
+    },
+    {
+      "endpoint": "/api/portmaps/{id}/{action}",
+      "method": "POST",
+      "caller": "PortMapping.kt",
+      "function": "action(id, action)",
+      "queryParams": [],
+      "requestBody": {},
+      "responseFields": {
+        "success": "Boolean",
+        "revision": "Long"
+      }
+    },
+    {
+      "endpoint": "/api/portmaps/{id}/history",
+      "method": "GET",
+      "caller": "PortMapping.kt",
+      "function": "history(id, minutes)",
+      "queryParams": [
+        "minutes (Int)"
+      ],
+      "requestBody": null,
+      "responseFields": {
+        "samples": [
+          {
+            "timestamp": "Long",
+            "activeConnections": "Long",
+            "activePeers": "Long",
+            "uploadBps": "Long",
+            "downloadBps": "Long"
+          }
+        ]
+      }
+    },
+    {
+      "endpoint": "/api/stun",
+      "method": "GET",
+      "caller": "StunPenetration.kt",
+      "function": "list()",
+      "queryParams": [],
+      "requestBody": null,
+      "responseFields": {
+        "rules": [
+          {
+            "id": "String",
+            "name": "String",
+            "enabled": "Boolean",
+            "listenPort": "Int",
+            "targetIpv4": "String",
+            "targetPort": "Int",
+            "serviceType": "String",
+            "transportProtocol": "String",
+            "forwardMode": "String",
+            "actualState": "String",
+            "firewallState": "String",
+            "nativeMappingState": "String",
+            "runtime": {
+              "state": "String",
+              "resolvedTarget": "String",
+              "publicEndpoint": "String",
+              "publicIp": "String",
+              "publicPort": "Int",
+              "mappingUpdatedAt": "Long?",
+              "activeConnections": "Long",
+              "activePeers": "Long",
+              "totalUploadBytes": "Long",
+              "totalDownloadBytes": "Long",
+              "lastError": "String"
+            }
+          }
+        ],
+        "agentOnline": "Boolean",
+        "agentLastSeenAt": "String"
+      }
+    },
+    {
+      "endpoint": "/api/stun",
+      "method": "POST",
+      "caller": "StunPenetration.kt",
+      "function": "create(draft)",
+      "queryParams": [],
+      "requestBody": {
+        "id": "String (optional)",
+        "serviceType": "String",
+        "transportProtocol": "String",
+        "targetIpv4": "String",
+        "targetPort": "Int",
+        "name": "String (optional)",
+        "enabled": "Boolean (true)"
+      },
+      "responseFields": {
+        "rule": "StunRule"
+      }
+    },
+    {
+      "endpoint": "/api/stun/{id}",
+      "method": "PUT",
+      "caller": "StunPenetration.kt",
+      "function": "update(id, draft)",
+      "queryParams": [],
+      "requestBody": {
+        "id": "String (optional)",
+        "serviceType": "String",
+        "transportProtocol": "String",
+        "targetIpv4": "String",
+        "targetPort": "Int",
+        "name": "String (optional)",
+        "enabled": "Boolean (true)"
+      },
+      "responseFields": {
+        "rule": "StunRule"
+      }
+    },
+    {
+      "endpoint": "/api/stun/{id}/{action}",
+      "method": "POST",
+      "caller": "StunPenetration.kt",
+      "function": "action(id, action)",
+      "queryParams": [],
+      "requestBody": {},
+      "responseFields": {
+        "success": "Boolean"
+      }
+    },
+    {
+      "endpoint": "/api/stun/{id}",
+      "method": "DELETE",
+      "caller": "StunPenetration.kt",
+      "function": "delete(id)",
+      "queryParams": [],
+      "requestBody": null,
+      "responseFields": {
+        "success": "Boolean"
+      }
+    },
+    {
+      "endpoint": "/api/stun/{id}/addresses",
+      "method": "GET",
+      "caller": "StunPenetration.kt",
+      "function": "addresses(id)",
+      "queryParams": [],
+      "requestBody": null,
+      "responseFields": {
+        "addresses": [
+          {
+            "endpoint": "String",
+            "updatedAt": "Long"
+          }
+        ]
+      }
+    },
+    {
+      "endpoint": "/api/wireguard/server",
+      "method": "GET",
+      "caller": "WireGuardClient.kt",
+      "function": "loadServerConfig()",
+      "queryParams": [],
+      "requestBody": null,
+      "responseFields": {
+        "server": {
+          "listenPort": "Int",
+          "mtu": "Int",
+          "address": "String",
+          "serverPublicKey": "String",
+          "enabled": "Boolean"
+        },
+        "agentStatus": {
+          "publicKey": "String"
+        },
+        "peers": [
+          {
+            "publicKey": "String",
+            "allowedIps": [
+              "String"
+            ],
+            "latestHandshakeAt": "Long",
+            "rxBytes": "Long",
+            "txBytes": "Long"
+          }
+        ],
+        "revision": "Long"
+      }
+    },
+    {
+      "endpoint": "/api/wireguard/server",
+      "method": "PUT",
+      "caller": "WireGuardClient.kt",
+      "function": "updateServerConfig(listenPort, mtu, address, enabled, peers)",
+      "queryParams": [],
+      "requestBody": {
+        "listenPort": "Int",
+        "mtu": "Int",
+        "address": "String",
+        "enabled": "Boolean",
+        "peers": [
+          {
+            "publicKey": "String",
+            "allowedIps": [
+              "String"
+            ],
+            "persistentKeepalive": "Int"
+          }
+        ]
+      },
+      "responseFields": {
+        "server": "WireGuardServerConfig",
+        "revision": "Long"
+      }
+    },
+    {
+      "endpoint": "/api/wireguard/endpoints/{id}",
+      "method": "PATCH",
+      "caller": "WireGuardClient.kt",
+      "function": "updateEndpoint(id, endpoint, endpointRevision)",
+      "queryParams": [],
+      "requestBody": {
+        "endpoint": "String",
+        "endpointRevision": "Long"
+      },
+      "responseFields": {
+        "success": "Boolean",
+        "revision": "Long"
+      }
+    },
+    {
+      "endpoint": "/api/router/firewall/automation",
+      "method": "GET",
+      "caller": "FirewallAutomation.kt",
+      "function": "list()",
+      "queryParams": [],
+      "requestBody": null,
+      "responseFields": {
+        "data": {
+          "bindings": [
+            {
+              "firewallUuid": "String",
+              "enabled": "Boolean",
+              "targetType": "String",
+              "mappingKind": "String",
+              "mappingId": "String",
+              "addressFamily": "String",
+              "matchField": "String",
+              "targetName": "String",
+              "ruleName": "String",
+              "direction": "String",
+              "currentAddress": "String",
+              "desiredAddress": "String",
+              "status": "String",
+              "statusMessage": "String",
+              "suspended": "Boolean",
+              "suspendedReason": "String"
+            }
+          ]
+        }
+      }
+    },
+    {
+      "endpoint": "/api/router/firewall/automation/{firewallUuid}",
+      "method": "PUT",
+      "caller": "FirewallAutomation.kt",
+      "function": "put(binding)",
+      "queryParams": [],
+      "requestBody": {
+        "enabled": "Boolean",
+        "targetType": "String (mapping)",
+        "mappingKind": "String",
+        "mappingId": "String",
+        "addressFamily": "String",
+        "matchField": "String"
+      },
+      "responseFields": {
+        "success": "Boolean"
+      }
+    },
+    {
+      "endpoint": "/api/router/firewall/automation/{firewallUuid}",
+      "method": "DELETE",
+      "caller": "FirewallAutomation.kt",
+      "function": "remove(firewallUuid)",
+      "queryParams": [],
+      "requestBody": {},
+      "responseFields": {
+        "success": "Boolean"
+      }
+    },
+    {
+      "endpoint": "/api/router/firewall/automation/{firewallUuid}/sync",
+      "method": "POST",
+      "caller": "FirewallAutomation.kt",
+      "function": "sync(firewallUuid)",
+      "queryParams": [],
+      "requestBody": {},
+      "responseFields": {
+        "success": "Boolean"
+      }
+    },
+    {
+      "endpoint": "/api/router/tasks/{kind}",
+      "method": "GET",
+      "caller": "RouterTaskRepository.kt",
+      "function": "get(kind)",
+      "queryParams": [],
+      "requestBody": null,
+      "responseFields": {
+        "task_id": "String",
+        "kind": "String",
+        "state": "String",
+        "progress": "Int / String",
+        "step": "String",
+        "message": "String",
+        "error": "String",
+        "result": "JSONObject",
+        "startedAt": "Long",
+        "finishedAt": "Long"
+      }
+    },
+    {
+      "endpoint": "/api/router/nat-diagnostic",
+      "method": "POST",
+      "caller": "RouterTaskRepository.kt",
+      "function": "startNat(payload)",
+      "queryParams": [],
+      "requestBody": {
+        "target_ip": "String (optional)",
+        "stun_server": "String (optional)"
+      },
+      "responseFields": {
+        "task_id": "String",
+        "kind": "String",
+        "state": "String"
+      }
+    },
+    {
+      "endpoint": "/api/router/beta-upgrade",
+      "method": "POST",
+      "caller": "RouterTaskRepository.kt",
+      "function": "startBeta()",
+      "queryParams": [
+        "force=1"
+      ],
+      "requestBody": {},
+      "responseFields": {
+        "task_id": "String",
+        "kind": "String",
+        "state": "String"
+      }
+    },
+    {
+      "endpoint": "/api/router/realtime",
+      "method": "GET",
+      "caller": "LiteRealtime.kt",
+      "function": "router()",
+      "queryParams": [],
+      "requestBody": null,
+      "responseFields": {
+        "cpu": "Double",
+        "memory": "Double",
+        "cpu_usage": "String",
+        "mem_usage": "String",
+        "wan_rx_bps": "Long",
+        "wan_tx_bps": "Long",
+        "uploadSpeed": "Double",
+        "downloadSpeed": "Double",
+        "traffic": {
+          "upload": "Long",
+          "download": "Long",
+          "uploadSpeed": "Double",
+          "downloadSpeed": "Double"
+        },
+        "cpuutil": "Double",
+        "memutil": "Double",
+        "temperature": "Double",
+        "temp": "Double",
+        "conntrack": "Int",
+        "conntrack_max": "Int",
+        "ports": [
+          "JSONObject"
+        ],
+        "wan_ip": "String",
+        "hardware": {
+          "cpu": "Double",
+          "memory": "Double",
+          "temperature": "Double"
+        },
+        "updatedAt": "Long / String"
+      }
+    },
+    {
+      "endpoint": "/api/devices/realtime",
+      "method": "GET",
+      "caller": "LiteRealtime.kt",
+      "function": "devices()",
+      "queryParams": [],
+      "requestBody": null,
+      "responseFields": {
+        "devices": [
+          {
+            "mac": "String",
+            "rx_bps": "Long",
+            "tx_bps": "Long",
+            "uploadSpeed": "Double",
+            "downloadSpeed": "Double",
+            "online": "Boolean",
+            "connected": "Boolean",
+            "ipv4": "String",
+            "ipv6": "String",
+            "rate": "String"
+          }
+        ],
+        "online_count": "Int",
+        "total_count": "Int"
+      }
+    },
+    {
+      "endpoint": "/api/agent/update/check",
+      "method": "POST",
+      "caller": "MainActivity.kt",
+      "function": "checkAgentUpdate()",
+      "queryParams": [],
+      "requestBody": {},
+      "responseFields": {
+        "hasUpdate": "Boolean",
+        "currentVersion": "String",
+        "latestVersion": "String",
+        "releaseNotes": "String",
+        "updateState": "String"
+      }
+    },
+    {
+      "endpoint": "/api/agent/update",
+      "method": "POST",
+      "caller": "MainActivity.kt",
+      "function": "startAgentUpdate()",
+      "queryParams": [],
+      "requestBody": {},
+      "responseFields": {
+        "commandId": "String",
+        "status": "String"
+      }
+    },
+    {
+      "endpoint": "/api/agent/update/status",
+      "method": "GET",
+      "caller": "MainActivity.kt",
+      "function": "pollAgentUpdateStatus()",
+      "queryParams": [],
+      "requestBody": null,
+      "responseFields": {
+        "updateState": "String",
+        "updateMessage": "String",
+        "currentVersion": "String",
+        "targetVersion": "String"
+      }
+    },
+    {
+      "endpoint": "/api/agent/cleanup",
+      "method": "POST",
+      "caller": "MainActivity.kt",
+      "function": "startAgentCleanup(payload)",
+      "queryParams": [],
+      "requestBody": {
+        "days": "Int (optional)",
+        "cleanBackups": "Boolean (optional)",
+        "cleanLogs": "Boolean (optional)",
+        "cleanTemp": "Boolean (optional)"
+      },
+      "responseFields": {
+        "commandId": "String",
+        "status": "String"
+      }
+    },
+    {
+      "endpoint": "/api/agent/cleanup/status",
+      "method": "GET",
+      "caller": "MainActivity.kt",
+      "function": "pollAgentCleanupStatus(commandId)",
+      "queryParams": [
+        "commandId (String)"
+      ],
+      "requestBody": null,
+      "responseFields": {
+        "commandId": "String",
+        "status": "String",
+        "freedBytes": "Long",
+        "freedText": "String",
+        "message": "String",
+        "finishedAt": "Long"
+      }
+    },
+    {
+      "endpoint": "/api/status",
+      "method": "GET",
+      "caller": "MainActivity.kt",
+      "function": "getStatus()",
+      "queryParams": [],
+      "requestBody": null,
+      "responseFields": {
+        "status": "String",
+        "version": "String",
+        "uptime": "Long",
+        "routerConnected": "Boolean",
+        "agentOnline": "Boolean"
+      }
+    },
+    {
+      "endpoint": "/api/router/dashboard",
+      "method": "GET",
+      "caller": "MainActivity.kt",
+      "function": "getRouterDashboard()",
+      "queryParams": [],
+      "requestBody": null,
+      "responseFields": {
+        "hardware": {
+          "cpu": "Double",
+          "memory": "Double",
+          "temperature": "Double",
+          "storage": "Double",
+          "uptime": "Long"
+        },
+        "traffic": {
+          "upload": "Long",
+          "download": "Long",
+          "uploadSpeed": "Double",
+          "downloadSpeed": "Double"
+        },
+        "network": {
+          "wanIp": "String",
+          "gateway": "String",
+          "dns": [
+            "String"
+          ],
+          "ipv6Wan": "String",
+          "ipv6Prefix": "String"
+        },
+        "ports": [
+          "JSONObject"
+        ],
+        "wireless": [
+          "JSONObject"
+        ],
+        "timestamp": "Long"
+      }
+    },
+    {
+      "endpoint": "/api/router/dashboard/refresh",
+      "method": "POST",
+      "caller": "MainActivity.kt",
+      "function": "requestRouterDashboardRefresh()",
+      "queryParams": [],
+      "requestBody": {},
+      "responseFields": {
+        "success": "Boolean",
+        "timestamp": "Long"
+      }
+    },
+    {
+      "endpoint": "/api/devices",
+      "method": "GET",
+      "caller": "MainActivity.kt",
+      "function": "getDevices(view)",
+      "queryParams": [
+        "view (optional, 'online')"
+      ],
+      "requestBody": null,
+      "responseFields": [
+        {
+          "mac": "String",
+          "ip": "String",
+          "name": "String",
+          "hostname": "String",
+          "vendor": "String",
+          "type": "String",
+          "interface": "String",
+          "signal": "Int",
+          "band": "String",
+          "linkSpeed": "Long",
+          "online": "Boolean",
+          "firstSeen": "Long",
+          "lastSeen": "Long",
+          "ipv6": [
+            "String"
+          ],
+          "rxBytes": "Long",
+          "txBytes": "Long",
+          "rxRateBps": "Long",
+          "txRateBps": "Long"
+        }
+      ]
+    },
+    {
+      "endpoint": "/api/sync/changes",
+      "method": "GET",
+      "caller": "MainActivity.kt",
+      "function": "getSyncChanges(since, limit)",
+      "queryParams": [
+        "since (Long)",
+        "limit (Int, e.g. 500)"
+      ],
+      "requestBody": null,
+      "responseFields": {
+        "revision": "Long",
+        "changes": [
+          {
+            "entityType": "String",
+            "entityId": "String",
+            "action": "String (upsert/delete)",
+            "data": "JSONObject",
+            "revision": "Long",
+            "updatedAt": "Long"
+          }
+        ]
+      }
+    },
+    {
+      "endpoint": "/api/sync/snapshot",
+      "method": "GET",
+      "caller": "MainActivity.kt",
+      "function": "getSyncSnapshot()",
+      "queryParams": [],
+      "requestBody": null,
+      "responseFields": {
+        "revision": "Long",
+        "devices": [
+          "JSONObject"
+        ],
+        "portmaps": [
+          "JSONObject"
+        ],
+        "stun": [
+          "JSONObject"
+        ],
+        "ddns": [
+          "JSONObject"
+        ],
+        "wireguard": [
+          "JSONObject"
+        ],
+        "timestamp": "Long"
+      }
+    },
+    {
+      "endpoint": "/api/sync/revision",
+      "method": "GET",
+      "caller": "MainActivity.kt",
+      "function": "getSyncRevision()",
+      "queryParams": [],
+      "requestBody": null,
+      "responseFields": {
+        "revision": "Long"
+      }
+    },
+    {
+      "endpoint": "/api/events",
+      "method": "GET",
+      "caller": "MainActivity.kt",
+      "function": "getEvents()",
+      "queryParams": [],
+      "requestBody": null,
+      "responseFields": [
+        {
+          "id": "String",
+          "type": "String",
+          "mac": "String",
+          "name": "String",
+          "timestamp": "Long",
+          "message": "String",
+          "details": "JSONObject"
+        }
+      ]
+    },
+    {
+      "endpoint": "/api/events/{id}",
+      "method": "DELETE",
+      "caller": "MainActivity.kt",
+      "function": "deleteEvent(id)",
+      "queryParams": [],
+      "requestBody": null,
+      "responseFields": {
+        "success": "Boolean"
+      }
+    },
+    {
+      "endpoint": "/api/daily",
+      "method": "GET",
+      "caller": "MainActivity.kt",
+      "function": "getDailyReport(date)",
+      "queryParams": [
+        "date (String YYYY-MM-DD)"
+      ],
+      "requestBody": null,
+      "responseFields": {
+        "date": "String",
+        "totalTraffic": "Long",
+        "peakSpeed": "Long",
+        "topDevices": [
+          "JSONObject"
+        ],
+        "onlineDeviceCount": "Int",
+        "roamingCount": "Int",
+        "note": "String"
+      }
+    },
+    {
+      "endpoint": "/api/daily/latest",
+      "method": "GET",
+      "caller": "MainActivity.kt",
+      "function": "getLatestDailyReport()",
+      "queryParams": [],
+      "requestBody": null,
+      "responseFields": {
+        "DailyReport": "object"
+      }
+    },
+    {
+      "endpoint": "/api/daily/list",
+      "method": "GET",
+      "caller": "MainActivity.kt",
+      "function": "listDailyReports()",
+      "queryParams": [],
+      "requestBody": null,
+      "responseFields": {
+        "reports": [
+          "DailyReportSummary"
+        ]
+      }
+    },
+    {
+      "endpoint": "/api/daily/note",
+      "method": "PUT",
+      "caller": "MainActivity.kt",
+      "function": "updateDailyNote(date, note)",
+      "queryParams": [
+        "date (String)"
+      ],
+      "requestBody": {
+        "note": "String"
+      },
+      "responseFields": {
+        "success": "Boolean"
+      }
+    },
+    {
+      "endpoint": "/api/wol",
+      "method": "POST",
+      "caller": "MainActivity.kt",
+      "function": "sendWolPacket(mac, ip, port)",
+      "queryParams": [],
+      "requestBody": {
+        "mac": "String",
+        "ip": "String (optional)",
+        "port": "Int (optional, 9)"
+      },
+      "responseFields": {
+        "success": "Boolean"
+      }
+    },
+    {
+      "endpoint": "/api/geo",
+      "method": "GET",
+      "caller": "MainActivity.kt",
+      "function": "getIpGeo(ip)",
+      "queryParams": [
+        "ip (String)"
+      ],
+      "requestBody": null,
+      "responseFields": {
+        "ip": "String",
+        "country": "String",
+        "region": "String",
+        "city": "String",
+        "isp": "String",
+        "flag": "String"
+      }
+    }
+  ],
+  "websocket": [
+    {
+      "endpoint": "/api/realtime/ws",
+      "protocol": "WSS (JSON text frames)",
+      "headers": {
+        "Authorization": "Bearer <app_token>",
+        "X-LabProbe-Token": "<app_token>",
+        "Accept": "application/json"
+      },
+      "watchdog": {
+        "okhttpPingIntervalSeconds": 10,
+        "watchdogCheckIntervalSeconds": 1,
+        "serverFrameTimeoutSeconds": 45,
+        "behavior": "Any valid server frame (including keepalive) updates lastFrameAt. If 45 consecutive seconds elapse without receiving any server frame, the local watchdog cancels the WebSocket, triggering automatic exponential-backoff reconnection."
+      },
+      "frames": [
+        {
+          "type": "ready",
+          "description": "Sent by Hub immediately after authentication succeeds. Notifies client WSS session is ready.",
+          "consumer": "HubMqttClient.kt:182 -> onRealtimeReady(reconnect)",
+          "dataPayload": {}
+        },
+        {
+          "type": "router",
+          "description": "High-frequency (1s) router performance and traffic metrics.",
+          "consumer": "MainActivity.kt:1040 -> RealtimeDisplaySmoother.acceptRouter() (RealtimeSmoothing.kt:47) -> mergeLiteRouterRealtime() (LiteRealtime.kt:33)",
+          "dataPayload": {
+            "uploadBps": "Long (default 0L)",
+            "downloadBps": "Long (default 0L)",
+            "cpuPercent": "Double (default 0.0)",
+            "memoryPercent": "Double (default 0.0)",
+            "temperatureC": "Double (default 0.0)",
+            "totalUploadBytes": "Long (default 0L)",
+            "totalDownloadBytes": "Long (default 0L)",
+            "uptimeSeconds": "Long (default 0L)",
+            "onlineDeviceCount": "Int (default 0)",
+            "ipv4Connections": "Long (default 0L)",
+            "ipv6Connections": "Long (default 0L)",
+            "ipv4HalfConnections": "Long (default 0L)",
+            "ipv6HalfConnections": "Long (default 0L)",
+            "cps": "Long (default 0L)",
+            "sampleEpochMs": "Long (default 0L)",
+            "sampleAgeMs": "Long (default 0L)",
+            "stale": "Boolean (default false)",
+            "temperature2gC": "Double (optional)",
+            "temperature5gC": "Double (optional)",
+            "storagePercent": "Double (optional)"
+          }
+        },
+        {
+          "type": "devices",
+          "description": "High-frequency (1s) delta traffic rates for online terminal devices.",
+          "consumer": "MainActivity.kt:1062 -> RealtimeDisplaySmoother.acceptDevices() (RealtimeSmoothing.kt:94) -> renderDevices() (RealtimeSmoothing.kt:190)",
+          "dataPayload": {
+            "devices": [
+              {
+                "mac": "String (required, MAC address)",
+                "uploadBps": "Long (default 0L)",
+                "downloadBps": "Long (default 0L)",
+                "connectionCount": "Int (default 0)"
+              }
+            ],
+            "onlineDeviceCount": "Int (optional)",
+            "onlineCount": "Int (optional)",
+            "delta": "Boolean (default false)",
+            "sampleEpochMs": "Long (default 0L)",
+            "sampleAgeMs": "Long (default 0L)"
+          }
+        },
+        {
+          "type": "devices_snapshot",
+          "description": "Durable snapshot of all terminal devices (online and historical offline).",
+          "consumer": "MainActivity.kt:1068 -> acceptDevicesSnapshot() (MainActivity.kt:1200) -> parseDeviceArray() / parseDevice() (DeviceCodec.kt:35)",
+          "dataPayload": {
+            "devices": [
+              {
+                "mac": "String (required)",
+                "name": "String (optional)",
+                "devRecommend": "String (optional fallback name)",
+                "hostname": "String (optional)",
+                "hostName": "String (optional fallback hostname)",
+                "vendor": "String (optional)",
+                "type": "String (optional)",
+                "devType": "String (optional fallback type)",
+                "interface": "String (optional, e.g. '2.4G', '5G', 'LAN1')",
+                "conType": "String (optional)",
+                "port": "String (optional)",
+                "ip": "String (optional)",
+                "ipv4": "String (optional)",
+                "ipv6": "Array of Strings (optional)",
+                "signal": "Int (optional, RSSI)",
+                "band": "String (optional)",
+                "linkSpeed": "Long (optional)",
+                "rate": "Long (optional)",
+                "online": "Boolean (default false)",
+                "firstSeen": "Long (optional epoch)",
+                "lastSeen": "Long (optional epoch)",
+                "rxBytes": "Long (default 0L)",
+                "txBytes": "Long (default 0L)",
+                "rxRateBps": "Long (default 0L)",
+                "txRateBps": "Long (default 0L)",
+                "connectionCount": "Int (default 0)",
+                "accessPolicy": "JSONObject / String (optional)",
+                "guest": "Boolean (default false)",
+                "blocked": "Boolean (default false)"
+              }
+            ],
+            "revision": "Long (optional)",
+            "updatedAt": "String / Long (optional)"
+          }
+        },
+        {
+          "type": "task",
+          "description": "Asynchronous router task status & progress updates (NAT diag, self-test, beta upgrade).",
+          "consumer": "MainActivity.kt:1069 -> RouterTaskRepository.acceptRealtime() (RouterTaskRepository.kt:60) -> parse() (RouterTaskRepository.kt:120)",
+          "dataPayload": {
+            "task_id": "String (optional)",
+            "taskId": "String (optional)",
+            "id": "String (optional)",
+            "kind": "String (required: 'nat', 'diagnostic', 'beta')",
+            "state": "String (required: 'idle', 'queued', 'running', 'completed', 'failed', 'timeout')",
+            "stage": "String (optional)",
+            "progress": "Int / String (optional)",
+            "step": "String (optional)",
+            "stageText": "String (optional)",
+            "message": "String (optional)",
+            "error": "String (optional)",
+            "errorMessage": "String (optional)",
+            "result": "JSONObject (optional)",
+            "startedAt": "Long (optional)",
+            "finishedAt": "Long (optional)"
+          }
+        },
+        {
+          "type": "config",
+          "description": "Router configuration mutation notification triggering lightweight preload.",
+          "consumer": "MainActivity.kt:1070 -> RouterRepository.acceptConfigRealtime() (RouterRepository.kt:100)",
+          "dataPayload": {
+            "resource": "String (required: 'portMappings', 'firewall', 'ddns', 'upnp')",
+            "data": "JSONObject (required: module-specific configuration payload)",
+            "source": "String (default 'sync', e.g. 'command')",
+            "revision": "Long (default 0L)",
+            "updatedAt": "Long (epoch seconds or milliseconds)"
+          }
+        },
+        {
+          "type": "agent",
+          "description": "Router extension agent presence and telemetry heartbeat.",
+          "consumer": "MainActivity.kt:1071 -> AgentPresenceStore.acceptRealtime() (AgentPresenceStore.kt:28)",
+          "dataPayload": {
+            "agentState": "String (optional: 'online', 'offline')",
+            "agentOnline": "Boolean (default false)",
+            "router": "String (optional)",
+            "agentLastSeenAt": "String (optional)",
+            "agentLastSeenEpoch": "Long (default 0L)",
+            "agentAgeSeconds": "Long (default 0L)",
+            "agentVersion": "String (optional)",
+            "agentRevision": "Long (default 0L)",
+            "capabilities": "Array of Strings (optional)",
+            "portRange": {
+              "min": "Int (default 20000)",
+              "max": "Int (default 20020)"
+            }
+          }
+        },
+        {
+          "type": "keepalive",
+          "description": "Periodic server keepalive heartbeat to refresh watchdog timer.",
+          "consumer": "HubMqttClient.kt:187 -> updates lastFrameAt, resets 45s watchdog",
+          "dataPayload": {}
+        }
+      ]
+    }
+  ]
+}

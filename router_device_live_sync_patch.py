@@ -15,13 +15,12 @@ import os
 import threading
 import time
 from datetime import date
-from types import MethodType
 from typing import Any, Dict, List, Set
 
 from flask import jsonify
 
 
-POLL_INTERVAL_SECONDS = max(5.0, float(os.environ.get("ROUTER_DEVICE_LIVE_POLL_SEC", "5")))
+POLL_INTERVAL_SECONDS = max(2.0, float(os.environ.get("ROUTER_DEVICE_LIVE_POLL_SEC", "2")))
 PERSIST_INTERVAL_SECONDS = max(
     POLL_INTERVAL_SECONDS,
     float(os.environ.get("ROUTER_DEVICE_PERSIST_SEC", "30")),
@@ -91,7 +90,6 @@ class RouterDeviceLiveSync:
         self.last_error_log_at = 0.0
         self.empty_streak = 0
         self.last_macs: Set[str] = set()
-        self._patch_wss_replay()
         if start:
             threading.Thread(
                 target=self._worker,
@@ -124,13 +122,19 @@ class RouterDeviceLiveSync:
             observed_delta = max(0, min(30, now_epoch - previous_epoch)) if previous_epoch else 0
             observed_seconds = old_seconds + observed_delta if old else 0
             seconds = max(router_seconds, observed_seconds)
+            target_up = _as_int(raw.get("flowUp"))
+            target_down = _as_int(raw.get("flowDown"))
+            old_up = _as_int(old.get("uploadBps"))
+            old_down = _as_int(old.get("downloadBps"))
+            smooth_up = int(old_up * 0.25 + target_up * 0.75) if old else target_up
+            smooth_down = int(old_down * 0.25 + target_down * 0.75) if old else target_down
             row.update(
                 {
                     "online": True,
                     "lastSeenAt": stamp,
                     "offlineAt": None,
-                    "uploadBps": _as_int(raw.get("flowUp")),
-                    "downloadBps": _as_int(raw.get("flowDown")),
+                    "uploadBps": smooth_up,
+                    "downloadBps": smooth_down,
                     "connectionCount": _as_int(raw.get("flow_cnt")),
                     "todayOnlineDurationSec": seconds,
                     "todayOnlineDurationText": self.hub.human_duration(seconds),
@@ -164,26 +168,10 @@ class RouterDeviceLiveSync:
         }
 
     def _publish(self, frame: Dict[str, Any]) -> None:
-        publisher = getattr(self.hub, "HUB_REALTIME_WEBSOCKET", None)
-        publish = getattr(publisher, "_publish", None)
+        realtime = getattr(self.hub, "ROUTER_REALTIME", None)
+        publish = getattr(realtime, "accept_devices_snapshot", None)
         if callable(publish):
-            publish("devices_snapshot", frame)
-
-    def _patch_wss_replay(self) -> None:
-        publisher = getattr(self.hub, "HUB_REALTIME_WEBSOCKET", None)
-        if publisher is None or getattr(publisher, "_device_snapshot_replay_patched", False):
-            return
-        original = publisher._send_initial_snapshots
-        service = self
-
-        def wrapped(this: Any, ws: Any, client: Any) -> None:
-            original(ws, client)
-            frame = service.snapshot()
-            if frame:
-                this._send(ws, client, this._frame("devices_snapshot", frame))
-
-        publisher._send_initial_snapshots = MethodType(wrapped, publisher)
-        publisher._device_snapshot_replay_patched = True
+            publish(frame)
 
     def snapshot(self) -> Dict[str, Any]:
         with self.lock:

@@ -91,6 +91,22 @@ fn now_epoch() -> u64 {
         .as_secs()
 }
 
+const MAX_PORTMAP_CLOCK_SKEW_SECONDS: u64 = 120;
+
+fn epoch_distance(left: u64, right: u64) -> u64 {
+    left.max(right) - left.min(right)
+}
+
+fn command_has_timed_rule(command: &Value) -> bool {
+    command
+        .get("payload")
+        .and_then(|value| value.get("rule"))
+        .and_then(|value| value.get("expiresAt"))
+        .and_then(Value::as_u64)
+        .map(|value| value > 0)
+        .unwrap_or(false)
+}
+
 fn arg_value(args: &[String], key: &str) -> Option<String> {
     args.iter()
         .position(|x| x == key)
@@ -1476,6 +1492,13 @@ async fn sync_portmaps(
         &format!("/api/router/portmaps/commands?router={}&limit=20", router),
     )
     .await?;
+    let local_epoch = now_epoch();
+    let server_epoch = root
+        .get("serverEpoch")
+        .or_else(|| root.get("serverTime"))
+        .and_then(Value::as_u64)
+        .unwrap_or(local_epoch);
+    let clock_skew_seconds = epoch_distance(local_epoch, server_epoch);
     let commands = root
         .get("commands")
         .and_then(Value::as_array)
@@ -1496,8 +1519,24 @@ async fn sync_portmaps(
                 }
                 _ => json!({"action":"invalid"}),
             };
-            let result = ctl_request(Path::new(&config.relay_socket), &local)
-                .unwrap_or_else(|e| json!({"ok":false,"error":e.to_string()}));
+            let result = if command_has_timed_rule(&command)
+                && clock_skew_seconds > MAX_PORTMAP_CLOCK_SKEW_SECONDS
+            {
+                json!({
+                    "ok": false,
+                    "errorCode": "clock_skew",
+                    "error": format!(
+                        "router clock differs from Hub by {} seconds; timed rule was not applied",
+                        clock_skew_seconds
+                    ),
+                    "clockSkewSeconds": clock_skew_seconds,
+                    "serverEpoch": server_epoch,
+                    "routerEpoch": local_epoch
+                })
+            } else {
+                ctl_request(Path::new(&config.relay_socket), &local)
+                    .unwrap_or_else(|e| json!({"ok":false,"error":e.to_string()}))
+            };
             acks.push(json!({"id":id,"ok":result.get("ok").and_then(Value::as_bool).unwrap_or(false),"result":result}));
         }
         post_json(
@@ -1690,7 +1729,15 @@ async fn sync_wireguard(
                     acks.push(json!({"id":id,"ok":true,"revision":revision,"result":value}));
                 }
                 Err(error) => {
-                    acks.push(json!({"id":id,"ok":false,"revision":revision,"result":{"ok":false,"error":error.to_string()}}));
+                    let error_text = format!("{error:#}");
+                    if action == "apply" && revision >= state.wireguard_revision {
+                        state.wireguard_apply_result = Some(json!({
+                            "ok": false,
+                            "revision": revision,
+                            "error": error_text.clone(),
+                        }));
+                    }
+                    acks.push(json!({"id":id,"ok":false,"revision":revision,"result":{"ok":false,"error":error_text}}));
                 }
             }
         }
@@ -1719,6 +1766,82 @@ async fn sync_wireguard(
     Ok(())
 }
 
+async fn tcp_session_ctl(config: &AgentConfig, request: Value) -> Value {
+    let socket_path = PathBuf::from(&config.relay_socket);
+    match tokio::task::spawn_blocking(move || ctl_request(&socket_path, &request)).await {
+        Ok(Ok(value)) => value,
+        Ok(Err(error)) => json!({"ok":false,"error":error.to_string()}),
+        Err(error) => json!({"ok":false,"error":format!("本地测试任务异常：{}", error)}),
+    }
+}
+
+async fn sync_tcp_session_test(client: &Client, config: &AgentConfig) -> Result<()> {
+    let router = url_encode(&config.router_name);
+    let root = get_json(
+        client,
+        config,
+        &format!("/api/router/tcp-session-test/commands?router={}&limit=5", router),
+    )
+    .await?;
+    let commands = root
+        .get("commands")
+        .and_then(Value::as_array)
+        .cloned()
+        .unwrap_or_default();
+    if !commands.is_empty() {
+        let mut acknowledgements = Vec::new();
+        for command in commands {
+            let command_id = command.get("id").and_then(Value::as_str).unwrap_or("");
+            let action = command.get("action").and_then(Value::as_str).unwrap_or("");
+            let payload = command.get("payload").cloned().unwrap_or_else(|| json!({}));
+            let local = match action {
+                "start" => json!({
+                    "action": "tcp_session_start",
+                    "taskId": payload.get("taskId").cloned().unwrap_or(Value::Null),
+                    "config": payload.get("config").cloned().unwrap_or(Value::Null),
+                }),
+                "stop" => json!({
+                    "action": "tcp_session_stop",
+                    "taskId": payload.get("taskId").cloned().unwrap_or(Value::Null),
+                }),
+                _ => json!({"action":"invalid"}),
+            };
+            let result = tcp_session_ctl(config, local).await;
+            acknowledgements.push(json!({
+                "id": command_id,
+                "ok": result.get("ok").and_then(Value::as_bool).unwrap_or(false),
+                "result": result,
+            }));
+        }
+        post_json(
+            client,
+            config,
+            "/api/router/tcp-session-test/ack",
+            &json!({"acks":acknowledgements}),
+        )
+        .await?;
+    }
+
+    if Path::new(&config.relay_socket).exists() {
+        let status = tcp_session_ctl(config, json!({"action":"tcp_session_status"})).await;
+        if status
+            .get("id")
+            .and_then(Value::as_str)
+            .map(|id| !id.is_empty())
+            .unwrap_or(false)
+        {
+            post_json(
+                client,
+                config,
+                "/api/router/tcp-session-test/status",
+                &status,
+            )
+            .await?;
+        }
+    }
+    Ok(())
+}
+
 async fn agent_cycle(client: &Client, config: &AgentConfig, state: &mut AgentState) -> Result<()> {
     let user_list = collect_user_list()?;
     let mut current = BTreeMap::new();
@@ -1741,6 +1864,29 @@ pub async fn run(args: &[String], once: bool) -> Result<()> {
     let mut last_agent_cycle_at = 0u64;
     let mut last_status_at = 0u64;
     log_line(&config, "INFO", "Rust agent started");
+    let _tcp_session_sync = if once {
+        None
+    } else {
+        let tcp_client = client.clone();
+        let tcp_config = config.clone();
+        Some(tokio::spawn(async move {
+            let mut last_error_log = 0u64;
+            loop {
+                if let Err(error) = sync_tcp_session_test(&tcp_client, &tcp_config).await {
+                    let now = now_epoch();
+                    if now.saturating_sub(last_error_log) >= 30 {
+                        log_line(
+                            &tcp_config,
+                            "WARN",
+                            &format!("TCP 峰值连接数测试同步暂时失败：{:#}", error),
+                        );
+                        last_error_log = now;
+                    }
+                }
+                sleep(Duration::from_secs(1)).await;
+            }
+        }))
+    };
     loop {
         let now = now_epoch();
         let was_unhealthy = !state.last_error.is_empty();
@@ -1749,6 +1895,13 @@ pub async fn run(args: &[String], once: bool) -> Result<()> {
         // slower full inventory cycle, so APP update/cleanup responds in 3–5 s.
         let status_due = once || last_status_at == 0 || now.saturating_sub(last_status_at) >= config.status_interval_seconds.clamp(3, 5);
         if status_due {
+            if once {
+                if let Err(error) = sync_tcp_session_test(&client, &config).await {
+                    let text = redact(&format!("TCP 峰值连接数测试同步：{:#}", error), &config.hook_token);
+                    log_limited(&config, &mut state, "WARN", "tcp-session-test", &text);
+                    errors.push(text);
+                }
+            }
             match sync_agent_update(&client, &config, &mut state).await {
                 Ok(_) => {}
                 Err(error) => log_limited(&config, &mut state, "WARN", "agent-command-check", &format!("agent command check skipped: {:#}", error)),

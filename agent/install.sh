@@ -62,6 +62,7 @@ esac
 TMP_DIR="/tmp/labrelay-install.$$"
 MANIFEST="$TMP_DIR/latest.json"
 DOWNLOADED_BINARY="$TMP_DIR/labrelay"
+DOWNLOADED_URL=""
 BACKUP_BINARY="$TMP_DIR/labrelay.backup"
 mkdir -p "$TMP_DIR"
 trap 'rm -rf "$TMP_DIR"' EXIT INT TERM
@@ -110,10 +111,45 @@ try_download_binary() {
   [ -n "$url" ] || return 1
   log "downloading $url"
   if http_get "$url" "$DOWNLOADED_BINARY" && is_labrelay_binary "$DOWNLOADED_BINARY"; then
+    DOWNLOADED_URL="$url"
     return 0
   fi
   rm -f "$DOWNLOADED_BINARY"
   return 1
+}
+
+# Verify the downloaded binary against the bundle checksums when they are
+# reachable. Missing checksums degrade to the historic verify-by-run behavior;
+# a mismatch aborts before anything is installed.
+verify_downloaded_binary() {
+  [ -n "$DOWNLOADED_URL" ] || return 0
+  if [ "${LABRELAY_SKIP_CHECKSUM:-0}" = "1" ]; then
+    log 'LABRELAY_SKIP_CHECKSUM=1 set; skipping sha256 verification'
+    return 0
+  fi
+  sums="$TMP_DIR/checksums.txt"
+  name="$(basename "$DOWNLOADED_URL")"
+  fetched=0
+  for sums_url in \
+    "${DOWNLOADED_URL%/*}/checksums.txt" \
+    "${HUB_URL%/}/agent/checksums.txt" \
+    "$REPOSITORY_ROOT/agent/checksums.txt" \
+    "$PUBLIC_FALLBACK_ROOT/agent/checksums.txt"; do
+    if http_get "$sums_url" "$sums" && [ -s "$sums" ]; then
+      fetched=1
+      break
+    fi
+  done
+  [ "$fetched" = 1 ] || { log 'checksums.txt unavailable; continuing without verification'; return 0; }
+  command -v sha256sum >/dev/null 2>&1 || fail '缺少 sha256sum，无法校验下载的二进制；可设置 LABRELAY_SKIP_CHECKSUM=1 跳过'
+  expected="$(grep -E "^[0-9a-fA-F]{64}[[:space:]]+\*?${name}([[:space:]]|\$)" "$sums" | head -n 1 | awk '{print $1}')"
+  if [ -z "$expected" ]; then
+    log "checksums.txt has no entry for $name; continuing without verification"
+    return 0
+  fi
+  actual="$(sha256sum "$DOWNLOADED_BINARY" | awk '{print $1}')"
+  [ "$actual" = "$expected" ] || fail "下载的二进制 sha256 校验失败（$actual != $expected）；未安装任何文件"
+  log "sha256 verified: $actual"
 }
 
 # Prefer a bundle-local binary. This keeps installation working even if the update server is unavailable.
@@ -184,6 +220,7 @@ else
   [ "$downloaded" = 1 ] || fail 'unable to download a runnable LabRelay binary; upload the complete agent bundle or repair /agent/latest.json'
 fi
 
+verify_downloaded_binary
 chmod 755 "$DOWNLOADED_BINARY"
 "$DOWNLOADED_BINARY" version >/dev/null 2>&1 || fail 'downloaded LabRelay binary cannot run on this router'
 
@@ -213,7 +250,10 @@ start_service() {
   procd_set_param respawn 5 5 0
   procd_set_param stdout 1
   procd_set_param stderr 1
-  procd_set_param limits nofile=4096 4096
+  # Keep the Relay process FD ceiling above the TCP test scale. Runtime guards
+  # still reserve 20% and stop earlier on conntrack, memory, source-port or CPU
+  # pressure, so raising RLIMIT_NOFILE does not bypass resource protection.
+  procd_set_param limits nofile=131072 131072
   procd_close_instance
 }
 EOF

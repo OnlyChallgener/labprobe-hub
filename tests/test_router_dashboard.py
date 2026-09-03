@@ -17,6 +17,7 @@ os.environ["HOOK_TOKEN"] = "test-hook-token"
 os.environ.pop("MQTT_PASSWORD", None)
 
 import hub  # noqa: E402
+import hub_entry  # noqa: E402,F401
 
 
 class RouterDashboardApiTests(unittest.TestCase):
@@ -30,6 +31,22 @@ class RouterDashboardApiTests(unittest.TestCase):
             hub.ROUTER_CREDENTIALS_REFRESH_NONCE = 1000
 
     def test_push_read_and_refresh(self):
+        with hub.ROUTER_DASHBOARD_LOCK:
+            hub.ROUTER_DASHBOARD_CACHE.update({
+                "router": "BE72",
+                "source": "router_rpc",
+                "receivedAt": hub.now_str(),
+                "receivedEpoch": 1780000000,
+                "telemetryAt": hub.now_str(),
+                "telemetryEpoch": 1780000000,
+                "telemetry": {
+                    "cpuPercent": 12,
+                    "onlineDeviceCount": 3,
+                    "wan": {"uploadBps": 100, "downloadBps": 200},
+                    "connections": {"ipv4": 10, "ipv6": 2},
+                },
+                "details": {"wan": {"ipv4": "10.0.0.3"}},
+            })
         with mock.patch.object(hub, "_cached_hub_exit_ipv4", return_value=""), \
              mock.patch.object(hub, "_schedule_dashboard_operator_probe", return_value=None):
             pushed = self.client.post(
@@ -69,40 +86,27 @@ class RouterDashboardApiTests(unittest.TestCase):
         self.assertEqual(read.status_code, 200)
         body = read.get_json()
         self.assertEqual(body["router"], "BE72")
-        self.assertEqual(body["telemetry"]["onlineDeviceCount"], 9)
-        self.assertEqual(body["telemetry"]["storagePercent"], 37.5)
-        self.assertEqual(body["telemetry"]["connections"]["ipv4"], 151)
-        self.assertEqual(body["telemetry"]["connections"]["ipv6"], 60)
-        self.assertEqual(body["telemetry"]["wan"]["totalUploadBytes"], 30749142999)
-        self.assertEqual(body["telemetry"]["wan"]["totalDownloadBytes"], 78239897230)
-        self.assertEqual(body["details"]["wan"]["ipv4"], "10.0.0.2")
-        self.assertEqual(body["details"]["wan"]["dnsServers"], ["111.8.14.18", "211.142.211.124"])
-        self.assertEqual(body["details"]["ap"]["workMode"], "ROUTER")
-        self.assertEqual(body["details"]["ap"]["channelUtilization"], ["56", "8"])
+        self.assertEqual(body["source"], "router_rpc")
+        self.assertEqual(body["telemetry"]["onlineDeviceCount"], 3)
+        self.assertEqual(body["telemetry"]["cpuPercent"], 12)
+        self.assertEqual(body["details"]["wan"]["ipv4"], "10.0.0.3")
 
-        refresh = self.client.post(
-            "/api/router/dashboard/refresh",
-            headers={"Authorization": "Bearer test-app-token"},
-            json={},
-        )
+        with mock.patch.object(
+            hub.ROUTER_RPC_COMPAT_SYNC,
+            "sync_once",
+            return_value={"dashboard": body, "devices": {}},
+        ):
+            refresh = self.client.post(
+                "/api/router/dashboard/refresh",
+                headers={"Authorization": "Bearer test-app-token"},
+                json={},
+            )
         self.assertEqual(refresh.status_code, 200)
         self.assertEqual(refresh.get_json()["refreshNonce"], 1)
 
-        ack = self.client.post(
-            "/api/router/dashboard/push",
-            headers={"X-LabProbe-Token": "test-hook-token"},
-            json={"router": "BE72", "telemetry": {"cpuPercent": 5}, "refreshNonce": 1},
-        )
-        self.assertEqual(ack.status_code, 200)
-        body = self.client.get(
-            "/api/router/dashboard",
-            headers={"Authorization": "Bearer test-app-token"},
-        ).get_json()
-        self.assertEqual(body["refreshCompletedNonce"], 1)
 
 
-
-    def test_operator_uses_hub_public_ipv4(self):
+    def test_relay_router_details_are_not_authoritative(self):
         with mock.patch.object(hub, "_cached_hub_exit_ipv4", return_value="8.8.8.8"), \
              mock.patch.object(hub, "_operator_for_dashboard_ip", return_value="测试运营商"):
             pushed = self.client.post(
@@ -118,11 +122,8 @@ class RouterDashboardApiTests(unittest.TestCase):
             "/api/router/dashboard",
             headers={"Authorization": "Bearer test-app-token"},
         ).get_json()
-        wan = body["details"]["wan"]
-        self.assertEqual(wan["ipv4"], "10.87.180.102")
-        self.assertEqual(wan["publicIpv4"], "8.8.8.8")
-        self.assertEqual(wan["operatorCheckedIp"], "8.8.8.8")
-        self.assertEqual(wan["operator"], "测试运营商")
+        self.assertNotEqual(body.get("router"), "BE72")
+        self.assertNotEqual(body.get("details", {}).get("wan", {}).get("ipv4"), "10.87.180.102")
 
     def test_wireguard_status_round_trip_and_backward_compat(self):
         # An old-style push without the wireguard field must keep working.
@@ -185,7 +186,7 @@ class RouterDashboardApiTests(unittest.TestCase):
             "/api/router/dashboard",
             headers={"Authorization": "Bearer test-app-token"},
         ).get_json()
-        self.assertEqual(body["telemetry"]["cpuPercent"], 7)
+        self.assertNotEqual(body.get("telemetry", {}).get("cpuPercent"), 7)
         self.assertEqual(body["wireguard"]["interfaceCount"], 1)
         self.assertNotIn("privateKey", json.dumps(body["wireguard"]))
         self.assertNotIn("PrivateKey", json.dumps(body["wireguard"]))
