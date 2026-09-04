@@ -2446,6 +2446,12 @@ def status_document() -> Dict[str, Any]:
     }
     state["vpnStunAddresses"] = vpn_addresses_list(state)
     state["vpnAddresses"] = state["vpnStunAddresses"]
+    stun_srv = globals().get("STUN_SERVICE")
+    if stun_srv is not None:
+        try:
+            state["stunRules"] = stun_srv.rows()
+        except Exception:
+            pass
     devices_state = load_json(DEVICES_FILE, {"updatedAt": None})
     state["devicesUpdatedAt"] = devices_state.get("updatedAt")
     if isinstance(state.get("hub"), dict):
