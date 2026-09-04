@@ -1107,6 +1107,25 @@ def upsert_vpn_address(name: Any, address: Any, source: str = "webhook") -> Tupl
     return item, old
 
 
+def resolve_placeholder_ipv6_address(addr: str, state: Optional[Dict[str, Any]] = None) -> str:
+    clean = clean_saved_value(addr)
+    if not clean:
+        return ""
+    low = clean.lower()
+    if low.startswith("ipv6:") or low.startswith("[ipv6]:"):
+        port = clean.split(":")[-1]
+        st = state if isinstance(state, dict) else load_json(STATE_FILE, {})
+        nas_v6 = (
+            clean_saved_value(st.get("nas", {}).get("exitIpv6"))
+            or clean_saved_value(st.get("nas", {}).get("ipv6"))
+            or clean_saved_value(st.get("router", {}).get("wanIpv6"))
+            or clean_saved_value(st.get("router", {}).get("exitIpv6"))
+        )
+        if nas_v6:
+            return f"[{nas_v6}]:{port}"
+    return clean
+
+
 def vpn_addresses_list(state: Optional[Dict[str, Any]] = None) -> List[Dict[str, Any]]:
     merged: Dict[str, Dict[str, Any]] = {}
     if isinstance(state, dict):
@@ -1115,19 +1134,19 @@ def vpn_addresses_list(state: Optional[Dict[str, Any]] = None) -> List[Dict[str,
             for k, item in vpn.items():
                 if isinstance(item, dict):
                     name = clean_saved_value(item.get("name")) or k
-                    addr = clean_vpn_address(item.get("address") or item.get("stun"))
+                    addr = resolve_placeholder_ipv6_address(clean_vpn_address(item.get("address") or item.get("stun")), state)
                     if addr:
                         merged[vpn_service_key(name)] = {"name": name, "address": addr, "stun": addr, "source": clean_saved_value(item.get("source")) or "state", "updatedAt": clean_saved_value(item.get("updatedAt"))}
         for legacy_key, default_name in [("luckyStun", "Lucky"), ("stun", "STUN")]:
             item = state.get(legacy_key)
             if isinstance(item, dict):
                 name = clean_saved_value(item.get("name")) or default_name
-                addr = clean_vpn_address(item.get("address") or item.get("stun") or item.get("publicAddress"))
+                addr = resolve_placeholder_ipv6_address(clean_vpn_address(item.get("address") or item.get("stun") or item.get("publicAddress")), state)
                 if addr:
                     merged.setdefault(vpn_service_key(name), {"name": name, "address": addr, "stun": addr, "source": clean_saved_value(item.get("source")) or "legacy", "updatedAt": clean_saved_value(item.get("updatedAt"))})
     for k, item in load_vpn_addresses().items():
         name = clean_saved_value(item.get("name")) or k
-        addr = clean_vpn_address(item.get("address") or item.get("stun"))
+        addr = resolve_placeholder_ipv6_address(clean_vpn_address(item.get("address") or item.get("stun")), state)
         if addr:
             merged[vpn_service_key(name)] = {"name": name, "address": addr, "stun": addr, "source": clean_saved_value(item.get("source")) or "webhook", "updatedAt": clean_saved_value(item.get("updatedAt"))}
     preferred = {"wireguard": 0, "openvpn": 1, "lucky": 2, "easytier": 3, "stun": 4}
@@ -1183,6 +1202,7 @@ def ensure_vpn_addresses_from_events(state: Dict[str, Any]) -> Dict[str, Any]:
         name, addr = vpn_address_from_event(e)
         if not name or not addr:
             continue
+        addr = resolve_placeholder_ipv6_address(addr, state)
         key = vpn_service_key(name)
         if key not in current or not clean_vpn_address(current.get(key, {}).get("address")):
             item, _ = upsert_vpn_address(name, addr, clean_saved_value(e.get("source")) or "event_repair")
@@ -4072,7 +4092,15 @@ def _api_portmaps_create():
             _queue_portmap_command("upsert", {"rule": rule}, reactivate=True)
 
         _mutate_portmap(rule["id"], create_operation)
-        add_event({"type": "portmap_created", "title": f"端口映射已创建：{rule['name']}", "name": rule["name"], "newValue": f"IPv6:{rule['listenPort']}"})
+        state = load_json(STATE_FILE, {})
+        nas_v6 = (
+            clean_saved_value(state.get("nas", {}).get("exitIpv6"))
+            or clean_saved_value(state.get("nas", {}).get("ipv6"))
+            or clean_saved_value(state.get("router", {}).get("wanIpv6"))
+            or clean_saved_value(state.get("router", {}).get("exitIpv6"))
+        )
+        endpoint_str = f"[{nas_v6}]:{rule['listenPort']}" if nas_v6 else f"IPv6:{rule['listenPort']}"
+        add_event({"type": "portmap_created", "title": f"端口映射已创建：{rule['name']}", "name": rule["name"], "newValue": endpoint_str})
         return jsonify({"ok": True, "rule": rule}), 201
     except Exception as e:
         return jsonify({"ok": False, "error": str(e)}), 400

@@ -1154,8 +1154,16 @@ def _portmap_create(executor, args, client_context) -> Dict[str, Any]:
     rows.append(rule)
     hub._save_portmap_rules(rows)
     hub._queue_portmap_command("upsert", {"rule": rule}, reactivate=True)
+    state = hub.load_json(hub.STATE_FILE, {})
+    nas_v6 = (
+        hub.clean_saved_value(state.get("nas", {}).get("exitIpv6"))
+        or hub.clean_saved_value(state.get("nas", {}).get("ipv6"))
+        or hub.clean_saved_value(state.get("router", {}).get("wanIpv6"))
+        or hub.clean_saved_value(state.get("router", {}).get("exitIpv6"))
+    )
+    endpoint_str = f"[{nas_v6}]:{rule['listenPort']}" if nas_v6 else f"IPv6:{rule['listenPort']}"
     hub.add_event({"type": "portmap_created", "title": f"端口映射已创建（AI）：{rule['name']}",
-                   "name": rule["name"], "newValue": f"IPv6:{rule['listenPort']}"})
+                   "name": rule["name"], "newValue": endpoint_str})
     return {"ok": True, "rule": _rule_view(rule, PORTMAP_VIEW_FIELDS),
             "message": (f"已创建端口映射：{rule['name']}"
                         f"（{rule['listenPort']} → {rule.get('targetIpv4')}:{rule.get('targetPort')}）")}
