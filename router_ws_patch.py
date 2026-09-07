@@ -31,10 +31,10 @@ MAX_ROUTER_RETRY_SECONDS = 2.0
 _MISSING = object()
 
 _FAST_WAN_INT_FIELDS = {
-    "uploadBps": ("up", "uploadBps", "upload_bps", "uploadSpeed", "upSpeed", "txSpeed"),
-    "downloadBps": ("down", "downloadBps", "download_bps", "downloadSpeed", "downSpeed", "rxSpeed"),
-    "totalUploadBytes": ("total_up", "totalUploadBytes", "totalUpload", "txBytes"),
-    "totalDownloadBytes": ("total_down", "totalDownloadBytes", "totalDownload", "rxBytes"),
+    "uploadBps": ("up", "uploadBps", "upload_bps", "uploadSpeed", "upSpeed"),
+    "downloadBps": ("down", "downloadBps", "download_bps", "downloadSpeed", "downSpeed"),
+    "totalUploadBytes": ("total_up", "totalUploadBytes", "totalUpload"),
+    "totalDownloadBytes": ("total_down", "totalDownloadBytes", "totalDownload"),
     "ipv4Connections": ("ipv4_connection_count", "ipv4Connections", "ipv4Conn", "v4Conn"),
     "ipv6Connections": ("ipv6_connection_count", "ipv6Connections", "ipv6Conn", "v6Conn"),
     "ipv4HalfConnections": ("ipv4_half_connection_count", "ipv4HalfConnections"),
@@ -190,8 +190,11 @@ def normalize_fast_message(message: Dict[str, Any]) -> Dict[str, Any]:
     sample: Dict[str, Any] = {}
     for target, keys in _FAST_WAN_INT_FIELDS.items():
         value = aggregate.get(target) if target in aggregate else _lookup_recursive(aggregate, keys)
-        if value is _MISSING:
-            value = _lookup_recursive(root, keys)
+        if value is _MISSING and isinstance(root, dict):
+            for key in keys:
+                if key in root and root.get(key) is not None:
+                    value = root.get(key)
+                    break
         number = _integer(value)
         if number is not _MISSING:
             sample[target] = number

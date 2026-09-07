@@ -43,3 +43,22 @@ def test_config_poll_interval_has_safe_floor(monkeypatch):
     assert _config_poll_seconds() == 10.0
     monkeypatch.setenv("ROUTER_CONFIG_POLL_SEC", "45")
     assert _config_poll_seconds() == 45.0
+
+
+def test_normalize_fast_message_does_not_extract_port_rates_as_wan_speed():
+    from router_ws_patch import normalize_fast_message
+
+    sample = normalize_fast_message({
+        "type": "fast",
+        "data": {
+            "ports": [
+                {"panel_name": "WAN", "txSpeed": 950000000, "rxSpeed": 475000000, "txBytes": 12345},
+            ],
+            "cpu_usage": 15,
+        }
+    })
+    assert "uploadBps" not in sample
+    assert "downloadBps" not in sample
+    assert "totalUploadBytes" not in sample
+    assert sample["cpuPercent"] == 15.0
+

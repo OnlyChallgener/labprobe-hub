@@ -61,7 +61,7 @@ def test_fast_stall_detection_uses_current_connection_only():
     )
     assert patch._fast_stream_stalled(monitor, now - 1, now) is False
     monitor._last_fast_at = now - patch.FAST_STALL_SECONDS - 0.1
-    assert patch._fast_stream_stalled(monitor, now - 10, now) is True
+    assert patch._fast_stream_stalled(monitor, now - 30, now) is True
 
 
 def test_run_connection_returns_quickly_when_fast_stream_is_silent(monkeypatch):

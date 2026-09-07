@@ -19,13 +19,13 @@ import websocket
 import router_lite_realtime_patch
 import router_ws_patch
 
-FAST_START_GRACE_SECONDS = 8.0
-FAST_STALL_SECONDS = 8.0
+FAST_START_GRACE_SECONDS = 15.0
+FAST_STALL_SECONDS = 15.0
 FAST_SOCKET_POLL_SECONDS = 1.0
 MAX_ROUTER_RETRY_SECONDS = 2.0
-DEVICE_DEMAND_TTL_SECONDS = 15.0
-ROUTER_STALE_MS = 12_000
-DEVICES_STALE_MS = 10_000
+DEVICE_DEMAND_TTL_SECONDS = 25.0
+ROUTER_STALE_MS = 18_000
+DEVICES_STALE_MS = 15_000
 
 
 def _fast_stream_stalled(monitor: Any, connected_at: float, now: float) -> bool:
