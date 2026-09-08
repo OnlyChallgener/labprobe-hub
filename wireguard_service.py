@@ -513,7 +513,12 @@ class WireGuardService:
                     raise ValueError("STUN Profile 需要独立的 UDP 穿透规则")
                 old_listen_port = _int(old.get("listenPort")) if old else 0
                 previous_listen_port = old_listen_port if old_listen_port and old_listen_port != listen_port else None
-                self._validate_stun_binding(stun_rule_id, listen_port, previous_listen_port)
+                try:
+                    self._validate_stun_binding(stun_rule_id, listen_port, previous_listen_port)
+                except ValueError as error:
+                    if str(error) == "STUN Profile 关联规则不存在" and old_profile is not None:
+                        continue
+                    raise
                 # STUN owns the public channel port; the router-native map
                 # forwards it to the Agent's fixed WireGuard listen port.
                 # WireGuard itself never binds the changing STUN port.

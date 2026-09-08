@@ -801,8 +801,12 @@ fn telemetry_from_fast(fast: &Value, online_devices: usize, cached_storage_perce
     let wan = object_path(fast, &["wan_stat", "wans"])
         .or_else(|| object_path(fast, &["wan_stat", "wan"]))
         .unwrap_or(&Value::Null);
-    let upload_raw = number(wan.get("up"));
-    let download_raw = number(wan.get("down"));
+    let upload_raw = number(wan.get("tx_rate_bps"))
+        .max(number(wan.get("tx_rate")))
+        .max(number(wan.get("up")));
+    let download_raw = number(wan.get("rx_rate_bps"))
+        .max(number(wan.get("rx_rate")))
+        .max(number(wan.get("down")));
     let total_upload_primary = first_number_by_keys(wan_primary, &["total_up", "total_upload", "totalTxBytes"]);
     let total_download_primary = first_number_by_keys(wan_primary, &["total_down", "total_download", "totalRxBytes"]);
     let total_upload = if total_upload_primary > 0.0 {

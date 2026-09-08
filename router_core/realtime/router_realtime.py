@@ -250,6 +250,11 @@ class RouterRealtimeEngine:
 
     def accept_router_slow(self, sample: Any, sample_epoch_ms: int = 0) -> None:
         """Merge slow eWeb fields such as storage without delaying APP refresh."""
+        if isinstance(sample, dict):
+            sample = {
+                k: v for k, v in sample.items()
+                if k not in {"uploadBps", "downloadBps", "ipv4Connections", "ipv6Connections", "cps"}
+            }
         self._accept_router_sample(sample, sample_epoch_ms, "router_eweb_ws_slow")
 
     def _accept_router_sample(self, sample: Any, sample_epoch_ms: int, source: str) -> None:

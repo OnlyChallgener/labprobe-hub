@@ -31,10 +31,30 @@ MAX_ROUTER_RETRY_SECONDS = 2.0
 _MISSING = object()
 
 _FAST_WAN_INT_FIELDS = {
-    "uploadBps": ("up", "uploadBps", "upload_bps", "uploadSpeed", "upSpeed", "txSpeed"),
-    "downloadBps": ("down", "downloadBps", "download_bps", "downloadSpeed", "downSpeed", "rxSpeed"),
-    "totalUploadBytes": ("total_up", "totalUploadBytes", "totalUpload", "txBytes"),
-    "totalDownloadBytes": ("total_down", "totalDownloadBytes", "totalDownload", "rxBytes"),
+    "uploadBps": (
+        "tx_rate_bps",
+        "tx_rate",
+        "upload_rate_bps",
+        "up",
+        "uploadBps",
+        "upload_bps",
+        "uploadSpeed",
+        "upSpeed",
+        "txSpeed",
+    ),
+    "downloadBps": (
+        "rx_rate_bps",
+        "rx_rate",
+        "download_rate_bps",
+        "down",
+        "downloadBps",
+        "download_bps",
+        "downloadSpeed",
+        "downSpeed",
+        "rxSpeed",
+    ),
+    "totalUploadBytes": ("tx_bytes", "total_up", "totalUploadBytes", "totalUpload", "txBytes"),
+    "totalDownloadBytes": ("rx_bytes", "total_down", "totalDownloadBytes", "totalDownload", "rxBytes"),
     "ipv4Connections": ("ipv4_connection_count", "ipv4Connections", "ipv4Conn", "v4Conn"),
     "ipv6Connections": ("ipv6_connection_count", "ipv6Connections", "ipv6Conn", "v6Conn"),
     "ipv4HalfConnections": ("ipv4_half_connection_count", "ipv4HalfConnections"),
@@ -190,12 +210,34 @@ def normalize_fast_message(message: Dict[str, Any]) -> Dict[str, Any]:
     sample: Dict[str, Any] = {}
     for target, keys in _FAST_WAN_INT_FIELDS.items():
         value = aggregate.get(target) if target in aggregate else _lookup_recursive(aggregate, keys)
-        if value is _MISSING:
+        if value is _MISSING and target in {"ipv4Connections", "ipv6Connections", "ipv4HalfConnections", "ipv6HalfConnections", "cps"}:
             value = _lookup_recursive(root, keys)
         number = _integer(value)
         if number is not _MISSING:
             sample[target] = number
 
+    for target, keys in _FAST_ROOT_INT_FIELDS.items():
+        number = _integer(_lookup_recursive(root, keys))
+        if number is not _MISSING:
+            sample[target] = number
+    for target, keys in _FAST_ROOT_NUMBER_FIELDS.items():
+        raw = _lookup_recursive(root, keys)
+        number = _percent(raw) if target in {"cpuPercent", "memoryPercent", "storagePercent"} else _number(raw)
+        if number is not _MISSING:
+            sample[target] = number
+    return sample
+
+
+def normalize_slow_message(message: Dict[str, Any]) -> Dict[str, Any]:
+    """Extract slow periodic metrics (storage, uptime, device count) from eWeb slow frame.
+
+    Slow frames must never emit uploadBps or downloadBps rates to prevent
+    cumulative historical byte counters from corrupting realtime traffic trends.
+    """
+    if not isinstance(message, dict):
+        return {}
+    root = _message_payload(message)
+    sample: Dict[str, Any] = {}
     for target, keys in _FAST_ROOT_INT_FIELDS.items():
         number = _integer(_lookup_recursive(root, keys))
         if number is not _MISSING:
@@ -407,7 +449,7 @@ class RouterWebSocketMonitor:
             return
         if message_type == "slow":
             epoch_ms = int(time.time() * 1000)
-            sample = normalize_fast_message(message)
+            sample = normalize_slow_message(message)
             if sample:
                 with self._fast_handler_lock:
                     handler = self._slow_handler

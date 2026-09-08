@@ -689,6 +689,22 @@ def test_server_toggle_enabled_state(tmp_path):
     assert latest_cmd["payload"]["server"]["enabled"] is False
 
 
+def test_prune_orphan_stun_profile_when_stun_rule_missing(tmp_path):
+    hub = _hub(tmp_path)
+    service = WireGuardService(hub)
+    saved = service.put(_server(), 0)
+    assert len(saved["server"]["endpointProfiles"]) == 2
+
+    # Delete the STUN rule from stun_rules.json
+    hub.save_json(Path(hub.DATA_DIR) / "stun_rules.json", {"revision": 1, "rules": []})
+
+    # When updating the server, the missing STUN profile is pruned gracefully
+    updated = service.put({"peers": []}, 1)
+    assert len(updated["server"]["endpointProfiles"]) == 1
+    assert updated["server"]["endpointProfiles"][0]["endpointSource"] == "ddns"
+
+
+
 
 
 
