@@ -2597,13 +2597,25 @@ def agent_status_for(router: str) -> Dict[str, Any]:
     return statuses.get(router, {}) if isinstance(statuses, dict) and isinstance(statuses.get(router), dict) else {}
 
 
+def _normalize_router_alias(name: str) -> str:
+    cleaned = clean_saved_value(name).casefold()
+    for prefix in ("ruijie-", "ruijie_", "ruijie ", "rg-", "rg_"):
+        if cleaned.startswith(prefix):
+            cleaned = cleaned[len(prefix):].strip("-_ ")
+    return cleaned.replace("-", "").replace("_", "").replace(" ", "")
+
+
 def resolve_agent_router(preferred: str) -> str:
     statuses = load_json(AGENT_STATUS_FILE, {})
     if not isinstance(statuses, dict):
         return preferred
     preferred = clean_saved_value(preferred)
-    if preferred and isinstance(statuses.get(preferred), dict):
+    now_epoch = time.time()
+    pref_status = statuses.get(preferred) if preferred and isinstance(statuses.get(preferred), dict) else None
+    pref_epoch = time_to_epoch(pref_status.get("lastSeenAt") or pref_status.get("time") or 0) if pref_status else 0
+    if pref_status and (now_epoch - pref_epoch) <= 180:
         return preferred
+
     reported = [
         (clean_saved_value(name), value)
         for name, value in statuses.items()
@@ -2611,12 +2623,27 @@ def resolve_agent_router(preferred: str) -> str:
     ]
     if not reported:
         return preferred
+
+    if preferred:
+        pref_norm = _normalize_router_alias(preferred)
+        for name, value in reported:
+            if _normalize_router_alias(name) == pref_norm:
+                c_epoch = time_to_epoch(value.get("lastSeenAt") or value.get("time") or 0)
+                if c_epoch > pref_epoch:
+                    return name
+
     online = sorted(
         reported,
         key=lambda item: time_to_epoch(item[1].get("lastSeenAt") or item[1].get("time") or 0),
         reverse=True,
     )
-    return online[0][0] if online else preferred
+    if online:
+        top_name, top_val = online[0]
+        top_epoch = time_to_epoch(top_val.get("lastSeenAt") or top_val.get("time") or 0)
+        if top_epoch > 0 and (pref_epoch == 0 or (now_epoch - pref_epoch > 600 and (now_epoch - top_epoch) <= 180)):
+            return top_name
+
+    return preferred if pref_status else (online[0][0] if online else preferred)
 
 
 def latest_agent_command(router: str, action: str = "update") -> Dict[str, Any]:
@@ -3591,7 +3618,10 @@ def _canonical_portmap_router(value: Any = "") -> str:
     canonical = clean_saved_value(primary_router_name()) or _portmap_router_name()
     candidate = clean_saved_value(value) or canonical or "router"
     if candidate.casefold() == "router" or (
-        canonical and candidate.casefold() == canonical.casefold()
+        canonical and (
+            candidate.casefold() == canonical.casefold()
+            or _normalize_router_alias(candidate) == _normalize_router_alias(canonical)
+        )
     ):
         return canonical or "router"
     return candidate

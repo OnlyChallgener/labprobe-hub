@@ -212,27 +212,38 @@ def install_labrelay_sync_patch(hub: Any) -> None:
         return value if isinstance(value, dict) else {}
 
     def presence(router: str = "") -> Dict[str, Any]:
-        router = router_name(router)
+        target = router_name(router)
+        if hasattr(hub, "resolve_agent_router"):
+            target = hub.resolve_agent_router(target)
         heartbeat: Dict[str, Any] = {}
+        target_norm = getattr(hub, "_normalize_router_alias", lambda x: str(x).lower())(target)
         for candidate_router, candidate in statuses().items():
-            if (
-                isinstance(candidate, dict)
-                and router_name(candidate_router) == router
-                and number(candidate.get("lastSeenEpoch")) >= number(heartbeat.get("lastSeenEpoch"))
-            ):
+            if not isinstance(candidate, dict):
+                continue
+            cand_norm = getattr(hub, "_normalize_router_alias", lambda x: str(x).lower())(candidate_router)
+            is_match = (router_name(candidate_router) == target or cand_norm == target_norm)
+            if is_match and number(candidate.get("lastSeenEpoch")) >= number(heartbeat.get("lastSeenEpoch")):
                 heartbeat = candidate
+        if not heartbeat and not router:
+            for candidate_router, candidate in statuses().items():
+                if isinstance(candidate, dict) and number(candidate.get("lastSeenEpoch")) >= number(heartbeat.get("lastSeenEpoch")):
+                    heartbeat = candidate
+                    target = candidate_router
         runtime = runtime_document()
-        same_router = router_name(runtime.get("router")) == router
+        same_router = (
+            router_name(runtime.get("router")) == target
+            or getattr(hub, "_normalize_router_alias", lambda x: str(x).lower())(runtime.get("router")) == target_norm
+        )
         heartbeat_seen = number(heartbeat.get("lastSeenEpoch"))
         runtime_seen = number(runtime.get("receivedEpoch")) if same_router else 0
         seen = max(heartbeat_seen, runtime_seen)
         now = int(time.time())
         age = max(0, now - seen) if seen else 0
-        online_grace = 12
-        stale_grace = 30
+        online_grace = 35
+        stale_grace = 90
         state = "online" if seen and age <= online_grace else ("stale" if seen and age <= stale_grace else "offline")
         return {
-            "router": router,
+            "router": target,
             "agentOnline": state == "online",
             "agentState": state,
             "agentLastSeenAt": clean(heartbeat.get("lastSeenAt") or runtime.get("receivedAt")),

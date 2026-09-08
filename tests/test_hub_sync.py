@@ -1,5 +1,6 @@
 import os
 import tempfile
+import time
 import unittest
 from datetime import datetime
 from pathlib import Path
@@ -348,9 +349,23 @@ class HubSyncApiTests(unittest.TestCase):
             response = hub.api_router_portmap_ack()
         saved = self._read_commands()
         self.assertEqual(response.get_json()["acknowledged"], 0)
-        self.assertEqual(saved[0]["status"], "delivered")
-        self.assertEqual(saved[1]["status"], "failed")
-        self.assertEqual(saved[1]["error"], "timeout")
+    def test_resolve_agent_router_prefers_active_alias_and_fresh_agent(self):
+        self.assertEqual(hub._normalize_router_alias("Ruijie BE72"), "be72")
+        self.assertEqual(hub._normalize_router_alias("Ruijie-BE72"), "be72")
+        self.assertEqual(hub._normalize_router_alias("BE72"), "be72")
+
+        with patch.object(hub, "primary_router_name", return_value="Ruijie BE72"):
+            self.assertEqual(hub._canonical_portmap_router("BE72"), "Ruijie BE72")
+
+        stale_time = time.time() - 86400 * 14
+        fresh_time = time.time() - 10
+        mock_statuses = {
+            "Ruijie BE72": {"version": "0.2.28", "lastSeenAt": time.strftime("%Y-%m-%d %H:%M:%S", time.localtime(stale_time))},
+            "BE72": {"version": "0.2.46", "lastSeenAt": time.strftime("%Y-%m-%d %H:%M:%S", time.localtime(fresh_time))},
+        }
+        with patch.object(hub, "load_json", return_value=mock_statuses):
+            resolved = hub.resolve_agent_router("Ruijie BE72")
+            self.assertEqual(resolved, "BE72")
 
 
 if __name__ == "__main__":

@@ -35,10 +35,19 @@ def _presence(hub: Any, router: str = "") -> Dict[str, Any]:
     if not isinstance(router_status, dict):
         router_status = {}
     target = hub.clean_saved_value(router or router_status.get("router") or hub.primary_router_name()) or "router"
+    if hasattr(hub, "resolve_agent_router"):
+        target = hub.resolve_agent_router(target)
     statuses = hub.load_json(hub.AGENT_STATUS_FILE, {})
     if not isinstance(statuses, dict):
         statuses = {}
     heartbeat = statuses.get(target) if isinstance(statuses.get(target), dict) else {}
+    if not heartbeat:
+        target_norm = getattr(hub, "_normalize_router_alias", lambda x: str(x).lower())(target)
+        for cand_name, cand_val in statuses.items():
+            if isinstance(cand_val, dict) and getattr(hub, "_normalize_router_alias", lambda x: str(x).lower())(cand_name) == target_norm:
+                heartbeat = cand_val
+                target = cand_name
+                break
     runtime_epoch = _epoch(router_status.get("receivedEpoch"))
     heartbeat_epoch = _epoch(heartbeat.get("lastSeenEpoch") or heartbeat.get("lastSeenAt"))
     seen_epoch = max(runtime_epoch, heartbeat_epoch)
