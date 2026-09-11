@@ -8,6 +8,7 @@ other or mutate the WireGuard kernel configuration revision.
 from __future__ import annotations
 
 import base64
+from contextlib import nullcontext
 import ipaddress
 import logging
 import re
@@ -240,6 +241,11 @@ class WireGuardService:
         return service
 
     @staticmethod
+    def _stun_lifecycle_lock(service: Any) -> Any:
+        lock = getattr(service, "lock", None)
+        return lock if hasattr(lock, "__enter__") else nullcontext()
+
+    @staticmethod
     def _wireguard_lan_firewall_rule(server: Dict[str, Any]) -> Dict[str, Any]:
         """Build the router-owned LAN forwarding rule for one WG server.
 
@@ -266,22 +272,23 @@ class WireGuardService:
     def _ensure_wireguard_lan_firewall(self, server: Dict[str, Any]) -> Dict[str, Any]:
         try:
             lifecycle = self._stun_lifecycle()
-            rule = self._wireguard_lan_firewall_rule(server)
-            firewall_id = rule["id"]
-            if not bool(server.get("enabled", True)):
-                lifecycle.remove_firewall(firewall_id)
-                return {"state": "not_required", "ruleId": firewall_id}
-            result = lifecycle.ensure_firewall(rule)
-            if _text(result.get("state")) == "verify_failed":
-                # A changed tunnel network is a desired-state change.  Recreate
-                # only when the lifecycle still owns the old fingerprint; a
-                # manual_change result is never removed or overwritten.
-                lifecycle.remove_firewall(firewall_id)
+            with self._stun_lifecycle_lock(lifecycle):
+                rule = self._wireguard_lan_firewall_rule(server)
+                firewall_id = rule["id"]
+                if not bool(server.get("enabled", True)):
+                    lifecycle.remove_firewall(firewall_id)
+                    return {"state": "not_required", "ruleId": firewall_id}
                 result = lifecycle.ensure_firewall(rule)
-            state = _text(result.get("state"))
-            if state != "ready":
-                logger.warning("WireGuard LAN firewall rule not ready: state=%s message=%s", state, result.get("message"))
-            return {**result, "ruleId": firewall_id, "sourceNetwork": rule["tunnelNetwork"]}
+                if _text(result.get("state")) == "verify_failed":
+                    # A changed tunnel network is a desired-state change. Recreate
+                    # only when the lifecycle still owns the old fingerprint; a
+                    # manual_change result is never removed or overwritten.
+                    lifecycle.remove_firewall(firewall_id)
+                    result = lifecycle.ensure_firewall(rule)
+                state = _text(result.get("state"))
+                if state != "ready":
+                    logger.warning("WireGuard LAN firewall rule not ready: state=%s message=%s", state, result.get("message"))
+                return {**result, "ruleId": firewall_id, "sourceNetwork": rule["tunnelNetwork"]}
         except Exception as error:
             logger.warning("WireGuard LAN firewall sync failed (non-fatal): %s", error)
             return {"state": "error", "message": str(error)}
@@ -291,7 +298,9 @@ class WireGuardService:
             return
         try:
             rule = self._wireguard_lan_firewall_rule(server)
-            self._stun_lifecycle().remove_firewall(rule["id"])
+            lifecycle = self._stun_lifecycle()
+            with self._stun_lifecycle_lock(lifecycle):
+                lifecycle.remove_firewall(rule["id"])
         except Exception as error:
             logger.warning("WireGuard LAN firewall removal failed (non-fatal): %s", error)
 
@@ -302,7 +311,9 @@ class WireGuardService:
                 old_id = self._wireguard_lan_firewall_rule(old_server)["id"]
             new_rule = self._wireguard_lan_firewall_rule(new_server)
             if old_id and old_id != new_rule["id"]:
-                self._stun_lifecycle().remove_firewall(old_id)
+                lifecycle = self._stun_lifecycle()
+                with self._stun_lifecycle_lock(lifecycle):
+                    lifecycle.remove_firewall(old_id)
         except Exception as error:
             logger.warning("WireGuard LAN firewall cleanup failed (non-fatal): %s", error)
         return self._ensure_wireguard_lan_firewall(new_server)
@@ -358,28 +369,31 @@ class WireGuardService:
     def _ensure_ddns_firewall(self, profile: Dict[str, Any], server: Dict[str, Any]) -> Dict[str, Any]:
         try:
             lifecycle = self._stun_lifecycle()
-            firewall_id = f"wireguard-ddns-{_text(profile.get('id'))}"
-            if not bool(server.get("enabled", True)) or not bool(profile.get("enabled", True)):
-                lifecycle.remove_firewall(firewall_id)
-                return {"state": "not_required", "ruleId": firewall_id}
-            rule = self._ddns_firewall_rule(profile, server)
-            result = lifecycle.ensure_firewall(rule)
-            if _text(result.get("state")) == "verify_failed":
-                # A previous LabProbe-owned rule may have a changed listen port;
-                # remove it through the fingerprinted lifecycle before recreating.
-                lifecycle.remove_firewall(firewall_id)
+            with self._stun_lifecycle_lock(lifecycle):
+                firewall_id = f"wireguard-ddns-{_text(profile.get('id'))}"
+                if not bool(server.get("enabled", True)) or not bool(profile.get("enabled", True)):
+                    lifecycle.remove_firewall(firewall_id)
+                    return {"state": "not_required", "ruleId": firewall_id}
+                rule = self._ddns_firewall_rule(profile, server)
                 result = lifecycle.ensure_firewall(rule)
-            state = _text(result.get("state"))
-            if state != "ready":
-                logger.warning("WireGuard DDNS firewall rule not ready: state=%s message=%s", state, result.get("message"))
-            return result
+                if _text(result.get("state")) == "verify_failed":
+                    # A previous LabProbe-owned rule may have a changed listen port;
+                    # remove it through the fingerprinted lifecycle before recreating.
+                    lifecycle.remove_firewall(firewall_id)
+                    result = lifecycle.ensure_firewall(rule)
+                state = _text(result.get("state"))
+                if state != "ready":
+                    logger.warning("WireGuard DDNS firewall rule not ready: state=%s message=%s", state, result.get("message"))
+                return result
         except Exception as error:
             logger.warning("WireGuard DDNS firewall sync failed (non-fatal): %s", error)
             return {"state": "error", "message": str(error)}
 
     def _remove_ddns_firewall(self, profile: Dict[str, Any]) -> None:
         try:
-            self._stun_lifecycle().remove_firewall(f"wireguard-ddns-{_text(profile.get('id'))}")
+            lifecycle = self._stun_lifecycle()
+            with self._stun_lifecycle_lock(lifecycle):
+                lifecycle.remove_firewall(f"wireguard-ddns-{_text(profile.get('id'))}")
         except Exception as error:
             logger.warning("WireGuard DDNS firewall removal failed (non-fatal): %s", error)
 
@@ -739,17 +753,19 @@ def create_wireguard_blueprint(hub: Any, service: WireGuardService) -> Blueprint
         if request.method == "GET":
             if not hub.check_read_token():
                 return jsonify({"ok": False, "error": "unauthorized"}), 401
-            document = service.document()
-            status = hub.load_json(service.status_path, {})
-            return jsonify({"ok": True, **document, "agentStatus": status if isinstance(status, dict) else {}, "lanForwarding": service.lan_forward_status(document.get("server"))})
+            with service.lock:
+                document = service.document()
+                status = hub.load_json(service.status_path, {})
+                return jsonify({"ok": True, **document, "agentStatus": status if isinstance(status, dict) else {}, "lanForwarding": service.lan_forward_status(document.get("server"))})
         if not hub.check_app_token():
             return jsonify({"ok": False, "error": "unauthorized"}), 401
         payload = request.get_json(silent=True) or {}
         expected = payload.get("expectedRevision")
         expected_revision = _int(expected) if expected is not None else None
         try:
-            document = service.delete(expected_revision) if request.method == "DELETE" else service.put(payload, expected_revision)
-            return jsonify({"ok": True, **document, "lanForwarding": service.lan_forward_status(document.get("server"))})
+            with service.lock:
+                document = service.delete(expected_revision) if request.method == "DELETE" else service.put(payload, expected_revision)
+                return jsonify({"ok": True, **document, "lanForwarding": service.lan_forward_status(document.get("server"))})
         except RuntimeError as error:
             return jsonify({"ok": False, "error": str(error), "currentRevision": service.document()["revision"]}), 409
         except Exception as error:

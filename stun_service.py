@@ -870,9 +870,10 @@ def create_stun_blueprint(hub: Any, service: StunService) -> Blueprint:
         if request.method == "GET":
             if not hub.check_read_token():
                 return jsonify({"ok": False, "error": "未授权"}), 401
-            doc = service._document()
-            status = service._status_record()
-            return jsonify({"ok": True, "rules": service.rows(), "revision": doc["revision"], "rulesUpdatedAt": doc["updatedAt"], "portRange": {"min": 20000, "max": 20020}, "agentOnline": _now() - _int(status.get("receivedEpoch"), 0) <= 35, "agentLastSeenAt": _text(status.get("receivedAt"))})
+            with service.lock:
+                doc = service._document()
+                status = service._status_record()
+                return jsonify({"ok": True, "rules": service.rows(), "revision": doc["revision"], "rulesUpdatedAt": doc["updatedAt"], "portRange": {"min": 20000, "max": 20020}, "agentOnline": _now() - _int(status.get("receivedEpoch"), 0) <= 35, "agentLastSeenAt": _text(status.get("receivedAt"))})
         if (denied := app_auth()) is not None:
             return denied
         try:
@@ -1038,9 +1039,10 @@ def create_stun_blueprint(hub: Any, service: StunService) -> Blueprint:
     def addresses(rule_id: str):
         if not hub.check_read_token():
             return jsonify({"ok": False, "error": "未授权"}), 401
-        if not any(_text(row.get("id")) == rule_id for row in service._document()["rules"]):
-            return jsonify({"ok": False, "error": "未找到 STUN 规则"}), 404
-        return jsonify({"ok": True, "id": rule_id, "addresses": service._history().get(rule_id, [])[:3]})
+        with service.lock:
+            if not any(_text(row.get("id")) == rule_id for row in service._document()["rules"]):
+                return jsonify({"ok": False, "error": "未找到 STUN 规则"}), 404
+            return jsonify({"ok": True, "id": rule_id, "addresses": service._history().get(rule_id, [])[:3]})
 
     @bp.get("/router/stun/commands")
     def agent_commands():

@@ -63,6 +63,22 @@ DATA_LOCK = threading.RLock()
 ROUTER_DASHBOARD_LOCK = threading.RLock()
 REFRESH_LOCK = threading.RLock()
 PORTMAP_MUTATION_LOCK = threading.RLock()
+
+# The request-wide lock exists for legacy load/modify/save handlers that do not
+# yet own a narrower service lock. Never hold it while a request streams or
+# waits for router/network I/O: one stalled operation would otherwise queue the
+# health check and every unrelated API behind it until the process is restarted.
+DATA_LOCK_REQUEST_TIMEOUT_SECONDS = 3.0
+DATA_LOCK_BYPASS_PREFIXES = (
+    "/api/ai/chat",
+    "/api/ai/notifications/stream",
+    "/api/stun",
+    "/api/router/stun",
+    "/api/wireguard",
+    "/api/router/wireguard",
+    "/api/tcp-session-test",
+    "/api/router/tcp-session-test",
+)
 REFRESH_RUNNING = False
 STATUS_REFRESH_TTL_SEC = int(os.environ.get("STATUS_REFRESH_TTL_SEC", "180"))
 STORE = SQLiteStore(DATA_DIR, BACKUPS_DIR, DB_PATH)
@@ -365,20 +381,39 @@ MQTT_PUBLISHER = MqttRevisionPublisher()
 MQTT_PUBLISHER.start()
 
 
+def request_uses_data_lock(path: str) -> bool:
+    """Return whether a request needs the legacy request-wide data lock."""
+    normalized = str(path or "")
+    if (
+        normalized.startswith("/api/router/dashboard")
+        or normalized.startswith("/api/router/realtime")
+        or normalized.startswith("/api/devices/realtime")
+        or normalized == "/api/realtime"
+        or normalized.startswith("/api/realtime/ws")
+    ):
+        return False
+    return not any(
+        normalized == prefix or normalized.startswith(prefix + "/")
+        for prefix in DATA_LOCK_BYPASS_PREFIXES
+    )
+
+
 @app.before_request
 def lock_request_data():
-    # High-frequency router telemetry uses a dedicated in-memory lock and must not
-    # block SQLite-backed device/event synchronization.
-    if (
-        request.path.startswith("/api/router/dashboard")
-        or request.path.startswith("/api/router/realtime")
-        or request.path.startswith("/api/devices/realtime")
-        or request.path == "/api/realtime"
-        or request.path.startswith("/api/realtime/ws")
-    ):
-        g.data_lock_acquired = False
+    # High-frequency telemetry and services with their own narrow locks must not
+    # be coupled to unrelated state synchronization.
+    g.data_lock_acquired = False
+    if not request_uses_data_lock(request.path):
         return
-    DATA_LOCK.acquire()
+    if not DATA_LOCK.acquire(timeout=DATA_LOCK_REQUEST_TIMEOUT_SECONDS):
+        LOGGER.error("request data lock timeout method=%s path=%s", request.method, request.path)
+        response = jsonify({
+            "ok": False,
+            "error": "HUB_DATA_BUSY",
+            "message": "Hub 数据操作繁忙，请稍后重试",
+        })
+        response.headers["Retry-After"] = "2"
+        return response, 503
     g.data_lock_acquired = True
 
 
