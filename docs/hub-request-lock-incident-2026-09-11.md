@@ -30,6 +30,7 @@
 - 2026-09-11：首次 GitHub CI 的 621 项 Hub 测试全部通过；随后发现 CI 仍校验旧 LabRelay `0.2.40`，已同步为仓库当前 `0.2.46` 后重新验证。
 - 2026-09-11：GitHub CI `34561666923` 全部通过：Hub 编译、621 项 Python 测试、版本约束、LabRelay 测试与构建、Hub Docker 镜像构建均成功。
 - 本地仅运行 Python 测试；不安装或运行 Android SDK、Gradle、模拟器。Android 与镜像构建交由 GitHub Actions。
+- 2026-09-11：测试发布 `test-bundle/wg-stun-native-20260911` 完成。GitHub Test Bundle `34568223251` 通过并发布 Hub 预发布包、LabRelay ARM64 包；Hub 多架构测试镜像为 `onlychallgener/labprobe-hub:test-wg-stun-native-20260911`，镜像索引摘要：`sha256:3ba3a1bee534172bf937d4c3ec195bdfeed9c9e0425b74e0f58b9a3bd8fdc840`。
 
 ## 部署观察
 
