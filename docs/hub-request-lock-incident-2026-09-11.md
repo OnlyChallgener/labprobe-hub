@@ -27,6 +27,7 @@
 - `tests/test_request_lock_isolation.py`：覆盖隔离路径、路径边界、普通接口仍串行，以及锁被占用时的有界 503。
 - `tests/test_stun_service.py`、`tests/test_wireguard_service.py`：覆盖规则增删改、回滚、端口联动、防火墙生命周期及并发修订。
 - 2026-09-11：上述定向测试共 82 项通过；完整 Python 测试共 621 项通过；`py_compile` 与 Git 差异检查通过。
+- 2026-09-11：首次 GitHub CI 的 621 项 Hub 测试全部通过；随后发现 CI 仍校验旧 LabRelay `0.2.40`，已同步为仓库当前 `0.2.46` 后重新验证。
 - 本地仅运行 Python 测试；不安装或运行 Android SDK、Gradle、模拟器。Android 与镜像构建交由 GitHub Actions。
 
 ## 部署观察
