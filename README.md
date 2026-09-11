@@ -4,6 +4,23 @@ LabProbe Hub 可部署在任意 Linux AMD64/ARM64 宿主机，包括服务器、
 
 版本变化统一记录在 [`CHANGELOG.md`](CHANGELOG.md)。旧 DSM/NAS 部署文档和旧 Shell 采集入口已归档到 Git 历史，请勿用于新安装。
 
+## 客户端联动效果 (LabProbe Android App)
+
+LabProbe Hub 与 [LabProbeApp](https://github.com/OnlyChallgener/LabProbeApp) Android 客户端深度协同，提供端到端的家庭网络遥测、STUN 穿透联动与智能运维能力：
+
+<div align="center">
+
+| 路由器状态与 15 分钟实时动态走势 | 智能 AI 助手与设备运维交互 |
+| :---: | :---: |
+| <img src="docs/images/screenshot_router_status.png" width="320" alt="路由器状态与趋势走势" /> | <img src="docs/images/screenshot_ai_assistant.png" width="320" alt="AI 对话交互" /> |
+| **实时硬件遥测、温度/连接数与 15 分钟平滑流量走势** | **自然语言查询状态与引导路由器 TCP 峰值压测** |
+
+| 极客网络工具箱与双栈状态 | 转发、穿透、WireGuard 与深度诊断 |
+| :---: | :---: |
+| <img src="docs/images/screenshot_toolbox.png" width="320" alt="工具箱与网络检测" /> | <img src="docs/images/screenshot_features.png" width="320" alt="转发穿透与高级配置" /> |
+| **双栈出口、运营商检测、NAT 类型与网络工具** | **STUN 穿透联动防火墙、WireGuard 多模式漫游** |
+
+</div>
 
 ## 运行目录
 
