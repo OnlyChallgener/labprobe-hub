@@ -12,9 +12,6 @@ RELAY_CONFIG="$INSTALL_DIR/relay.json"
 INIT_SCRIPT="/etc/init.d/labprobe"
 TMP_BIN="/tmp/labrelay.new"
 TMP_SUM="/tmp/labrelay.new.sha256"
-LOCAL_BINARY="${LABRELAY_BINARY:-}"
-LOCAL_BINARY_SOURCE=""
-[ -n "$LOCAL_BINARY" ] && LOCAL_BINARY_SOURCE="LABRELAY_BINARY"
 UPDATE_ROOT="${LABPROBE_UPDATE_ROOT:-https://lab.net86.dynv6.net:27772}"
 case "${LABPROBE_AGENT_BASE:-$UPDATE_ROOT}" in
   */releases/download/*) AGENT_BASE="${LABPROBE_AGENT_BASE:-${UPDATE_ROOT%/}}" ;;
@@ -165,54 +162,6 @@ download_binary() {
   chmod 0755 "$TMP_BIN"
 }
 
-resolve_local_binary() {
-  [ -n "$LOCAL_BINARY" ] && return 0
-
-  script_dir="$(CDPATH= cd "$(dirname "$0")" 2>/dev/null && pwd || echo /tmp)"
-  for candidate in \
-    "$script_dir/labrelay-linux-$ARCH" \
-    "$script_dir/labrelay-$ARCH-musl" \
-    "$script_dir/labrelay-aarch64-musl" \
-    "$script_dir/labrelay-linux-aarch64" \
-    "/tmp/labrelay-linux-$ARCH" \
-    "/tmp/labrelay-$ARCH-musl" \
-    "/tmp/labrelay-aarch64-musl" \
-    "/tmp/labrelay-linux-aarch64"; do
-    [ -f "$candidate" ] || continue
-    [ -s "$candidate" ] || continue
-    chmod 0755 "$candidate" 2>/dev/null || continue
-    candidate_version="$("$candidate" version 2>/dev/null || "$candidate" --version 2>/dev/null || true)"
-    [ -n "$candidate_version" ] || continue
-
-    LOCAL_BINARY="$candidate"
-    case "$candidate" in
-      "$script_dir"/*) LOCAL_BINARY_SOURCE="安装脚本同目录" ;;
-      /tmp/*) LOCAL_BINARY_SOURCE="/tmp 本地安装包" ;;
-      *) LOCAL_BINARY_SOURCE="本地安装包" ;;
-    esac
-    say "发现本地 Rust Agent：$candidate（$candidate_version）"
-    return 0
-  done
-}
-
-prepare_binary() {
-  if [ -n "$LOCAL_BINARY" ]; then
-    [ -f "$LOCAL_BINARY" ] || fail "指定的本地 Rust Agent 不存在：$LOCAL_BINARY"
-    [ -s "$LOCAL_BINARY" ] || fail "指定的本地 Rust Agent 为空：$LOCAL_BINARY"
-    say "使用本地 Rust Agent：$LOCAL_BINARY（来源：${LOCAL_BINARY_SOURCE:-本地文件}）"
-    rm -f "$TMP_BIN" "$TMP_SUM"
-    cp "$LOCAL_BINARY" "$TMP_BIN" || fail "复制本地 Rust Agent 失败：$LOCAL_BINARY"
-    chmod 0755 "$TMP_BIN"
-    local_version="$("$TMP_BIN" version 2>/dev/null || "$TMP_BIN" --version 2>/dev/null || true)"
-    [ -n "$local_version" ] || fail "指定的本地文件不是可运行的 LabRelay：$LOCAL_BINARY"
-    actual="$(sha256sum "$TMP_BIN" | awk '{print $1}')"
-    say "本地 Rust Agent 已校验：$local_version"
-    say "本地 Rust Agent SHA256：$actual"
-    return 0
-  fi
-  download_binary
-}
-
 backup_old() {
   rm -f /tmp/labprobe-cron.old /tmp/labprobe-cron.new
   stamp="$(date +%Y%m%d%H%M%S)"; BACKUP="$INSTALL_DIR/backups/$stamp"; mkdir -p "$BACKUP"
@@ -244,10 +193,6 @@ cleanup_legacy() {
       mv "$old_init" "$BACKUP/$service.legacy-init"
     fi
   done
-  # Some vendor/OpenWrt builds leave stale rc.d links after disable.
-  # Remove only legacy services; keep the unified /etc/init.d/labprobe links.
-  rm -f /etc/rc.d/S??labrelay /etc/rc.d/K??labrelay \
-    /etc/rc.d/S??labrelay_agent /etc/rc.d/K??labrelay_agent
   # The unified service has not started yet, so any remaining labrelay process
   # belongs to a legacy init/script and must not survive the migration.
   killall labrelay >/dev/null 2>&1 || true
@@ -271,14 +216,10 @@ USE_PROCD=1
 start_service() {
   mkdir -p /tmp/labprobe
   procd_open_instance relay
-  # The BE72 vendor procd keeps the inherited hard FD ceiling unless the root
-  # shell raises it immediately before exec. The daemon accepts the union of
-  # PortMap/IPv6 20000-29999 and STUN local channels 30000-32767.
-  procd_set_param command /bin/sh -c 'ulimit -Hn 131072 2>/dev/null || true; ulimit -Sn 131072 2>/dev/null || true; exec /usr/bin/labrelay daemon --config /etc/labprobe/relay.json --socket /tmp/labrelay.sock --state /tmp/labprobe/relay-state.json --port-min 20000 --port-max 32767 --lan-if br-lan'
+  procd_set_param command /usr/bin/labrelay daemon --config /etc/labprobe/relay.json --socket /tmp/labrelay.sock --state /tmp/labprobe/relay-state.json
   procd_set_param respawn 3600 5 5
   procd_set_param stdout 1
   procd_set_param stderr 1
-  procd_set_param limits nofile="131072 131072"
   procd_close_instance
 
   procd_open_instance agent
@@ -304,23 +245,14 @@ rollback() {
     old_name="$(basename "$legacy" .legacy)"
     mv "$legacy" "$INSTALL_DIR/$old_name"
   done
-  if [ "${HAD_OLD_INIT:-0}" = "1" ]; then
-    # We upgraded from the unified labprobe service. Never resurrect legacy
-    # split labrelay/labrelay_agent services during rollback, otherwise procd
-    # will run two daemons and two agents against the same socket/ports.
-    rm -f /etc/init.d/labrelay /etc/init.d/labrelay_agent       /etc/rc.d/S??labrelay /etc/rc.d/K??labrelay       /etc/rc.d/S??labrelay_agent /etc/rc.d/K??labrelay_agent
-  else
-    # First migration from the legacy split services: restore them only when
-    # no unified labprobe service existed before the failed install.
-    for legacy_init in "$BACKUP"/*.legacy-init; do
-      [ -f "$legacy_init" ] || continue
-      old_name="$(basename "$legacy_init" .legacy-init)"
-      mv "$legacy_init" "/etc/init.d/$old_name"
-      chmod 0755 "/etc/init.d/$old_name"
-      "/etc/init.d/$old_name" enable >/dev/null 2>&1 || true
-      "/etc/init.d/$old_name" start >/dev/null 2>&1 || true
-    done
-  fi
+  for legacy_init in "$BACKUP"/*.legacy-init; do
+    [ -f "$legacy_init" ] || continue
+    old_name="$(basename "$legacy_init" .legacy-init)"
+    mv "$legacy_init" "/etc/init.d/$old_name"
+    chmod 0755 "/etc/init.d/$old_name"
+    "/etc/init.d/$old_name" enable >/dev/null 2>&1 || true
+    "/etc/init.d/$old_name" start >/dev/null 2>&1 || true
+  done
   [ -x "$INIT_SCRIPT" ] && "$INIT_SCRIPT" restart >/dev/null 2>&1 || true
   command_ack "failed" "安装失败：$INSTALL_STAGE"
   exit 1
@@ -342,30 +274,6 @@ wait_for_relay() {
     sleep 1
     attempt=$((attempt + 1))
   done
-  return 1
-}
-
-verify_relay_nofile() {
-  for pid in $(pidof labrelay 2>/dev/null); do
-    [ -r "/proc/$pid/cmdline" ] || continue
-    cmdline="$(tr '\000' ' ' < "/proc/$pid/cmdline" 2>/dev/null)"
-    case "$cmdline" in
-      *" labrelay daemon "*|*"/labrelay daemon "*)
-        soft="$(awk '/Max open files/ {print $4; exit}' "/proc/$pid/limits" 2>/dev/null)"
-        hard="$(awk '/Max open files/ {print $5; exit}' "/proc/$pid/limits" 2>/dev/null)"
-        case "$soft:$hard" in
-          *[!0-9:]*|:*) return 1 ;;
-        esac
-        if [ "$soft" -ge 65536 ] && [ "$hard" -ge 65536 ]; then
-          say "Relay FD 上限已生效：soft=$soft hard=$hard"
-          return 0
-        fi
-        say "Relay FD 上限未生效：soft=$soft hard=$hard"
-        return 1
-        ;;
-    esac
-  done
-  say "未找到 Relay daemon 进程，无法校验 FD 上限"
   return 1
 }
 
@@ -393,53 +301,30 @@ uninstall_agent() {
 
 [ "$ACTION" = "uninstall" ] && uninstall_agent
 need_root
+ask_yes "是否安装 LabProbe Rust Agent？[Y/n]" Y || exit 0
 detect_arch
-resolve_local_binary
 check_router
+discover_hub
+say "自动发现 Hub：$HUB_URL"
+ask_yes "自动发现的 Hub 是否正确？[Y/n]" Y || fail "已取消；请设置 HUB_URL 后重试"
 
 HOOK_TOKEN_INPUT="${HOOK_TOKEN:-}"
-if [ "$ACTION" = "upgrade" ]; then
-  [ -s "$CONFIG" ] || fail "upgrade 需要现有 $CONFIG；首次安装请使用 install"
-  [ -x "$BIN" ] || fail "upgrade 需要现有 $BIN；首次安装请使用 install"
-  SAVED_HUB_URL="$(sed -n 's/.*"hubUrl"[[:space:]]*:[[:space:]]*"\([^"]*\)".*/\1/p' "$CONFIG" | head -n1)"
-  HUB_URL="${HUB_URL:-$SAVED_HUB_URL}"
-  [ -n "$HUB_URL" ] || fail "现有 Agent 配置缺少 hubUrl，无法执行就地升级"
-  case "$HUB_URL" in
-    http://*|https://*) ;;
-    *) fail "现有 Agent hubUrl 无效：$HUB_URL" ;;
-  esac
-  # Upgrade is intentionally non-destructive: keep the existing Agent config
-  # and only replace the binary/service definition, then run health checks.
-  HOOK_TOKEN_INPUT=""
-  say "升级模式：保留现有 Agent 配置，不重新注册；Hub=$HUB_URL"
-else
-  ask_yes "是否安装 LabProbe Rust Agent？[Y/n]" Y || exit 0
-  discover_hub
-  say "自动发现 Hub：$HUB_URL"
-  ask_yes "自动发现的 Hub 是否正确？[Y/n]" Y || fail "已取消；请设置 HUB_URL 后重试"
-
-  if [ "$ACTION" = "install" ] || [ "$ACTION" = "configure" ] || ! grep -q '"hookToken"[[:space:]]*:' "$CONFIG" 2>/dev/null; then
-    if [ -z "$HOOK_TOKEN_INPUT" ]; then
-      printf "请输入 Hub HOOK_TOKEN："; read HOOK_TOKEN_INPUT || HOOK_TOKEN_INPUT=""
-    fi
-    [ -n "$HOOK_TOKEN_INPUT" ] || fail "HOOK_TOKEN 不能为空"
+if [ "$ACTION" = "install" ] || [ "$ACTION" = "configure" ] || ! grep -q '"hookToken"[[:space:]]*:' "$CONFIG" 2>/dev/null; then
+  if [ -z "$HOOK_TOKEN_INPUT" ]; then
+    printf "请输入 Hub HOOK_TOKEN："; read HOOK_TOKEN_INPUT || HOOK_TOKEN_INPUT=""
   fi
-
-  say "架构=$ARCH，Hub=$HUB_URL，将安装采集、事件、IPv6、端口映射、重试、日志和开机自启"
-  ask_yes "确认安装？[Y/n]" Y || exit 0
+  [ -n "$HOOK_TOKEN_INPUT" ] || fail "HOOK_TOKEN 不能为空"
 fi
+
+say "架构=$ARCH，Hub=$HUB_URL，将安装采集、事件、IPv6、端口映射、重试、日志和开机自启"
+ask_yes "确认安装？[Y/n]" Y || exit 0
 
 mkdir -p "$INSTALL_DIR/backups" /tmp/labprobe
 INSTALL_STAGE="备份现有 Agent"
 backup_old
 prune_backups
-if [ -n "$LOCAL_BINARY" ]; then
-  INSTALL_STAGE="校验本地 ARM64 Agent"
-else
-  INSTALL_STAGE="下载并校验 ARM64 Agent"
-  say "未发现可用本地安装包，改用更新仓库：$AGENT_BASE"
-fi
-prepare_binary
+INSTALL_STAGE="下载并校验 ARM64 Agent"
+download_binary
 [ -x "$INIT_SCRIPT" ] && "$INIT_SCRIPT" stop >/dev/null 2>&1 || true
 INSTALL_STAGE="替换 Agent 程序"
 cp "$TMP_BIN" "$BIN" || rollback
@@ -465,8 +350,6 @@ INSTALL_STAGE="启动 Relay 与 Agent 服务"
 "$INIT_SCRIPT" start >/tmp/labprobe/service-start.log 2>&1 || { show_stage_log /tmp/labprobe/service-start.log; rollback; }
 INSTALL_STAGE="等待 Relay 控制套接字"
 wait_for_relay || { show_stage_log /tmp/labprobe/service-start.log; rollback; }
-INSTALL_STAGE="校验 Relay FD 上限"
-verify_relay_nofile || { show_stage_log /tmp/labprobe/service-start.log; rollback; }
 INSTALL_STAGE="校验 Hub 连通性"
 wait_for_hub || { show_stage_log /tmp/labprobe/install-test.log; rollback; }
 if [ "$0" != "$INSTALL_DIR/labprobe-install.sh" ]; then
@@ -474,11 +357,7 @@ if [ "$0" != "$INSTALL_DIR/labprobe-install.sh" ]; then
   cp "$0" "$INSTALL_DIR/labprobe-install.sh" || rollback
 fi
 chmod 0755 "$INSTALL_DIR/labprobe-install.sh"
-if [ "$ACTION" = "upgrade" ]; then
-  say "升级完成"
-else
-  say "安装完成"
-fi
+say "安装完成"
 "$BIN" status --config "$CONFIG"
 say "诊断：labrelay doctor / status / test-hub"
 command_ack "completed" "Agent 已升级并通过 Relay 与 Hub 校验"

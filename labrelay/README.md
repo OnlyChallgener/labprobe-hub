@@ -1,41 +1,45 @@
-# LabRelay v0.2.4
+# LabRelay (Rust Router Agent & Relay Daemon)
 
-面向 LabProbe / 极客网探的轻量 Rust 四层 TCP 反代服务。
+LabRelay 是运行在已适配路由器（如锐捷 ReyeeOS / OpenWrt aarch64 等）上的高性能纯 Rust 采集代理与中继守护进程。
 
-## 第一版范围
+---
 
-- 公网 IPv6 TCP → 内网 IPv4（6→4）
-- 公网 IPv6 TCP → 内网 IPv6（6→6）
-- 6→6 完整 IPv6、MAC + IPv6 后缀动态匹配
-- 多规则、启停、编辑、自动到期
-- 最大连接数、空闲超时、当前连接数、上下行字节统计
-- Unix Socket 结构化控制
-- 不支持 UDP、4→4、HTTP Host/SNI、TLS 解密
-- 不修改防火墙
+## 核心架构
 
-## 路由器要求
+- **`labrelay daemon`**：统一管理本地 UNIX Domain Socket (`/tmp/labrelay.sock`) 与状态文件 (`/tmp/labprobe/relay-state.json`)，承载本地穿透转发、双栈连接管理与秒级 TCP 峰值压测。
+- **`labrelay agent`**：轻量级后台采集进程，定时与事件驱动采集终端清单 (`dev_sta/user_list`)、网口速率、WAN6 前缀与系统负载，通过 `HOOK_TOKEN` 上报 Hub。
+- **系统级自愈**：由 OpenWrt `procd` 统一托管自启 (`/etc/init.d/labprobe`)，内存极低（< 15MB），断网与路由器重启后秒级自动重连。
 
-- Linux aarch64
-- `ip`、`curl`、OpenWrt `procd`
-- 手动放行 WAN6 → 路由器 INPUT TCP 20000–20020
+---
 
-## Agent 配置
+## 快速安装与配置
 
-LabRelay 直接使用 Hub 的 `HOOK_TOKEN`：
+在路由器 SSH 终端中执行一键安装脚本：
 
 ```sh
-labrelay configure --hub http://192.168.1.20:58443 --hook-token YOUR_HOOK_TOKEN --name router
+# 格式：sh install.sh <HUB_URL> <HOOK_TOKEN> [ROUTER_NAME]
+wget -O /tmp/install.sh http://<你的Hub地址>:58443/agent/install.sh
+sh /tmp/install.sh http://<你的Hub地址>:58443 YOUR_HOOK_TOKEN router
+```
+
+配置文件路径：`/etc/labprobe/agent.json`。
+
+---
+
+## 常用运维命令
+
+```sh
+# 1. 验证与 Hub 的通信连通性及鉴权
 labrelay test-hub
+
+# 2. 查看当前 Agent 采集状态与设备列表
+labrelay status
+
+# 3. 本地中继与连通性自检
+labrelay doctor
+
+# 4. 平滑热升级（保留现有配置）
+sh /etc/labprobe/install.sh upgrade
 ```
 
-配置文件中的字段名为 `hookToken`，默认路径为 `/etc/labprobe/agent.json`。
-## 本机测试
-
-```sh
-cargo run -- daemon --config ./relay.json --socket /tmp/labrelay-test.sock --state /tmp/labrelay-state.json
-cargo run -- ctl --socket /tmp/labrelay-test.sock '{"action":"status"}'
-```
-
-## 编译 BE72 静态程序
-
-GitHub Actions 运行 `Build LabRelay Router Binary`，下载 `labrelay-linux-arm64（v0.2.4）`。
+详细多端协同安装与升级说明请参阅 [`INSTALL_AND_UPDATE_GUIDE.md`](../INSTALL_AND_UPDATE_GUIDE.md)。
