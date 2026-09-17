@@ -103,8 +103,8 @@ jobs:
           file "$OUT/labrelay-linux-arm64" > "$RUNNER_TEMP/labrelay-file.txt"
           grep -Eqi 'aarch64|ARM aarch64|ARM64' "$RUNNER_TEMP/labrelay-file.txt"
           sh -n "$OUT/install.sh"
-          grep -q "ulimit -Hn 131072" "$OUT/install.sh"
-          grep -q "procd_set_param limits nofile=\"131072 131072\"" "$OUT/install.sh"
+          grep -q "ulimit -n 131072" "$OUT/install.sh"
+          grep -q 'procd_set_param limits nofile="131072 131072"' "$OUT/install.sh"
           python3 - <<'PY'
           import hashlib
           import json
