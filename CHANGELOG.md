@@ -1,5 +1,12 @@
 # LabProbe 变更记录
 
+## 0.13.2 / LabRelay 0.2.48
+
+- **修复 Hub 容器无限重启**：`hub.py` 在模块顶层导入的 `child_guard_service.py` 从未被加入镜像（Dockerfile 用的是手工维护的逐行 `COPY` 白名单），容器启动即 `ModuleNotFoundError`，在 `restart: unless-stopped` 下无限重启。
+- **镜像与仓库不再漂移**：根级模块改为 `COPY *.py /app/` 整目录带入，新增模块不再需要手工登记，从结构上消除这一类漏拷。
+- **构建期暴露缺失**：新增 `scripts/docker_preflight.py`，在镜像构建阶段解析 `hub_entry.py` / `hub.py` 的全部导入并逐个断言可解析；编译范围由手工清单改为 `compileall` 全量覆盖。此前语法检查通过但文件缺失，三层防护全部漏过，现在这类问题会让构建直接失败。
+- **发布流程**：CI 与镜像工作流的触发分支补上实际开发分支，修正镜像 tag 仍停留在 0.12.2 的陈旧配置。
+
 ## 0.13.1 / LabRelay 0.2.48
 
 - **发布修复**：补齐儿童上网 Phase 2A 的 Android 预览调用与 LabRelay Rust 类型推断，确保测试发布可以完成编译。

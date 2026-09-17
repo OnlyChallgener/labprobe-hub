@@ -6,12 +6,14 @@ on:
     branches:
       - main
       - refactor/router-core-v1
+      - codex/child-internet
     tags:
       - 'v*'
   pull_request:
     branches:
       - main
       - refactor/router-core-v1
+      - codex/child-internet
 
 concurrency:
   group: hub-ci-${{ github.ref }}
@@ -38,19 +40,13 @@ jobs:
         run: pip install --disable-pip-version-check -r requirements.txt pytest
 
       - name: Compile Hub sources
+        # Compile everything that ships instead of a hand-written list.  The old
+        # list was missing child_guard_service.py, which is how a module that
+        # hub.py imports at module scope reached production uncompiled and
+        # unverified.
         run: |
-          python -m py_compile \
-            hub.py hub_entry.py hub_realtime_ws.py hub0934_fixes.py hub0935_sync_fix.py \
-            final_stability_patch.py followup_stability_patch.py \
-            device_history_patch.py portmap_persistence_patch.py agent_presence_patch.py \
-            router_task_manager_patch.py router_config_sync_patch.py stun_service.py \
-            wireguard_service.py router_device_live_sync_patch.py router_lite_realtime_patch.py \
-            labrelay_sync_patch.py router/firewall_automation.py router_compat.py \
-            router_core/errors.py router_core/driver/reyee_session.py router_core/driver/reyee_rpc.py \
-            router_core/driver/reyee.py router_core/cache/router_cache.py \
-            router_core/realtime/router_realtime.py router_core/service/router_service.py \
-            router_core/service/blueprint.py
-          python -m py_compile assistant/*.py
+          python -m compileall -q hub.py hub_entry.py *.py router router_core assistant
+          python scripts/docker_preflight.py .
 
       - name: Run Hub tests
         run: python -m pytest -q
@@ -58,7 +54,7 @@ jobs:
       - name: Verify release versions
         run: |
           set -e
-          grep -q 'HUB_VERSION = "0.13.1"' hub_entry.py
+          grep -q 'HUB_VERSION = "0.13.2"' hub_entry.py
           grep -q 'create_router_blueprint_v1' hub_entry.py
           grep -q 'create_ai_blueprint' hub_entry.py
           grep -q 'install_hub0934_fixes(hub)' hub_entry.py
@@ -72,7 +68,12 @@ jobs:
           grep -q 'install_router_device_live_sync_patch' hub_entry.py
           grep -q '/api/realtime/ws' hub_realtime_ws.py
           test ! -e assistant/wechat.py
-          ! git grep -qi -E 'wechat|clawbot|openclaw' -- '*.py' '*.md' '*.env*' 'Dockerfile'
+          # Guards against the removed OpenClaw / WeChat bridge reappearing in
+          # shipped Hub code or docs.  Test fixtures are excluded on purpose:
+          # the child-guard allowlist mirrors the router's own RDPI app ids, and
+          # "wechat" is the identifier the firmware reports for 微信.  Naming it
+          # in a fixture is not the bridge coming back.
+          ! git grep -qi -E 'wechat|clawbot|openclaw' -- '*.py' '*.md' '*.env*' 'Dockerfile' ':(exclude)tests/**'
           grep -q 'version = "0.2.48"' labrelay/Cargo.toml
           grep -q 'PORTMAP_PORT_MAX = 29999' labrelay_sync_patch.py
           grep -q 'STUN_LOCAL_PORT_MIN = 30000' labrelay_sync_patch.py
@@ -92,7 +93,10 @@ jobs:
           cargo build --release
 
       - name: Build Hub Docker image
+        # Building the image and importing the entry point from inside it is the
+        # check that proves the image is self-contained.  It is deliberately run
+        # against the built image, not the working tree.
         run: |
-          docker build --pull=false -t labprobe-hub:0.13.1 .
-          docker run --rm --entrypoint python labprobe-hub:0.13.1 -c \
-            'import hub_entry, assistant, router_core, hub0934_fixes, hub0935_sync_fix, labrelay_sync_patch; print("Hub 0.13.1 imports OK")'
+          docker build --pull=false -t labprobe-hub:0.13.2 .
+          docker run --rm --entrypoint python labprobe-hub:0.13.2 -c \
+            'import hub_entry, child_guard_service, assistant, router_core, hub0934_fixes, hub0935_sync_fix, labrelay_sync_patch; print("Hub 0.13.2 imports OK")'
