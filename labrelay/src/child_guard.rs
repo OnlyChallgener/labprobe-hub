@@ -36,6 +36,7 @@ struct DeviceIdentity {
 
 impl Snapshot {
     fn sections_of(&self, kind: &str) -> impl Iterator<Item = &UciSection> {
+        let kind = kind.to_owned();
         self.sections
             .iter()
             .filter(move |section| section.kind == kind)
@@ -718,7 +719,8 @@ fn user_payload_with_times(
                     for time in times.iter().filter_map(Value::as_str) {
                         let parts: Vec<&str> = time.split('-').collect();
                         if parts.len() == 3 {
-                            days.entry(parts[0].into()).or_insert_with(|| json!([]));
+                            days.entry(parts[0].to_string())
+                                .or_insert_with(|| json!([]));
                             if let Some(values) =
                                 days.get_mut(parts[0]).and_then(Value::as_array_mut)
                             {

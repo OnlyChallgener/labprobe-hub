@@ -5,13 +5,13 @@ def test_cargo_toml_version():
     cargo_path = Path("labrelay/Cargo.toml")
     assert cargo_path.exists(), "Cargo.toml must exist"
     text = cargo_path.read_text(encoding="utf-8")
-    assert 'version = "0.2.47"' in text, "Cargo.toml must specify version 0.2.47"
+    assert 'version = "0.2.48"' in text, "Cargo.toml must specify version 0.2.48"
 
 def test_cargo_lock_version():
     lock_path = Path("labrelay/Cargo.lock")
     assert lock_path.exists(), "Cargo.lock must exist"
     text = lock_path.read_text(encoding="utf-8")
-    assert 'name = "labrelay"\nversion = "0.2.47"' in text, "Cargo.lock must record version 0.2.47"
+    assert 'name = "labrelay"\nversion = "0.2.48"' in text, "Cargo.lock must record version 0.2.48"
 
 def test_tcp_session_test_safety_guards():
     rs_path = Path("labrelay/src/tcp_session_test.rs")
