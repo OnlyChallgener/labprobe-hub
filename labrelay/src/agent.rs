@@ -1484,6 +1484,50 @@ fn url_encode(value: &str) -> String {
         .collect()
 }
 
+async fn sync_child_guard(client: &Client, config: &AgentConfig, state: &mut AgentState) -> Result<()> {
+    let router = url_encode(&config.router_name);
+    let root = get_json(
+        client,
+        config,
+        &format!("/api/router/child-guard/commands?router={}&limit=10", router),
+    )
+    .await?;
+    let commands = root
+        .get("commands")
+        .and_then(Value::as_array)
+        .cloned()
+        .unwrap_or_default();
+    if commands.is_empty() {
+        return Ok(());
+    }
+    let mut acknowledgements = Vec::new();
+    for command in commands {
+        let id = command.get("id").and_then(Value::as_str).unwrap_or("").to_string();
+        let action = command.get("action").and_then(Value::as_str).unwrap_or("").to_string();
+        let payload = command.get("payload").cloned().unwrap_or_else(|| json!({}));
+        let action_for_worker = action.clone();
+        let result = tokio::task::spawn_blocking(move || {
+            crate::child_guard::execute(&action_for_worker, &payload)
+        })
+        .await
+        .unwrap_or_else(|error| json!({"ok": false, "errorCode": "adapter_panic", "error": error.to_string()}));
+        acknowledgements.push(json!({
+            "id": id,
+            "ok": result.get("ok").and_then(Value::as_bool).unwrap_or(false),
+            "result": result,
+        }));
+    }
+    post_json(
+        client,
+        config,
+        &format!("/api/router/child-guard/ack?router={}", router),
+        &json!({"acks": acknowledgements}),
+    )
+    .await?;
+    state.last_command_at = now_epoch();
+    Ok(())
+}
+
 async fn sync_portmaps(
     client: &Client,
     config: &AgentConfig,
@@ -1928,6 +1972,11 @@ pub async fn run(args: &[String], once: bool) -> Result<()> {
             if let Err(error) = sync_wireguard(&client, &config, &mut state).await {
                 let text = redact(&format!("wireguard status: {:#}", error), &config.hook_token);
                 log_limited(&config, &mut state, "WARN", "wireguard-status", &text);
+                errors.push(text);
+            }
+            if let Err(error) = sync_child_guard(&client, &config, &mut state).await {
+                let text = redact(&format!("child guard command: {:#}", error), &config.hook_token);
+                log_limited(&config, &mut state, "WARN", "child-guard-command", &text);
                 errors.push(text);
             }
             last_status_at = now;

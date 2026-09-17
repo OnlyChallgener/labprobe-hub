@@ -19,6 +19,7 @@ use tokio::task::{JoinHandle, JoinSet};
 use tokio::time::{sleep, timeout};
 
 mod agent;
+mod child_guard;
 mod ddns_address;
 mod tcp_session_test;
 mod wireguard;

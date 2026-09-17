@@ -1,5 +1,12 @@
 # LabProbe 变更记录
 
+## 0.13.0 / LabRelay 0.2.47
+
+- **儿童上网 Phase 2A**：APP 新增儿童上网总览、设备报告/计划/家长提醒与应用选择 UI，首阶段使用本地状态与 Mock 数据，保留既有路由详情入口。
+- **child_guard 真链路**：Hub/Relay 接入 BE72 原厂 `child_guard` v2.1，支持设备、计划、启停、删除、运行时 PID/effect policy 查询，并通过快照、验证和失败回滚保护写操作。
+- **设备识别补充**：Relay 只读关联 `dev_identify.get_dev_info`，以 MAC 将 `pc/pad/phone` 等识别元数据映射到守护设备；不以类型阻断 PC 的应用控制。
+- **应用 ID 展开**：应用允许列表支持一个 UI 应用对应多个 RDPI ID，微信预置多 ID 映射；未修改 Router Core、RPC、WSS 或其他既有通信链路。
+
 ## Unreleased
 
 - **Hub 请求隔离**：STUN、WireGuard、TCP 测试与 AI 流式请求不再持有全 Hub 请求级数据锁；路由器 RPC 或上游流式响应变慢时，不再连带阻塞健康检查、同步、通知和无关页面。

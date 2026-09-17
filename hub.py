@@ -24,9 +24,16 @@ import dns.resolver
 import paho.mqtt.client as mqtt
 from flask import Flask, request, jsonify, g
 from labprobe_storage import SQLiteStore
+from child_guard_service import (
+    ChildGuardCommandStore,
+    ChildGuardValidationError,
+    clean_plan as clean_child_guard_plan,
+    validate_plan_id as validate_child_guard_plan_id,
+    validate_uid as validate_child_guard_uid,
+)
 
 BEIJING_TZ = ZoneInfo("Asia/Shanghai")
-APP_VERSION = "0.12.2"
+APP_VERSION = "0.13.0"
 PORT = int(os.environ.get("PORT", "58443"))
 BASE_DIR = Path(os.environ.get("LABPROBE_BASE_DIR", ".")).resolve()
 CONFIG_DIR = Path(os.environ.get("CONFIG_DIR", str(BASE_DIR / "config"))).resolve()
@@ -78,10 +85,12 @@ DATA_LOCK_BYPASS_PREFIXES = (
     "/api/router/wireguard",
     "/api/tcp-session-test",
     "/api/router/tcp-session-test",
+    "/api/router/child-guard",
 )
 REFRESH_RUNNING = False
 STATUS_REFRESH_TTL_SEC = int(os.environ.get("STATUS_REFRESH_TTL_SEC", "180"))
 STORE = SQLiteStore(DATA_DIR, BACKUPS_DIR, DB_PATH)
+CHILD_GUARD_COMMANDS = ChildGuardCommandStore(DATA_DIR)
 UPDATE_REPOSITORY_ROOT = (os.environ.get("UPDATE_REPOSITORY_ROOT") or "").strip().rstrip("/") or "https://lab.net86.dynv6.net:27772"
 AGENT_MANIFEST_URL = f"{UPDATE_REPOSITORY_ROOT}/agent/latest.json"
 AGENT_INSTALLER_URL = f"{UPDATE_REPOSITORY_ROOT}/agent/install.sh"
@@ -2943,6 +2952,157 @@ def api_router_agent_status():
     if changed:
         save_json(AGENT_UPDATE_COMMANDS_FILE, {"commands": commands})
     return jsonify({"ok": True, "time": now_str()})
+
+
+def _child_guard_router(payload: Optional[Dict[str, Any]] = None) -> str:
+    body = payload if isinstance(payload, dict) else {}
+    requested = clean_saved_value(
+        body.get("router") or request.args.get("router") or primary_router_name()
+    ) or "router"
+    return resolve_agent_router(requested) or requested
+
+
+def _child_guard_execute(action: str, payload: Optional[Dict[str, Any]] = None, *, success_status: int = 200):
+    body = payload if isinstance(payload, dict) else {}
+    router = _child_guard_router(body)
+    command = CHILD_GUARD_COMMANDS.enqueue(router, action, body)
+    notify_agent_commands_changed()
+    completed = CHILD_GUARD_COMMANDS.wait(command["id"], timeout_seconds=35.0)
+    if completed.state == "done":
+        result = dict(completed.result)
+        result.setdefault("ok", True)
+        result.setdefault("router", router)
+        return jsonify(result), success_status
+    if completed.state == "timeout":
+        return jsonify({"ok": False, "router": router, "commandId": command["id"],
+                        "errorCode": "agent_timeout", "error": completed.error}), 504
+    result = dict(completed.result)
+    return jsonify({"ok": False, "router": router, "commandId": command["id"],
+                    "errorCode": clean_saved_value(result.get("errorCode")) or "agent_failed",
+                    "error": completed.error or clean_saved_value(result.get("error")) or "儿童上网操作失败",
+                    "rollback": result.get("rollback")}), 409
+
+
+@app.route("/api/router/child-guard/capabilities", methods=["GET"])
+def api_child_guard_capabilities():
+    if not check_read_token():
+        return jsonify({"ok": False, "error": "unauthorized"}), 401
+    return _child_guard_execute("get_capabilities")
+
+
+@app.route("/api/router/child-guard/devices", methods=["GET"])
+def api_child_guard_devices():
+    if not check_read_token():
+        return jsonify({"ok": False, "error": "unauthorized"}), 401
+    return _child_guard_execute("get_users")
+
+
+@app.route("/api/router/child-guard/devices/<uid>/plans", methods=["GET", "POST"])
+def api_child_guard_plans(uid: str):
+    try:
+        normalized_uid = validate_child_guard_uid(uid)
+    except ChildGuardValidationError as error:
+        return jsonify({"ok": False, "errorCode": "invalid_request", "error": str(error)}), 400
+    if request.method == "GET":
+        if not check_read_token():
+            return jsonify({"ok": False, "error": "unauthorized"}), 401
+        return _child_guard_execute("get_plans", {"uid": normalized_uid})
+    if not check_app_token():
+        return jsonify({"ok": False, "error": "unauthorized"}), 401
+    try:
+        body = request.get_json(silent=True) or {}
+        plan = clean_child_guard_plan(body)
+    except ChildGuardValidationError as error:
+        return jsonify({"ok": False, "errorCode": "invalid_request", "error": str(error)}), 400
+    return _child_guard_execute("create_plan", {"uid": normalized_uid, "plan": plan,
+                                                 "router": body.get("router")}, success_status=201)
+
+
+@app.route("/api/router/child-guard/devices/<uid>/plans/<plan_id>", methods=["PUT", "DELETE"])
+def api_child_guard_plan_item(uid: str, plan_id: str):
+    if not check_app_token():
+        return jsonify({"ok": False, "error": "unauthorized"}), 401
+    try:
+        normalized_uid = validate_child_guard_uid(uid)
+        normalized_plan_id = validate_child_guard_plan_id(plan_id)
+        body = request.get_json(silent=True) or {}
+        if request.method == "PUT":
+            plan = clean_child_guard_plan(body, plan_id=normalized_plan_id)
+            return _child_guard_execute("update_plan", {"uid": normalized_uid,
+                                                         "planId": normalized_plan_id,
+                                                         "plan": plan, "router": body.get("router")})
+        return _child_guard_execute("delete_plan", {"uid": normalized_uid,
+                                                     "planId": normalized_plan_id,
+                                                     "router": body.get("router")})
+    except ChildGuardValidationError as error:
+        return jsonify({"ok": False, "errorCode": "invalid_request", "error": str(error)}), 400
+
+
+@app.route("/api/router/child-guard/devices/<uid>/plans/<plan_id>/enabled", methods=["POST"])
+def api_child_guard_plan_enabled(uid: str, plan_id: str):
+    if not check_app_token():
+        return jsonify({"ok": False, "error": "unauthorized"}), 401
+    try:
+        normalized_uid = validate_child_guard_uid(uid)
+        normalized_plan_id = validate_child_guard_plan_id(plan_id)
+        body = request.get_json(silent=True) or {}
+        if not isinstance(body.get("enabled"), bool):
+            raise ChildGuardValidationError("enabled must be a boolean")
+    except ChildGuardValidationError as error:
+        return jsonify({"ok": False, "errorCode": "invalid_request", "error": str(error)}), 400
+    return _child_guard_execute("set_plan_enabled", {"uid": normalized_uid,
+                                                      "planId": normalized_plan_id,
+                                                      "enabled": body["enabled"],
+                                                      "router": body.get("router")})
+
+
+@app.route("/api/router/child-guard/devices/<uid>/runtime", methods=["GET"])
+def api_child_guard_runtime(uid: str):
+    if not check_read_token():
+        return jsonify({"ok": False, "error": "unauthorized"}), 401
+    try:
+        normalized_uid = validate_child_guard_uid(uid)
+    except ChildGuardValidationError as error:
+        return jsonify({"ok": False, "errorCode": "invalid_request", "error": str(error)}), 400
+    return _child_guard_execute("get_runtime_state", {"uid": normalized_uid})
+
+
+@app.route("/api/router/child-guard/devices/<uid>/<action>", methods=["POST"])
+def api_child_guard_device_action(uid: str, action: str):
+    if not check_app_token():
+        return jsonify({"ok": False, "error": "unauthorized"}), 401
+    if action not in {"pause", "resume"}:
+        return jsonify({"ok": False, "errorCode": "unsupported_action", "error": "unsupported action"}), 404
+    try:
+        normalized_uid = validate_child_guard_uid(uid)
+    except ChildGuardValidationError as error:
+        return jsonify({"ok": False, "errorCode": "invalid_request", "error": str(error)}), 400
+    body = request.get_json(silent=True) or {}
+    operation = {"uid": normalized_uid, "router": body.get("router")}
+    if action == "pause" and body.get("untilEpoch") is not None:
+        operation["untilEpoch"] = max(0, to_int(body.get("untilEpoch"), 0))
+    return _child_guard_execute(f"{action}_device", operation)
+
+
+@app.route("/api/router/child-guard/commands", methods=["GET"])
+def api_router_child_guard_commands():
+    if not check_hook_token():
+        return jsonify({"ok": False, "error": "bad hook token"}), 401
+    router = CHILD_GUARD_COMMANDS.canonical_router(request.args.get("router") or primary_router_name())
+    limit = max(1, min(20, to_int(request.args.get("limit"), 10) or 10))
+    return jsonify({"ok": True, "commands": CHILD_GUARD_COMMANDS.take(router, limit),
+                    "serverEpoch": int(time.time())})
+
+
+@app.route("/api/router/child-guard/ack", methods=["POST"])
+def api_router_child_guard_ack():
+    if not check_hook_token():
+        return jsonify({"ok": False, "error": "bad hook token"}), 401
+    body = request.get_json(silent=True) or {}
+    router = CHILD_GUARD_COMMANDS.canonical_router(
+        request.args.get("router") or body.get("router") or primary_router_name())
+    count = CHILD_GUARD_COMMANDS.acknowledge(router, body.get("acks", []))
+    return jsonify({"ok": True, "acknowledged": count})
 
 
 

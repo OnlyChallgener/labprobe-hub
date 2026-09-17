@@ -49,8 +49,8 @@ from router_core.realtime.router_realtime import RouterRealtimeEngine, RealtimeF
 from router_core.service.router_service import RouterService
 from router_core.service.blueprint import create_router_blueprint_v1
 
-PREVIOUS_HUB_VERSION = "0.12.1"
-HUB_VERSION = "0.12.2"
+PREVIOUS_HUB_VERSION = "0.12.2"
+HUB_VERSION = "0.13.0"
 hub.APP_VERSION = HUB_VERSION
 install_ipv6_neighbor_archive_patch(hub)
 
