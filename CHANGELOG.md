@@ -1,5 +1,14 @@
 # LabProbe 变更记录
 
+## 0.14.0 / LabRelay 0.2.48
+
+- **路由器原生测速(Hub 端到端)**:新增 `speedtest_service.py`,蓝图 `/api/router/speedtest/{ports,servers,state,progress,history,start}`。纯传输层,全部走既有 `hub.ROUTER_DRIVER.rpc("devSta.get", ...)`,未改动 Router Core / RPC / WSS / Agent。
+- **真机验证闭环**:零 mock 验证脚本以真实 `ReyeeSessionManager→ReyeeRpcClient→Driver` 栈驱动蓝图,真实测速一次通过(下行 587.52 / 上行 49.10 Mbps,81 采样)。
+- **修复端口列表为空**:`/ports` 原先误用 `module=speedtest` 调 `port_status`,真机返回无 `List`;改为独立 module 并加回归测试。
+- **wire 事实钉住**:`downspeed/upspeed` 在 `get_cur_intf_rst` 是数组、在 `get_his_rst` 是字符串标量;`get_servers` 返回 `data.servers[]`;`start_test` 形态 `{type:'start_test', intf:['wan'], set_nodes:{wan:['0']}}`。
+- **测试**:新增 `tests/test_speedtest_service.py` 18 个用例,全部用真实抓包报文钉住;全库 644 测试通过。
+- **关键 wire 记录**:测速服务已部署到线上 Hub(容器可写层),正式镜像由本版本 CI 构建。
+
 ## 0.13.2 / LabRelay 0.2.48
 
 - **修复 Hub 容器无限重启**：`hub.py` 在模块顶层导入的 `child_guard_service.py` 从未被加入镜像（Dockerfile 用的是手工维护的逐行 `COPY` 白名单），容器启动即 `ModuleNotFoundError`，在 `restart: unless-stopped` 下无限重启。
