@@ -485,7 +485,7 @@ dependencies = [
 
 [[package]]
 name = "labrelay"
-version = "0.2.48"
+version = "0.2.49"
 dependencies = [
  "anyhow",
  "futures-util",
