@@ -72,6 +72,20 @@ def validate_uid(value: Any) -> str:
     return uid
 
 
+def router_alias(value: Any) -> str:
+    """Normalize router display names so "Ruijie BE72" matches the agent's "BE72".
+
+    Mirrors the alias rules used elsewhere in the Hub; without this the agent
+    polls `?router=BE72` while App requests are stored under the display name
+    and every command stays pending forever.
+    """
+    cleaned = str(value or "").strip().casefold()
+    for prefix in ("ruijie-", "ruijie_", "ruijie ", "rg-", "rg_"):
+        if cleaned.startswith(prefix):
+            cleaned = cleaned[len(prefix):].strip("-_ ")
+    return cleaned.replace("-", "").replace("_", "").replace(" ", "")
+
+
 def validate_plan_id(value: Any) -> str:
     plan_id = str(value or "").strip()
     if not _PLAN_ID_RE.fullmatch(plan_id):
@@ -208,13 +222,25 @@ class ChildGuardCommandStore:
 
     def take(self, router: Any, limit: int = 10) -> List[Dict[str, Any]]:
         canonical = self.canonical_router(router)
+        canonical_alias = router_alias(canonical)
         selected: List[Dict[str, Any]] = []
         now = int(time.time())
         with self.lock:
             rows = self._load()
             changed = False
             for command in rows:
-                if command.get("router") != canonical:
+                if router_alias(command.get("router")) != canonical_alias:
+                    continue
+                status = command.get("status")
+                created = int(command.get("createdEpoch") or 0)
+                if status == "pending" and created and now - created > 600:
+                    command.update({
+                        "status": "failed",
+                        "finishedAt": _now_text(),
+                        "error": "stale command expired before delivery",
+                        "result": {"ok": False, "errorCode": "stale_command"},
+                    })
+                    changed = True
                     continue
                 status = command.get("status")
                 age = now - int(command.get("deliveredEpoch") or 0)
@@ -252,6 +278,7 @@ class ChildGuardCommandStore:
 
     def acknowledge(self, router: Any, acknowledgements: Any) -> int:
         canonical = self.canonical_router(router)
+        canonical_alias = router_alias(canonical)
         if not isinstance(acknowledgements, list):
             return 0
         ack_map = {
@@ -263,7 +290,7 @@ class ChildGuardCommandStore:
         with self.changed:
             rows = self._load()
             for command in rows:
-                if command.get("router") != canonical:
+                if router_alias(command.get("router")) != canonical_alias:
                     continue
                 acknowledgement = ack_map.get(str(command.get("id") or ""))
                 if not acknowledgement or command.get("status") not in {"pending", "delivered"}:
