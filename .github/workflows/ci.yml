@@ -74,7 +74,28 @@ jobs:
           # "wechat" is the identifier the firmware reports for 微信.  Naming it
           # in a fixture is not the bridge coming back.
           ! git grep -qi -E 'wechat|clawbot|openclaw' -- '*.py' '*.md' '*.env*' 'Dockerfile' ':(exclude)tests/**'
-          grep -q 'version = "0.2.48"' labrelay/Cargo.toml
+          # LabRelay's version is whatever Cargo.toml declares, and Cargo.lock
+          # must agree with it. Do NOT hardcode the number here: a stale literal
+          # turns every version bump into a red build across all branches (the
+          # old `version = "0.2.48"` grep did exactly that from 0.2.49 onward).
+          python - <<'PY'
+          import re
+          from pathlib import Path
+          version = re.search(
+              r'^version = "([^"]+)"',
+              Path('labrelay/Cargo.toml').read_text(encoding='utf-8'),
+              re.M,
+          ).group(1)
+          lock = Path('labrelay/Cargo.lock').read_text(encoding='utf-8')
+          match = re.search(
+              r'\[\[package\]\]\nname = "labrelay"\nversion = "([^"]+)"', lock
+          )
+          assert match, 'labrelay package missing from Cargo.lock'
+          assert match.group(1) == version, (
+              f'Cargo.lock {match.group(1)} != Cargo.toml {version}'
+          )
+          print(f'LabRelay {version} consistent across Cargo.toml and Cargo.lock')
+          PY
           grep -q 'PORTMAP_PORT_MAX = 29999' labrelay_sync_patch.py
           grep -q 'STUN_LOCAL_PORT_MIN = 30000' labrelay_sync_patch.py
           grep -q 'STUN_LOCAL_PORT_MAX = 32767' labrelay_sync_patch.py
