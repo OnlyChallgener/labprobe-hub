@@ -1392,6 +1392,212 @@ fn verify_device_block(uid: &str, timestamp: u64) -> Result<()> {
     }
 }
 
+/// Guard membership management: the App's "select devices to guard" page maps
+/// to creating/removing child_guard user sections (the official app does the
+/// same through its cloud, which the router pulls every 15 minutes).
+fn generate_uid() -> String {
+    use std::io::Read;
+    let mut bytes = [0u8; 16];
+    let ok = std::fs::File::open("/dev/urandom")
+        .and_then(|mut file| file.read_exact(&mut bytes))
+        .is_ok();
+    if !ok {
+        let mut state = now_epoch() ^ ((std::process::id() as u64) << 32) | 1;
+        for byte in bytes.iter_mut() {
+            state ^= state << 13;
+            state ^= state >> 7;
+            state ^= state << 17;
+            *byte = (state & 0xff) as u8;
+        }
+    }
+    bytes.iter().map(|byte| format!("{byte:02X}")).collect()
+}
+
+fn verify_user_presence(uid: &str, should_exist: bool) -> Result<()> {
+    let deadline = Instant::now() + VERIFY_TIMEOUT;
+    loop {
+        let snapshot = load_snapshot()?;
+        let in_uci = snapshot.user(uid).is_some();
+        let user_text =
+            serde_json::to_string(&ubus_show("sniffer.user").unwrap_or(Value::Null))
+                .unwrap_or_default();
+        let in_runtime = user_text.contains(uid);
+        if should_exist && in_uci && in_runtime {
+            return Ok(());
+        }
+        if !should_exist && !in_uci && !in_runtime {
+            return Ok(());
+        }
+        if Instant::now() >= deadline {
+            bail!("child_guard membership verification timed out");
+        }
+        thread::sleep(Duration::from_secs(1));
+    }
+}
+
+fn mutate_membership(action: &str, payload: &Value) -> Result<Value> {
+    match action {
+        "add_device" => {
+            let macs = json_strings(payload.get("macs"))
+                .into_iter()
+                .map(|value| normalize_mac(&value))
+                .filter(|value| value.contains(':'))
+                .collect::<Vec<_>>();
+            if macs.is_empty() {
+                bail!("at least one valid mac is required");
+            }
+            let snapshot = load_snapshot()?;
+            // Idempotent: if any requested mac is already guarded, report it.
+            if let Some(user) = snapshot.sections_of("user").find(|user| {
+                user.lists
+                    .get("mac")
+                    .map(|list| {
+                        list.iter()
+                            .any(|mac| macs.contains(&normalize_mac(mac)))
+                    })
+                    .unwrap_or(false)
+            }) {
+                let uid = user.name.clone();
+                return Ok(json!({
+                    "ok": true,
+                    "uid": uid,
+                    "macs": user.lists.get("mac").cloned().unwrap_or_default(),
+                    "created": false,
+                }));
+            }
+            let mut uid = generate_uid();
+            while snapshot.named(&uid).is_some() {
+                uid = generate_uid();
+            }
+            let name = payload
+                .get("deviceName")
+                .or_else(|| payload.get("name"))
+                .and_then(Value::as_str)
+                .map(|value| value.trim().chars().take(120).collect::<String>())
+                .filter(|value| !value.is_empty())
+                .unwrap_or_else(|| "受守护设备".into());
+            let data = json!({
+                "uid": uid,
+                "macs": macs,
+                "policies": [],
+                "block": "0",
+                "pause": "0",
+                "name": name,
+            });
+            let body = serde_json::to_string(&json!({"data": data}))?;
+            command_output("dev_config", &["add", "-m", CONFIG, &body])?;
+            command_output(
+                "uci",
+                &["-q", "set", &format!("{CONFIG}.{uid}.labprobe_managed=1")],
+            )?;
+            command_output("uci", &["-q", "commit", CONFIG])?;
+            trigger_reload();
+            verify_user_presence(&uid, true)?;
+            Ok(json!({"ok": true, "uid": uid, "macs": macs, "created": true}))
+        }
+        "remove_device" => {
+            let uid = payload
+                .get("uid")
+                .and_then(Value::as_str)
+                .ok_or_else(|| anyhow!("missing uid"))?;
+            let snapshot = load_snapshot()?;
+            if snapshot.user(uid).is_none() {
+                bail!("device not found");
+            }
+            let plans = policies_for(&snapshot, uid);
+            let removed_plans = plans.len();
+            let plan_names = plans
+                .iter()
+                .map(|policy| policy.name.clone())
+                .collect::<Vec<_>>();
+            let body = serde_json::to_string(&json!({"list": [uid]}))?;
+            command_output("dev_config", &["del", "-m", CONFIG, &body])?;
+            // The user's plans are now unreferenced. The init reload removes
+            // the user from sniffer.user but leaves orphaned sniffer.policy
+            // entries, and does not remove the orphaned UCI policy sections.
+            for pid in &plan_names {
+                drop_runtime_policy(pid);
+                let _ = command_output("uci", &["-q", "delete", &format!("{CONFIG}.{pid}")]);
+            }
+            if !plan_names.is_empty() {
+                let _ = command_output("uci", &["-q", "commit", CONFIG]);
+            }
+            trigger_reload();
+            verify_user_presence(uid, false)?;
+            Ok(json!({"ok": true, "uid": uid, "removedPlans": removed_plans}))
+        }
+        _ => bail!("unsupported membership action"),
+    }
+}
+
+/// Candidate LAN devices for the App's "select devices to guard" page, from the
+/// DHCP lease table. Each entry carries its guard status so the App can show
+/// which devices are already managed (with their uid) and which are available.
+fn list_lan_devices() -> Result<Value> {
+    let snapshot = load_snapshot()?;
+    let mut guarded: BTreeMap<String, String> = BTreeMap::new();
+    let mut guarded_names: BTreeMap<String, String> = BTreeMap::new();
+    for user in snapshot.sections_of("user") {
+        let uid = user.name.clone();
+        let name = user
+            .options
+            .get("name")
+            .cloned()
+            .unwrap_or_else(|| "受守护设备".into());
+        for mac in user.lists.get("mac").into_iter().flatten() {
+            let normalized = normalize_mac(mac);
+            if normalized.contains(':') {
+                guarded.insert(normalized.clone(), uid.clone());
+                guarded_names.insert(normalized, name.clone());
+            }
+        }
+    }
+    let mut devices = Vec::new();
+    if let Ok(text) = std::fs::read_to_string("/tmp/dhcp.leases") {
+        for line in text.lines() {
+            let fields: Vec<&str> = line.split_whitespace().collect();
+            if fields.len() < 3 {
+                continue;
+            }
+            let mac = normalize_mac(fields[1]);
+            if !mac.contains(':') {
+                continue;
+            }
+            let hostname = fields.get(3).copied().unwrap_or("").to_string();
+            let ip = fields[2].to_string();
+            let (is_guarded, uid) = match guarded.get(&mac) {
+                Some(uid) => (true, uid.clone()),
+                None => (false, String::new()),
+            };
+            let mut entry = json!({
+                "mac": mac,
+                "ip": ip,
+                "hostname": hostname,
+                "guarded": is_guarded,
+            });
+            if is_guarded {
+                entry["uid"] = json!(uid);
+                entry["name"] = json!(guarded_names.get(&mac).cloned().unwrap_or_default());
+            }
+            devices.push(entry);
+        }
+    }
+    devices.sort_by(|a, b| {
+        let key = |value: &Value| {
+            (
+                !value.get("guarded").and_then(Value::as_bool).unwrap_or(false),
+                value
+                    .get("ip")
+                    .and_then(Value::as_str)
+                    .unwrap_or("")
+                    .to_string(),
+            )
+        };
+        key(a).cmp(&key(b))
+    });
+    Ok(json!({"ok": true, "devices": devices}))
+}
+
 pub fn execute(action: &str, payload: &Value) -> Value {
     let result: Result<Value> = (|| match action {
         "get_capabilities" => Ok(capabilities()),
@@ -1444,6 +1650,8 @@ pub fn execute(action: &str, payload: &Value) -> Value {
             mutate_plan(action, payload)
         }
         "get_usage" => usage_report(payload),
+        "list_devices" => list_lan_devices(),
+        "add_device" | "remove_device" => mutate_membership(action, payload),
         "pause_device" | "resume_device" => device_pause(action, payload),
         _ => bail!("unsupported child_guard action"),
     })();

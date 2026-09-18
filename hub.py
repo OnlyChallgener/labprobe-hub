@@ -3096,6 +3096,51 @@ def api_child_guard_device_action(uid: str, action: str):
     return _child_guard_execute(f"{action}_device", operation)
 
 
+@app.route("/api/router/child-guard/devices/candidates", methods=["GET"])
+def api_child_guard_devices_candidates():
+    """All LAN devices from the DHCP lease table, with guard status, for the
+    App's 'select devices to guard' page."""
+    if not check_read_token():
+        return jsonify({"ok": False, "error": "unauthorized"}), 401
+    return _child_guard_execute("list_devices")
+
+
+@app.route("/api/router/child-guard/devices", methods=["POST"])
+def api_child_guard_devices_collection():
+    """Add a device (by MAC) to child guarding."""
+    if not check_app_token():
+        return jsonify({"ok": False, "error": "unauthorized"}), 401
+    body = request.get_json(silent=True) or {}
+    raw_macs = body.get("macs")
+    if not isinstance(raw_macs, list) or not raw_macs:
+        return jsonify({"ok": False, "errorCode": "invalid_request",
+                        "error": "macs must be a non-empty list"}), 400
+    macs = []
+    for raw in raw_macs[:16]:
+        mac = clean_saved_value(raw).lower()
+        if not re.fullmatch(r"[0-9a-f]{2}(:[0-9a-f]{2}){5}", mac):
+            return jsonify({"ok": False, "errorCode": "invalid_request",
+                            "error": f"invalid mac: {mac}"}), 400
+        if mac not in macs:
+            macs.append(mac)
+    return _child_guard_execute("add_device", {"macs": macs,
+                                               "deviceName": body.get("deviceName"),
+                                               "router": body.get("router")})
+
+
+@app.route("/api/router/child-guard/devices/<uid>", methods=["DELETE"])
+def api_child_guard_device_delete(uid: str):
+    if not check_app_token():
+        return jsonify({"ok": False, "error": "unauthorized"}), 401
+    try:
+        normalized_uid = validate_child_guard_uid(uid)
+    except ChildGuardValidationError as error:
+        return jsonify({"ok": False, "errorCode": "invalid_request", "error": str(error)}), 400
+    body = request.get_json(silent=True) or {}
+    return _child_guard_execute("remove_device", {"uid": normalized_uid,
+                                                  "router": body.get("router")})
+
+
 @app.route("/api/router/child-guard/commands", methods=["GET"])
 def api_router_child_guard_commands():
     if not check_hook_token():

@@ -31,10 +31,13 @@ _ACTIONS = {
     "get_plans",
     "get_runtime_state",
     "get_usage",
+    "list_devices",
     "create_plan",
     "update_plan",
     "delete_plan",
     "set_plan_enabled",
+    "add_device",
+    "remove_device",
     "pause_device",
     "resume_device",
 }
