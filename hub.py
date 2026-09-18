@@ -3079,6 +3079,110 @@ def api_child_guard_usage(uid: str):
     return _child_guard_execute("get_usage", {"uid": normalized_uid})
 
 
+# --- 上网统计 (official-style usage report) ---------------------------------
+#
+# The router samples the sniffer dump every 60s, folds it into hourly/app
+# buckets and pushes them here; the Hub is our cloud. The App reads this
+# endpoint, so the page keeps working when the router reboots or is briefly
+# unreachable — and it never has to wait on a router round-trip for history.
+
+_CHILD_GUARD_DATE_RE = re.compile(r"^\d{4}-\d{2}-\d{2}$")
+
+
+def _child_guard_raw(action: str, payload: Optional[Dict[str, Any]] = None,
+                     timeout_seconds: float = 35.0) -> Optional[Dict[str, Any]]:
+    """Like ``_child_guard_execute`` but returns the raw result instead of a
+    Flask response, for callers that only need the data."""
+    body = payload if isinstance(payload, dict) else {}
+    router = _child_guard_router(body)
+    command = CHILD_GUARD_COMMANDS.enqueue(router, action, body)
+    notify_agent_commands_changed()
+    completed = CHILD_GUARD_COMMANDS.wait(command["id"], timeout_seconds=timeout_seconds)
+    if completed.state != "done":
+        return None
+    return dict(completed.result)
+
+
+def _child_guard_macs_for_uid(uid: str) -> List[str]:
+    """Resolve a guarded device's MAC list through the router's own user table."""
+    result = _child_guard_raw("get_users")
+    if not result:
+        return []
+    for device in result.get("devices") or []:
+        if isinstance(device, dict) and device.get("uid") == uid:
+            macs = device.get("macs")
+            if isinstance(macs, list):
+                return [str(mac).strip().lower() for mac in macs if str(mac).strip()]
+    return []
+
+
+def _usage_aggregate_store():
+    """The Hub-side aggregate store, or None when usage collection is off.
+
+    Resolved against *this module* (not the Flask app) so it shares its cache
+    with the `install_usage_aggregate(hub)` call in ``hub_entry``.
+    """
+    try:
+        from usage_aggregate import resolve_store
+
+        return resolve_store(sys.modules[__name__])
+    except Exception:  # pragma: no cover - defensive only
+        LOGGER.warning("child guard usage report: aggregate store unavailable", exc_info=True)
+        return None
+
+
+@app.route("/api/router/child-guard/devices/<uid>/usage-report", methods=["GET"])
+def api_child_guard_usage_report(uid: str):
+    """官方版式的「上网统计」：在线时间 + 小时柱状图 + 应用时长统计。
+
+    ``source`` says where the numbers came from: ``hub`` (the router pushed
+    aggregates) or ``relay`` (nothing pushed for that day yet, so we asked the
+    router live). The App only needs to render; it never has to care which.
+    """
+    if not check_read_token():
+        return jsonify({"ok": False, "error": "unauthorized"}), 401
+    try:
+        normalized_uid = validate_child_guard_uid(uid)
+    except ChildGuardValidationError as error:
+        return jsonify({"ok": False, "errorCode": "invalid_request", "error": str(error)}), 400
+
+    from usage_aggregate import compose_device_report, default_keep_days
+
+    usage_keep_days = default_keep_days()
+
+    date = (request.args.get("date") or "").strip() or time.strftime("%Y-%m-%d")
+    if not _CHILD_GUARD_DATE_RE.fullmatch(date):
+        return jsonify({"ok": False, "errorCode": "invalid_request",
+                        "error": "date must be YYYY-MM-DD"}), 400
+    # The 最近N天 chart asks for a window; clamp to the retention window so one
+    # request can never scan more days than we actually keep.
+    try:
+        days = int(request.args.get("days") or "1")
+    except (TypeError, ValueError):
+        days = 1
+    days = max(1, min(days, max(1, usage_keep_days["hourly"])))
+    router = _child_guard_router({"router": request.args.get("router")})
+
+    # An explicit macs list is only for verification runs; the App always uses uid.
+    raw_macs = (request.args.get("macs") or "").strip()
+    if raw_macs:
+        macs = [item.strip().lower() for item in raw_macs.replace(";", ",").split(",") if item.strip()]
+    else:
+        macs = _child_guard_macs_for_uid(normalized_uid)
+    if not macs:
+        return jsonify({"ok": False, "router": router, "errorCode": "device_not_found",
+                        "error": "该设备不在管控名单中"}), 404
+
+    def _live_relay_report() -> Optional[Dict[str, Any]]:
+        return _child_guard_raw("get_usage_stats", {"uid": normalized_uid, "date": date})
+
+    payload = compose_device_report(
+        _usage_aggregate_store(), macs, date, live=_live_relay_report, range_days=days
+    )
+    payload.update({"ok": True, "uid": normalized_uid, "macs": macs, "router": router})
+    return jsonify(payload)
+
+
 @app.route("/api/router/child-guard/devices/<uid>/<action>", methods=["POST"])
 def api_child_guard_device_action(uid: str, action: str):
     if not check_app_token():

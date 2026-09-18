@@ -22,6 +22,7 @@ mod agent;
 mod child_guard;
 mod ddns_address;
 mod tcp_session_test;
+mod usage_stats;
 mod wireguard;
 
 const VERSION: &str = env!("CARGO_PKG_VERSION");

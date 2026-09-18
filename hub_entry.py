@@ -34,6 +34,7 @@ from router_realtime_stability_patch import (
 from router_relay_credentials_patch import install_router_relay_credentials_patch
 from router_rpc import EncryptedRouterConfigStore
 from speedtest_service import install_speedtest_service
+from usage_aggregate import install_usage_aggregate
 from router_task_manager_patch import RouterTaskManager
 from router_ws_patch import RouterWebSocketMonitor
 from stun_service import install_stun_service
@@ -248,6 +249,7 @@ router_ws_monitor.start()
 # Retained LabRelay & Product Extensions
 # Router-native speed test: pure transport over the Router Core RPC channel.
 install_speedtest_service(hub)
+install_usage_aggregate(hub)
 install_router_config_sync_patch(hub, router_driver)
 install_firewall_automation(hub, router_driver)
 install_portmap_firewall(hub, router_driver)

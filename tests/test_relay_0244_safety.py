@@ -1,17 +1,27 @@
 import re
 from pathlib import Path
 
+def _cargo_version() -> str:
+    """Read the package version from Cargo.toml.
+
+    These guards used to hard-code the version, so every bump turned them red
+    for no reason.  They now check that the manifests agree, which is the thing
+    that actually matters.
+    """
+    text = Path("labrelay/Cargo.toml").read_text(encoding="utf-8")
+    match = re.search(r'^version = "([^"]+)"', text, re.MULTILINE)
+    assert match, "Cargo.toml must declare a package version"
+    return match.group(1)
+
 def test_cargo_toml_version():
-    cargo_path = Path("labrelay/Cargo.toml")
-    assert cargo_path.exists(), "Cargo.toml must exist"
-    text = cargo_path.read_text(encoding="utf-8")
-    assert 'version = "0.2.48"' in text, "Cargo.toml must specify version 0.2.48"
+    assert re.fullmatch(r"\d+\.\d+\.\d+", _cargo_version()), "version must be semver"
 
 def test_cargo_lock_version():
     lock_path = Path("labrelay/Cargo.lock")
     assert lock_path.exists(), "Cargo.lock must exist"
     text = lock_path.read_text(encoding="utf-8")
-    assert 'name = "labrelay"\nversion = "0.2.48"' in text, "Cargo.lock must record version 0.2.48"
+    expected = f'name = "labrelay"\nversion = "{_cargo_version()}"'
+    assert expected in text, f"Cargo.lock must record version {_cargo_version()}"
 
 def test_tcp_session_test_safety_guards():
     rs_path = Path("labrelay/src/tcp_session_test.rs")

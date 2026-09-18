@@ -13,6 +13,7 @@ use tokio::time::sleep;
 
 use crate::ctl_request;
 use crate::ddns_address;
+use crate::usage_stats;
 
 const DEFAULT_AGENT_CONFIG: &str = "/etc/labprobe/agent.json";
 const DEFAULT_AGENT_STATE: &str = "/tmp/labprobe/agent-state.json";
@@ -1528,6 +1529,83 @@ async fn sync_child_guard(client: &Client, config: &AgentConfig, state: &mut Age
     Ok(())
 }
 
+/// Sample the sniffer dump, fold it into usage buckets and hand the aggregates
+/// to the Hub — the glue that turns `usage_stats` from a library into a running
+/// feature.
+///
+/// Cadence comes from `SamplerState` rather than the 1s loop: a sample every
+/// `SAMPLE_INTERVAL_SECS` (60s), a push every `PUSH_INTERVAL_SECS` (5min) and
+/// only when something actually changed, and an `rdpi -t` refresh every
+/// `APP_MAP_REFRESH_SECS` (6h). Pushes carry absolute bucket values, so the Hub
+/// merges them with `max()` and a retry can never double-count.
+async fn sync_usage_stats(
+    client: &Client,
+    config: &AgentConfig,
+    sampler: &mut usage_stats::SamplerState,
+) -> Result<()> {
+    let now = now_epoch();
+    let mut problems: Vec<String> = Vec::new();
+
+    // Warm (and periodically refresh) the appid -> name map. Without it rows
+    // still feed byte totals but no app ever gets a name.
+    if sampler.app_map_due(now) {
+        match tokio::task::spawn_blocking(usage_stats::refresh_app_map).await {
+            Ok(map) if !map.is_empty() => sampler.note_app_map(now),
+            Ok(_) => problems.push(format!(
+                "rdpi -t returned no appid table; per-app names unavailable (retry in {}s)",
+                usage_stats::SAMPLE_INTERVAL_SECS
+            )),
+            Err(error) => problems.push(format!("rdpi -t task failed: {}", error)),
+        }
+    }
+
+    if sampler.sample_due(now) {
+        let keep_days = usage_stats::DEFAULT_KEEP_DAYS;
+        match tokio::task::spawn_blocking(move || usage_stats::tick(keep_days)).await {
+            Ok((_store, reports)) => sampler.note_sample(now, &reports),
+            Err(error) => problems.push(format!("usage sample task failed: {}", error)),
+        }
+    }
+
+    if sampler.push_due(now) {
+        let keep_days = usage_stats::DEFAULT_KEEP_DAYS;
+        let payload = tokio::task::spawn_blocking(move || {
+            let store = usage_stats::load_store();
+            usage_stats::ingest_payload(
+                &store,
+                keep_days,
+                usage_stats::router_today().as_deref(),
+            )
+        })
+        .await;
+        match payload {
+            Ok(body) => match post_json(
+                client,
+                config,
+                "/api/router/child-guard/usage/ingest",
+                &body,
+            )
+            .await
+            {
+                Ok(_) => sampler.note_push(now),
+                Err(error) => {
+                    // Space the retries out: a Hub outage must not become a 1s
+                    // retry storm, and `dirty` stays set so nothing is lost.
+                    sampler.last_push_at = now;
+                    problems.push(format!("usage ingest push failed: {:#}", error));
+                }
+            },
+            Err(error) => problems.push(format!("usage payload task failed: {}", error)),
+        }
+    }
+
+    if problems.is_empty() {
+        Ok(())
+    } else {
+        Err(anyhow!(problems.join(" | ")))
+    }
+}
+
 async fn sync_portmaps(
     client: &Client,
     config: &AgentConfig,
@@ -1911,6 +1989,9 @@ pub async fn run(args: &[String], once: bool) -> Result<()> {
     let client = http_client()?;
     let mut last_agent_cycle_at = 0u64;
     let mut last_status_at = 0u64;
+    // Cadence + dirty flag for the usage sampler. Not persisted: a fresh boot
+    // always re-pushes the (idempotent) aggregate window.
+    let mut usage_sampler = usage_stats::SamplerState::default();
     log_line(&config, "INFO", "Rust agent started");
     let _tcp_session_sync = if once {
         None
@@ -1997,6 +2078,15 @@ pub async fn run(args: &[String], once: bool) -> Result<()> {
             if let Err(error) = sync_router_dashboard(&client, &config, &mut state, once).await {
                 let text = redact(&format!("router dashboard: {:#}", error), &config.hook_token);
                 log_limited(&config, &mut state, "WARN", "router-dashboard", &text);
+                errors.push(text);
+            }
+        }
+        // Usage sampling is its own cadence (60s sample / 5min push / 6h app
+        // map), so it only enters the loop when one of those is actually due.
+        if once || usage_sampler.sample_due(now) || usage_sampler.push_due(now) {
+            if let Err(error) = sync_usage_stats(&client, &config, &mut usage_sampler).await {
+                let text = redact(&format!("usage stats: {:#}", error), &config.hook_token);
+                log_limited(&config, &mut state, "WARN", "usage-stats", &text);
                 errors.push(text);
             }
         }

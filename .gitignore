@@ -210,6 +210,9 @@ tempCodeRunnerFile.py
 /backups/
 /logs/
 
+# Local relay build/scratch artifacts (large binaries, never shipped)
+/build_artifacts/
+
 # Ruff stuff:
 .ruff_cache/
 

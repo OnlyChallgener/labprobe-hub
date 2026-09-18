@@ -356,6 +356,80 @@ fn usage_report(payload: &Value) -> Result<Value> {
     }))
 }
 
+/// Official-style usage report (上网统计): hourly bars plus per-app minutes,
+/// read from the relay's own aggregate buckets.
+///
+/// Deliberately separate from `get_usage`: `get_usage` reports raw *bytes* from
+/// `flow_audit` (IPv4 flow accounting), while this reports *time*, folded from
+/// the sniffer dump by `usage_stats`. Accepts either a `uid` (resolved to its
+/// bound macs) or an explicit `macs` list, plus an optional `date`.
+fn usage_stats_report(payload: &Value) -> Result<Value> {
+    let snapshot_macs = |uid: &str| -> Result<Vec<String>> {
+        let snapshot = load_snapshot()?;
+        let user = snapshot
+            .user(uid)
+            .ok_or_else(|| anyhow!("device not found"))?;
+        Ok(user
+            .lists
+            .get("mac")
+            .cloned()
+            .unwrap_or_default()
+            .iter()
+            .map(|value| normalize_mac(value))
+            .filter(|mac| !mac.is_empty())
+            .collect())
+    };
+
+    let mut macs: Vec<String> = payload
+        .get("macs")
+        .and_then(Value::as_array)
+        .map(|items| {
+            items
+                .iter()
+                .filter_map(Value::as_str)
+                .map(normalize_mac)
+                .filter(|mac| !mac.is_empty())
+                .collect()
+        })
+        .unwrap_or_default();
+
+    if macs.is_empty() {
+        let uid = payload
+            .get("uid")
+            .and_then(Value::as_str)
+            .ok_or_else(|| anyhow!("missing uid and no macs given"))?;
+        macs = snapshot_macs(uid)?;
+    }
+    if macs.is_empty() {
+        bail!("device has no mac bound");
+    }
+
+    let store = crate::usage_stats::load_store();
+    // Prefer the router's own calendar date: the firmware stamps every dump block
+    // with local time, so this stays right even before any sample has landed.
+    let date = payload
+        .get("date")
+        .and_then(Value::as_str)
+        .map(str::to_string)
+        .or_else(crate::usage_stats::router_today)
+        .or_else(|| store.newest_date())
+        .unwrap_or_else(|| "unknown".into());
+
+    let mut report = crate::usage_stats::report_json(&store, &macs, &date);
+    if let Some(object) = report.as_object_mut() {
+        object.insert("ok".into(), json!(true));
+        object.insert("uid".into(), payload.get("uid").cloned().unwrap_or(Value::Null));
+        object.insert("macs".into(), json!(macs));
+        object.insert("source".into(), json!("relay"));
+        object.insert(
+            "keepDays".into(),
+            json!(crate::usage_stats::DEFAULT_KEEP_DAYS),
+        );
+        object.insert("verifiedAtEpoch".into(), json!(now_epoch()));
+    }
+    Ok(report)
+}
+
 fn normalize_mac(value: &str) -> String {
     let compact = value
         .trim()
@@ -827,6 +901,22 @@ fn direct_policy(plan: &Value, public_id: &str) -> Result<UciSection> {
     );
     let mut lists = BTreeMap::new();
     if !apps.is_empty() {
+        // CROSS-REPO CONTRACT — do not remove this `app` list as "unused UI data".
+        //
+        // The firmware's own `/usr/lib/lua/child_guard_reload.lua` scans every
+        // `child_guard.<uid>` user and sets `is_have_app = true` as soon as ANY
+        // of that user's policies carries a non-empty `app` list. When it is
+        // true, `child_reload()` calls `ip6_add(mac_list)`, which runs
+        // `ipset add child_guard_ip6_block <mac>`. That ipset is `hash:mac` and
+        // is matched by `ip6tables -t filter child_guard ... -j DROP`, so every
+        // IPv6 packet of the guarded device is dropped and the device falls back
+        // to IPv4 — where the sniffer/RDPI engine actually works.
+        //
+        // In other words: writing a non-empty `app` list is what makes per-app
+        // identification possible at all for apps whose traffic is mostly IPv6
+        // (WeChat, Douyin). No `app` list => no IPv6 block => those apps never
+        // show up in the report. Verified against the extracted firmware lua
+        // (`_analysis/extract/rootfs/usr/lib/lua/child_guard_reload.lua`).
         lists.insert("app".into(), apps);
     }
     let tr_times = if enabled { desired } else { BTreeMap::new() };
@@ -1420,8 +1510,102 @@ fn generate_uid() -> String {
     bytes.iter().map(|byte| format!("{byte:02X}")).collect()
 }
 
-fn verify_user_presence(uid: &str, should_exist: bool) -> Result<()> {
+/// Merge the macs already present in the runtime with the requested set.
+/// Existing entries keep their original formatting; requested macs are
+/// normalized and appended only when not already present (normalized compare).
+fn merge_runtime_macs(existing: &[String], wanted: &[String]) -> Vec<String> {
+    let mut merged = existing.to_vec();
+    for mac in wanted {
+        let normalized = normalize_mac(mac);
+        if !normalized.contains(':') {
+            continue;
+        }
+        if !merged.iter().any(|item| normalize_mac(item) == normalized) {
+            merged.push(normalized);
+        }
+    }
+    merged
+}
+
+/// Read the runtime `sniffer.user` object for `uid` (as returned by ubus).
+fn runtime_user_object(uid: &str) -> Option<Map<String, Value>> {
+    let show = ubus_show("sniffer.user").ok()?;
+    recursive_object_by_uid(&show, uid).cloned()
+}
+
+fn runtime_macs(uid: &str) -> Vec<String> {
+    runtime_user_object(uid)
+        .and_then(|object| object.get("mac").cloned())
+        .map(|value| json_strings(Some(&value)))
+        .unwrap_or_default()
+}
+
+/// Repair a runtime `sniffer.user` entry whose mac list was lost.
+///
+/// The firmware reload pushes UCI users into `sniffer.user` through a Lua path
+/// that silently returns -1 when the mac list is empty (and the vendor cloud
+/// sync can mutate the section mid-traversal), while the caller still clears the
+/// reload flag — so a dropped push never self-heals. After a reload we re-read
+/// the runtime and, when the expected macs are missing, write the entry back
+/// with `ubus sniffer.user set`, preserving its policy bindings and effect
+/// policy. No-op when the runtime already carries every requested mac.
+fn ensure_runtime_user_macs(uid: &str, macs: &[String]) -> Result<()> {
+    let current = runtime_user_object(uid);
+    let existing = current
+        .as_ref()
+        .and_then(|object| object.get("mac").cloned())
+        .map(|value| json_strings(Some(&value)))
+        .unwrap_or_default();
+    let wanted = macs
+        .iter()
+        .map(|mac| normalize_mac(mac))
+        .filter(|mac| mac.contains(':'))
+        .collect::<Vec<_>>();
+    let missing = wanted
+        .iter()
+        .any(|mac| !existing.iter().any(|item| normalize_mac(item) == *mac));
+    if !missing && !existing.is_empty() {
+        return Ok(());
+    }
+    let merged = merge_runtime_macs(&existing, &wanted);
+    if merged.is_empty() {
+        bail!("runtime user {uid} has no usable mac to push");
+    }
+    let policy = current
+        .as_ref()
+        .and_then(|object| object.get("policy").or_else(|| object.get("policies")).cloned())
+        .map(|value| json_strings(Some(&value)))
+        .unwrap_or_default();
+    let effect = current
+        .as_ref()
+        .and_then(|object| {
+            object
+                .get("effect policy")
+                .or_else(|| object.get("effect_policy"))
+                .or_else(|| object.get("effectPolicy"))
+        })
+        .and_then(Value::as_str)
+        .filter(|value| !value.is_empty())
+        .unwrap_or("none")
+        .to_string();
+    let body = serde_json::to_string(&json!({
+        "uid": uid,
+        "mac": merged,
+        "policy": policy,
+        "effect policy": effect,
+        "skip": 0,
+    }))?;
+    command_output("ubus", &["call", "sniffer.user", "set", &body])?;
+    Ok(())
+}
+
+/// Verify both UCI and runtime membership. When `should_exist` and `macs` are
+/// supplied the runtime mac list must contain every requested mac — the runtime
+/// entry existing with an empty mac list is exactly the failure mode that made
+/// guarded devices silently lose attribution.
+fn verify_user_presence(uid: &str, should_exist: bool, macs: &[String]) -> Result<()> {
     let deadline = Instant::now() + VERIFY_TIMEOUT;
+    let mut repaired = false;
     loop {
         let snapshot = load_snapshot()?;
         let in_uci = snapshot.user(uid).is_some();
@@ -1429,13 +1613,35 @@ fn verify_user_presence(uid: &str, should_exist: bool) -> Result<()> {
             serde_json::to_string(&ubus_show("sniffer.user").unwrap_or(Value::Null))
                 .unwrap_or_default();
         let in_runtime = user_text.contains(uid);
-        if should_exist && in_uci && in_runtime {
+        let wants_macs = should_exist && !macs.is_empty();
+        let macs_ok = if wants_macs {
+            let present = runtime_macs(uid);
+            macs.iter().all(|mac| {
+                let wanted = normalize_mac(mac);
+                present.iter().any(|item| normalize_mac(item) == wanted)
+            })
+        } else {
+            true
+        };
+        if should_exist && in_uci && in_runtime && macs_ok {
             return Ok(());
         }
         if !should_exist && !in_uci && !in_runtime {
             return Ok(());
         }
+        // Self-heal once: the Lua reload may have dropped the mac push.
+        if wants_macs && in_runtime && !macs_ok && !repaired {
+            repaired = ensure_runtime_user_macs(uid, macs).is_ok();
+        }
         if Instant::now() >= deadline {
+            if wants_macs && !macs_ok {
+                bail!(
+                    "child_guard membership verification timed out: runtime mac missing for {uid} \
+                     (wanted {:?}, runtime {:?})",
+                    macs,
+                    runtime_macs(uid)
+                );
+            }
             bail!("child_guard membership verification timed out");
         }
         thread::sleep(Duration::from_secs(1));
@@ -1465,10 +1671,14 @@ fn mutate_membership(action: &str, payload: &Value) -> Result<Value> {
                     .unwrap_or(false)
             }) {
                 let uid = user.name.clone();
+                let existing_macs = user.lists.get("mac").cloned().unwrap_or_default();
+                // A previous add may have landed in UCI but lost the runtime mac
+                // push; repair it here so an idempotent re-add self-heals.
+                let _ = ensure_runtime_user_macs(&uid, &existing_macs);
                 return Ok(json!({
                     "ok": true,
                     "uid": uid,
-                    "macs": user.lists.get("mac").cloned().unwrap_or_default(),
+                    "macs": existing_macs,
                     "created": false,
                 }));
             }
@@ -1499,7 +1709,10 @@ fn mutate_membership(action: &str, payload: &Value) -> Result<Value> {
             )?;
             command_output("uci", &["-q", "commit", CONFIG])?;
             trigger_reload();
-            verify_user_presence(&uid, true)?;
+            // Pass the requested macs so a reload that dropped the runtime mac
+            // push is detected and self-healed instead of silently leaving a
+            // guarded device with no attribution.
+            verify_user_presence(&uid, true, &macs)?;
             Ok(json!({"ok": true, "uid": uid, "macs": macs, "created": true}))
         }
         "remove_device" => {
@@ -1530,7 +1743,7 @@ fn mutate_membership(action: &str, payload: &Value) -> Result<Value> {
                 let _ = command_output("uci", &["-q", "commit", CONFIG]);
             }
             trigger_reload();
-            verify_user_presence(uid, false)?;
+            verify_user_presence(uid, false, &[])?;
             Ok(json!({"ok": true, "uid": uid, "removedPlans": removed_plans}))
         }
         _ => bail!("unsupported membership action"),
@@ -1657,6 +1870,7 @@ pub fn execute(action: &str, payload: &Value) -> Value {
             mutate_plan(action, payload)
         }
         "get_usage" => usage_report(payload),
+        "get_usage_stats" => usage_stats_report(payload),
         "list_devices" => list_lan_devices(),
         "add_device" | "remove_device" => mutate_membership(action, payload),
         "pause_device" | "resume_device" => device_pause(action, payload),
@@ -1864,5 +2078,40 @@ config user 'router_uid'
         let value = user_value(parsed.user("router_uid").unwrap(), &parsed, &identities);
         assert_eq!(value["name"], "书房电脑");
         assert_eq!(value["hostname"], "DESKTOP-LAB");
+    }
+
+    #[test]
+    fn runtime_mac_merge_recovers_dropped_push() {
+        // uid exists in the runtime with an empty mac list (the observed bug):
+        // the requested mac must be written back.
+        assert_eq!(
+            merge_runtime_macs(&[], &["1a:9c:c5:c5:b7:bb".to_string()]),
+            vec!["1a:9c:c5:c5:b7:bb"]
+        );
+        // existing macs are preserved and the missing one appended.
+        assert_eq!(
+            merge_runtime_macs(
+                &["aa:bb:cc:dd:ee:ff".to_string()],
+                &[
+                    "aa:bb:cc:dd:ee:ff".to_string(),
+                    "1a:9c:c5:c5:b7:bb".to_string()
+                ]
+            ),
+            vec!["aa:bb:cc:dd:ee:ff", "1a:9c:c5:c5:b7:bb"]
+        );
+    }
+
+    #[test]
+    fn runtime_mac_merge_normalizes_and_rejects_invalid() {
+        // Same mac in a different notation must not be duplicated.
+        assert_eq!(
+            merge_runtime_macs(
+                &["AA-BB-CC-DD-EE-FF".to_string()],
+                &["aabb.ccdd.eeff".to_string()]
+            ),
+            vec!["AA-BB-CC-DD-EE-FF"]
+        );
+        // Garbage never reaches the runtime push.
+        assert!(merge_runtime_macs(&[], &["not-a-mac".to_string()]).is_empty());
     }
 }

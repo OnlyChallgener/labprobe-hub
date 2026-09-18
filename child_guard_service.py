@@ -31,6 +31,7 @@ _ACTIONS = {
     "get_plans",
     "get_runtime_state",
     "get_usage",
+    "get_usage_stats",
     "list_devices",
     "create_plan",
     "update_plan",
