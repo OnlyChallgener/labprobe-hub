@@ -1031,12 +1031,59 @@ fn user_payload_with_times(
 /// the lua for minutes and blew the whole command through the Hub's 35s wait.
 /// When the cap hits, verification below still polls the runtime and reports
 /// a precise failure instead of hanging.
+fn sync_child_guard_ip6_block_router() {
+    let _ = Command::new("ipset")
+        .args(&["create", "child_guard_ip6_block", "hash:mac", "-exist"])
+        .status();
+    let _ = Command::new("ip6tables")
+        .args(&["-C", "FORWARD", "-m", "set", "--match-set", "child_guard_ip6_block", "src", "-j", "REJECT", "--reject-with", "icmp6-adm-prohibited"])
+        .status()
+        .map(|status| {
+            if !status.success() {
+                let _ = Command::new("ip6tables")
+                    .args(&["-I", "FORWARD", "1", "-m", "set", "--match-set", "child_guard_ip6_block", "src", "-j", "REJECT", "--reject-with", "icmp6-adm-prohibited"])
+                    .status();
+            }
+        });
+    let _ = Command::new("ip6tables")
+        .args(&["-C", "FORWARD", "-m", "set", "--match-set", "child_guard_ip6_block", "dst", "-j", "REJECT", "--reject-with", "icmp6-adm-prohibited"])
+        .status()
+        .map(|status| {
+            if !status.success() {
+                let _ = Command::new("ip6tables")
+                    .args(&["-I", "FORWARD", "1", "-m", "set", "--match-set", "child_guard_ip6_block", "dst", "-j", "REJECT", "--reject-with", "icmp6-adm-prohibited"])
+                    .status();
+            }
+        });
+
+    if let Ok(snapshot) = load_snapshot() {
+        let mut guarded_macs = BTreeSet::new();
+        for user in snapshot.sections_of("user") {
+            for mac in user.lists.get("mac").into_iter().flatten() {
+                let normalized = normalize_mac(mac);
+                if normalized.contains(':') {
+                    guarded_macs.insert(normalized);
+                }
+            }
+        }
+        let _ = Command::new("ipset")
+            .args(&["flush", "child_guard_ip6_block"])
+            .status();
+        for mac in guarded_macs {
+            let _ = Command::new("ipset")
+                .args(&["add", "child_guard_ip6_block", &mac, "-exist"])
+                .status();
+        }
+    }
+}
+
 fn trigger_reload() {
     // BusyBox on this firmware: `timeout [-t SECS] [-s SIG] PROG ARGS`.
     let _ = command_output(
         "sh",
         &["-c", "timeout -t 14 /etc/init.d/child_guard reload >/dev/null 2>&1"],
     );
+    sync_child_guard_ip6_block_router();
     thread::sleep(Duration::from_secs(2));
 }
 
@@ -1234,6 +1281,7 @@ fn capabilities() -> Value {
         .map(|value| value == "1")
         .unwrap_or(false);
     let available = child_guard && available() && sniffer_user && sniffer_policy;
+    sync_child_guard_ip6_block_router();
     json!({
         "ok": true,
         "capabilities": {

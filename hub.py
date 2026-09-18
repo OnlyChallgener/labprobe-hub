@@ -86,6 +86,7 @@ DATA_LOCK_BYPASS_PREFIXES = (
     "/api/tcp-session-test",
     "/api/router/tcp-session-test",
     "/api/router/child-guard",
+    "/api/router/rdpi",
 )
 REFRESH_RUNNING = False
 STATUS_REFRESH_TTL_SEC = int(os.environ.get("STATUS_REFRESH_TTL_SEC", "180"))
@@ -2990,11 +2991,21 @@ def api_child_guard_capabilities():
     return _child_guard_execute("get_capabilities")
 
 
+def _safe_sync_ip6(macs: Optional[List[str]] = None):
+    try:
+        from rdpi_signature_service import sync_child_guard_ip6_block
+        sync_child_guard_ip6_block(macs)
+    except Exception as e:
+        LOGGER.warning("Failed to auto-sync child_guard_ip6_block: %s", e)
+
+
 @app.route("/api/router/child-guard/devices", methods=["GET"])
 def api_child_guard_devices():
     if not check_read_token():
         return jsonify({"ok": False, "error": "unauthorized"}), 401
+    threading.Thread(target=_safe_sync_ip6, daemon=True).start()
     return _child_guard_execute("get_users")
+
 
 
 @app.route("/api/router/child-guard/devices/<uid>/plans", methods=["GET", "POST"])
@@ -3227,6 +3238,7 @@ def api_child_guard_devices_collection():
                             "error": f"invalid mac: {mac}"}), 400
         if mac not in macs:
             macs.append(mac)
+    threading.Thread(target=lambda: _safe_sync_ip6(macs), daemon=True).start()
     return _child_guard_execute("add_device", {"macs": macs,
                                                "deviceName": body.get("deviceName"),
                                                "router": body.get("router")})
@@ -3241,6 +3253,7 @@ def api_child_guard_device_delete(uid: str):
     except ChildGuardValidationError as error:
         return jsonify({"ok": False, "errorCode": "invalid_request", "error": str(error)}), 400
     body = request.get_json(silent=True) or {}
+    threading.Thread(target=lambda: _safe_sync_ip6(), daemon=True).start()
     return _child_guard_execute("remove_device", {"uid": normalized_uid,
                                                   "router": body.get("router")})
 
@@ -3264,6 +3277,88 @@ def api_router_child_guard_ack():
         request.args.get("router") or body.get("router") or primary_router_name())
     count = CHILD_GUARD_COMMANDS.acknowledge(router, body.get("acks", []))
     return jsonify({"ok": True, "acknowledged": count})
+
+
+@app.route("/api/router/rdpi/signatures", methods=["GET"])
+def api_router_rdpi_signatures_get():
+    if not check_app_token():
+        return jsonify({"ok": False, "error": "unauthorized"}), 401
+    try:
+        from rdpi_signature_service import get_rdpi_signatures_summary
+        summary = get_rdpi_signatures_summary()
+        return jsonify(summary)
+    except Exception as e:
+        return jsonify({"ok": False, "error": str(e)}), 500
+
+
+@app.route("/api/router/rdpi/signatures", methods=["POST"])
+def api_router_rdpi_signatures_post():
+    if not check_app_token():
+        return jsonify({"ok": False, "error": "unauthorized"}), 401
+    body = request.get_json(silent=True)
+    if not body:
+        return jsonify({"ok": False, "error": "missing or invalid JSON body"}), 400
+    try:
+        from rdpi_signature_service import add_or_update_rdpi_signature
+        result = add_or_update_rdpi_signature(body)
+        return jsonify(result)
+    except Exception as e:
+        return jsonify({"ok": False, "error": str(e)}), 400
+
+
+@app.route("/api/router/rdpi/signatures/<target>", methods=["DELETE"])
+def api_router_rdpi_signatures_delete(target: str):
+    if not check_app_token():
+        return jsonify({"ok": False, "error": "unauthorized"}), 401
+    try:
+        from rdpi_signature_service import delete_rdpi_signature
+        result = delete_rdpi_signature(target)
+        return jsonify(result)
+    except Exception as e:
+        return jsonify({"ok": False, "error": str(e)}), 500
+
+
+@app.route("/api/router/rdpi/signatures/bundle", methods=["POST"])
+def api_router_rdpi_signatures_bundle():
+    """Apply curated high-frequency signatures bundle (WeChat Video Channels, Douyin, Kuaishou, PDD, JD, Taobao)."""
+    if not check_app_token():
+        return jsonify({"ok": False, "error": "unauthorized"}), 401
+    try:
+        from rdpi_signature_service import apply_curated_signature_bundle
+        result = apply_curated_signature_bundle()
+        return jsonify(result)
+    except Exception as e:
+        return jsonify({"ok": False, "error": str(e)}), 500
+
+
+@app.route("/api/router/child-guard/ip6-audit/sync", methods=["POST"])
+def api_child_guard_ip6_audit_sync():
+    """Synchronize guarded device MACs into router `child_guard_ip6_block`."""
+    if not check_app_token():
+        return jsonify({"ok": False, "error": "unauthorized"}), 401
+    body = request.get_json(silent=True) or {}
+    macs = body.get("macs")
+    try:
+        from rdpi_signature_service import sync_child_guard_ip6_block
+        result = sync_child_guard_ip6_block(macs=macs if isinstance(macs, list) else None)
+        return jsonify(result)
+    except Exception as e:
+        return jsonify({"ok": False, "error": str(e)}), 500
+
+
+@app.route("/api/router/child-guard/ip6-audit/status", methods=["GET"])
+def api_child_guard_ip6_audit_status():
+    """Query current status of `child_guard_ip6_block`."""
+    if not check_read_token():
+        return jsonify({"ok": False, "error": "unauthorized"}), 401
+    try:
+        from rdpi_signature_service import get_child_guard_ip6_block_status
+        result = get_child_guard_ip6_block_status()
+        return jsonify(result)
+    except Exception as e:
+        return jsonify({"ok": False, "error": str(e)}), 500
+
+
 
 
 

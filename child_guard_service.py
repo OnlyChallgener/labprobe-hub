@@ -234,7 +234,8 @@ class ChildGuardCommandStore:
             rows = self._load()
             changed = False
             for command in rows:
-                if router_alias(command.get("router")) != canonical_alias:
+                cmd_alias = router_alias(command.get("router"))
+                if cmd_alias != canonical_alias and cmd_alias not in ("default", "router", "primary", "") and canonical_alias not in ("default", "router", "primary", ""):
                     continue
                 status = command.get("status")
                 created = int(command.get("createdEpoch") or 0)
@@ -295,7 +296,8 @@ class ChildGuardCommandStore:
         with self.changed:
             rows = self._load()
             for command in rows:
-                if router_alias(command.get("router")) != canonical_alias:
+                cmd_alias = router_alias(command.get("router"))
+                if cmd_alias != canonical_alias and cmd_alias not in ("default", "router", "primary", "") and canonical_alias not in ("default", "router", "primary", ""):
                     continue
                 acknowledgement = ack_map.get(str(command.get("id") or ""))
                 if not acknowledgement or command.get("status") not in {"pending", "delivered"}:
