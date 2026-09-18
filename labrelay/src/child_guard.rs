@@ -935,10 +935,17 @@ fn user_payload_with_times(
 /// re-pushes every user section into `sniffer.user` and its referenced
 /// policies into `sniffer.policy`. Without this trigger the UCI write never
 /// reaches the runtime and plan verification always times out.
+///
+/// The reload is capped: the firmware's own cloud sync can transiently mutate
+/// user sections mid-traversal (mac-named temporary users), which once stalled
+/// the lua for minutes and blew the whole command through the Hub's 35s wait.
+/// When the cap hits, verification below still polls the runtime and reports
+/// a precise failure instead of hanging.
 fn trigger_reload() {
+    // BusyBox on this firmware: `timeout [-t SECS] [-s SIG] PROG ARGS`.
     let _ = command_output(
         "sh",
-        &["-c", "/etc/init.d/child_guard reload >/dev/null 2>&1"],
+        &["-c", "timeout -t 14 /etc/init.d/child_guard reload >/dev/null 2>&1"],
     );
     thread::sleep(Duration::from_secs(2));
 }
