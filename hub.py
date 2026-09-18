@@ -3067,6 +3067,18 @@ def api_child_guard_runtime(uid: str):
     return _child_guard_execute("get_runtime_state", {"uid": normalized_uid})
 
 
+@app.route("/api/router/child-guard/devices/<uid>/usage", methods=["GET"])
+def api_child_guard_usage(uid: str):
+    """Per-device traffic usage (daily totals + recent rates) from flow_audit."""
+    if not check_read_token():
+        return jsonify({"ok": False, "error": "unauthorized"}), 401
+    try:
+        normalized_uid = validate_child_guard_uid(uid)
+    except ChildGuardValidationError as error:
+        return jsonify({"ok": False, "errorCode": "invalid_request", "error": str(error)}), 400
+    return _child_guard_execute("get_usage", {"uid": normalized_uid})
+
+
 @app.route("/api/router/child-guard/devices/<uid>/<action>", methods=["POST"])
 def api_child_guard_device_action(uid: str, action: str):
     if not check_app_token():

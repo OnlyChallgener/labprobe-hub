@@ -30,6 +30,7 @@ _ACTIONS = {
     "get_users",
     "get_plans",
     "get_runtime_state",
+    "get_usage",
     "create_plan",
     "update_plan",
     "delete_plan",
