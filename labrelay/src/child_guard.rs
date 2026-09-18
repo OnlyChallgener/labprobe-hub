@@ -235,7 +235,9 @@ fn flow_daily_for_ip(ip: &str) -> Vec<(String, u64, u64)> {
             }
         }
     }
-    rows.into_iter().collect()
+    rows.into_iter()
+        .map(|(date, (tx, rx))| (date, tx, rx))
+        .collect()
 }
 
 /// Recent per-second rates from flow_audit. Returns (avg_tx_rate, avg_rx_rate)
@@ -322,8 +324,8 @@ fn usage_report(payload: &Value) -> Result<Value> {
             .cloned()
             .unwrap_or_else(|| "unknown".into())
     };
-    let today_tx = daily.values().map(|(tx, _)| tx).sum();
-    let today_rx = daily.values().map(|(_, rx)| rx).sum();
+    let today_tx: u64 = daily.values().map(|(tx, _)| *tx).sum();
+    let today_rx: u64 = daily.values().map(|(_, rx)| *rx).sum();
     let mut recent_tx = 0.0f64;
     let mut recent_rx = 0.0f64;
     for ip in &bound_ips {
