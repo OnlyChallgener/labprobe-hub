@@ -167,6 +167,193 @@ fn ubus_show(object: &str) -> Result<Value> {
     command_json("ubus", &["call", object, "show", "{}"])
 }
 
+/// MAC -> IP mapping from the standard OpenWrt DHCP lease file, used to bind
+/// child_guard user MACs to the per-IP flow audit tables.
+fn dhcp_mac_ip_map() -> BTreeMap<String, String> {
+    let mut map = BTreeMap::new();
+    if let Ok(text) = std::fs::read_to_string("/tmp/dhcp.leases") {
+        for line in text.lines() {
+            let fields: Vec<&str> = line.split_whitespace().collect();
+            if fields.len() >= 3 {
+                let mac = normalize_mac(fields[1]);
+                if mac.contains(':') {
+                    map.insert(mac, fields[2].to_string());
+                }
+            }
+        }
+    }
+    map
+}
+
+/// Per-IP daily byte totals from the flow_audit ubus object. The firmware
+/// keeps only a couple of days in memory; the Hub accumulates beyond that.
+/// Returns (date, tx_bytes, rx_bytes) rows.
+fn flow_daily_for_ip(ip: &str) -> Vec<(String, u64, u64)> {
+    let arg = format!("{{\"ip\":\"{}\"}}", ip);
+    let root = match command_json("ubus", &["call", "flow_audit", "get_daily_ip", &arg]) {
+        Ok(value) => value,
+        Err(_) => return Vec::new(),
+    };
+    let mut rows: BTreeMap<String, (u64, u64)> = BTreeMap::new();
+    if let Some(entries) = root.get("ip_list").and_then(Value::as_array) {
+        for entry in entries {
+            if entry.get("ip_addr").and_then(Value::as_str) != Some(ip) {
+                continue;
+            }
+            let daily = match entry.get("daily").and_then(Value::as_array) {
+                Some(value) => value,
+                None => continue,
+            };
+            for day in daily {
+                let raw_date = day.get("date").and_then(Value::as_u64).unwrap_or(0);
+                if raw_date < 20_000_000 {
+                    continue;
+                }
+                let date = format!(
+                    "{}-{:02}-{:02}",
+                    raw_date / 10000,
+                    (raw_date / 100) % 100,
+                    raw_date % 100
+                );
+                let parse_bytes = |key: &str| -> u64 {
+                    day.get(key)
+                        .and_then(Value::as_str)
+                        .and_then(|value| value.trim().parse::<u64>().ok())
+                        .unwrap_or(0)
+                };
+                let tx = parse_bytes("tx_bytes");
+                let rx = parse_bytes("rx_bytes");
+                // The same date can appear twice (closed period + in-progress
+                // snapshot); the larger row already contains the smaller one.
+                let slot = rows.entry(date).or_default();
+                if tx > slot.0 {
+                    slot.0 = tx;
+                }
+                if rx > slot.1 {
+                    slot.1 = rx;
+                }
+            }
+        }
+    }
+    rows.into_iter().collect()
+}
+
+/// Recent per-second rates from flow_audit. Returns (avg_tx_rate, avg_rx_rate)
+/// in bytes per second over the requested window.
+fn flow_recent_rate_for_ip(ip: &str, limit: usize) -> (f64, f64) {
+    let arg = format!("{{\"ip\":\"{}\",\"limit\":{}}}", ip, limit);
+    let root = match command_json("ubus", &["call", "flow_audit", "get_recent_ip", &arg]) {
+        Ok(value) => value,
+        Err(_) => return (0.0, 0.0),
+    };
+    let csv = root
+        .get("ip_list")
+        .and_then(Value::as_array)
+        .and_then(|entries| entries.first())
+        .and_then(|entry| entry.get("recent"))
+        .and_then(Value::as_str)
+        .unwrap_or_default();
+    let mut tx_sum = 0.0f64;
+    let mut rx_sum = 0.0f64;
+    let mut count = 0usize;
+    for (index, line) in csv.lines().enumerate() {
+        if index == 0 && line.starts_with("ts,") {
+            continue;
+        }
+        let fields: Vec<&str> = line.split(',').collect();
+        if fields.len() < 3 {
+            continue;
+        }
+        let tx = fields[1].trim().parse::<f64>().unwrap_or(0.0);
+        let rx = fields[2].trim().parse::<f64>().unwrap_or(0.0);
+        tx_sum += tx;
+        rx_sum += rx;
+        count += 1;
+    }
+    if count == 0 {
+        (0.0, 0.0)
+    } else {
+        (tx_sum / count as f64, rx_sum / count as f64)
+    }
+}
+
+fn usage_report(payload: &Value) -> Result<Value> {
+    let uid = payload
+        .get("uid")
+        .and_then(Value::as_str)
+        .ok_or_else(|| anyhow!("missing uid"))?;
+    let snapshot = load_snapshot()?;
+    let user = snapshot.user(uid).ok_or_else(|| anyhow!("device not found"))?;
+    let macs: Vec<String> = user
+        .lists
+        .get("mac")
+        .cloned()
+        .unwrap_or_default()
+        .iter()
+        .map(|value| normalize_mac(value))
+        .collect();
+    if macs.is_empty() {
+        bail!("device has no mac bound");
+    }
+    let leases = dhcp_mac_ip_map();
+    let mut bound_ips = Vec::new();
+    for mac in &macs {
+        if let Some(ip) = leases.get(mac) {
+            bound_ips.push(ip.clone());
+        }
+    }
+    bound_ips.sort();
+    bound_ips.dedup();
+
+    let mut daily: BTreeMap<String, (u64, u64)> = BTreeMap::new();
+    for ip in &bound_ips {
+        for (date, tx, rx) in flow_daily_for_ip(ip) {
+            let slot = daily.entry(date).or_default();
+            slot.0 += tx;
+            slot.1 += rx;
+        }
+    }
+    let router_date = {
+        // Router local date comes straight from the flow audit rows; fall back
+        // to the UTC calendar date when the table is empty.
+        daily
+            .keys()
+            .last()
+            .cloned()
+            .unwrap_or_else(|| "unknown".into())
+    };
+    let today_tx = daily.values().map(|(tx, _)| tx).sum();
+    let today_rx = daily.values().map(|(_, rx)| rx).sum();
+    let mut recent_tx = 0.0f64;
+    let mut recent_rx = 0.0f64;
+    for ip in &bound_ips {
+        let (tx, rx) = flow_recent_rate_for_ip(ip, 60);
+        recent_tx += tx;
+        recent_rx += rx;
+    }
+    let daily_json: Vec<Value> = daily
+        .iter()
+        .map(|(date, (tx, rx))| {
+            json!({"date": date, "txBytes": tx, "rxBytes": rx, "totalBytes": tx + rx})
+        })
+        .collect();
+    Ok(json!({
+        "ok": true,
+        "uid": uid,
+        "usage": {
+            "date": router_date,
+            "todayTxBytes": today_tx,
+            "todayRxBytes": today_rx,
+            "todayTotalBytes": today_tx + today_rx,
+            "recentAvgTxRate": recent_tx.round() as u64,
+            "recentAvgRxRate": recent_rx.round() as u64,
+            "boundIps": bound_ips,
+            "daily": daily_json,
+        },
+        "verifiedAtEpoch": now_epoch(),
+    }))
+}
+
 fn normalize_mac(value: &str) -> String {
     let compact = value
         .trim()
@@ -1254,6 +1441,7 @@ pub fn execute(action: &str, payload: &Value) -> Value {
         "create_plan" | "update_plan" | "delete_plan" | "set_plan_enabled" => {
             mutate_plan(action, payload)
         }
+        "get_usage" => usage_report(payload),
         "pause_device" | "resume_device" => device_pause(action, payload),
         _ => bail!("unsupported child_guard action"),
     })();
