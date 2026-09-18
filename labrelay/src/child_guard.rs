@@ -8,7 +8,10 @@ use std::thread;
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 const CONFIG: &str = "child_guard";
-const VERIFY_TIMEOUT: Duration = Duration::from_secs(14);
+// The reload path runs the full init restart (iptables rebuild + lua reboot-mode
+// push to sniffer/tmngtd), which takes a few seconds on the router; give the
+// runtime state enough room to converge before declaring a verification failure.
+const VERIFY_TIMEOUT: Duration = Duration::from_secs(25);
 static ID_COUNTER: AtomicU64 = AtomicU64::new(1);
 
 #[derive(Clone, Debug, Default, PartialEq, Eq)]
@@ -736,6 +739,31 @@ fn user_payload_with_times(
     Ok(value)
 }
 
+/// The native config tool (`dev_config add/del -m child_guard`) only persists
+/// UCI sections. The sniffer/tmngtd runtime is fed by the child_guard init
+/// script, whose reload performs a full restart and runs
+/// `lua /usr/lib/lua/child_guard_reload.lua reboot` — that reboot-mode pass
+/// re-pushes every user section into `sniffer.user` and its referenced
+/// policies into `sniffer.policy`. Without this trigger the UCI write never
+/// reaches the runtime and plan verification always times out.
+fn trigger_reload() {
+    let _ = command_output(
+        "sh",
+        &["-c", "/etc/init.d/child_guard reload >/dev/null 2>&1"],
+    );
+    thread::sleep(Duration::from_secs(2));
+}
+
+/// Reload only removes runtime entries whose user section disappeared; an
+/// app policy that is dropped from UCI while its user survives leaves an
+/// orphan `sniffer.policy` entry behind, so delete it explicitly.
+fn drop_runtime_policy(pid: &str) {
+    let _ = command_output(
+        "ubus",
+        &["call", "sniffer.policy", "del", &format!("{{\"pid\":\"{}\"}}", pid)],
+    );
+}
+
 fn write_user(
     snapshot: &Snapshot,
     uid: &str,
@@ -750,6 +778,7 @@ fn write_user(
     let body = serde_json::to_string(&json!({"data": data}))?;
     command_output("dev_config", &["add", "-m", CONFIG, &body])?;
     restore_metadata(&policies)?;
+    trigger_reload();
     Ok(())
 }
 
@@ -776,6 +805,7 @@ fn restore_metadata(policies: &[UciSection]) -> Result<()> {
 fn delete_user(uid: &str) -> Result<()> {
     let body = serde_json::to_string(&json!({"list": [uid]}))?;
     command_output("dev_config", &["del", "-m", CONFIG, &body])?;
+    trigger_reload();
     Ok(())
 }
 
@@ -845,6 +875,7 @@ fn verify_snapshot_restored(snapshot: &Snapshot, uid: &str) -> Result<()> {
 
 fn verify_policy(uid: &str, pid: &str, should_exist: bool, app_policy: bool) -> Result<()> {
     let deadline = Instant::now() + VERIFY_TIMEOUT;
+    let mut orphan_dropped = false;
     loop {
         let snapshot = load_snapshot()?;
         let in_uci = snapshot.user(uid).is_some() && snapshot.named(pid).is_some();
@@ -860,6 +891,12 @@ fn verify_policy(uid: &str, pid: &str, should_exist: bool, app_policy: bool) -> 
         }
         if !should_exist && !in_uci && !user_text.contains(pid) && !policy_text.contains(pid) {
             return Ok(());
+        }
+        if !should_exist && !in_uci && !orphan_dropped && policy_text.contains(pid) {
+            // The init reload leaves the dropped app policy in the sniffer
+            // runtime; remove it once so the verification can converge.
+            drop_runtime_policy(pid);
+            orphan_dropped = true;
         }
         if Instant::now() >= deadline {
             bail!("child_guard reload verification timed out");
@@ -1083,7 +1120,15 @@ fn mutate_plan(action: &str, payload: &Value) -> Result<Value> {
             }
             Ok(())
         },
-        |snapshot| snapshot_user_restore(snapshot, uid),
+        |snapshot| {
+            snapshot_user_restore(snapshot, uid)?;
+            // When the failed mutation added a new app policy, restoring the
+            // previous UCI leaves that pid orphaned in the sniffer runtime.
+            if should_exist {
+                drop_runtime_policy(&verify_pid);
+            }
+            Ok(())
+        },
     )?;
     let after = load_snapshot()?;
     let plan = response_plan.and_then(|policy| {
