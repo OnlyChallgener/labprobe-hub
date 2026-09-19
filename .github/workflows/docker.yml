@@ -6,6 +6,7 @@ on:
       - main
       - refactor/router-core-v1
       - codex/child-internet
+      - reverse_engineer_parental_control
     tags:
       - 'v*'
   workflow_dispatch:

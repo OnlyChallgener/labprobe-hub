@@ -5,6 +5,9 @@ on:
   push:
     branches:
       - fix/relay-nofile-upgrade-0.2.33-v2
+      - reverse_engineer_parental_control
+      - codex/child-internet
+      - main
 
 concurrency:
   group: publish-labrelay-${{ github.ref }}
