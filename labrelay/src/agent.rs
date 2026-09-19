@@ -1559,6 +1559,21 @@ async fn sync_usage_stats(
         }
     }
 
+    // The firmware forgets its identify list and full mode whenever the guard
+    // configuration is reloaded, and with either one switched off the dump is
+    // nothing but header blocks, so re-assert them on a slow cycle instead of
+    // treating this as one-shot setup.
+    if sampler.sniffer_due(now) {
+        sampler.note_sniffer(now);
+        match tokio::task::spawn_blocking(usage_stats::prepare_sniffer).await {
+            Ok(true) => {}
+            Ok(false) => problems.push(
+                "sniffer identification unavailable; usage will stay empty".to_string(),
+            ),
+            Err(error) => problems.push(format!("sniffer preparation failed: {}", error)),
+        }
+    }
+
     if sampler.sample_due(now) {
         let keep_days = usage_stats::DEFAULT_KEEP_DAYS;
         match tokio::task::spawn_blocking(move || usage_stats::tick(keep_days)).await {

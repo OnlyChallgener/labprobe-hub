@@ -440,15 +440,58 @@ pub struct AppBucket {
     pub sessions: u32,
 }
 
-#[derive(Debug, Default, Clone)]
+/// One flow's highest cumulative counters, plus when we last saw it.
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct SeenFlow {
+    counters: FlowCounters,
+    epoch: u64,
+}
+
+/// How long a flow baseline survives after its last sighting.
+///
+/// The firmware's flow timeouts top out at 3600s, so a flow that has not been
+/// in the table for longer than that can never reappear with a comparable
+/// counter and its baseline would only waste space in the persisted store.
+const FLOW_BASELINE_TTL_SECS: u64 = 3600;
+
+#[derive(Debug, Clone)]
 pub struct UsageStore {
     /// (mac, date, hour) -> activity for that wall-clock hour.
     pub hourly: BTreeMap<(String, String, u8), HourBucket>,
     /// (mac, date, app) -> per-app totals for that day.
     pub apps: BTreeMap<(String, String, String), AppBucket>,
-    /// Counters from the previous sample, used to derive deltas.
-    last: BTreeMap<FlowKey, FlowCounters>,
+    /// Highest cumulative counters seen per flow, carried **across samples**.
+    ///
+    /// This map is the reason byte deltas work at all: the dump holds cumulative
+    /// per-flow counters, so a delta only exists if the previous value is still
+    /// around. It is deliberately memory-only — it is keyed by remote address
+    /// and port, and the store's privacy promise is that only aggregates ever
+    /// reach disk. Callers must therefore keep one `UsageStore` alive across
+    /// samples (`tick` borrows it) instead of re-loading it every tick, which is
+    /// exactly how the report once sat at "0 分钟 / 0 字节" forever while the
+    /// session counter kept climbing.
+    seen: BTreeMap<FlowKey, SeenFlow>,
     last_epoch: u64,
+    /// Set when the store came back from disk without flow baselines, so the
+    /// next sample re-establishes them instead of crediting every live flow's
+    /// whole accumulated counter to a single minute.
+    resume_pending: bool,
+}
+
+impl Default for UsageStore {
+    fn default() -> Self {
+        Self {
+            hourly: BTreeMap::new(),
+            apps: BTreeMap::new(),
+            seen: BTreeMap::new(),
+            last_epoch: 0,
+            // A store that has never folded a sample has nothing to subtract
+            // from, so the first sample may only establish baselines. Otherwise
+            // a cold start would credit every live flow's lifetime to one
+            // minute.
+            resume_pending: true,
+        }
+    }
 }
 
 #[derive(Debug, Default, Clone, PartialEq, Eq)]
@@ -469,10 +512,12 @@ impl UsageStore {
         Self::default()
     }
 
-    /// Drop all observations. Used when the membership set changes enough that
-    /// prior deltas would be misattributed.
+    /// Drop all flow baselines. Used when the membership set changes enough
+    /// that prior deltas would be misattributed; the next sample then only
+    /// re-establishes baselines instead of crediting them.
     pub fn clear_deltas(&mut self) {
-        self.last.clear();
+        self.seen.clear();
+        self.resume_pending = true;
     }
 
     /// Fold one sample into the buckets.
@@ -501,53 +546,89 @@ impl UsageStore {
         };
 
         let mut active: BTreeSet<(String, String)> = BTreeSet::new();
-        let mut cur: BTreeMap<FlowKey, FlowCounters> = BTreeMap::new();
 
         // Byte floor a flow must clear inside this interval to count as "in
         // use". Everything below it is heartbeat/keepalive noise: it still adds
         // to the byte totals, but it must not buy usage seconds.
         let active_floor = active_floor_bytes(gap);
+        let resuming = self.resume_pending;
 
         for row in rows {
             if row.appid == UNIDENTIFIED_APPID {
                 continue;
             }
             let key = row.key();
-            let previous = self.last.get(&key);
-            let (delta_up, delta_down) = match previous {
-                // Unknown baseline: credit nothing rather than dumping whatever
-                // the flow had accumulated before we started watching.
+            let previous = self.seen.get(&key).cloned();
+            // Counters that went backwards mean the firmware re-used the same
+            // address/port tuple for a new connection. That is a new session
+            // whose whole counter is new traffic, and clamping the drop to zero
+            // would silently erase it.
+            let restarted = matches!(&previous, Some(prev)
+                if row.counters.bytes_up < prev.counters.bytes_up
+                    || row.counters.bytes_down < prev.counters.bytes_down);
+            let (delta_up, delta_down) = match &previous {
+                // No baseline and none owed: these counters are the bytes the
+                // flow moved since we last looked. The sniffer table is a
+                // sliding window whose rows usually live for less than one
+                // sample, so that is its entire lifetime.
+                None if !resuming => (row.counters.bytes_up, row.counters.bytes_down),
                 None => (0, 0),
+                Some(_) if restarted => (row.counters.bytes_up, row.counters.bytes_down),
                 Some(prev) => (
-                    row.counters.bytes_up.saturating_sub(prev.bytes_up),
+                    row.counters.bytes_up.saturating_sub(prev.counters.bytes_up),
                     row.counters
                         .bytes_down
-                        .saturating_sub(prev.bytes_down),
+                        .saturating_sub(prev.counters.bytes_down),
                 ),
             };
-            let is_new = previous.is_none();
+            let is_new = previous.is_none() || restarted;
             let delta = delta_up + delta_down;
             report.bytes_delta += delta;
 
-            if matches!(previous, Some(prev) if *prev != row.counters) {
+            if matches!(&previous, Some(prev) if prev.counters != row.counters) {
                 report.updated_flows += 1;
             }
             if is_new {
                 report.new_flows += 1;
             }
 
+            // Baseline, kept across samples. A fresh connection starts over, so
+            // its baseline starts over with it; an ongoing one only ever grows,
+            // and taking the high-water mark keeps a jittery sample from
+            // crediting the same bytes twice.
+            self.seen.insert(
+                key,
+                SeenFlow {
+                    counters: if is_new {
+                        row.counters.clone()
+                    } else {
+                        FlowCounters {
+                            bytes_up: row
+                                .counters
+                                .bytes_up
+                                .max(previous.as_ref().map_or(0, |prev| prev.counters.bytes_up)),
+                            bytes_down: row
+                                .counters
+                                .bytes_down
+                                .max(previous.as_ref().map_or(0, |prev| prev.counters.bytes_down)),
+                        }
+                    },
+                    epoch: stamp.epoch,
+                },
+            );
+
             let app = match app_of(&row.appid) {
                 Some(name) => name,
                 None => {
                     report.unknown_apps += 1;
-                    cur.insert(key, row.counters.clone());
                     continue;
                 }
             };
 
-            // A brand-new flow is a *baseline*, not activity: its counters hold
-            // everything the connection did before we first saw it, so it earns
-            // nothing until the next sample proves it moved.
+            // Activity is decided by the bytes this flow moved *inside this
+            // interval*, so a one-shot connection (the common case: a page
+            // load, an API call, a push acknowledgement) counts exactly like a
+            // long-lived stream that reported the same delta.
             if delta >= active_floor {
                 active.insert((row.mac.clone(), app.clone()));
             } else if delta > 0 {
@@ -603,8 +684,8 @@ impl UsageStore {
         }
         report.active_macs = active.iter().map(|(mac, _)| mac).collect::<BTreeSet<_>>().len();
 
-        self.last = cur;
         self.last_epoch = stamp.epoch;
+        self.resume_pending = false;
         report
     }
 
@@ -694,6 +775,7 @@ impl UsageStore {
     /// and working in "distinct dates present" avoids depending on the current
     /// date being passed in correctly.
     pub fn prune(&mut self, keep_days: usize) -> usize {
+        self.prune_flows();
         let dates = self.dates();
         if dates.len() <= keep_days || keep_days == 0 {
             return 0;
@@ -704,6 +786,17 @@ impl UsageStore {
         self.hourly.retain(|(_, date, _), _| !drop_dates.contains(date));
         self.apps.retain(|(_, date, _), _| !drop_dates.contains(date));
         before - (self.hourly.len() + self.apps.len())
+    }
+
+    /// Drop flow baselines the sniffer can no longer report again.
+    ///
+    /// `seen` is the one unbounded structure in the store: it grows with every
+    /// distinct address/port tuple the LAN opens. Entries older than the
+    /// longest firmware flow timeout can never match a future row, so they are
+    /// pure overhead in the file that is rewritten every minute.
+    fn prune_flows(&mut self) {
+        let cutoff = self.last_epoch.saturating_sub(FLOW_BASELINE_TTL_SECS);
+        self.seen.retain(|_, flow| flow.epoch >= cutoff);
     }
 
     /// Serialise so the store survives a relay restart.
@@ -802,6 +895,10 @@ impl UsageStore {
                 );
             }
         }
+        // Flow baselines are never restored, because they are never written:
+        // see `UsageStore::seen`. The next sample therefore re-establishes them
+        // without crediting anything, so a restart can never inflate a bucket.
+        store.resume_pending = true;
         store
     }
 }
@@ -820,6 +917,8 @@ pub const RDPI_TABLE_CACHE: &str = "/tmp/labprobe_rdpi_table.txt";
 pub const USAGE_STORE: &str = "/tmp/labprobe_usage_store.json";
 /// Optional IPv6 prefix table (supplement layer), written by the Hub.
 pub const PREFIX_TABLE: &str = "/tmp/labprobe_ipv6_prefixes.json";
+/// The firmware's child-device table, one `MAC  CHILD  DEV_IDYC` row per station.
+pub const SNIFFER_INFO: &str = "/proc/net/sniffer_info";
 
 pub fn read_text(path: &str) -> Option<String> {
     std::fs::read_to_string(path).ok()
@@ -888,8 +987,14 @@ pub fn save_store(store: &UsageStore) -> std::io::Result<()> {
 /// Raw rows are consumed and dropped inside `ingest_dump`; only aggregates ever
 /// reach disk. Re-reading the same dump is a no-op because blocks are ordered
 /// and already-seen epochs are skipped.
-pub fn tick(keep_days: usize) -> (UsageStore, Vec<IngestReport>) {
-    let mut store = load_store();
+///
+/// The store is borrowed rather than re-loaded on purpose. The per-flow
+/// baselines a delta is derived from (`UsageStore::seen`) are memory-only, so
+/// reloading the file here would erase them every minute and every delta would
+/// come out zero — which is exactly how the report once sat at "0 分钟 /
+/// 0 字节" forever while the session counter kept climbing. Callers load once
+/// at startup and keep the same store.
+pub fn tick(store: &mut UsageStore, keep_days: usize) -> Vec<IngestReport> {
     let apps = load_app_map();
     let reports = match read_text(SNIFFER_DUMP) {
         Some(text) => store.ingest_dump(&text, |appid| {
@@ -899,9 +1004,9 @@ pub fn tick(keep_days: usize) -> (UsageStore, Vec<IngestReport>) {
     };
     if !reports.is_empty() {
         store.prune(keep_days);
-        let _ = save_store(&store);
+        let _ = save_store(store);
     }
-    (store, reports)
+    reports
 }
 
 /// Build the payload the App consumes: hourly bars plus per-app totals, which
@@ -1012,6 +1117,8 @@ pub struct SamplerState {
     pub last_sample_at: u64,
     pub last_push_at: u64,
     pub last_app_map_at: u64,
+    /// Last time the sniffer's identify list / full mode were re-asserted.
+    pub last_sniffer_at: u64,
     /// Set when a sample changed something; cleared after a successful push.
     /// Without it a quiet LAN would re-upload the same aggregate every cycle.
     pub dirty: bool,
@@ -1033,6 +1140,11 @@ impl SamplerState {
     pub fn app_map_due(&self, now: u64) -> bool {
         self.last_app_map_at == 0
             || now.saturating_sub(self.last_app_map_at) >= APP_MAP_REFRESH_SECS
+    }
+
+    pub fn sniffer_due(&self, now: u64) -> bool {
+        self.last_sniffer_at == 0
+            || now.saturating_sub(self.last_sniffer_at) >= SNIFFER_PREPARE_INTERVAL_SECS
     }
 
     /// Record a completed sample and decide whether a push is warranted.
@@ -1065,6 +1177,10 @@ impl SamplerState {
 
     pub fn note_app_map(&mut self, now: u64) {
         self.last_app_map_at = now;
+    }
+
+    pub fn note_sniffer(&mut self, now: u64) {
+        self.last_sniffer_at = now;
     }
 }
 
@@ -1104,6 +1220,72 @@ pub fn router_today() -> Option<String> {
     parse_dump(&text)
         .last()
         .map(|sample| sample.stamp.date.clone())
+}
+
+/// Stations the firmware currently treats as child devices.
+///
+/// `/proc/net/sniffer_info` is the authoritative list: it is the same child
+/// membership the guard policies are built from, so it picks up devices the
+/// App adds without the relay having to re-read UCI.
+pub fn child_macs() -> Vec<String> {
+    let Some(text) = read_text(SNIFFER_INFO) else {
+        return Vec::new();
+    };
+    let mut macs: Vec<String> = text
+        .lines()
+        .filter_map(|line| {
+            let fields: Vec<&str> = line.split_whitespace().collect();
+            if fields.len() < 2 || fields[1] != "1" {
+                return None;
+            }
+            let mac = fields[0].to_ascii_lowercase();
+            if mac.len() == 17 && mac.contains(':') {
+                Some(mac)
+            } else {
+                None
+            }
+        })
+        .collect();
+    macs.sort();
+    macs.dedup();
+    macs
+}
+
+fn ubus_call(object: &str, method: &str, body: &str) -> bool {
+    match std::process::Command::new("ubus")
+        .args(["call", object, method, body])
+        .output()
+    {
+        Ok(output) => output.status.success(),
+        Err(_) => false,
+    }
+}
+
+/// Turn on the two firmware switches the usage pipeline depends on.
+///
+/// Neither is set by the vendor's `child_guard` reload path on this model, and
+/// without them the report is structurally empty:
+///
+/// * `sniffer.idyc add {mac}` — a device that is not in the identify list has
+///   every flow resolved to the `0-0-0-0` placeholder, which the sampler drops.
+/// * `sniffer enable {"mod":"full_mode"}` — `/proc/net/sniffer_flow`, the table
+///   the firmware dumps for us, is only filled in full mode. Without it the
+///   dump carries header blocks and not a single row.
+///
+/// Both calls are idempotent, so this is safe to run on every sample and it
+/// self-heals after a firmware reload wipes the runtime state.
+pub fn prepare_sniffer() -> bool {
+    let macs = child_macs();
+    if macs.is_empty() {
+        return false;
+    }
+    let identifiers = ubus_call("sniffer.idyc", "add", &json!({ "mac": macs }).to_string());
+    let full_mode = ubus_call(
+        "sniffer",
+        "enable",
+        &json!({ "mod": "full_mode" }).to_string(),
+    );
+    identifiers && full_mode
 }
 
 #[cfg(test)]
@@ -1214,8 +1396,92 @@ da:1f:85:0c:19:fc 192.168.5.132 117.185.244.54 47218 443 TCP 3 18-158-1-0 3560 3
     fn counter_reset_is_not_counted_as_negative() {
         let mut store = UsageStore::new();
         store.ingest(&stamp(BASE, "2026-09-18", 10), &[row(5000, 5000, "18-158-1-0")], pdd);
+        // The same tuple came back with a much lower counter, i.e. the firmware
+        // re-used the key for a new connection. The delta must never go
+        // negative; the new connection's own counter is new traffic.
         let report = store.ingest(&stamp(BASE + 60, "2026-09-18", 10), &[row(20, 30, "18-158-1-0")], pdd);
-        assert_eq!(report.bytes_delta, 0);
+        assert_eq!(report.bytes_delta, 50);
+        assert_eq!(report.new_flows, 1, "a re-used key is a new session");
+        assert_eq!(
+            store.online_secs("da:1f:85:0c:19:fc", "2026-09-18"),
+            0,
+            "50 bytes is under the active gate, so it buys no time"
+        );
+    }
+
+    #[test]
+    fn a_flow_first_seen_in_a_later_sample_is_fully_credited() {
+        // The sniffer table is a sliding window, so the common case is a
+        // connection that opens and closes between two samples. It appears
+        // exactly once and must still land in the buckets -- treating it as an
+        // "unknown baseline" is what kept the report at zero.
+        let mut store = UsageStore::new();
+        store.ingest(&stamp(BASE, "2026-09-18", 10), &[], pdd);
+        let report = store.ingest(
+            &stamp(BASE + 60, "2026-09-18", 10),
+            &[row(9_000, 12_000, "18-158-1-0")],
+            pdd,
+        );
+        assert_eq!(report.new_flows, 1);
+        assert_eq!(report.bytes_delta, 21_000);
+        assert_eq!(store.online_secs("da:1f:85:0c:19:fc", "2026-09-18"), 60);
+        let apps = store.apps_json("da:1f:85:0c:19:fc", "2026-09-18");
+        assert_eq!(apps[0]["txBytes"], 9_000);
+        assert_eq!(apps[0]["rxBytes"], 12_000);
+    }
+
+    #[test]
+    fn flow_baselines_survive_a_store_round_trip() {
+        // `tick()` reloads the store from disk on every sample, so a baseline
+        // that is not persisted can never yield a delta. This is the regression
+        // that made 上网报告 read 0 分钟 / 0 字节 forever.
+        let mut store = UsageStore::new();
+        store.ingest(&stamp(BASE, "2026-09-18", 10), &[row(1_000, 1_000, "18-158-1-0")], pdd);
+        let mut reloaded = UsageStore::from_json(&store.to_json());
+        assert!(!reloaded.resume_pending, "baselines came back from disk");
+        let report = reloaded.ingest(
+            &stamp(BASE + 60, "2026-09-18", 10),
+            &[row(4_000, 3_000, "18-158-1-0")],
+            pdd,
+        );
+        assert_eq!(report.bytes_delta, 3_000 + 2_000);
+        assert_eq!(report.new_flows, 0, "the same key is not a new session");
+        assert_eq!(reloaded.online_secs("da:1f:85:0c:19:fc", "2026-09-18"), 60);
+    }
+
+    #[test]
+    fn a_store_without_baselines_resumes_without_inflating() {
+        // An older store (or a first boot) has no flow baselines: the next
+        // sample may only establish them.
+        let legacy = json!({
+            "version": 1,
+            "lastEpoch": BASE,
+            "hourly": [],
+            "apps": [],
+        });
+        let mut store = UsageStore::from_json(&legacy);
+        assert!(store.resume_pending);
+        let report = store.ingest(
+            &stamp(BASE + 60, "2026-09-18", 10),
+            &[row(9_000, 12_000, "18-158-1-0")],
+            pdd,
+        );
+        assert_eq!(report.bytes_delta, 0, "resuming must not credit the backlog");
+        assert!(!store.resume_pending, "the next sample is a real delta again");
+    }
+
+    #[test]
+    fn stale_flow_baselines_are_pruned() {
+        let mut store = UsageStore::new();
+        store.ingest(&stamp(BASE, "2026-09-18", 10), &[row(0, 0, "18-158-1-0")], pdd);
+        assert_eq!(store.seen.len(), 1);
+        store.ingest(
+            &stamp(BASE + FLOW_BASELINE_TTL_SECS + 120, "2026-09-18", 11),
+            &[],
+            pdd,
+        );
+        store.prune(30);
+        assert!(store.seen.is_empty(), "a flow that can never reappear is dropped");
     }
 
     #[test]
