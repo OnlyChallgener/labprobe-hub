@@ -89,14 +89,13 @@ const UNIDENTIFIED_APPID: &str = "0-0-0-0";
 /// Absolute byte floor (up+down) a flow must move within one sample interval
 /// before it counts as "in use" for that interval.
 ///
-/// ~2 KB per minute sits comfortably above TCP keepalives and app heartbeats
-/// (tens to hundreds of bytes) and comfortably below any real user action.
-/// Tune here if real-device data shows light chat being under-counted.
-pub const ACTIVE_MIN_BYTES: u64 = 2048;
+/// Filter out pure TCP/UDP keepalives (<128B) while preserving hardware-offloaded
+/// streaming / chat sessions where sniffer captures the initial TLS/SNI handshake.
+pub const ACTIVE_MIN_BYTES: u64 = 128;
 
 /// The same gate as a sustained rate, so a single short burst inside a long
 /// interval cannot buy the whole interval as usage time.
-pub const ACTIVE_MIN_BYTES_PER_SEC: u64 = 32;
+pub const ACTIVE_MIN_BYTES_PER_SEC: u64 = 8;
 
 /// Effective per-sample byte floor for an interval of `gap_secs` seconds.
 ///
@@ -284,11 +283,15 @@ fn looks_like_appid(value: &str) -> bool {
 /// genuinely treats as separate apps (`微信视频号`, `企业微信`, `微信支付`) are
 /// left alone because the official report lists them separately.
 pub fn canonical_app(name: &str) -> String {
+    if name == "支付宝_weak_relation" || name.contains("alipayobjects") || name.contains("alicdn") || name == "阿里CDN" {
+        return "阿里CDN".to_string();
+    }
     let base = name.split('_').next().unwrap_or(name).trim();
     match base {
         "抖音系列" => "抖音".to_string(),
         "快手系列" => "快手".to_string(),
         "哔哩哔哩" => "哔哩哔哩".to_string(),
+        "红果短剧" | "红果免费短剧" => "红果免费短剧".to_string(),
         other => other.to_string(),
     }
 }
@@ -449,6 +452,8 @@ pub struct UsageStore {
     /// Counters from the previous sample, used to derive deltas.
     last: BTreeMap<FlowKey, FlowCounters>,
     last_epoch: u64,
+    /// Last active epoch per (mac, app) to cluster continuous usage into interaction sessions.
+    last_active_app_epoch: BTreeMap<(String, String), u64>,
 }
 
 #[derive(Debug, Default, Clone, PartialEq, Eq)]
@@ -473,6 +478,7 @@ impl UsageStore {
     /// prior deltas would be misattributed.
     pub fn clear_deltas(&mut self) {
         self.last.clear();
+        self.last_active_app_epoch.clear();
     }
 
     /// Fold one sample into the buckets.
@@ -515,9 +521,16 @@ impl UsageStore {
             let key = row.key();
             let previous = self.last.get(&key);
             let (delta_up, delta_down) = match previous {
-                // Unknown baseline: credit nothing rather than dumping whatever
-                // the flow had accumulated before we started watching.
-                None => (0, 0),
+                // If the sampler is running (gap > 0), a newly appeared flow started
+                // in this interval, so its current counters are the delta for this interval.
+                // On cold start baseline (gap == 0), credit nothing to avoid historical spill.
+                None => {
+                    if gap > 0 {
+                        (row.counters.bytes_up, row.counters.bytes_down)
+                    } else {
+                        (0, 0)
+                    }
+                }
                 Some(prev) => (
                     row.counters.bytes_up.saturating_sub(prev.bytes_up),
                     row.counters
@@ -545,9 +558,7 @@ impl UsageStore {
                 }
             };
 
-            // A brand-new flow is a *baseline*, not activity: its counters hold
-            // everything the connection did before we first saw it, so it earns
-            // nothing until the next sample proves it moved.
+            // A flow whose delta clears the gate counts as active usage.
             if delta >= active_floor {
                 active.insert((row.mac.clone(), app.clone()));
             } else if delta > 0 {
@@ -560,9 +571,6 @@ impl UsageStore {
                 .or_default();
             app_slot.tx_bytes += delta_up;
             app_slot.rx_bytes += delta_down;
-            if is_new {
-                app_slot.sessions += 1;
-            }
 
             let hour_slot = self
                 .hourly
@@ -599,6 +607,15 @@ impl UsageStore {
                     .active_secs
                     .saturating_add(gap as u32)
                     .min(MAX_SECS_PER_DAY);
+
+                // Cluster continuous interaction: if an app is seen active after >300s
+                // of silence (or for the first time), it starts a new user session.
+                let session_key = (mac.clone(), app.clone());
+                let last_active = self.last_active_app_epoch.get(&session_key).copied().unwrap_or(0);
+                if stamp.epoch.saturating_sub(last_active) > 300 {
+                    app_slot.sessions += 1;
+                }
+                self.last_active_app_epoch.insert(session_key, stamp.epoch);
             }
         }
         report.active_macs = active.iter().map(|(mac, _)| mac).collect::<BTreeSet<_>>().len();
@@ -893,7 +910,9 @@ pub fn tick(keep_days: usize) -> (UsageStore, Vec<IngestReport>) {
     let apps = load_app_map();
     let reports = match read_text(SNIFFER_DUMP) {
         Some(text) => store.ingest_dump(&text, |appid| {
-            apps.get(appid).map(|name| canonical_app(name))
+            apps.get(appid)
+                .map(|name| canonical_app(name))
+                .filter(|s| !s.is_empty())
         }),
         None => Vec::new(),
     };

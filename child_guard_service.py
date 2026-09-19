@@ -74,7 +74,7 @@ def validate_uid(value: Any) -> str:
     uid = str(value or "").strip()
     if not _UID_RE.fullmatch(uid):
         raise ChildGuardValidationError("invalid device uid")
-    return uid
+    return uid.upper() if len(uid) == 32 else uid
 
 
 def router_alias(value: Any) -> str:

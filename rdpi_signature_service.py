@@ -504,12 +504,24 @@ def sync_child_guard_ip6_block(macs: Optional[List[str]] = None, client: Optiona
                         if re.fullmatch(r"^[0-9a-f]{2}(:[0-9a-f]{2}){5}$", clean):
                             target_macs.add(clean)
 
+        # Filter out known infrastructure devices (NAS, router interfaces)
+        EXCLUDED_INFRA_MACS = {"6c:1f:f7:76:71:04"}
+        target_macs = {m for m in target_macs if m not in EXCLUDED_INFRA_MACS}
+
         # Ensure ipset exists
         _remote_exec(client, "ipset create child_guard_ip6_block hash:mac 2>/dev/null")
+        for excluded in EXCLUDED_INFRA_MACS:
+            _remote_exec(client, f"ipset del child_guard_ip6_block {excluded} 2>/dev/null")
 
         # Add each target mac
         for mac in sorted(target_macs):
             _remote_exec(client, f"ipset add child_guard_ip6_block {mac} 2>/dev/null")
+
+        # Ensure firewall forward rule only rejects WAN outbound IPv6 (! -o br-lan)
+        # and delete any legacy blanket forward/dst rules
+        _remote_exec(client, "ip6tables -D FORWARD -m set --match-set child_guard_ip6_block dst -j REJECT --reject-with icmp6-adm-prohibited 2>/dev/null || true")
+        _remote_exec(client, "ip6tables -D FORWARD -m set --match-set child_guard_ip6_block src -j REJECT --reject-with icmp6-adm-prohibited 2>/dev/null || true")
+        _remote_exec(client, "ip6tables -C FORWARD ! -o br-lan -m set --match-set child_guard_ip6_block src -j REJECT --reject-with icmp6-adm-prohibited 2>/dev/null || ip6tables -I FORWARD 1 ! -o br-lan -m set --match-set child_guard_ip6_block src -j REJECT --reject-with icmp6-adm-prohibited")
 
         # Fetch active members
         out_list, _ = _remote_exec(client, "ipset list child_guard_ip6_block")

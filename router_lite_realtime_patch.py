@@ -19,8 +19,8 @@ from flask import jsonify, request
 
 
 DEMAND_TTL_SECONDS = 45.0
-ROUTER_STALE_MS = 3_000
-DEVICES_STALE_MS = 4_000
+ROUTER_STALE_MS = 10_000
+DEVICES_STALE_MS = 15_000
 _ROUTER_FIELDS = {
     "uploadBps",
     "downloadBps",

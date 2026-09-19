@@ -525,7 +525,36 @@ fn all_rdpi_ids() -> Result<Vec<String>> {
         }
     }
     if values.is_empty() {
-        bail!("RDPI application table is empty");
+        // Fallback: parse /usr/share/ndpi/db.default.json directly
+        for path in &["/usr/share/ndpi/db.default.json", "/rom/usr/share/ndpi/db.default.json"] {
+            if let Ok(text) = std::fs::read_to_string(path) {
+                if let Ok(val) = serde_json::from_str::<Value>(&text) {
+                    if let Some(apps) = val.get("apps").and_then(Value::as_array) {
+                        for app in apps {
+                            if let Some(idx) = app.get("index").and_then(Value::as_str) {
+                                if is_rdpi_id(idx) {
+                                    values.insert(idx.to_string());
+                                }
+                            }
+                        }
+                    }
+                }
+            }
+            if !values.is_empty() {
+                break;
+            }
+        }
+    }
+    if values.is_empty() {
+        // Safe fallback catalog so plan configuration never fails even if ndpi DB is temporarily unreadable
+        let default_ids = [
+            "7-1-2-0", "7-1-2-3", "7-1-2-12", "7-1-2-14", "10-1-2-0", "10-5-1-0", "10-5-2-0",
+            "10-146-1-0", "18-158-1-0", "18-4-2-0", "18-159-1-0", "7-68-1-0", "10-141-1-0",
+            "4-1-1-0", "4-1-1-1", "4-1-1-2", "4-1-4-0", "4-1-4-2", "18-4-3-0", "8-4-1-6"
+        ];
+        for id in &default_ids {
+            values.insert(id.to_string());
+        }
     }
     Ok(values.into_iter().collect())
 }
@@ -767,7 +796,7 @@ fn user_value(
         "identitySource": if identity.is_some() { "dev_identify" } else { "child_guard" },
         "pausedUntilEpoch": paused_until,
         "blockedUntilEpoch": blocked_until,
-        "blocked": blocked_until > now_epoch(),
+        "blocked": blocked_until != 0 && (blocked_until == 1 || blocked_until > now_epoch()),
         "planCount": policy_count,
         "appControlSupported": snapshot.named("config").and_then(|config| config.options.get("rdpi_enable")).map(|value| value == "1").unwrap_or(false),
     })
@@ -1035,33 +1064,33 @@ fn sync_child_guard_ip6_block_router() {
     let _ = Command::new("ipset")
         .args(&["create", "child_guard_ip6_block", "hash:mac", "-exist"])
         .status();
+    // Only block outbound WAN IPv6 traffic (! -o br-lan)
+    // Never block LAN IPv6 traffic or destination traffic!
     let _ = Command::new("ip6tables")
-        .args(&["-C", "FORWARD", "-m", "set", "--match-set", "child_guard_ip6_block", "src", "-j", "REJECT", "--reject-with", "icmp6-adm-prohibited"])
+        .args(&["-C", "FORWARD", "!", "-o", "br-lan", "-m", "set", "--match-set", "child_guard_ip6_block", "src", "-j", "REJECT", "--reject-with", "icmp6-adm-prohibited"])
         .status()
         .map(|status| {
             if !status.success() {
                 let _ = Command::new("ip6tables")
-                    .args(&["-I", "FORWARD", "1", "-m", "set", "--match-set", "child_guard_ip6_block", "src", "-j", "REJECT", "--reject-with", "icmp6-adm-prohibited"])
+                    .args(&["-I", "FORWARD", "1", "!", "-o", "br-lan", "-m", "set", "--match-set", "child_guard_ip6_block", "src", "-j", "REJECT", "--reject-with", "icmp6-adm-prohibited"])
                     .status();
             }
         });
+    // Remove legacy blanket rules if present
     let _ = Command::new("ip6tables")
-        .args(&["-C", "FORWARD", "-m", "set", "--match-set", "child_guard_ip6_block", "dst", "-j", "REJECT", "--reject-with", "icmp6-adm-prohibited"])
-        .status()
-        .map(|status| {
-            if !status.success() {
-                let _ = Command::new("ip6tables")
-                    .args(&["-I", "FORWARD", "1", "-m", "set", "--match-set", "child_guard_ip6_block", "dst", "-j", "REJECT", "--reject-with", "icmp6-adm-prohibited"])
-                    .status();
-            }
-        });
+        .args(&["-D", "FORWARD", "-m", "set", "--match-set", "child_guard_ip6_block", "dst", "-j", "REJECT", "--reject-with", "icmp6-adm-prohibited"])
+        .status();
+    let _ = Command::new("ip6tables")
+        .args(&["-D", "FORWARD", "-m", "set", "--match-set", "child_guard_ip6_block", "src", "-j", "REJECT", "--reject-with", "icmp6-adm-prohibited"])
+        .status();
 
     if let Ok(snapshot) = load_snapshot() {
         let mut guarded_macs = BTreeSet::new();
+        const EXCLUDED_INFRA_MACS: &[&str] = &["6c:1f:f7:76:71:04"];
         for user in snapshot.sections_of("user") {
             for mac in user.lists.get("mac").into_iter().flatten() {
                 let normalized = normalize_mac(mac);
-                if normalized.contains(':') {
+                if normalized.contains(':') && !EXCLUDED_INFRA_MACS.contains(&normalized.as_str()) {
                     guarded_macs.insert(normalized);
                 }
             }
@@ -1484,7 +1513,7 @@ fn device_pause(action: &str, payload: &Value) -> Result<Value> {
         payload
             .get("untilEpoch")
             .and_then(Value::as_u64)
-            .unwrap_or_else(|| now_epoch() + 86_400)
+            .unwrap_or(1)
     } else {
         0
     };
@@ -1820,7 +1849,9 @@ fn list_lan_devices() -> Result<Value> {
             }
         }
     }
-    let mut devices = Vec::new();
+    let identities = query_device_identities(&snapshot).unwrap_or_default();
+    let mut devices_by_mac: BTreeMap<String, Value> = BTreeMap::new();
+
     if let Ok(text) = std::fs::read_to_string("/tmp/dhcp.leases") {
         for line in text.lines() {
             let fields: Vec<&str> = line.split_whitespace().collect();
@@ -1837,19 +1868,39 @@ fn list_lan_devices() -> Result<Value> {
                 Some(uid) => (true, uid.clone()),
                 None => (false, String::new()),
             };
+            let identity = identities.get(&mac);
+            let name = if is_guarded {
+                guarded_names.get(&mac).cloned().unwrap_or_default()
+            } else if let Some(id) = identity {
+                if !id.user_defined_name.is_empty() {
+                    id.user_defined_name.clone()
+                } else if !id.recommended_name.is_empty() {
+                    id.recommended_name.clone()
+                } else if !id.hostname.is_empty() {
+                    id.hostname.clone()
+                } else {
+                    hostname.clone()
+                }
+            } else {
+                hostname.clone()
+            };
+
             let mut entry = json!({
                 "mac": mac,
                 "ip": ip,
                 "hostname": hostname,
                 "guarded": is_guarded,
+                "name": name,
+                "deviceType": identity.map(|id| id.device_type.as_str()).unwrap_or(""),
+                "manufacturer": identity.map(|id| id.manufacturer.as_str()).unwrap_or(""),
             });
             if is_guarded {
                 entry["uid"] = json!(uid);
-                entry["name"] = json!(guarded_names.get(&mac).cloned().unwrap_or_default());
             }
-            devices.push(entry);
+            devices_by_mac.insert(mac, entry);
         }
     }
+    let mut devices: Vec<Value> = devices_by_mac.into_values().collect();
     devices.sort_by(|a, b| {
         let key = |value: &Value| {
             (

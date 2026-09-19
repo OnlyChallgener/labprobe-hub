@@ -33,7 +33,7 @@ from child_guard_service import (
 )
 
 BEIJING_TZ = ZoneInfo("Asia/Shanghai")
-APP_VERSION = "0.13.2"
+APP_VERSION = "0.13.4"
 PORT = int(os.environ.get("PORT", "58443"))
 BASE_DIR = Path(os.environ.get("LABPROBE_BASE_DIR", ".")).resolve()
 CONFIG_DIR = Path(os.environ.get("CONFIG_DIR", str(BASE_DIR / "config"))).resolve()
@@ -3003,8 +3003,23 @@ def _safe_sync_ip6(macs: Optional[List[str]] = None):
 def api_child_guard_devices():
     if not check_read_token():
         return jsonify({"ok": False, "error": "unauthorized"}), 401
-    threading.Thread(target=_safe_sync_ip6, daemon=True).start()
-    return _child_guard_execute("get_users")
+    resp = _child_guard_execute("get_users")
+    try:
+        data = resp[0].get_json() if isinstance(resp, tuple) else resp.get_json()
+        if data and data.get("ok") and isinstance(data.get("devices"), list):
+            store = _usage_aggregate_store()
+            if store:
+                today = time.strftime("%Y-%m-%d")
+                for dev in data["devices"]:
+                    macs = [m for m in dev.get("macs", []) if m]
+                    if macs:
+                        rep = store.report(macs, today)
+                        dev["todayMinutes"] = rep.get("onlineMinutes", 0)
+            status_code = resp[1] if isinstance(resp, tuple) else 200
+            return jsonify(data), status_code
+    except Exception as e:
+        LOGGER.warning("Enriching child guard devices with todayMinutes failed: %s", e)
+    return resp
 
 
 
@@ -3114,17 +3129,42 @@ def _child_guard_raw(action: str, payload: Optional[Dict[str, Any]] = None,
     return dict(completed.result)
 
 
-def _child_guard_macs_for_uid(uid: str) -> List[str]:
-    """Resolve a guarded device's MAC list through the router's own user table."""
-    result = _child_guard_raw("get_users")
-    if not result:
-        return []
-    for device in result.get("devices") or []:
-        if isinstance(device, dict) and device.get("uid") == uid:
-            macs = device.get("macs")
-            if isinstance(macs, list):
-                return [str(mac).strip().lower() for mac in macs if str(mac).strip()]
-    return []
+_CHILD_GUARD_MACS_CACHE: Dict[str, Tuple[float, List[str]]] = {}
+
+
+def _child_guard_macs_for_uid(uid: str, router: Optional[str] = None) -> List[str]:
+    """Resolve a guarded device's MAC list through the router's own user table with cache."""
+    cleaned_uid = str(uid or "").strip().lower()
+    if ":" in cleaned_uid and len(cleaned_uid) == 17:
+        return [cleaned_uid]
+    now = time.time()
+    cached = _CHILD_GUARD_MACS_CACHE.get(uid)
+    if cached and (now - cached[0]) < 60.0:
+        return list(cached[1])
+    payload = {"router": router} if router else {}
+    result = _child_guard_raw("get_users", payload, timeout_seconds=4.0)
+    if result and isinstance(result.get("devices"), list):
+        for device in result["devices"]:
+            if isinstance(device, dict):
+                dev_uid = device.get("uid")
+                dev_macs = device.get("macs")
+                if isinstance(dev_uid, str) and isinstance(dev_macs, list):
+                    cleaned = [str(m).strip().lower() for m in dev_macs if str(m).strip()]
+                    _CHILD_GUARD_MACS_CACHE[dev_uid] = (now, cleaned)
+    macs = list(_CHILD_GUARD_MACS_CACHE.get(uid, (0, []))[1])
+    if not macs:
+        # Fallback to querying device history / candidate cache in Hub
+        try:
+            from child_guard_service import child_guard_candidates
+            candidates = child_guard_candidates().get("devices", [])
+            for c in candidates:
+                if c.get("uid") == uid and c.get("mac"):
+                    mac = c["mac"].strip().lower()
+                    _CHILD_GUARD_MACS_CACHE[uid] = (now, [mac])
+                    return [mac]
+        except Exception:
+            pass
+    return macs
 
 
 def _usage_aggregate_store():
@@ -3137,8 +3177,7 @@ def _usage_aggregate_store():
         from usage_aggregate import resolve_store
 
         return resolve_store(sys.modules[__name__])
-    except Exception:  # pragma: no cover - defensive only
-        LOGGER.warning("child guard usage report: aggregate store unavailable", exc_info=True)
+    except Exception:
         return None
 
 
@@ -3179,13 +3218,13 @@ def api_child_guard_usage_report(uid: str):
     if raw_macs:
         macs = [item.strip().lower() for item in raw_macs.replace(";", ",").split(",") if item.strip()]
     else:
-        macs = _child_guard_macs_for_uid(normalized_uid)
+        macs = _child_guard_macs_for_uid(normalized_uid, router)
     if not macs:
         return jsonify({"ok": False, "router": router, "errorCode": "device_not_found",
                         "error": "该设备不在管控名单中"}), 404
 
     def _live_relay_report() -> Optional[Dict[str, Any]]:
-        return _child_guard_raw("get_usage_stats", {"uid": normalized_uid, "date": date})
+        return _child_guard_raw("get_usage_stats", {"uid": normalized_uid, "date": date}, timeout_seconds=2.0)
 
     payload = compose_device_report(
         _usage_aggregate_store(), macs, date, live=_live_relay_report, range_days=days
@@ -3238,7 +3277,6 @@ def api_child_guard_devices_collection():
                             "error": f"invalid mac: {mac}"}), 400
         if mac not in macs:
             macs.append(mac)
-    threading.Thread(target=lambda: _safe_sync_ip6(macs), daemon=True).start()
     return _child_guard_execute("add_device", {"macs": macs,
                                                "deviceName": body.get("deviceName"),
                                                "router": body.get("router")})
@@ -3253,7 +3291,6 @@ def api_child_guard_device_delete(uid: str):
     except ChildGuardValidationError as error:
         return jsonify({"ok": False, "errorCode": "invalid_request", "error": str(error)}), 400
     body = request.get_json(silent=True) or {}
-    threading.Thread(target=lambda: _safe_sync_ip6(), daemon=True).start()
     return _child_guard_execute("remove_device", {"uid": normalized_uid,
                                                   "router": body.get("router")})
 
@@ -5285,9 +5322,15 @@ def command_line() -> int:
         LOGGER.warning("configuration: %s", warning)
     for error in report["errors"]:
         LOGGER.error("configuration: %s", error)
-    # Flask 3 enables threaded serving by default. Keep it explicit because
-    # notification SSE and slow router diagnostics require concurrent requests.
-    app.run(host="0.0.0.0", port=PORT, threaded=True)
+    bind_host = os.environ.get("HUB_BIND_HOST", "::")
+    try:
+        app.run(host=bind_host, port=PORT, threaded=True)
+    except OSError:
+        if bind_host == "::":
+            LOGGER.warning("binding to [::] failed; falling back to 0.0.0.0")
+            app.run(host="0.0.0.0", port=PORT, threaded=True)
+        else:
+            raise
     return 0
 
 

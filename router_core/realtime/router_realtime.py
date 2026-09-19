@@ -24,8 +24,8 @@ import time
 from typing import Any, Callable, Dict, List, Optional, Set
 
 
-ROUTER_STALE_MS = 3_000
-DEVICES_STALE_MS = 4_000
+ROUTER_STALE_MS = 10_000
+DEVICES_STALE_MS = 15_000
 _ROUTER_INTEGER_FIELDS = {
     "uploadBps",
     "downloadBps",
