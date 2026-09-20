@@ -3098,11 +3098,12 @@ def _child_guard_runtime_snapshot(key: str, uid: str) -> Optional[Dict[str, Any]
 
 def _child_guard_cached_read(action: str, agent_router: str, payload: Dict[str, Any],
                              snapshot: Optional[Dict[str, Any]],
-                             ttl_seconds: int):
+                             ttl_seconds: int, *, refresh_when_stale: bool = True):
     """命中缓存就直接回 Flask 响应，没命中回 ``None`` 让调用方去问路由器。
 
     ``snapshot`` 过期时照样返回它，只是顺手补一次后台读：界面上「3 分钟前的计划」
-    远好过一整屏 HTML。
+    远好过一整页 HTML。``refresh_when_stale=False`` 留给那些「问了路由器也只会
+    失败」的读 —— 见 ``get_runtime_state``。
     """
     if not snapshot:
         return None
@@ -3110,7 +3111,7 @@ def _child_guard_cached_read(action: str, agent_router: str, payload: Dict[str, 
     stale = age > ttl_seconds
     body = {**snapshot, "ok": True, "router": agent_router,
             "cached": True, "cacheAgeSeconds": age, "stale": stale}
-    if stale:
+    if stale and refresh_when_stale:
         _child_guard_refresh_async(agent_router, action, payload)
     return jsonify(body), 200
 
@@ -3248,7 +3249,11 @@ def api_child_guard_runtime(uid: str):
     cached = _child_guard_cached_read(
         "get_runtime_state", agent_router, payload,
         _child_guard_runtime_snapshot(_child_guard_router_key(agent_router), normalized_uid),
-        CHILD_GUARD_RUNTIME_TTL_SECONDS)
+        CHILD_GUARD_RUNTIME_TTL_SECONDS,
+        # BE72 上的 ``ubus call sniffer.user show`` / ``sniffer.policy show`` 实测
+        # 8 秒必超时（2026-09-20 直接在路由器上跑过），所以这一读的后台补读只会
+        # 稳定制造失败：封禁状态本来就由 ``get_users`` 和禁网 ack 从 UCI 里带回来。
+        refresh_when_stale=False)
     if cached is not None:
         return cached
     return _child_guard_execute("get_runtime_state", payload)

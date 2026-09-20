@@ -292,9 +292,29 @@ class TestMinuteReport:
         store.insert_app_minutes([app_minutes_row(MAC_B, DAY, "抖音", gapped)])
         both = store.report([MAC_B], DAY)["apps"][0]
         assert both["minutes"] == 3
-        assert both["sessions"] == 3, "60-second steps only; a gap must split the run"
+        assert both["sessions"] == 3, "空 9 分钟远超容差，必须断开"
         assert [row["minutes"] for row in both["sessionRanges"]] == [1, 1, 1]
         assert [row["endEpoch"] - row["startEpoch"] for row in both["sessionRanges"]] == [60] * 3
+
+    def test_a_two_minute_hole_stays_one_range_but_loses_no_minute(self, store):
+        """固件周期性重分类长连接 → 真实分钟之间会缺一两格。
+
+        时段可以跨过这个洞（否则一条微信通话会被说成 75 次），但时长只能数
+        真实活跃过的分钟：08:15/08:16/(缺 08:17)/08:18 显示 08:15–08:19，
+        仍然是 3 分钟。
+        """
+        minutes = [bj_minute(DAY, 8, 15), bj_minute(DAY, 8, 16),
+                   bj_minute(DAY, 8, 18), bj_minute(DAY, 8, 22), bj_minute(DAY, 8, 23)]
+        store.insert_app_minutes([app_minutes_row(MAC_A, DAY, "微信", minutes)])
+        app = store.report([MAC_A], DAY)["apps"][0]
+        assert app["minutes"] == 5
+        assert [row["minutes"] for row in app["sessionRanges"]] == [3, 2]
+        assert app["sessionRanges"][0]["startEpoch"] == minutes[0]
+        assert app["sessionRanges"][0]["endEpoch"] == minutes[2] + 60
+        assert app["sessionRanges"][0]["activeSeconds"] == 180
+        # 缺 3 格（08:19/20/21）就断开：容差是「最多跨过两个空分钟」。
+        assert app["sessionRanges"][1]["startEpoch"] == minutes[3]
+        assert app["sessions"] == 2
 
     def test_apps_have_no_invented_bytes_on_the_minute_basis(self, store):
         store.insert_app_minutes([
@@ -1182,6 +1202,19 @@ class TestGuardDeviceDirectory:
     def test_devices_are_scoped_per_router(self, store):
         store.remember_guard_devices(ROUTER, [{"uid": UID, "macs": [MAC_A]}])
         assert store.guard_devices("other") == []
+
+    def test_a_placeholder_name_never_eats_the_real_one(self, store):
+        """中继没有身份信息时回的是占位串，写进缓存会把真名字抹掉。
+
+        界面上那「一长串设备名」就是这条链路：真名字被抹了，App 只能退回 UID。
+        """
+        store.remember_guard_devices(ROUTER, [{"uid": UID, "macs": [MAC_A], "name": "华为Mate60"}])
+        store.remember_guard_devices(ROUTER, [{"uid": UID, "name": "LabProbe 设备"}])
+        assert store.guard_device(ROUTER, UID)["name"] == "华为Mate60"
+        store.remember_guard_devices(ROUTER, [{"uid": "OTHERUID", "name": "受守护设备"}])
+        assert store.guard_device(ROUTER, "OTHERUID")["name"] == ""
+        store.remember_guard_devices(ROUTER, [{"uid": UID, "userDefinedName": "爸爸的手机"}])
+        assert store.guard_device(ROUTER, UID)["name"] == "爸爸的手机"
 
     def test_forget_drops_only_that_uid(self, store):
         store.remember_guard_devices(ROUTER, [

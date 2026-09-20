@@ -108,6 +108,10 @@ DEFAULT_MINUTE_KEEP_DAYS = int(os.environ.get("USAGE_MINUTE_KEEP_DAYS", "10"))
 MAX_ROWS_PER_PUSH = 5000
 
 MINUTE_SECONDS = 60
+#: 相邻时段之间允许跨过这么多个「空分钟」仍然算同一段。固件会周期性地把一条长
+#: 连接重新分类一次，于是微信的一条通话会被记成 08:15、08:16、(缺 08:17)、08:18
+#: —— 时长还是真实的那三分钟，只是不再被拆成两段显示。
+RUN_MERGE_GAP_MINUTES = 2
 #: A day has at most this many minute buckets; more than that is malformed input.
 MAX_MINUTES_PER_ROW = 24 * 60
 #: 家长请注意 window is 00:00-06:00 Beijing time, i.e. hours 0..5.
@@ -177,6 +181,16 @@ def _with_router(rows: Any, router: Any) -> List[Dict[str, Any]]:
             continue
         prepared.append({**row, "router": row.get("router") or key})
     return prepared
+
+
+#: 中继在拿不到任何身份信息时回的就是这些占位串 —— 它们不是名字。缓存里一旦被
+#: 它们覆盖，上一次真读到的「华为Mate60」就没了，界面上只能退回一长串 UID。
+GUARD_NAME_PLACEHOLDERS = frozenset({"受守护设备", "受保护设备", "labprobe 设备", "未知设备"})
+
+
+def _guard_name(value: Any) -> str:
+    name = str(value or "").strip()[:120]
+    return "" if name.casefold() in GUARD_NAME_PLACEHOLDERS else name
 
 
 def _guard_uid(value: Any) -> str:
@@ -551,7 +565,7 @@ class UsageAggregateStore:
             macs = device.get("macs")
             clean_macs = [normalize_mac(mac) for mac in macs if str(mac or "").strip()] \
                 if isinstance(macs, (list, tuple)) else None
-            name = str(device.get("name") or device.get("userDefinedName") or "").strip()[:120]
+            name = _guard_name(device.get("name")) or _guard_name(device.get("userDefinedName"))
             blocked = device.get("blocked")
             until = _as_count(device.get("blockedUntilEpoch") or device.get("pausedUntilEpoch"))
             with self._lock:
@@ -1375,10 +1389,16 @@ def _app_minute_runs(
 ) -> List[tuple]:
     """Group each app's minute rows into consecutive-minute runs.
 
-    Gaps-and-islands in SQL: inside one (date, app) the n-th distinct minute of
-    an unbroken run is ``first + (n-1) * 60``, so ``minute - row_number * 60``
-    is constant exactly while the minutes step by 60.  Any other step opens a
-    new run, which is why 08:15/08:25/08:35 is three ranges and not one.
+    Gaps-and-islands in SQL: a new run starts wherever the step from the
+    previous minute is bigger than ``RUN_MERGE_GAP_MINUTES`` empty minutes.
+    08:15/08:25/08:35 is still three ranges; 08:15/08:16/(08:17)/08:18 is one.
+
+    The tolerance only ever joins **displayed** ranges.  ``minutes`` stays
+    ``COUNT(*)`` of the real active minutes, so a run shown as 08:15–08:19
+    still reports 3 分钟 — the missing minute is never invented.  Measured on
+    the live BE72 (2026-09-20, 微信 135 分钟): 53 gaps were one empty minute and
+    23 were two, which is why the firmware's periodic re-classification of a
+    long-lived flow used to print ~75 "sessions" for one WeChat call.
     """
     holders = ", ".join("?" for _ in wanted)
     clause, prefix = _router_clause(router)
@@ -1395,19 +1415,27 @@ def _app_minute_runs(
                   {late_filter}
             ), stepped AS (
                 SELECT date, app, minute_epoch,
-                       minute_epoch - (ROW_NUMBER() OVER (
-                           PARTITION BY date, app ORDER BY minute_epoch
-                       ) * {MINUTE_SECONDS}) AS island
+                       CASE WHEN minute_epoch - LAG(minute_epoch) OVER (
+                                PARTITION BY date, app ORDER BY minute_epoch
+                            ) > ? THEN 1 ELSE 0 END AS opens_island
                 FROM seen
+            ), islanded AS (
+                SELECT date, app, minute_epoch,
+                       SUM(opens_island) OVER (
+                           PARTITION BY date, app ORDER BY minute_epoch
+                           ROWS BETWEEN UNBOUNDED PRECEDING AND CURRENT ROW
+                       ) AS island
+                FROM stepped
             )
             SELECT date, app,
                    COUNT(*) AS minutes,
                    MIN(minute_epoch) AS first_minute,
                    MAX(minute_epoch) AS last_minute
-            FROM stepped
+            FROM islanded
             GROUP BY date, app, island
             ORDER BY date, app, first_minute""",
-        (*prefix, first, last, *wanted),
+        (*prefix, first, last, *wanted,
+         MINUTE_SECONDS * (RUN_MERGE_GAP_MINUTES + 1)),
     ).fetchall()
     grouped: Dict[tuple, List[Dict[str, int]]] = {}
     for row in rows:

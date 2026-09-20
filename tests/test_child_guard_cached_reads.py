@@ -106,6 +106,27 @@ def test_runtime_for_an_unknown_device_falls_back_to_the_router(monkeypatch, tmp
     assert asked == ["get_runtime_state"]
 
 
+def test_a_stale_runtime_snapshot_does_not_re_ask_the_router(monkeypatch, tmp_path):
+    """BE72 上 ``ubus call sniffer.user show`` 实测 8 秒必超时。
+
+    所以 runtime 这一读过期了也只回缓存，不再补问：问了就是往队列里塞一条
+    注定失败的命令（真机日志里 17:07–17:19 每一条 get_runtime_state 都是红的）。
+    """
+    aggregate = _aggregate(tmp_path)
+    aggregate.remember_guard_devices(ROUTER, [
+        {"uid": UID, "macs": ["1A:9C:C5:C5:B7:BB"], "name": "Mate60", "blocked": True,
+         "blockedUntilEpoch": int(time.time()) + 600}])
+    client, _asked = _prepare(monkeypatch, tmp_path, aggregate)
+    enqueued = []
+    monkeypatch.setattr(hub.CHILD_GUARD_COMMANDS, "enqueue",
+                        lambda *args, **kwargs: enqueued.append(args))
+    monkeypatch.setattr(hub, "CHILD_GUARD_RUNTIME_TTL_SECONDS", -1)
+    body = client.get(RUNTIME_PATH).get_json()
+    assert body["stale"] is True and body["cached"] is True
+    assert body["runtime"]["blocked"] is True
+    assert enqueued == []
+
+
 def test_a_plan_write_invalidates_the_cached_list(monkeypatch, tmp_path):
     """新增/删除之后总览那句「生效态」必须跟着变，靠的就是同一份快照。"""
     aggregate = _aggregate(tmp_path)
