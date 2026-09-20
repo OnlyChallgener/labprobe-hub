@@ -1549,7 +1549,16 @@ fn mutate_plan(action: &str, payload: &Value) -> Result<Value> {
             (pid, true, Some(policy), Some(replaced.name))
         }
         "delete_plan" => {
-            let index = old_index.ok_or_else(|| anyhow!("plan not found"))?;
+            // 规则本来就不在（官方 App 里删过设备/规则）：要的状态已经成立，报
+            // 「plan not found」只会让界面弹英文原文、这条规则在界面上永远删不掉。
+            let index = match old_index {
+                Some(index) => index,
+                None => {
+                    return Ok(json!({"ok": true, "uid": uid, "plan": Value::Null,
+                                     "deleted": true, "alreadyAbsent": true,
+                                     "rollback": "not_needed"}))
+                }
+            };
             let removed = policies.remove(index);
             (removed.name, false, None, None)
         }
@@ -1926,7 +1935,12 @@ fn mutate_membership(action: &str, payload: &Value) -> Result<Value> {
                 .ok_or_else(|| anyhow!("missing uid"))?;
             let snapshot = load_snapshot()?;
             if snapshot.user(uid).is_none() {
-                bail!("device not found");
+                // 设备本来就不在了（比如在官方星耀家里被移出守护）。要的状态已经成立，
+                // 报「device not found」只会让界面弹一句英文原文、列表里那行永远删不掉。
+                return Ok(json!({
+                    "ok": true, "uid": uid, "alreadyAbsent": true,
+                    "removedPlans": 0, "rollback": "not_needed",
+                }));
             }
             let plans = policies_for(&snapshot, uid);
             let removed_plans = plans.len();
