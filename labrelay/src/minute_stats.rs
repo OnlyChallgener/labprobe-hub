@@ -1010,6 +1010,15 @@ pub fn prepare_sniffer() -> bool {
     crate::usage_stats::prepare_sniffer()
 }
 
+/// 看门狗用：有没有受守护设备（没有就不该把 sniffer 重启），以及带冷却的重启。
+pub fn has_guarded_devices() -> bool {
+    crate::usage_stats::has_guarded_devices()
+}
+
+pub fn restart_sniffer(now: u64) -> bool {
+    crate::usage_stats::restart_sniffer(now)
+}
+
 // ---------------------------------------------------------------------------
 // 节拍
 // ---------------------------------------------------------------------------

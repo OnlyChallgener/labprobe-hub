@@ -1208,7 +1208,7 @@ fn sync_child_guard_ip6_block_router() {
 ///
 /// 所以现在后台跑完整、并且把期间的多次触发合并成「这一轮跑完再补一轮」。写请求
 /// 不等它 —— 配置已经落在 UCI 里，验证也只判 UCI。
-fn trigger_reload() {
+pub fn trigger_reload() {
     if RELOAD_BUSY.swap(true, Ordering::SeqCst) {
         RELOAD_AGAIN.store(true, Ordering::SeqCst);
         return;

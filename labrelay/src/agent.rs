@@ -1550,9 +1550,30 @@ async fn sync_usage_stats(client: &Client, config: &AgentConfig) -> Result<()> {
         minute_stats::note_sniffer(now);
         match tokio::task::spawn_blocking(minute_stats::prepare_sniffer).await {
             Ok(true) => {}
-            Ok(false) => problems.push(
-                "sniffer identification unavailable; app usage will stay empty".to_string(),
-            ),
+            Ok(false) => {
+                // 重申失败就是 sniffer 不可用。真机抓到过进程干脆没了、而 procd 因为
+                // `respawn retry: 5` 的预算耗尽不再拉起的现场，应用时长因此冻结了近
+                // 一小时没人管 —— 所以这里主动重启一次，下一轮重申再确认。
+                // 没有受守护设备时 prepare_sniffer 也返回 false，那是「没东西可声明」，
+                // 不能拿它当重启的理由。两者都要 fork，所以丢进 spawn_blocking，
+                // 不把异步执行线程占住。
+                let restarted = tokio::task::spawn_blocking(move || {
+                    minute_stats::has_guarded_devices() && minute_stats::restart_sniffer(now)
+                })
+                .await
+                .unwrap_or(false);
+                if restarted {
+                    // 重启会清掉已经推进 sniffer 的守护用户，让 child_guard 再推一次。
+                    crate::child_guard::trigger_reload();
+                    problems.push(
+                        "sniffer identification unavailable; restarted sniffer.elf".to_string(),
+                    );
+                } else {
+                    problems.push(
+                        "sniffer identification unavailable; app usage will stay empty".to_string(),
+                    );
+                }
+            }
             Err(error) => problems.push(format!("sniffer preparation failed: {}", error)),
         }
     }

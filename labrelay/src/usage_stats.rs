@@ -287,3 +287,63 @@ pub fn prepare_sniffer() -> bool {
     );
     identifiers && full_mode
 }
+
+/// 有没有受守护设备。`prepare_sniffer` 在没有受守护设备时也返回 `false`，那是
+/// 「没东西可声明」，不是 sniffer 坏了 —— 不能拿它当重启的理由。
+pub fn has_guarded_devices() -> bool {
+    !child_macs().is_empty()
+}
+
+/// 两次重启 sniffer 之间至少隔这么久。5 秒一轮的采样配一个无冷却的重启，等于把
+/// 路由器拖进重启循环。
+pub const SNIFFER_RESTART_COOLDOWN_SECS: u64 = 15 * 60;
+
+/// 冷却判断单独拿出来，好测。`last == 0` 表示从没重启过。
+pub fn sniffer_restart_allowed(now: u64, last: u64) -> bool {
+    last == 0 || now.saturating_sub(last) >= SNIFFER_RESTART_COOLDOWN_SECS
+}
+
+static LAST_SNIFFER_RESTART_AT: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+
+/// sniffer.elf 会卡死（进程在、state R、所有 ubus 调用超时），也会干脆不在 ——
+/// 真机 2026-09-20 抓到两种现场各一次，其中进程没了的那次 procd 并没有把它拉回来
+/// （respawn 是 `retry: 5`，大概被重试预算耗光了），于是应用时长冻结了将近一小时。
+/// 两种情况 ubus 都问不到，所以只要重申失败就主动重启一次，下一轮再重申。
+pub fn restart_sniffer(now: u64) -> bool {
+    let last = LAST_SNIFFER_RESTART_AT.load(std::sync::atomic::Ordering::Relaxed);
+    if !sniffer_restart_allowed(now, last) {
+        return false;
+    }
+    LAST_SNIFFER_RESTART_AT.store(now, std::sync::atomic::Ordering::Relaxed);
+    // 这台固件上没有 `service`，只能直接调 init 脚本（实测可用）。
+    std::process::Command::new("/etc/init.d/sniffer")
+        .arg("restart")
+        .stdout(std::process::Stdio::null())
+        .stderr(std::process::Stdio::null())
+        .status()
+        .map(|status| status.success())
+        .unwrap_or(false)
+}
+
+#[cfg(test)]
+mod watchdog_tests {
+    use super::{sniffer_restart_allowed, SNIFFER_RESTART_COOLDOWN_SECS};
+
+    #[test]
+    fn the_first_failure_restarts_immediately() {
+        assert!(sniffer_restart_allowed(1_000, 0));
+    }
+
+    #[test]
+    fn restarts_are_spaced_out_so_we_do_not_thrash() {
+        let started = 1_000_000;
+        assert!(!sniffer_restart_allowed(started + 60, started));
+        assert!(!sniffer_restart_allowed(started + SNIFFER_RESTART_COOLDOWN_SECS - 1, started));
+        assert!(sniffer_restart_allowed(started + SNIFFER_RESTART_COOLDOWN_SECS, started));
+    }
+
+    #[test]
+    fn a_clock_that_went_backwards_does_not_trigger_a_restart_storm() {
+        assert!(!sniffer_restart_allowed(900, 1_000));
+    }
+}
