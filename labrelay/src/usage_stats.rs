@@ -89,13 +89,13 @@ const UNIDENTIFIED_APPID: &str = "0-0-0-0";
 /// Absolute byte floor (up+down) a flow must move within one sample interval
 /// before it counts as "in use" for that interval.
 ///
-/// Filter out pure TCP/UDP keepalives (<128B) while preserving hardware-offloaded
-/// streaming / chat sessions where sniffer captures the initial TLS/SNI handshake.
-pub const ACTIVE_MIN_BYTES: u64 = 128;
+/// Ten seconds of a typical background push or audio ping is ~1.5 KB, so 2 KB
+/// sits comfortably above keepalives while catching real user interactions.
+pub const ACTIVE_MIN_BYTES: u64 = 2048;
 
 /// The same gate as a sustained rate, so a single short burst inside a long
 /// interval cannot buy the whole interval as usage time.
-pub const ACTIVE_MIN_BYTES_PER_SEC: u64 = 8;
+pub const ACTIVE_MIN_BYTES_PER_SEC: u64 = 32;
 
 /// Effective per-sample byte floor for an interval of `gap_secs` seconds.
 ///
@@ -520,6 +520,7 @@ impl UsageStore {
             }
             let key = row.key();
             let previous = self.last.get(&key);
+            let is_new = previous.is_none();
             let (delta_up, delta_down) = match previous {
                 // If the sampler is running (gap > 0), a newly appeared flow started
                 // in this interval, so its current counters are the delta for this interval.
@@ -538,15 +539,14 @@ impl UsageStore {
                         .saturating_sub(prev.bytes_down),
                 ),
             };
-            let is_new = previous.is_none();
+
             let delta = delta_up + delta_down;
             report.bytes_delta += delta;
 
-            if matches!(previous, Some(prev) if *prev != row.counters) {
-                report.updated_flows += 1;
-            }
             if is_new {
                 report.new_flows += 1;
+            } else if delta > 0 {
+                report.updated_flows += 1;
             }
 
             let app = match app_of(&row.appid) {
@@ -571,6 +571,9 @@ impl UsageStore {
                 .or_default();
             app_slot.tx_bytes += delta_up;
             app_slot.rx_bytes += delta_down;
+            if is_new {
+                app_slot.sessions += 1;
+            }
 
             let hour_slot = self
                 .hourly
@@ -607,15 +610,6 @@ impl UsageStore {
                     .active_secs
                     .saturating_add(gap as u32)
                     .min(MAX_SECS_PER_DAY);
-
-                // Cluster continuous interaction: if an app is seen active after >300s
-                // of silence (or for the first time), it starts a new user session.
-                let session_key = (mac.clone(), app.clone());
-                let last_active = self.last_active_app_epoch.get(&session_key).copied().unwrap_or(0);
-                if stamp.epoch.saturating_sub(last_active) > 300 {
-                    app_slot.sessions += 1;
-                }
-                self.last_active_app_epoch.insert(session_key, stamp.epoch);
             }
         }
         report.active_macs = active.iter().map(|(mac, _)| mac).collect::<BTreeSet<_>>().len();
