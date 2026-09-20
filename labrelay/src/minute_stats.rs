@@ -239,56 +239,6 @@ pub fn parse_flow_audit_ips(text: &str) -> BTreeMap<String, IpCounters> {
     out
 }
 
-/// 解析 `flow_audit get_daily_ip` 的历史日流量。
-///
-/// 固件对“今天”会同时下发一条已结算记录和一条 `today_inprogress`，两者不互相
-/// 包含（实测 inprogress 的下载量远大于结算行、上传量却更小）。今天只认
-/// `today_inprogress`，历史日只认结算行；混着取 max 会凭空放大总数。
-pub fn parse_flow_audit_daily(text: &str, today: &str) -> BTreeMap<String, TrafficCounters> {
-    let mut out = BTreeMap::new();
-    let Ok(value) = serde_json::from_str::<Value>(text) else {
-        return out;
-    };
-    let Some(list) = value.get("ip_list").and_then(Value::as_array) else {
-        return out;
-    };
-    for row in list {
-        let Some(days) = row.get("daily").and_then(Value::as_array) else {
-            continue;
-        };
-        for day in days {
-            let raw = day
-                .get("date")
-                .map(|v| match v {
-                    Value::String(text) => text.clone(),
-                    Value::Number(number) => number.to_string(),
-                    _ => String::new(),
-                })
-                .unwrap_or_default();
-            if raw.len() != 8 {
-                continue;
-            }
-            let date = format!("{}-{}-{}", &raw[0..4], &raw[4..6], &raw[6..8]);
-            let in_progress = day
-                .get("stat")
-                .and_then(Value::as_str)
-                .map(|stat| stat == "today_inprogress")
-                .unwrap_or(false);
-            if in_progress != (date == today) {
-                continue;
-            }
-            out.insert(
-                date,
-                TrafficCounters {
-                    tx_bytes: json_u64(day.get("tx_bytes")),
-                    rx_bytes: json_u64(day.get("rx_bytes")),
-                },
-            );
-        }
-    }
-    out
-}
-
 /// `/tmp/dhcp.leases` -> MAC -> 该 MAC 当前的全部 IPv4。
 pub fn parse_mac_ips(text: &str) -> BTreeMap<String, BTreeSet<String>> {
     let mut out: BTreeMap<String, BTreeSet<String>> = BTreeMap::new();
@@ -950,13 +900,6 @@ pub fn local_date() -> Option<String> {
     (text.len() == 10).then_some(text)
 }
 
-/// 路由器本地 epoch 秒。
-pub fn now_epoch() -> u64 {
-    command_text("date", &["+%s"])
-        .and_then(|text| text.parse().ok())
-        .unwrap_or(0)
-}
-
 fn command_text(program: &str, args: &[&str]) -> Option<String> {
     let output = Command::new(program).args(args).output().ok()?;
     if !output.status.success() {
@@ -999,14 +942,6 @@ pub fn read_ip_counters() -> BTreeMap<String, IpCounters> {
         .unwrap_or_default()
 }
 
-/// 按 IP 取历史日流量（固件只留最近几天，用来补中继重启当天的空档）。
-pub fn read_daily_traffic(ip: &str, today: &str) -> BTreeMap<String, TrafficCounters> {
-    let body = json!({"ip": ip}).to_string();
-    ubus_text("flow_audit", "get_daily_ip", &body)
-        .map(|text| parse_flow_audit_daily(&text, today))
-        .unwrap_or_default()
-}
-
 pub fn read_mac_ips() -> BTreeMap<String, BTreeSet<String>> {
     read_text(DHCP_LEASES)
         .map(|text| parse_mac_ips(&text))
@@ -1028,16 +963,6 @@ pub fn read_child_macs() -> BTreeSet<String> {
             (mac.len() == 17 && mac.contains(':')).then_some(mac)
         })
         .collect()
-}
-
-/// `rdpi -t` 的 appid -> 名称表；采样期间只读缓存，刷新交给调用方按小时安排。
-pub fn app_names() -> AppIdMap {
-    let cached = load_app_map();
-    if cached.is_empty() {
-        refresh_app_map()
-    } else {
-        cached
-    }
 }
 
 /// 把日期往前/往后挪若干天，用于保留窗口裁剪（不依赖时区库）。
@@ -1450,16 +1375,26 @@ mod tests {
     }
 
     #[test]
-    fn three_separate_minutes_become_three_ranges() {
-        let minutes = BTreeSet::from([minute_start(T0), minute_start(T0) + 60, minute_start(T0) + 600]);
+    fn consecutive_minutes_merge_and_a_gap_starts_a_new_range() {
+        // 08:15 + 08:16 是连续的两分钟，合成一段 08:15–08:17；08:25 单独一段。
+        // 断开的分钟绝不并成一段，也不用首末时间冒充连续使用。
+        let minutes = BTreeSet::from([
+            minute_start(T0),
+            minute_start(T0) + 60,
+            minute_start(T0) + 600,
+        ]);
         let ranges = ranges_from_minutes(&minutes);
-        assert_eq!(ranges.len(), 3);
+        assert_eq!(ranges.len(), 2);
         assert_eq!(ranges[0]["minutes"], json!(2));
         assert_eq!(
             ranges[0]["endEpoch"].as_u64().unwrap() - ranges[0]["startEpoch"].as_u64().unwrap(),
             120
         );
-        assert_eq!(ranges[2]["minutes"], json!(1));
+        assert_eq!(ranges[1]["minutes"], json!(1));
+        assert_eq!(
+            ranges[1]["endEpoch"].as_u64().unwrap() - ranges[1]["startEpoch"].as_u64().unwrap(),
+            60
+        );
     }
 
     #[test]
@@ -1564,24 +1499,6 @@ mod tests {
         assert_eq!(
             parsed.get("192.168.5.132"),
             Some(&IpCounters { total_up: 123, total_down: 456, daily_up: 12, daily_down: 45 })
-        );
-    }
-
-    #[test]
-    fn daily_history_prefers_inprogress_for_today() {
-        let text = r#"{"ip_list":[{"ip_addr":"192.168.5.132","daily":[
-            {"date":"20260920","tx_bytes":"100","rx_bytes":"200","stat":"closed"},
-            {"date":"20260920","tx_bytes":"900","rx_bytes":"5000","stat":"today_inprogress"},
-            {"date":"20260919","tx_bytes":"70","rx_bytes":"80","stat":"closed"}
-        ]}]}"#;
-        let parsed = parse_flow_audit_daily(text, "2026-09-20");
-        assert_eq!(
-            parsed.get("2026-09-20"),
-            Some(&TrafficCounters { tx_bytes: 900, rx_bytes: 5000 })
-        );
-        assert_eq!(
-            parsed.get("2026-09-19"),
-            Some(&TrafficCounters { tx_bytes: 70, rx_bytes: 80 })
         );
     }
 
