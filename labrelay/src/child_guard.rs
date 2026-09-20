@@ -3,7 +3,7 @@ use serde_json::{json, Map, Value};
 use std::collections::{BTreeMap, BTreeSet};
 use std::path::Path;
 use std::process::Command;
-use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::thread;
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
@@ -13,6 +13,11 @@ const CONFIG: &str = "child_guard";
 // runtime state enough room to converge before declaring a verification failure.
 const VERIFY_TIMEOUT: Duration = Duration::from_secs(25);
 static ID_COUNTER: AtomicU64 = AtomicU64::new(1);
+static RELOAD_BUSY: AtomicBool = AtomicBool::new(false);
+static RELOAD_AGAIN: AtomicBool = AtomicBool::new(false);
+/// sniffer 的 ubus 读一旦问不到，这么久之内不再重问（秒）。
+const RUNTIME_DEAF_SECONDS: u64 = 120;
+static RUNTIME_DEAF_UNTIL: AtomicU64 = AtomicU64::new(0);
 
 #[derive(Clone, Debug, Default, PartialEq, Eq)]
 struct UciSection {
@@ -164,7 +169,82 @@ fn load_snapshot() -> Result<Snapshot> {
 }
 
 fn ubus_show(object: &str) -> Result<Value> {
-    command_json("ubus", &["call", object, "show", "{}"])
+    // `-t` 是 ubus 自己的请求超时。不给的话，一个卡死的 sniffer.elf 会让这条
+    // 调用一直挂着（BE72 实测：`sniffer.user`/`sniffer.policy` 连 `status` 都
+    // 要等到超时），整个中继就被一次读拖住。
+    command_json("ubus", &["-t", "3", "call", object, "show", "{}"])
+}
+
+/// 运行时视图的 JSON 形式；`Value::Null` = 问不到，不是「运行时里没有」。
+///
+/// 一次问不到之后把「问不到」熔断一段时间：BE72 实测 sniffer 卡死时这条调用要等
+/// 满超时才回（`ubus -t 30 call sniffer.user show` → rc=7、整整 30 秒），不熔断的
+/// 话每个要问运行时的地方都会重复付一遍这 30 秒。
+fn runtime_value(object: &str) -> Value {
+    let now = now_epoch();
+    if now < RUNTIME_DEAF_UNTIL.load(Ordering::Relaxed) {
+        return Value::Null;
+    }
+    match ubus_show(object) {
+        Ok(value) => {
+            RUNTIME_DEAF_UNTIL.store(0, Ordering::Relaxed);
+            value
+        }
+        Err(_) => {
+            RUNTIME_DEAF_UNTIL.store(now + RUNTIME_DEAF_SECONDS, Ordering::Relaxed);
+            Value::Null
+        }
+    }
+}
+
+fn verify_policy(
+    uid: &str,
+    pid: &str,
+    should_exist: bool,
+    expected: Option<&UciSection>,
+) -> Result<()> {
+    let deadline = Instant::now() + VERIFY_TIMEOUT;
+    let mut orphan_dropped = false;
+    loop {
+        let snapshot = load_snapshot()?;
+        let in_uci = snapshot.user(uid).is_some() && snapshot.named(pid).is_some();
+        let config_matches = expected
+            .map(|wanted| {
+                snapshot
+                    .named(pid)
+                    .map(|actual| policy_config_matches(actual, wanted))
+                    .unwrap_or(false)
+            })
+            .unwrap_or(true);
+        if policy_is_settled(in_uci, config_matches, should_exist) {
+            return Ok(());
+        }
+        if !should_exist && !in_uci && !orphan_dropped {
+            // The init reload leaves the dropped app policy in the sniffer
+            // runtime; remove it once so the next reload can't resurrect it.
+            drop_runtime_policy(pid);
+            orphan_dropped = true;
+        }
+        if Instant::now() >= deadline {
+            bail!("child_guard reload/config verification timed out");
+        }
+        thread::sleep(Duration::from_secs(1));
+    }
+}
+
+/// 期望的策略状态是否已经落进 UCI。
+///
+/// 只判 UCI 是刻意的：运行时推送由 `trigger_reload` 的后台 `child_guard reload`
+/// 完成，而真机实测这一轮要 40 秒以上（`/etc/init.d/child_guard reload` 其实是
+/// `restart`：先拆 iptables 链再把配置推给 sniffer）。在写请求里等 sniffer 承认
+/// 收到，等于必然等满 `VERIFY_TIMEOUT` 然后把一份其实写成功的配置回滚掉 ——
+/// 真机 2026-09-20 的 `create_plan | failed | rollback=failed` 就是这条链路。
+fn policy_is_settled(in_uci: bool, config_matches: bool, should_exist: bool) -> bool {
+    if should_exist {
+        in_uci && config_matches
+    } else {
+        !in_uci
+    }
 }
 
 /// MAC -> IP mapping from the standard OpenWrt DHCP lease file, used to bind
@@ -1119,14 +1199,35 @@ fn sync_child_guard_ip6_block_router() {
     }
 }
 
+/// `/etc/init.d/child_guard reload` 其实是 `restart`：`child_guard_stop` 先把
+/// iptables 的 child_guard 链拆下来，`child_guard_start` 再挂回去，然后 lua 把
+/// UCI 里的用户/策略逐条 `ubus call sniffer.user add` 推给 sniffer。真机实测这一
+/// 轮要 40 秒以上，而中继以前用 `timeout -t 14` 等它 —— 等于每次写配置都把这次
+/// 重启拦腰砍断：链拆了没重建、sniffer 的推送只跑了一半，界面上就是「规则不生效」，
+/// 反复砍下去连 sniffer.elf 自己都不再回 ubus 了。
+///
+/// 所以现在后台跑完整、并且把期间的多次触发合并成「这一轮跑完再补一轮」。写请求
+/// 不等它 —— 配置已经落在 UCI 里，验证也只判 UCI。
 fn trigger_reload() {
-    // BusyBox on this firmware: `timeout [-t SECS] [-s SIG] PROG ARGS`.
-    let _ = command_output(
-        "sh",
-        &["-c", "timeout -t 14 /etc/init.d/child_guard reload >/dev/null 2>&1"],
-    );
-    sync_child_guard_ip6_block_router();
-    thread::sleep(Duration::from_secs(2));
+    if RELOAD_BUSY.swap(true, Ordering::SeqCst) {
+        RELOAD_AGAIN.store(true, Ordering::SeqCst);
+        return;
+    }
+    thread::spawn(|| {
+        loop {
+            RELOAD_AGAIN.store(false, Ordering::SeqCst);
+            // 留足余量，只用来兜住「reload 自己卡死」这一种情况。
+            let _ = command_output(
+                "sh",
+                &["-c", "timeout -t 240 /etc/init.d/child_guard reload >/dev/null 2>&1"],
+            );
+            sync_child_guard_ip6_block_router();
+            if !RELOAD_AGAIN.load(Ordering::SeqCst) {
+                break;
+            }
+        }
+        RELOAD_BUSY.store(false, Ordering::SeqCst);
+    });
 }
 
 /// Reload only removes runtime entries whose user section disappeared; an
@@ -1208,7 +1309,7 @@ fn verify_snapshot_restored(snapshot: &Snapshot, uid: &str) -> Result<()> {
     let deadline = Instant::now() + VERIFY_TIMEOUT;
     loop {
         let current = load_snapshot()?;
-        let uci_matches = if snapshot.user(uid).is_some() {
+        let restored = if snapshot.user(uid).is_some() {
             let current_pids = policies_for(&current, uid)
                 .iter()
                 .map(|policy| policy.name.clone())
@@ -1221,24 +1322,10 @@ fn verify_snapshot_restored(snapshot: &Snapshot, uid: &str) -> Result<()> {
         } else {
             current.user(uid).is_none()
         };
-        let user_text = serde_json::to_string(&ubus_show("sniffer.user").unwrap_or(Value::Null))
-            .unwrap_or_default();
-        let runtime_matches = if snapshot.user(uid).is_some() {
-            user_text.contains(uid)
-                && expected
-                    .iter()
-                    .filter(|policy| {
-                        policy
-                            .options
-                            .get("type")
-                            .map(|value| value != "0")
-                            .unwrap_or(false)
-                    })
-                    .all(|policy| user_text.contains(&policy.name))
-        } else {
-            !user_text.contains(uid)
-        };
-        if uci_matches && runtime_matches {
+        // 只判 UCI：回滚是把快照写回 UCI，运行时由后台 reload 收敛。在这里等
+        // sniffer 承认，会把一次其实已经成功的回滚报成「rollback verification
+        // timed out」，让调用方看到一条根本没发生过的失败。
+        if restored {
             return Ok(());
         }
         if Instant::now() >= deadline {
@@ -1264,51 +1351,6 @@ fn policy_config_matches(actual: &UciSection, expected: &UciSection) -> bool {
         && actual.lists.get("app") == expected.lists.get("app")
 }
 
-fn verify_policy(
-    uid: &str,
-    pid: &str,
-    should_exist: bool,
-    app_policy: bool,
-    expected: Option<&UciSection>,
-) -> Result<()> {
-    let deadline = Instant::now() + VERIFY_TIMEOUT;
-    let mut orphan_dropped = false;
-    loop {
-        let snapshot = load_snapshot()?;
-        let in_uci = snapshot.user(uid).is_some() && snapshot.named(pid).is_some();
-        let config_matches = expected
-            .map(|wanted| {
-                snapshot
-                    .named(pid)
-                    .map(|actual| policy_config_matches(actual, wanted))
-                    .unwrap_or(false)
-            })
-            .unwrap_or(true);
-        let sniffer_user = ubus_show("sniffer.user").unwrap_or(Value::Null);
-        let user_text = serde_json::to_string(&sniffer_user).unwrap_or_default();
-        let in_user = user_text.contains(uid) && (!app_policy || user_text.contains(pid));
-        let policy_text =
-            serde_json::to_string(&ubus_show("sniffer.policy").unwrap_or(Value::Null))
-                .unwrap_or_default();
-        let in_policy = !app_policy || policy_text.contains(pid);
-        if should_exist && in_uci && config_matches && in_user && in_policy {
-            return Ok(());
-        }
-        if !should_exist && !in_uci && !user_text.contains(pid) && !policy_text.contains(pid) {
-            return Ok(());
-        }
-        if !should_exist && !in_uci && !orphan_dropped && policy_text.contains(pid) {
-            // The init reload leaves the dropped app policy in the sniffer
-            // runtime; remove it once so the verification can converge.
-            drop_runtime_policy(pid);
-            orphan_dropped = true;
-        }
-        if Instant::now() >= deadline {
-            bail!("child_guard reload/config verification timed out");
-        }
-        thread::sleep(Duration::from_secs(1));
-    }
-}
 
 fn transactional_write<S, W, V, R>(
     snapshot: &S,
@@ -1441,19 +1483,14 @@ fn mutate_plan(action: &str, payload: &Value) -> Result<Value> {
             .iter()
             .position(|policy| public_plan_id(policy) == old_plan_id)
     };
-    let (verify_pid, should_exist, app_policy, response_plan, stale_policy) = match action {
+    let (verify_pid, should_exist, response_plan, stale_policy) = match action {
         "create_plan" => {
             let plan = payload.get("plan").ok_or_else(|| anyhow!("missing plan"))?;
             let public_id = format!("lp_{:016x}", fnv64(&format!("{}:{}", uid, plan_pid())));
             let policy = direct_policy(plan, &public_id)?;
             let pid = policy.name.clone();
-            let is_app = policy
-                .options
-                .get("type")
-                .map(|value| value != "0")
-                .unwrap_or(false);
             policies.push(policy.clone());
-            (pid, true, is_app, Some(policy), None)
+            (pid, true, Some(policy), None)
         }
         "update_plan" => {
             let index = old_index.ok_or_else(|| anyhow!("plan not found"))?;
@@ -1461,39 +1498,13 @@ fn mutate_plan(action: &str, payload: &Value) -> Result<Value> {
             let replaced = policies[index].clone();
             let policy = direct_policy(plan, old_plan_id)?;
             let pid = policy.name.clone();
-            let is_app = policy
-                .options
-                .get("type")
-                .map(|value| value != "0")
-                .unwrap_or(false);
             policies[index] = policy.clone();
-            let replaced_is_app = replaced
-                .options
-                .get("type")
-                .map(|value| value != "0")
-                .unwrap_or(false);
-            (
-                pid,
-                true,
-                is_app,
-                Some(policy),
-                Some((replaced.name, replaced_is_app)),
-            )
+            (pid, true, Some(policy), Some(replaced.name))
         }
         "delete_plan" => {
             let index = old_index.ok_or_else(|| anyhow!("plan not found"))?;
             let removed = policies.remove(index);
-            (
-                removed.name,
-                false,
-                removed
-                    .options
-                    .get("type")
-                    .map(|value| value != "0")
-                    .unwrap_or(false),
-                None,
-                None,
-            )
+            (removed.name, false, None, None)
         }
         "set_plan_enabled" => {
             let index = old_index.ok_or_else(|| anyhow!("plan not found"))?;
@@ -1503,13 +1514,8 @@ fn mutate_plan(action: &str, payload: &Value) -> Result<Value> {
                 .ok_or_else(|| anyhow!("missing enabled"))?;
             let updated = policy_with_enabled(&policies[index], &before, enabled);
             let pid = updated.name.clone();
-            let is_app = updated
-                .options
-                .get("type")
-                .map(|value| value != "0")
-                .unwrap_or(false);
             policies[index] = updated.clone();
-            (pid, true, is_app, Some(updated), None)
+            (pid, true, Some(updated), None)
         }
         _ => bail!("unsupported mutation"),
     };
@@ -1518,16 +1524,10 @@ fn mutate_plan(action: &str, payload: &Value) -> Result<Value> {
         &before,
         || write_user(&before, uid, &policies, fallback),
         || {
-            verify_policy(
-                uid,
-                &verify_pid,
-                should_exist,
-                app_policy,
-                response_plan.as_ref(),
-            )?;
-            if let Some((stale_pid, stale_is_app)) = stale_policy.as_ref() {
+            verify_policy(uid, &verify_pid, should_exist, response_plan.as_ref())?;
+            if let Some(stale_pid) = stale_policy.as_ref() {
                 if stale_pid != &verify_pid {
-                    verify_policy(uid, stale_pid, false, *stale_is_app, None)?;
+                    verify_policy(uid, stale_pid, false, None)?;
                 }
             }
             Ok(())
@@ -1585,6 +1585,9 @@ fn device_pause(action: &str, payload: &Value) -> Result<Value> {
             verify_device_block(uid, *old)
         },
     )?;
+    // `dev_sta set -m child_block` 只改 UCI 的 `block`；把它变成 ipset 里的
+    // 一条 MAC 是 reload 的活。不推这一次，界面上「已禁网」而设备照常上网。
+    trigger_reload();
     Ok(json!({"ok": true, "uid": uid, "blockedUntilEpoch": timestamp, "rollback": "not_needed"}))
 }
 
@@ -1603,11 +1606,10 @@ fn verify_device_block(uid: &str, timestamp: u64) -> Result<()> {
             .and_then(|value| value.options.get("block"))
             .and_then(|value| value.parse::<u64>().ok())
             .unwrap_or(0);
-        let reload_completed = user
-            .and_then(|value| value.options.get("reload"))
-            .map(|value| value == "0")
-            .unwrap_or(false);
-        if current == timestamp && reload_completed {
+        // 不再要求 `reload == 0`：那是后台 reload 跑完才会翻回来的标志，而这一轮
+        // 真机要 40 秒以上，写在请求里等它等于每次都判超时、再回滚掉一次成功的
+        // 禁网 —— 界面上就是「点立即禁网一直显示正在同步，然后也没法成功」。
+        if current == timestamp {
             return Ok(());
         }
         if Instant::now() >= deadline {
@@ -1657,15 +1659,12 @@ fn merge_runtime_macs(existing: &[String], wanted: &[String]) -> Vec<String> {
 
 /// Read the runtime `sniffer.user` object for `uid` (as returned by ubus).
 fn runtime_user_object(uid: &str) -> Option<Map<String, Value>> {
-    let show = ubus_show("sniffer.user").ok()?;
+    // 走 `runtime_value` 而不是直接 ubus：sniffer 问不到时这条也要立刻放弃。
+    let show = runtime_value("sniffer.user");
+    if show.is_null() {
+        return None;
+    }
     recursive_object_by_uid(&show, uid).cloned()
-}
-
-fn runtime_macs(uid: &str) -> Vec<String> {
-    runtime_user_object(uid)
-        .and_then(|object| object.get("mac").cloned())
-        .map(|value| json_strings(Some(&value)))
-        .unwrap_or_default()
 }
 
 /// Repair a runtime `sniffer.user` entry whose mac list was lost.
@@ -1727,49 +1726,28 @@ fn ensure_runtime_user_macs(uid: &str, macs: &[String]) -> Result<()> {
     Ok(())
 }
 
-/// Verify both UCI and runtime membership. When `should_exist` and `macs` are
-/// supplied the runtime mac list must contain every requested mac — the runtime
-/// entry existing with an empty mac list is exactly the failure mode that made
-/// guarded devices silently lose attribution.
+/// Verify that membership landed in UCI, then repair the runtime mac list once.
+///
+/// UCI 是这次写入的落点，也是唯一能同步判定的东西：运行时那一半要等后台
+/// `child_guard reload`（真机 40 秒以上）才会推给 sniffer，在写请求里等它只会
+/// 得到假失败。以前「运行时里必须有这些 mac」这条硬要求，配合被中继砍断的
+/// reload，正是加入/移出守护「验证失败 → 回滚 → 界面上删除设备也不行」的成因。
+/// Lua 偶尔会漏推 mac，所以运行时问得到时仍补一次，但补不上也不判失败。
 fn verify_user_presence(uid: &str, should_exist: bool, macs: &[String]) -> Result<()> {
     let deadline = Instant::now() + VERIFY_TIMEOUT;
     let mut repaired = false;
     loop {
         let snapshot = load_snapshot()?;
-        let in_uci = snapshot.user(uid).is_some();
-        let user_text =
-            serde_json::to_string(&ubus_show("sniffer.user").unwrap_or(Value::Null))
-                .unwrap_or_default();
-        let in_runtime = user_text.contains(uid);
-        let wants_macs = should_exist && !macs.is_empty();
-        let macs_ok = if wants_macs {
-            let present = runtime_macs(uid);
-            macs.iter().all(|mac| {
-                let wanted = normalize_mac(mac);
-                present.iter().any(|item| normalize_mac(item) == wanted)
-            })
-        } else {
-            true
-        };
-        if should_exist && in_uci && in_runtime && macs_ok {
+        if snapshot.user(uid).is_some() == should_exist {
+            if should_exist && !macs.is_empty() && !repaired {
+                repaired = true;
+                if runtime_user_object(uid).is_some() {
+                    let _ = ensure_runtime_user_macs(uid, macs);
+                }
+            }
             return Ok(());
-        }
-        if !should_exist && !in_uci && !in_runtime {
-            return Ok(());
-        }
-        // Self-heal once: the Lua reload may have dropped the mac push.
-        if wants_macs && in_runtime && !macs_ok && !repaired {
-            repaired = ensure_runtime_user_macs(uid, macs).is_ok();
         }
         if Instant::now() >= deadline {
-            if wants_macs && !macs_ok {
-                bail!(
-                    "child_guard membership verification timed out: runtime mac missing for {uid} \
-                     (wanted {:?}, runtime {:?})",
-                    macs,
-                    runtime_macs(uid)
-                );
-            }
             bail!("child_guard membership verification timed out");
         }
         thread::sleep(Duration::from_secs(1));
@@ -1978,10 +1956,13 @@ pub fn execute(action: &str, payload: &Value) -> Value {
                 .get("uid")
                 .and_then(Value::as_str)
                 .ok_or_else(|| anyhow!("missing uid"))?;
+            // 封禁状态出自 UCI，一定给得出；`policyIds`/`effectPolicyId` 要问
+            // sniffer 的运行时，BE72 上问不到就留空 —— 让整条读失败等于界面上
+            // 连「有没有被禁网」都显示不出来。
             let mut runtime = runtime_mapping(
                 uid,
-                &ubus_show("sniffer.user")?,
-                &ubus_show("sniffer.policy")?,
+                &runtime_value("sniffer.user"),
+                &runtime_value("sniffer.policy"),
             );
             let snapshot = load_snapshot()?;
             let blocked_until = snapshot
@@ -2245,5 +2226,26 @@ config user 'router_uid'
         );
         // Garbage never reaches the runtime push.
         assert!(merge_runtime_macs(&[], &["not-a-mac".to_string()]).is_empty());
+    }
+
+    #[test]
+    fn a_committed_uci_policy_settles_without_asking_the_runtime() {
+        // The write lands in UCI; the sniffer push happens on the background
+        // reload, which takes 40s+ on this firmware. Waiting for the runtime
+        // here is what rolled back every successful plan write.
+        assert!(policy_is_settled(true, true, true));
+    }
+
+    #[test]
+    fn a_policy_still_missing_from_uci_never_settles() {
+        assert!(!policy_is_settled(false, true, true));
+        // Present but with different options means `dev_config` dropped the edit.
+        assert!(!policy_is_settled(true, false, true));
+    }
+
+    #[test]
+    fn a_deleted_policy_settles_once_uci_drops_it() {
+        assert!(policy_is_settled(false, true, false));
+        assert!(!policy_is_settled(true, true, false));
     }
 }
