@@ -404,18 +404,17 @@ fn usage_stats_report(payload: &Value) -> Result<Value> {
         bail!("device has no mac bound");
     }
 
-    let store = crate::usage_stats::load_store();
-    // Prefer the router's own calendar date: the firmware stamps every dump block
-    // with local time, so this stays right even before any sample has landed.
+    // Read the live, process-lifetime buckets. Going to disk here would hand the
+    // sampler a fresh store with no per-flow baselines, and the next sample would
+    // have nothing to diff — which is how "今日上网" freezes at an old value.
     let date = payload
         .get("date")
         .and_then(Value::as_str)
         .map(str::to_string)
-        .or_else(crate::usage_stats::router_today)
-        .or_else(|| store.newest_date())
+        .or_else(crate::minute_stats::local_date)
         .unwrap_or_else(|| "unknown".into());
 
-    let mut report = crate::usage_stats::report_json(&store, &macs, &date);
+    let mut report = crate::minute_stats::with_store(|store| store.report_json(&macs, &date));
     if let Some(object) = report.as_object_mut() {
         object.insert("ok".into(), json!(true));
         object.insert("uid".into(), payload.get("uid").cloned().unwrap_or(Value::Null));
@@ -423,7 +422,7 @@ fn usage_stats_report(payload: &Value) -> Result<Value> {
         object.insert("source".into(), json!("relay"));
         object.insert(
             "keepDays".into(),
-            json!(crate::usage_stats::DEFAULT_KEEP_DAYS),
+            json!(crate::minute_stats::DEFAULT_KEEP_DAYS),
         );
         object.insert("verifiedAtEpoch".into(), json!(now_epoch()));
     }
@@ -589,6 +588,21 @@ fn parse_times(section: &UciSection) -> BTreeMap<String, Vec<(String, String)>> 
     result
 }
 
+fn is_weekday_key(day: &str) -> bool {
+    matches!(day, "mon" | "tue" | "wed" | "thu" | "fri" | "sat" | "sun")
+}
+
+fn is_clock(value: &str) -> bool {
+    let parts: Vec<&str> = value.split(':').collect();
+    if parts.len() != 2 {
+        return false;
+    }
+    let (Ok(hour), Ok(minute)) = (parts[0].parse::<u8>(), parts[1].parse::<u8>()) else {
+        return false;
+    };
+    hour <= 23 && minute <= 59
+}
+
 fn desired_times(
     policy: &UciSection,
     snapshot: &Snapshot,
@@ -704,6 +718,9 @@ fn plan_value(policy: &UciSection, snapshot: &Snapshot) -> Value {
         "startTime": first.0,
         "endTime": first.1,
         "weekdays": times.keys().cloned().collect::<Vec<_>>(),
+        // Full per-day ranges — the official app edits several rules per
+        // weekday, so the flattened startTime/endTime alone cannot round-trip.
+        "times": times_json(&times),
         "mode": mode,
         "applications": applications_metadata(policy, &allowed),
         "applicationRdpiIds": allowed,
@@ -767,7 +784,7 @@ fn user_value(
         "identitySource": if identity.is_some() { "dev_identify" } else { "child_guard" },
         "pausedUntilEpoch": paused_until,
         "blockedUntilEpoch": blocked_until,
-        "blocked": blocked_until > now_epoch(),
+        "blocked": blocked_until == 1 || blocked_until > now_epoch(),
         "planCount": policy_count,
         "appControlSupported": snapshot.named("config").and_then(|config| config.options.get("rdpi_enable")).map(|value| value == "1").unwrap_or(false),
     })
@@ -844,9 +861,36 @@ fn direct_policy(plan: &Value, public_id: &str) -> Result<UciSection> {
         .unwrap_or("23:59");
     let weekdays = json_strings(plan.get("weekdays"));
     let allowed = json_strings(plan.get("applicationRdpiIds"));
-    let mut desired = BTreeMap::new();
-    for day in weekdays {
-        desired.insert(day, vec![(start.to_string(), end.to_string())]);
+    // Official-style multi-rule plans: `times` is {"mon": [["08:00","12:00"],
+    // ["14:00","17:00"]], ...}. When present it wins; the flattened
+    // startTime/endTime × weekdays pair is the legacy single-rule shape.
+    let mut desired: BTreeMap<String, Vec<(String, String)>> = BTreeMap::new();
+    if let Some(Value::Object(days)) = plan.get("times") {
+        for (day, ranges) in days {
+            if !is_weekday_key(day) {
+                continue;
+            }
+            let parsed = ranges
+                .as_array()
+                .into_iter()
+                .flatten()
+                .filter_map(|pair| {
+                    let values = pair.as_array()?;
+                    let start = values.first()?.as_str()?;
+                    let end = values.get(1)?.as_str()?;
+                    (is_clock(start) && is_clock(end) && start < end)
+                        .then(|| (start.to_string(), end.to_string()))
+                })
+                .collect::<Vec<_>>();
+            if !parsed.is_empty() {
+                desired.insert(day.clone(), parsed);
+            }
+        }
+    }
+    if desired.is_empty() {
+        for day in weekdays {
+            desired.insert(day, vec![(start.to_string(), end.to_string())]);
+        }
     }
     let apps = match mode {
         "app_allowlist" => {
@@ -1036,25 +1080,23 @@ fn sync_child_guard_ip6_block_router() {
         .args(&["create", "child_guard_ip6_block", "hash:mac", "-exist"])
         .status();
     let _ = Command::new("ip6tables")
-        .args(&["-C", "FORWARD", "-m", "set", "--match-set", "child_guard_ip6_block", "src", "-j", "REJECT", "--reject-with", "icmp6-adm-prohibited"])
+        .args(&["-C", "FORWARD", "!", "-o", "br-lan", "-m", "set", "--match-set", "child_guard_ip6_block", "src", "-j", "REJECT", "--reject-with", "icmp6-adm-prohibited"])
         .status()
         .map(|status| {
             if !status.success() {
                 let _ = Command::new("ip6tables")
-                    .args(&["-I", "FORWARD", "1", "-m", "set", "--match-set", "child_guard_ip6_block", "src", "-j", "REJECT", "--reject-with", "icmp6-adm-prohibited"])
+                    .args(&["-I", "FORWARD", "1", "!", "-o", "br-lan", "-m", "set", "--match-set", "child_guard_ip6_block", "src", "-j", "REJECT", "--reject-with", "icmp6-adm-prohibited"])
                     .status();
             }
         });
+    // Remove the legacy blanket rules.  They also rejected LAN-local IPv6 and
+    // return traffic; only outbound WAN forwarding needs to fall back to IPv4.
     let _ = Command::new("ip6tables")
-        .args(&["-C", "FORWARD", "-m", "set", "--match-set", "child_guard_ip6_block", "dst", "-j", "REJECT", "--reject-with", "icmp6-adm-prohibited"])
-        .status()
-        .map(|status| {
-            if !status.success() {
-                let _ = Command::new("ip6tables")
-                    .args(&["-I", "FORWARD", "1", "-m", "set", "--match-set", "child_guard_ip6_block", "dst", "-j", "REJECT", "--reject-with", "icmp6-adm-prohibited"])
-                    .status();
-            }
-        });
+        .args(&["-D", "FORWARD", "-m", "set", "--match-set", "child_guard_ip6_block", "dst", "-j", "REJECT", "--reject-with", "icmp6-adm-prohibited"])
+        .status();
+    let _ = Command::new("ip6tables")
+        .args(&["-D", "FORWARD", "-m", "set", "--match-set", "child_guard_ip6_block", "src", "-j", "REJECT", "--reject-with", "icmp6-adm-prohibited"])
+        .status();
 
     if let Ok(snapshot) = load_snapshot() {
         let mut guarded_macs = BTreeSet::new();
@@ -1206,12 +1248,42 @@ fn verify_snapshot_restored(snapshot: &Snapshot, uid: &str) -> Result<()> {
     }
 }
 
-fn verify_policy(uid: &str, pid: &str, should_exist: bool, app_policy: bool) -> Result<()> {
+fn policy_config_matches(actual: &UciSection, expected: &UciSection) -> bool {
+    const OPTIONS: &[&str] = &[
+        "type",
+        "labprobe_plan_id",
+        "labprobe_name",
+        "labprobe_enabled",
+        "labprobe_time",
+        "labprobe_allowed_rdpi",
+        "labprobe_applications",
+    ];
+    OPTIONS
+        .iter()
+        .all(|key| actual.options.get(*key) == expected.options.get(*key))
+        && actual.lists.get("app") == expected.lists.get("app")
+}
+
+fn verify_policy(
+    uid: &str,
+    pid: &str,
+    should_exist: bool,
+    app_policy: bool,
+    expected: Option<&UciSection>,
+) -> Result<()> {
     let deadline = Instant::now() + VERIFY_TIMEOUT;
     let mut orphan_dropped = false;
     loop {
         let snapshot = load_snapshot()?;
         let in_uci = snapshot.user(uid).is_some() && snapshot.named(pid).is_some();
+        let config_matches = expected
+            .map(|wanted| {
+                snapshot
+                    .named(pid)
+                    .map(|actual| policy_config_matches(actual, wanted))
+                    .unwrap_or(false)
+            })
+            .unwrap_or(true);
         let sniffer_user = ubus_show("sniffer.user").unwrap_or(Value::Null);
         let user_text = serde_json::to_string(&sniffer_user).unwrap_or_default();
         let in_user = user_text.contains(uid) && (!app_policy || user_text.contains(pid));
@@ -1219,7 +1291,7 @@ fn verify_policy(uid: &str, pid: &str, should_exist: bool, app_policy: bool) -> 
             serde_json::to_string(&ubus_show("sniffer.policy").unwrap_or(Value::Null))
                 .unwrap_or_default();
         let in_policy = !app_policy || policy_text.contains(pid);
-        if should_exist && in_uci && in_user && in_policy {
+        if should_exist && in_uci && config_matches && in_user && in_policy {
             return Ok(());
         }
         if !should_exist && !in_uci && !user_text.contains(pid) && !policy_text.contains(pid) {
@@ -1232,7 +1304,7 @@ fn verify_policy(uid: &str, pid: &str, should_exist: bool, app_policy: bool) -> 
             orphan_dropped = true;
         }
         if Instant::now() >= deadline {
-            bail!("child_guard reload verification timed out");
+            bail!("child_guard reload/config verification timed out");
         }
         thread::sleep(Duration::from_secs(1));
     }
@@ -1446,10 +1518,16 @@ fn mutate_plan(action: &str, payload: &Value) -> Result<Value> {
         &before,
         || write_user(&before, uid, &policies, fallback),
         || {
-            verify_policy(uid, &verify_pid, should_exist, app_policy)?;
+            verify_policy(
+                uid,
+                &verify_pid,
+                should_exist,
+                app_policy,
+                response_plan.as_ref(),
+            )?;
             if let Some((stale_pid, stale_is_app)) = stale_policy.as_ref() {
                 if stale_pid != &verify_pid {
-                    verify_policy(uid, stale_pid, false, *stale_is_app)?;
+                    verify_policy(uid, stale_pid, false, *stale_is_app, None)?;
                 }
             }
             Ok(())
@@ -1484,7 +1562,9 @@ fn device_pause(action: &str, payload: &Value) -> Result<Value> {
         payload
             .get("untilEpoch")
             .and_then(Value::as_u64)
-            .unwrap_or_else(|| now_epoch() + 86_400)
+            // Firmware sentinel `1` means paused until explicitly resumed.
+            // A made-up 24h timestamp made a successful pause silently expire.
+            .unwrap_or(1)
     } else {
         0
     };
@@ -1722,7 +1802,8 @@ fn mutate_membership(action: &str, payload: &Value) -> Result<Value> {
                 let existing_macs = user.lists.get("mac").cloned().unwrap_or_default();
                 // A previous add may have landed in UCI but lost the runtime mac
                 // push; repair it here so an idempotent re-add self-heals.
-                let _ = ensure_runtime_user_macs(&uid, &existing_macs);
+                ensure_runtime_user_macs(&uid, &existing_macs)?;
+                verify_user_presence(&uid, true, &existing_macs)?;
                 return Ok(json!({
                     "ok": true,
                     "uid": uid,
@@ -1909,7 +1990,10 @@ pub fn execute(action: &str, payload: &Value) -> Value {
                 .and_then(|value| value.parse::<u64>().ok())
                 .unwrap_or(0);
             if let Some(object) = runtime.as_object_mut() {
-                object.insert("blocked".into(), json!(blocked_until > now_epoch()));
+                object.insert(
+                    "blocked".into(),
+                    json!(blocked_until == 1 || blocked_until > now_epoch()),
+                );
                 object.insert("blockedUntilEpoch".into(), json!(blocked_until));
             }
             Ok(json!({"ok": true, "runtime": runtime}))

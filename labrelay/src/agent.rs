@@ -1529,87 +1529,72 @@ async fn sync_child_guard(client: &Client, config: &AgentConfig, state: &mut Age
     Ok(())
 }
 
-/// Sample the sniffer dump, fold it into usage buckets and hand the aggregates
-/// to the Hub — the glue that turns `usage_stats` from a library into a running
-/// feature.
+/// Keep the natural-minute buckets warm and hand the deltas to the Hub.
 ///
-/// Cadence comes from `SamplerState` rather than the 1s loop: a sample every
-/// `SAMPLE_INTERVAL_SECS` (60s), a push every `PUSH_INTERVAL_SECS` (5min) and
-/// only when something actually changed, and an `rdpi -t` refresh every
-/// `APP_MAP_REFRESH_SECS` (6h). Pushes carry absolute bucket values, so the Hub
-/// merges them with `max()` and a retry can never double-count.
-async fn sync_usage_stats(
-    client: &Client,
-    config: &AgentConfig,
-    sampler: &mut usage_stats::SamplerState,
-) -> Result<()> {
+/// Sampling is a background duty on its own 5s cadence — it does not care
+/// whether anyone is looking at the App, and a page open must never start a
+/// scan. The App reads whatever the last push left in the Hub, so this is the
+/// only place in the relay that touches the firmware tables.
+///
+/// The store and the cadence both live for the whole process (see
+/// `minute_stats::with_store`), so a `get_usage_stats` command can read the
+/// aggregates without discarding the per-flow baselines the next sample needs.
+async fn sync_usage_stats(client: &Client, config: &AgentConfig) -> Result<()> {
     let now = now_epoch();
     let mut problems: Vec<String> = Vec::new();
 
-    // Warm (and periodically refresh) the appid -> name map. Without it rows
-    // still feed byte totals but no app ever gets a name.
-    if sampler.app_map_due(now) {
-        match tokio::task::spawn_blocking(usage_stats::refresh_app_map).await {
-            Ok(map) if !map.is_empty() => sampler.note_app_map(now),
-            Ok(_) => problems.push(format!(
-                "rdpi -t returned no appid table; per-app names unavailable (retry in {}s)",
-                usage_stats::SAMPLE_INTERVAL_SECS
-            )),
-            Err(error) => problems.push(format!("rdpi -t task failed: {}", error)),
-        }
-    }
-
-    // The firmware forgets its identify list and full mode whenever the guard
-    // configuration is reloaded, and with either one switched off the dump is
-    // nothing but header blocks, so re-assert them on a slow cycle instead of
-    // treating this as one-shot setup.
-    if sampler.sniffer_due(now) {
-        sampler.note_sniffer(now);
-        match tokio::task::spawn_blocking(usage_stats::prepare_sniffer).await {
+    // The firmware forgets its identify list and full mode every time the guard
+    // configuration is reloaded, and with either one off the flow table holds no
+    // classified row at all — so this is a slow-cycle re-assertion, not setup.
+    if minute_stats::sniffer_due(now) {
+        minute_stats::note_sniffer(now);
+        match tokio::task::spawn_blocking(minute_stats::prepare_sniffer).await {
             Ok(true) => {}
             Ok(false) => problems.push(
-                "sniffer identification unavailable; usage will stay empty".to_string(),
+                "sniffer identification unavailable; app usage will stay empty".to_string(),
             ),
             Err(error) => problems.push(format!("sniffer preparation failed: {}", error)),
         }
     }
 
-    if sampler.sample_due(now) {
-        let keep_days = usage_stats::DEFAULT_KEEP_DAYS;
-        match tokio::task::spawn_blocking(move || usage_stats::tick(keep_days)).await {
-            Ok((_store, reports)) => sampler.note_sample(now, &reports),
+    if minute_stats::sample_due(now) {
+        match tokio::task::spawn_blocking(move || minute_stats::sample_now(now)).await {
+            Ok(Ok(report)) => {
+                // One line a minute is what makes "the numbers froze" debuggable
+                // from the router alone: it separates an empty firmware table
+                // from buckets that stopped advancing.
+                if minute_stats::log_due(now) {
+                    log_line(&config, "INFO", &format!("usage sample: {}", report.summary()));
+                }
+            }
+            Ok(Err(problem)) => problems.push(problem),
             Err(error) => problems.push(format!("usage sample task failed: {}", error)),
         }
     }
 
-    if sampler.push_due(now) {
-        let keep_days = usage_stats::DEFAULT_KEEP_DAYS;
-        let payload = tokio::task::spawn_blocking(move || {
-            let store = usage_stats::load_store();
-            usage_stats::ingest_payload(
-                &store,
-                keep_days,
-                usage_stats::router_today().as_deref(),
-            )
-        })
-        .await;
-        match payload {
-            Ok(body) => match post_json(
-                client,
-                config,
-                "/api/router/child-guard/usage/ingest",
-                &body,
-            )
-            .await
-            {
-                Ok(_) => sampler.note_push(now),
-                Err(error) => {
-                    // Space the retries out: a Hub outage must not become a 1s
-                    // retry storm, and `dirty` stays set so nothing is lost.
-                    sampler.last_push_at = now;
-                    problems.push(format!("usage ingest push failed: {:#}", error));
+    // Minutes are only settled once their natural minute has passed, so a 30s
+    // push is what keeps "今日上网" from lagging more than a minute behind.
+    if minute_stats::push_due(now) {
+        match tokio::task::spawn_blocking(minute_stats::unsent_payload).await {
+            Ok(None) => minute_stats::note_push(now),
+            Ok(Some(body)) => {
+                match post_json(
+                    client,
+                    config,
+                    "/api/router/child-guard/usage/ingest",
+                    &body,
+                )
+                .await
+                {
+                    Ok(_) => {
+                        minute_stats::note_payload_pushed(&body);
+                        minute_stats::note_push(now);
+                    }
+                    // Watermarks stay put, so the next cycle re-sends the same
+                    // minutes and the Hub's idempotent insert absorbs it.
+                    Err(error) => problems.push(format!("usage ingest push failed: {:#}", error)),
                 }
-            },
+            }
             Err(error) => problems.push(format!("usage payload task failed: {}", error)),
         }
     }
@@ -2004,9 +1989,6 @@ pub async fn run(args: &[String], once: bool) -> Result<()> {
     let client = http_client()?;
     let mut last_agent_cycle_at = 0u64;
     let mut last_status_at = 0u64;
-    // Cadence + dirty flag for the usage sampler. Not persisted: a fresh boot
-    // always re-pushes the (idempotent) aggregate window.
-    let mut usage_sampler = usage_stats::SamplerState::default();
     log_line(&config, "INFO", "Rust agent started");
     let _tcp_session_sync = if once {
         None
@@ -2096,10 +2078,16 @@ pub async fn run(args: &[String], once: bool) -> Result<()> {
                 errors.push(text);
             }
         }
-        // Usage sampling is its own cadence (60s sample / 5min push / 6h app
-        // map), so it only enters the loop when one of those is actually due.
-        if once || usage_sampler.sample_due(now) || usage_sampler.push_due(now) {
-            if let Err(error) = sync_usage_stats(&client, &config, &mut usage_sampler).await {
+        // Usage sampling is its own cadence (5s sample / 30s push / 5min sniffer
+        // re-assert), so it only enters the loop when one of those is due. The
+        // minute buckets live in `minute_stats` for the whole process, not here:
+        // nothing in this loop may rebuild them.
+        if once
+            || minute_stats::sample_due(now)
+            || minute_stats::push_due(now)
+            || minute_stats::sniffer_due(now)
+        {
+            if let Err(error) = sync_usage_stats(&client, &config).await {
                 let text = redact(&format!("usage stats: {:#}", error), &config.hook_token);
                 log_limited(&config, &mut state, "WARN", "usage-stats", &text);
                 errors.push(text);
