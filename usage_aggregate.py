@@ -87,6 +87,7 @@ not lossless.
 
 from __future__ import annotations
 
+import json
 import os
 import sqlite3
 import threading
@@ -96,6 +97,8 @@ from pathlib import Path
 from typing import Any, Callable, Dict, Iterable, List, Optional, Sequence
 
 from flask import Blueprint, jsonify, request
+
+from child_guard_schedule import schedule_state
 
 DEFAULT_HOURLY_KEEP_DAYS = int(os.environ.get("USAGE_HOURLY_KEEP_DAYS", "10"))
 DEFAULT_DAILY_KEEP_DAYS = int(os.environ.get("USAGE_DAILY_KEEP_DAYS", "10"))
@@ -401,6 +404,14 @@ class UsageAggregateStore:
                         updated_at    INTEGER NOT NULL DEFAULT 0,
                         PRIMARY KEY (router, uid)
                     ) WITHOUT ROWID;
+
+                    CREATE TABLE IF NOT EXISTS child_guard_plan_cache (
+                        router       TEXT    NOT NULL,
+                        uid          TEXT    NOT NULL,
+                        plans_json   TEXT    NOT NULL DEFAULT '[]',
+                        updated_at   INTEGER NOT NULL DEFAULT 0,
+                        PRIMARY KEY (router, uid)
+                    ) WITHOUT ROWID;
                     """
                 )
                 _migrate_router_columns(conn)
@@ -597,6 +608,82 @@ class UsageAggregateStore:
             for row in rows
         ]
 
+    def remember_guard_plans(self, router: Any, uid: Any,
+                             plans: Iterable[Dict[str, Any]]) -> bool:
+        """缓存一台设备的上网计划，只用于总览那句「此刻生效态」。
+
+        计划的事实存在路由器上，这里存的是最后一次成功读到的快照：路由器暂时
+        不可达时总览仍然能说出「禁网中 · 至 17:00」，而不是把读失败摊给用户。
+        """
+        key = router_key(router)
+        identity = _guard_uid(uid)
+        if not identity:
+            return False
+        payload = json.dumps(
+            [plan for plan in (plans or []) if isinstance(plan, dict)], ensure_ascii=False)
+        with self._lock:
+            conn = self.connect()
+            try:
+                conn.execute(
+                    "INSERT INTO child_guard_plan_cache(router, uid, plans_json, updated_at)"
+                    " VALUES(?, ?, ?, ?) ON CONFLICT(router, uid) DO UPDATE SET"
+                    " plans_json = excluded.plans_json, updated_at = excluded.updated_at",
+                    (key, identity, payload, int(time.time())),
+                )
+            finally:
+                conn.close()
+        return True
+
+    def guard_plans(self, router: Any) -> Dict[str, List[Dict[str, Any]]]:
+        """``uid -> 计划快照``；总览一次读全部，再逐台算生效态。"""
+        key = router_key(router)
+        with self._lock:
+            conn = self.connect()
+            try:
+                rows = conn.execute(
+                    "SELECT uid, plans_json FROM child_guard_plan_cache WHERE router = ?",
+                    (key,),
+                ).fetchall()
+            finally:
+                conn.close()
+        out: Dict[str, List[Dict[str, Any]]] = {}
+        for row in rows:
+            try:
+                value = json.loads(str(row["plans_json"] or "[]"))
+            except Exception:  # pragma: no cover - 坏 JSON 当成没有缓存
+                continue
+            if isinstance(value, list):
+                out[str(row["uid"])] = [item for item in value if isinstance(item, dict)]
+        return out
+
+    def guard_plan_snapshot(self, router: Any, uid: Any) -> Optional[List[Dict[str, Any]]]:
+        """这台设备最后一次读到的完整计划列表；None = 从没读过。
+
+        ``None`` 和 ``[]`` 是两件事：前者是「不知道」，后者是路由器明确说「一条
+        也没有」。生效态卡片对这两句的说法完全不同，所以这里不能合并成空列表。
+        """
+        key = router_key(router)
+        wanted = _guard_uid(uid)
+        if not wanted:
+            return None
+        return self.guard_plans(key).get(wanted)
+
+    def guard_plans_updated_at(self, router: Any, uid: Any) -> int:
+        """计划快照的落盘时间；0 = 没有快照。"""
+        key = router_key(router)
+        wanted = _guard_uid(uid)
+        if not wanted:
+            return 0
+        with self._lock:
+            conn = self.connect()
+            try:
+                row = conn.execute(
+                    "SELECT updated_at FROM child_guard_plan_cache WHERE router = ? AND uid = ?",
+                    (key, wanted)).fetchone()
+            finally:
+                conn.close()
+        return int(row["updated_at"] or 0) if row is not None else 0
+
     def guard_device(self, router: Any, uid: Any) -> Optional[Dict[str, Any]]:
         """单台设备的缓存条目；None = Hub 从未见过这个 uid（才允许问路由器）。"""
         key = router_key(router)
@@ -633,6 +720,9 @@ class UsageAggregateStore:
             try:
                 cursor = conn.execute(
                     "DELETE FROM child_guard_device WHERE router = ? AND uid = ?",
+                    (key, wanted))
+                conn.execute(
+                    "DELETE FROM child_guard_plan_cache WHERE router = ? AND uid = ?",
                     (key, wanted))
                 return cursor.rowcount or 0
             finally:
@@ -1639,6 +1729,14 @@ def build_guard_overview(
     latest_by_mac = snapshot.get("latestByMac") or {}
     meta_by_mac = snapshot.get("metaByMac") or {}
     active_floor = _minute_floor(stamp) - ACTIVE_NOW_LAG_SECONDS
+    # 计划是 Hub 缓存的快照：读它零路由器流量，所以生效态跟今天时长一样，
+    # 路由器掉线时也照样能报「禁网中 · 至 17:00」。
+    plans_by_uid: Dict[str, List[Dict[str, Any]]] = {}
+    if store is not None:
+        try:
+            plans_by_uid = store.guard_plans(router)
+        except Exception:  # pragma: no cover - 概览宁可少一个字段也不要 500
+            plans_by_uid = {}
 
     entries: List[Dict[str, Any]] = []
     device_last_sample = 0
@@ -1670,6 +1768,8 @@ def build_guard_overview(
         active_now = any(minute >= active_floor for minute in union)
         # 「从未有过数据」和「今天还没上网」是两件事，App 显示的文字也不同。
         has_data = bool(has_rows or seen > 0)
+        uid = _guard_uid(device.get("uid"))
+        schedule = schedule_state(plans_by_uid.get(uid), stamp)
         entries.append({
             "uid": str(device.get("uid") or ""),
             "macs": device_macs,
@@ -1681,6 +1781,12 @@ def build_guard_overview(
             "topApps": top_apps,
             "blocked": bool(device.get("blocked")),
             "blockedUntilEpoch": _as_count(device.get("blockedUntilEpoch")),
+            "planCount": schedule["planCount"],
+            "schedule": schedule["schedule"],
+            "currentRange": schedule["currentRange"],
+            "blockedRange": schedule.get("blockedRange"),
+            "nextChangeAtEpoch": schedule["nextChangeAtEpoch"],
+            "minutesToChange": schedule["minutesToChange"],
             "attention": _attention_state(today_minutes, late_minutes, has_rows),
             "lastSampleAt": seen,
             "stale": bool(seen <= 0 or stamp - seen > STALE_AFTER_SECONDS),

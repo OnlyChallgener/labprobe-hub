@@ -2988,32 +2988,157 @@ def child_guard_usage_router(payload: Optional[Dict[str, Any]] = None) -> str:
 CHILD_GUARD_USAGE_ROUTER: Callable[..., str] = child_guard_usage_router
 
 
+# 同步等多久。反代（Lucky）的 upstream 超时比这短得多，等满 35 秒它会先放弃，
+# 用户看到的是整页 502 而不是「路由器还在处理」。超过这个时间就交回 commandId。
+CHILD_GUARD_SYNC_WAIT_SECONDS = 8.0
+
+# 命令 backed 的读接口里只有 get_users 需要 Hub 补统计字段。注册表而不是参数，
+# 是为了让「同步返回」和「异步轮询」两条路补的是同一份字段 —— 否则 App 轮询拿到的
+# 设备列表会缺 todayMinutes，把「暂无数据」显示成 0 分钟。
+_CHILD_GUARD_ENRICHERS: Dict[str, Callable[[Dict[str, Any], str], Dict[str, Any]]] = {}
+
+
+def _child_guard_finalize(action: str, result: Dict[str, Any], router: str,
+                          body: Dict[str, Any]) -> Dict[str, Any]:
+    result.setdefault("ok", True)
+    result.setdefault("router", router)
+    _child_guard_remember_devices(action, result, router, body)
+    enrich = _CHILD_GUARD_ENRICHERS.get(action)
+    if enrich is not None:
+        try:
+            result = enrich(result, router)
+        except Exception:  # pragma: no cover - 页面读取不能因为补充字段失败
+            LOGGER.warning("child guard enrich failed for %s", action, exc_info=True)
+    return result
+
+
 def _child_guard_execute(action: str, payload: Optional[Dict[str, Any]] = None, *,
                          success_status: int = 200,
-                         enrich: Optional[Callable[[Dict[str, Any], str], Dict[str, Any]]] = None):
+                         enrich: Optional[Callable[[Dict[str, Any], str], Dict[str, Any]]] = None,
+                         wait_seconds: Optional[float] = None):
+    if enrich is not None:
+        _CHILD_GUARD_ENRICHERS.setdefault(action, enrich)
     body = payload if isinstance(payload, dict) else {}
     router = _child_guard_router(body)
     command = CHILD_GUARD_COMMANDS.enqueue(router, action, body)
     notify_agent_commands_changed()
-    completed = CHILD_GUARD_COMMANDS.wait(command["id"], timeout_seconds=35.0)
+    timeout = CHILD_GUARD_SYNC_WAIT_SECONDS if wait_seconds is None else max(0.0, float(wait_seconds))
+    completed = CHILD_GUARD_COMMANDS.wait(command["id"], timeout_seconds=timeout)
     if completed.state == "done":
-        result = dict(completed.result)
-        result.setdefault("ok", True)
-        result.setdefault("router", router)
-        _child_guard_remember_devices(action, result, router, body)
-        if enrich is not None:
-            try:
-                result = enrich(result, router)
-            except Exception:  # pragma: no cover - 页面读取不能因为补充字段失败
-                LOGGER.warning("child guard enrich failed for %s", action, exc_info=True)
-        return jsonify(result), success_status
+        return jsonify(_child_guard_finalize(action, dict(completed.result), router, body)), success_status
     if completed.state == "timeout":
-        return jsonify({"ok": False, "router": router, "commandId": command["id"],
-                        "errorCode": "agent_timeout", "error": completed.error}), 504
+        return jsonify({"ok": True, "pending": True, "commandId": command["id"],
+                        "action": action, "router": router}), 202
     result = dict(completed.result)
     return jsonify({"ok": False, "router": router, "commandId": command["id"],
                     "errorCode": clean_saved_value(result.get("errorCode")) or "agent_failed",
                     "error": completed.error or clean_saved_value(result.get("error")) or "儿童上网操作失败",
+                    "rollback": result.get("rollback")}), 409
+
+
+#: 计划与运行态这两读要穿过 Lucky 反向代理：Hub 等路由器等到第 35 秒，反代早
+#: 就回了一整页 502 HTML，App 拿到的比「旧一点的真数据」更没用。所以读接口一律
+#: 缓存优先 —— 有快照就立刻返回，把真读丢到后台，ack 到达时观察者刷新缓存。
+CHILD_GUARD_PLANS_TTL_SECONDS = 900
+CHILD_GUARD_RUNTIME_TTL_SECONDS = 60
+#: 同一台设备、同一个动作，这么久之内只替用户补读一次路由器。
+CHILD_GUARD_REFRESH_GAP_SECONDS = 30.0
+_CHILD_GUARD_REFRESH_AT: Dict[str, float] = {}
+_CHILD_GUARD_REFRESH_LOCK = threading.Lock()
+
+
+def _child_guard_refresh_async(key: str, action: str,
+                               payload: Dict[str, Any]) -> None:
+    """把一次读丢进队列就走，不占这次 HTTP 请求的时间。"""
+    signature = f"{key}|{action}|{payload.get('uid') or ''}"
+    now = time.time()
+    with _CHILD_GUARD_REFRESH_LOCK:
+        if now - _CHILD_GUARD_REFRESH_AT.get(signature, 0.0) < CHILD_GUARD_REFRESH_GAP_SECONDS:
+            return
+        _CHILD_GUARD_REFRESH_AT[signature] = now
+    try:
+        CHILD_GUARD_COMMANDS.enqueue(key, action, payload)
+        notify_agent_commands_changed()
+    except Exception:  # pragma: no cover - 补读失败下次还会再试
+        LOGGER.debug("child guard background refresh enqueue failed (%s)", action,
+                     exc_info=True)
+
+
+def _child_guard_plans_snapshot(key: str, uid: str) -> Optional[Dict[str, Any]]:
+    """Hub 读过的这份计划列表；None = 这台设备从没成功读到过计划。"""
+    store = _usage_aggregate_store()
+    if store is None:
+        return None
+    plans = store.guard_plan_snapshot(key, uid)
+    if plans is None:
+        return None
+    return {"uid": uid, "plans": plans, "updatedAt": store.guard_plans_updated_at(key, uid)}
+
+
+def _child_guard_runtime_snapshot(key: str, uid: str) -> Optional[Dict[str, Any]]:
+    """设备目录里的封禁状态 —— ``get_users`` 和禁网 ack 都会更新它。
+
+    App 只从 runtime 读「有没有被禁网、禁到什么时候」这两个数（``policyIds``
+    一类字段界面上没人用），而这两个数 Hub 已经有一份和列表页同源的。
+    """
+    store = _usage_aggregate_store()
+    row = store.guard_device(key, uid) if store is not None else None
+    if not row:
+        return None
+    return {
+        "uid": uid,
+        "runtime": {
+            "uid": row.get("uid") or uid,
+            "blocked": bool(row.get("blocked")),
+            "blockedUntilEpoch": int(row.get("blockedUntilEpoch") or 0),
+        },
+        "updatedAt": int(row.get("updatedAt") or 0),
+    }
+
+
+def _child_guard_cached_read(action: str, agent_router: str, payload: Dict[str, Any],
+                             snapshot: Optional[Dict[str, Any]],
+                             ttl_seconds: int):
+    """命中缓存就直接回 Flask 响应，没命中回 ``None`` 让调用方去问路由器。
+
+    ``snapshot`` 过期时照样返回它，只是顺手补一次后台读：界面上「3 分钟前的计划」
+    远好过一整屏 HTML。
+    """
+    if not snapshot:
+        return None
+    age = max(0, int(time.time()) - int(snapshot.get("updatedAt") or 0))
+    stale = age > ttl_seconds
+    body = {**snapshot, "ok": True, "router": agent_router,
+            "cached": True, "cacheAgeSeconds": age, "stale": stale}
+    if stale:
+        _child_guard_refresh_async(agent_router, action, payload)
+    return jsonify(body), 200
+
+
+@app.route("/api/router/child-guard/command/<command_id>", methods=["GET"])
+def api_child_guard_command(command_id: str):
+    """异步命令的结果查询：``pending`` 表示路由器还没 ack，App 继续轮询这个地址。"""
+    if not check_read_token():
+        return jsonify({"ok": False, "error": "unauthorized"}), 401
+    cid = str(command_id or "").strip()
+    if not re.fullmatch(r"[0-9a-f]{24}", cid):
+        return jsonify({"ok": False, "errorCode": "invalid_request", "error": "unknown command"}), 400
+    row = CHILD_GUARD_COMMANDS.record(cid)
+    if not row:
+        return jsonify({"ok": False, "errorCode": "not_found", "error": "command not found"}), 404
+    action = str(row.get("action") or "")
+    state = str(row.get("status") or "pending")
+    if state not in {"done", "failed"}:
+        return jsonify({"ok": True, "pending": True, "commandId": cid,
+                        "state": state, "action": action}), 200
+    router = str(row.get("router") or "")
+    body = row.get("payload") if isinstance(row.get("payload"), dict) else {}
+    result = row.get("result") if isinstance(row.get("result"), dict) else {}
+    if state == "done":
+        return jsonify(_child_guard_finalize(action, dict(result), router, body)), 200
+    return jsonify({"ok": False, "commandId": cid, "state": "failed", "action": action,
+                    "errorCode": clean_saved_value(result.get("errorCode")) or "agent_failed",
+                    "error": str(row.get("error") or clean_saved_value(result.get("error")) or "儿童上网操作失败"),
                     "rollback": result.get("rollback")}), 409
 
 
@@ -3052,7 +3177,15 @@ def api_child_guard_plans(uid: str):
     if request.method == "GET":
         if not check_read_token():
             return jsonify({"ok": False, "error": "unauthorized"}), 401
-        return _child_guard_execute("get_plans", {"uid": normalized_uid})
+        payload = {"uid": normalized_uid}
+        agent_router = _child_guard_router(payload)
+        cached = _child_guard_cached_read(
+            "get_plans", agent_router, payload,
+            _child_guard_plans_snapshot(_child_guard_router_key(agent_router), normalized_uid),
+            CHILD_GUARD_PLANS_TTL_SECONDS)
+        if cached is not None:
+            return cached
+        return _child_guard_execute("get_plans", payload)
     if not check_app_token():
         return jsonify({"ok": False, "error": "unauthorized"}), 401
     try:
@@ -3110,7 +3243,15 @@ def api_child_guard_runtime(uid: str):
         normalized_uid = validate_child_guard_uid(uid)
     except ChildGuardValidationError as error:
         return jsonify({"ok": False, "errorCode": "invalid_request", "error": str(error)}), 400
-    return _child_guard_execute("get_runtime_state", {"uid": normalized_uid})
+    payload = {"uid": normalized_uid}
+    agent_router = _child_guard_router(payload)
+    cached = _child_guard_cached_read(
+        "get_runtime_state", agent_router, payload,
+        _child_guard_runtime_snapshot(_child_guard_router_key(agent_router), normalized_uid),
+        CHILD_GUARD_RUNTIME_TTL_SECONDS)
+    if cached is not None:
+        return cached
+    return _child_guard_execute("get_runtime_state", payload)
 
 
 @app.route("/api/router/child-guard/devices/<uid>/usage", methods=["GET"])
@@ -3173,6 +3314,9 @@ def _child_guard_remember_devices(action: str, result: Dict[str, Any],
     ``add_device`` 的新增成员、``pause_device``/``resume_device`` 的封禁时间、
     ``remove_device`` 的注销，以及中继异步 ack 回来的同一批结果。之后
     ``_child_guard_macs_for_uid``、设备列表和 overview 都是纯本地读。
+
+    计划（``get_plans`` 和增删改）走 ``_child_guard_remember_plans``，同一份快照
+    让总览能在不碰路由器的前提下说出「禁网中 · 还有 139 分钟」。
     """
     store = _usage_aggregate_store()
     if store is None or not isinstance(result, dict):
@@ -3199,8 +3343,50 @@ def _child_guard_remember_devices(action: str, result: Dict[str, Any],
             }])
         elif action == "remove_device":
             store.forget_guard_device(key, str(result.get("uid") or body.get("uid") or ""))
+        else:
+            _child_guard_remember_plans(store, key, action, result, body)
     except Exception:  # pragma: no cover - 缓存失败不能拖垮业务响应
         LOGGER.warning("child guard device cache write failed (%s)", action, exc_info=True)
+
+
+def _child_guard_remember_plans(store: Any, key: str, action: str,
+                                result: Dict[str, Any],
+                                body: Dict[str, Any]) -> None:
+    """缓存「这台设备的计划列表」，供 overview 离线算生效态。
+
+    只有 ``get_plans`` 给的是完整快照；增/改/删是在已有快照上打补丁。缓存里
+    没有这台设备时**不**凭空写一条 —— 「只见过 1 条计划」和「一共 3 条计划」
+    会被总览说成两句完全不同的话，宁可留空让界面显示未知。
+    """
+    uid = result.get("uid") or body.get("uid")
+    if not str(uid or "").strip():
+        return
+    if action == "get_plans":
+        plans = result.get("plans")
+        if isinstance(plans, list):
+            store.remember_guard_plans(key, uid, [p for p in plans if isinstance(p, dict)])
+        return
+    if action not in ("create_plan", "update_plan", "delete_plan", "set_plan_enabled"):
+        return
+    # 增删改的 ack 只带回收被改的那一条，总览要的是「这台设备一共有哪几条计划」，
+    # 所以在本地缓存的那份完整快照上做替换/删除。读的是本地 SQLite，不碰路由器。
+    cached = store.guard_plan_snapshot(key, uid)
+    if cached is None:
+        return
+    plan = result.get("plan") if isinstance(result.get("plan"), dict) else None
+    plan_id = str((plan or {}).get("id") or body.get("planId") or "").strip().lower()
+    if not plan_id:
+        return
+
+    def is_wanted(item: Dict[str, Any]) -> bool:
+        return str(item.get("id") or "").strip().lower() == plan_id
+
+    kept = [item for item in cached if not is_wanted(item)]
+    if action == "delete_plan" or plan is None:
+        store.remember_guard_plans(key, uid, kept)
+        return
+    previous = next((item for item in cached if is_wanted(item)), None)
+    store.remember_guard_plans(key, uid, kept + [{**(previous or {}), **plan}])
 
 
 def _child_guard_on_command_result(command: Dict[str, Any]) -> None:
@@ -3354,11 +3540,15 @@ def _child_guard_devices_enriched(result: Dict[str, Any], router: str) -> Dict[s
         item.setdefault("macs", entry.get("macs") or [])
         item["todayMinutes"] = int(entry.get("todayMinutes") or 0)
         item["hasData"] = bool(entry.get("hasData"))
-        item["hasAttention"] = bool(entry.get("hasAttention"))
+        item["hasAttention"] = str(entry.get("attention") or {}).get("state") not in ("", "none", "unknown")
         item["activeNow"] = bool(entry.get("activeNow"))
         if entry.get("online") is not None:
             item["online"] = bool(entry.get("online"))
         item["attention"] = entry.get("attention") or {"state": "unknown", "lateNightMinutes": 0, "text": ""}
+        for field in ("currentRange", "blockedRange", "nextChangeAtEpoch", "minutesToChange"):
+            item[field] = entry.get(field)
+        item["planCount"] = int(entry.get("planCount") or 0)
+        item["schedule"] = str(entry.get("schedule") or "unknown")
         item["lastSampleAt"] = int(entry.get("lastSampleAt") or 0)
         item["updatedAt"] = int(entry.get("updatedAt") or 0)
         item["stale"] = bool(entry.get("stale"))

@@ -384,6 +384,14 @@ class ChildGuardCommandStore:
         self._notify(settled)
         return count
 
+    def record(self, command_id: str) -> Optional[Dict[str, Any]]:
+        """Raw command row, so an async caller can finish what the waiter did not."""
+        with self.lock:
+            return next(
+                (dict(item) for item in self._load() if item.get("id") == command_id),
+                None,
+            )
+
     def result(self, command_id: str) -> Optional[CommandResult]:
         with self.lock:
             command = next(

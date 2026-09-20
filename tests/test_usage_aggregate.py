@@ -1007,6 +1007,7 @@ from usage_aggregate import (  # noqa: E402
     STALE_AFTER_SECONDS,
     build_guard_overview,
 )
+from child_guard_schedule import BEIJING, WEEKDAY_KEYS  # noqa: E402
 
 UID = "0123456789ABCDEF0123456789ABCDEF"
 ROUTER = "be72"
@@ -1188,6 +1189,40 @@ class TestGuardDeviceDirectory:
         assert store.forget_guard_device(ROUTER, UID.lower()) == 1
         assert [row["uid"] for row in store.guard_devices(ROUTER)] == ["OTHERUID"]
 
+    def test_forget_also_drops_the_cached_plans(self, store):
+        store.remember_guard_devices(ROUTER, [{"uid": UID, "macs": [MAC_A]}])
+        store.remember_guard_plans(ROUTER, UID, [{"id": "p1"}])
+        store.forget_guard_device(ROUTER, UID)
+        assert store.guard_plan_snapshot(ROUTER, UID) is None
+
+
+class TestGuardPlanCache:
+    """计划快照是总览生效态的唯一来源 —— 「没读过」不等于「没有计划」。"""
+
+    def test_an_unread_device_has_no_snapshot(self, store):
+        assert store.guard_plan_snapshot(ROUTER, UID) is None
+
+    def test_an_empty_snapshot_is_not_the_same_as_no_snapshot(self, store):
+        store.remember_guard_plans(ROUTER, UID, [])
+        assert store.guard_plan_snapshot(ROUTER, UID) == []
+
+    def test_the_uid_normalises_on_both_ends(self, store):
+        store.remember_guard_plans(ROUTER, UID.lower(), [{"id": "p1"}])
+        assert store.guard_plan_snapshot(ROUTER, UID) == [{"id": "p1"}]
+
+    def test_the_latest_snapshot_replaces_the_old_one(self, store):
+        store.remember_guard_plans(ROUTER, UID, [{"id": "p1"}, {"id": "p2"}])
+        store.remember_guard_plans(ROUTER, UID, [{"id": "p3"}])
+        assert [plan["id"] for plan in store.guard_plan_snapshot(ROUTER, UID)] == ["p3"]
+
+    def test_plans_are_scoped_per_router(self, store):
+        store.remember_guard_plans(ROUTER, UID, [{"id": "p1"}])
+        assert store.guard_plan_snapshot("other", UID) is None
+
+    def test_a_non_dict_plan_is_dropped_instead_of_breaking_the_json(self, store):
+        store.remember_guard_plans(ROUTER, UID, [{"id": "p1"}, "junk", None])
+        assert store.guard_plan_snapshot(ROUTER, UID) == [{"id": "p1"}]
+
 
 class TestGuardOverview:
     """One set of SQL reads, zero router traffic, honest unknowns."""
@@ -1296,6 +1331,50 @@ class TestGuardOverview:
         off = self.build(store, rows, now_epoch=reference + 5,
                          presence={MAC_A: False, MAC_B: False})["devices"][0]
         assert off["online"] is False
+
+    def schedule(self, store, plans, *, hour=13, minute=0):
+        reference = bj_minute(DAY, hour, minute)
+        store.remember_guard_plans(ROUTER, UID, plans)
+        device = self.build(store, [{"uid": UID, "macs": [MAC_A]}],
+                            now_epoch=reference)["devices"][0]
+        return reference, device
+
+    def test_no_cached_snapshot_is_unknown_not_unrestricted(self, store):
+        reference = bj_minute(DAY, 13)
+        device = self.build(store, [{"uid": UID, "macs": [MAC_A]}],
+                            now_epoch=reference)["devices"][0]
+        assert device["schedule"] == "unknown"
+        assert device["planCount"] == 0
+        assert device["currentRange"] is None
+
+    def test_an_empty_snapshot_means_the_router_said_no_plans(self, store):
+        _reference, device = self.schedule(store, [])
+        assert device["schedule"] == "unrestricted"
+        assert device["planCount"] == 0
+
+    def test_a_cached_window_drives_the_effective_state(self, store):
+        today = WEEKDAY_KEYS[datetime.fromtimestamp(bj_minute(DAY, 13), BEIJING).weekday()]
+        reference, device = self.schedule(
+            store, [{"id": "p1", "enabled": True, "mode": "internet_window",
+                     "startTime": "17:00", "endTime": "21:30", "weekdays": [today]}],
+            hour=14, minute=41)
+        assert device["schedule"] == "blocked"
+        assert device["planCount"] == 1
+        assert device["blockedRange"] == {"start": "00:00", "end": "17:00", "kind": "block"}
+        assert device["minutesToChange"] == 139
+        assert device["nextChangeAtEpoch"] == reference + 139 * MINUTE_SECONDS
+
+    def test_inside_a_window_the_card_names_the_range(self, store):
+        today = WEEKDAY_KEYS[datetime.fromtimestamp(bj_minute(DAY, 18), BEIJING).weekday()]
+        _reference, device = self.schedule(
+            store, [{"id": "p1", "enabled": True, "mode": "app_allowlist",
+                     "startTime": "17:00", "endTime": "21:30", "weekdays": [today]}],
+            hour=18)
+        assert device["schedule"] == "partial"
+        assert device["blockedRange"] is None
+        assert device["currentRange"]["start"] == "17:00"
+        assert device["currentRange"]["end"] == "21:30"
+
 
     def test_the_router_is_never_part_of_an_overview(self, store):
         class NoStore:
