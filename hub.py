@@ -3573,7 +3573,32 @@ def api_child_guard_overview():
     router = _child_guard_router()
     payload = _child_guard_overview_payload(router)
     payload.update({"ok": True, "router": router})
+    _child_guard_warm_plan_cache(router, payload)
     return jsonify(payload)
+
+
+def _child_guard_warm_plan_cache(agent_router: str, overview: Dict[str, Any]) -> None:
+    """让总览自己把缺的计划快照补齐。
+
+    卡片那句「禁网中 · 2 小时 19 分钟后允许上网」要的是这台设备的计划列表，而
+    Hub 过去只有在用户点开设备页时才读过它 —— 于是列表上永远有几格停在「不知道」。
+    总览本来就是 20 秒一轮的纯本地读，顺手把「从没读过 / 超过 TTL 没读」的设备丢进
+    队列补一次：``_child_guard_refresh_async`` 自带 30 秒节流，路由器最多每台每
+    15 分钟被问一次。
+    """
+    store = _usage_aggregate_store()
+    if store is None:
+        return
+    key = _child_guard_router_key(agent_router)
+    now = time.time()
+    for row in overview.get("devices") or []:
+        uid = str(row.get("uid") or "") if isinstance(row, dict) else ""
+        if not uid:
+            continue
+        if store.guard_plan_snapshot(key, uid) is not None and \
+                now - store.guard_plans_updated_at(key, uid) < CHILD_GUARD_PLANS_TTL_SECONDS:
+            continue
+        _child_guard_refresh_async(agent_router, "get_plans", {"uid": uid})
 
 
 @app.route("/api/router/child-guard/devices/<uid>/usage-report", methods=["GET"])

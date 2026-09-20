@@ -135,3 +135,22 @@ def test_a_mutation_without_a_snapshot_does_not_invent_one(monkeypatch, tmp_path
         "create_plan", {"ok": True, "uid": UID, "plan": _plan("new")}, ROUTER,
         {"uid": UID, "plan": _plan("new")})
     assert aggregate.guard_plan_snapshot(ROUTER, UID) is None
+
+
+def test_the_overview_warms_the_snapshots_it_is_missing(monkeypatch, tmp_path):
+    """列表页那句生效态不能永远停在 unknown：总览顺手把缺的读一次。"""
+    aggregate = _aggregate(tmp_path)
+    aggregate.remember_guard_devices(ROUTER, [
+        {"uid": UID, "macs": ["1A:9C:C5:C5:B7:BB"], "name": "Mate60"}])
+    client, _asked = _prepare(monkeypatch, tmp_path, aggregate)
+    enqueued = []
+    monkeypatch.setattr(hub.CHILD_GUARD_COMMANDS, "enqueue",
+                        lambda *args, **kwargs: enqueued.append(args))
+    body = client.get("/api/router/child-guard/overview").get_json()
+    device = body["devices"][0]
+    assert device["schedule"] == "unknown"
+    assert [item[1] for item in enqueued] == ["get_plans"]
+    # App 是 20 秒一轮的轮询，节流必须挡住「每轮都替全网设备问一次路由器」。
+    for _ in range(3):
+        client.get("/api/router/child-guard/overview")
+    assert len(enqueued) == 1
