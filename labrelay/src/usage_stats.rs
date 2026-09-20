@@ -250,23 +250,36 @@ fn ubus_call(object: &str, method: &str, body: &str) -> bool {
 
 /// Turn on the two firmware switches the usage pipeline depends on.
 ///
-/// Neither is set by the vendor's `child_guard` reload path on this model, and
-/// without them the report is structurally empty:
+/// Neither is set by the vendor's `child_guard` reload path on this model:
 ///
-/// * `sniffer.idyc add {mac}` — a device that is not in the identify list has
-///   every flow resolved to the `0-0-0-0` placeholder, which the sampler drops.
-/// * `sniffer enable {"mod":"full_mode"}` — `/proc/net/sniffer_flow`, the table
-///   the firmware dumps for us, is only filled in full mode. Without it the
-///   dump carries header blocks and not a single row.
+/// * `sniffer.idyc add` puts a MAC in the identify list (`DEV_IDYC=1` in
+///   `/proc/net/sniffer_info`). The call *silently ignores every MAC but the
+///   first* when handed an array — it still answers `code 0`, so a batch call
+///   looks like it worked while four of five devices stay unidentified. One
+///   process per MAC is the only form the firmware honours; measured 2026-09-20
+///   on the BE72, all six children flipped to 1 that way and none of them did
+///   with the array.
+/// * `sniffer enable {"mod":"full_mode"}` is what makes the firmware keep the
+///   per-flow table at all.
 ///
-/// Both calls are idempotent, so this is safe to run on every sample and it
-/// self-heals after a firmware reload wipes the runtime state.
+/// Identification is still partial with it on — RDPI only names a minority of
+/// connections (9 of ~64 rows on a busy box), so unclassified traffic must keep
+/// counting towards the device, never be discarded.
+///
+/// Every call is idempotent, so this is safe to re-run and it self-heals after a
+/// firmware reload wipes the runtime state.
 pub fn prepare_sniffer() -> bool {
     let macs = child_macs();
     if macs.is_empty() {
         return false;
     }
-    let identifiers = ubus_call("sniffer.idyc", "add", &json!({ "mac": macs }).to_string());
+    let identifiers = macs.iter().all(|mac| {
+        ubus_call(
+            "sniffer.idyc",
+            "add",
+            &json!({ "mac": [mac] }).to_string(),
+        )
+    });
     let full_mode = ubus_call(
         "sniffer",
         "enable",

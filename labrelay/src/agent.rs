@@ -13,7 +13,7 @@ use tokio::time::sleep;
 
 use crate::ctl_request;
 use crate::ddns_address;
-use crate::usage_stats;
+use crate::minute_stats;
 
 const DEFAULT_AGENT_CONFIG: &str = "/etc/labprobe/agent.json";
 const DEFAULT_AGENT_STATE: &str = "/tmp/labprobe/agent-state.json";

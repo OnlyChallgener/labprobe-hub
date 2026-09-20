@@ -402,11 +402,18 @@ impl MinuteStore {
                 self.settle_app(&key, settled.minute, &settled.evidence);
             }
         }
-        let slot = self.pending_app
-            .entry(key)
-            .or_insert(Pending { minute, evidence: MinuteEvidence::default() });
-        slot.minute = minute;
-        slot.evidence.add_window(bytes, new_flow);
+        let evidence = {
+            let slot = self
+                .pending_app
+                .entry(key.clone())
+                .or_insert(Pending { minute, evidence: MinuteEvidence::default() });
+            slot.minute = minute;
+            slot.evidence.add_window(bytes, new_flow);
+            slot.evidence.clone()
+        };
+        // 证据一够就立刻入账，当前分钟当场可见，不用等它过完。分钟起点是天然
+        // 的稳定去重键，同一分钟后面再命中也只是往集合里插同一个值。
+        self.settle_app(&key, minute, &evidence);
     }
 
     fn add_device_evidence(&mut self, mac: &str, date: &str, minute: u64, bytes: u64) {
@@ -418,11 +425,16 @@ impl MinuteStore {
                 self.settle_device(&key, settled.minute, &settled.evidence);
             }
         }
-        let slot = self.pending_device
-            .entry(key)
-            .or_insert(Pending { minute, evidence: MinuteEvidence::default() });
-        slot.minute = minute;
-        slot.evidence.add_window(bytes, false);
+        let evidence = {
+            let slot = self
+                .pending_device
+                .entry(key.clone())
+                .or_insert(Pending { minute, evidence: MinuteEvidence::default() });
+            slot.minute = minute;
+            slot.evidence.add_window(bytes, false);
+            slot.evidence.clone()
+        };
+        self.settle_device(&key, minute, &evidence);
     }
 
     fn settle_app(&mut self, key: &(String, String, String), minute: u64, evidence: &MinuteEvidence) {
@@ -430,7 +442,7 @@ impl MinuteStore {
             return;
         }
         self.app_minutes
-            .entry((key.0.clone(), key.1.clone()))
+            .entry((key.0.clone(), key.1.clone(), key.2.clone()))
             .or_default()
             .insert(minute);
     }
@@ -723,7 +735,7 @@ impl MinuteStore {
     }
 }
 
-fn rows(value: &Value, key: &str) -> Vec<&Value> {
+fn rows<'a>(value: &'a Value, key: &str) -> Vec<&'a Value> {
     value
         .get(key)
         .and_then(Value::as_array)
@@ -956,7 +968,7 @@ fn command_text(program: &str, args: &[&str]) -> Option<String> {
 pub fn load_minute_store() -> MinuteStore {
     read_text(MINUTE_STORE_PATH)
         .and_then(|text| serde_json::from_str::<Value>(&text).ok())
-        .map(MinuteStore::from_json)
+        .map(|value| MinuteStore::from_json(&value))
         .unwrap_or_default()
 }
 
@@ -997,7 +1009,7 @@ pub fn read_daily_traffic(ip: &str, today: &str) -> BTreeMap<String, TrafficCoun
 
 pub fn read_mac_ips() -> BTreeMap<String, BTreeSet<String>> {
     read_text(DHCP_LEASES)
-        .map(parse_mac_ips)
+        .map(|text| parse_mac_ips(&text))
         .unwrap_or_default()
 }
 
@@ -1187,7 +1199,7 @@ impl MinuteSampler {
             child_macs: read_child_macs(),
         };
         let persist = now.saturating_sub(self.last_saved_at) >= PERSIST_INTERVAL_SECS;
-        let report = with_store(|store| {
+        let report = with_store(|store| -> Result<MinuteReport, String> {
             let report = apply_sample(store, &input);
             store.prune(DEFAULT_KEEP_DAYS, &date);
             if persist {
@@ -1285,7 +1297,6 @@ mod tests {
             counters(1_000_000, 8_000_000),
         );
         apply_sample(&mut store, &next);
-        // 结算分钟要等分钟过去，先手工推进到下一分钟。
         store.advance_to(T0 + 60);
         let minutes = store
             .app_minutes
@@ -1301,6 +1312,47 @@ mod tests {
                 .map(|m| m.len()),
             Some(1)
         );
+    }
+
+    #[test]
+    fn current_minute_is_visible_before_it_closes() {
+        let mut store = MinuteStore::default();
+        apply_sample(&mut store, &input(T0, vec![], counters(0, 0)));
+        // 11:03:05 用微信：证据一够就当分钟入账，不等 11:03 过完。
+        apply_sample(
+            &mut store,
+            &input(
+                T0 + 5,
+                vec![flow("7-1-2-0", 4_600, 10_000, 47218)],
+                counters(1_000_000, 8_000_000),
+            ),
+        );
+        let key = (MAC.to_string(), "2026-09-20".to_string(), "微信".to_string());
+        let credited = store.app_minutes.get(&key).cloned().unwrap_or_default();
+        assert_eq!(credited.iter().copied().collect::<Vec<_>>(), vec![minute_start(T0)]);
+
+        // 同一分钟再命中 20 次也只能是 1 分钟，且分钟起点这个键不会漂。
+        for i in 0..20 {
+            apply_sample(
+                &mut store,
+                &input(
+                    T0 + 10 + i,
+                    vec![flow("7-1-2-0", 4_600 + (i as u64) * 500, 10_000, 47218)],
+                    counters(1_000_000, 8_000_000),
+                ),
+            );
+        }
+        assert_eq!(store.app_minutes.get(&key).map(|m| m.len()), Some(1));
+        assert_eq!(
+            store
+                .device_minutes
+                .get(&(MAC.to_string(), "2026-09-20".to_string()))
+                .map(|m| m.len()),
+            Some(1)
+        );
+        // 跨过分钟边界也不该多出第二个桶，或把已记的分钟挪走。
+        store.advance_to(T0 + 60);
+        assert_eq!(store.app_minutes.get(&key).map(|m| m.len()), Some(1));
     }
 
     #[test]
@@ -1546,10 +1598,10 @@ mod tests {
 
     #[test]
     fn real_flow_row_line_parses() {
-        let row = parse_proc_flow(
+        let mut rows = parse_proc_flow(
             "da:1f:85:0c:19:fc 192.168.5.132 117.185.244.54 47218 443 TCP 3 18-158-1-0 3572 3600 11 1006 11 1372 1",
-        )
-        .expect("row");
+        );
+        let row = rows.remove(0);
         assert_eq!(row.appid, "18-158-1-0");
         assert_eq!(row.counters.bytes_up, 1006);
     }
