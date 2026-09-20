@@ -15,7 +15,7 @@ import time
 from dataclasses import dataclass
 from datetime import datetime
 from pathlib import Path
-from typing import Any, Dict, Iterable, List, Optional
+from typing import Any, Callable, Dict, Iterable, List, Optional
 
 
 _UID_RE = re.compile(r"^[A-Za-z0-9_-]{6,128}$")
@@ -74,7 +74,10 @@ def validate_uid(value: Any) -> str:
     uid = str(value or "").strip()
     if not _UID_RE.fullmatch(uid):
         raise ChildGuardValidationError("invalid device uid")
-    return uid
+    # Router-generated child_guard UIDs are 16-byte hex identifiers.  UCI and
+    # the runtime expose them in upper case, so normalise that stable format
+    # while preserving human/plugin supplied identifiers verbatim.
+    return uid.upper() if len(uid) == 32 else uid
 
 
 def router_alias(value: Any) -> str:
@@ -147,6 +150,42 @@ def clean_plan(payload: Any, *, plan_id: str = "") -> Dict[str, Any]:
     if not weekdays:
         raise ChildGuardValidationError("at least one weekday is required")
 
+    # Official-style multi-rule plans: {"mon": [["08:00","12:00"], ...]}.
+    # When present it is the source of truth; startTime/endTime/weekdays stay
+    # populated as a flattened legacy view (first range, union of days).
+    raw_times = payload.get("times")
+    times: Optional[Dict[str, List[List[str]]]] = None
+    if raw_times is not None:
+        if not isinstance(raw_times, dict):
+            raise ChildGuardValidationError("times must be an object")
+        times = {}
+        for raw_day, raw_ranges in raw_times.items():
+            day = _WEEKDAY_NUMBERS.get(str(raw_day or "").strip().lower(),
+                                       str(raw_day or "").strip().lower())
+            if day not in _WEEKDAYS:
+                raise ChildGuardValidationError(f"invalid weekday: {raw_day}")
+            if not isinstance(raw_ranges, list):
+                raise ChildGuardValidationError(f"times for {day} must be a list")
+            ranges: List[List[str]] = []
+            for raw_range in raw_ranges:
+                pair = list(raw_range) if isinstance(raw_range, (list, tuple)) else None
+                if not pair or len(pair) != 2:
+                    raise ChildGuardValidationError(f"invalid time range for {day}")
+                start = str(pair[0] or "").strip()
+                end = str(pair[1] or "").strip()
+                if not _TIME_RE.fullmatch(start) or not _TIME_RE.fullmatch(end) or start >= end:
+                    raise ChildGuardValidationError(f"invalid time range for {day}")
+                if [start, end] not in ranges:
+                    ranges.append([start, end])
+            if ranges:
+                times[day] = ranges
+        if not times:
+            raise ChildGuardValidationError("at least one time range is required")
+        weekdays = [day for day in ("mon", "tue", "wed", "thu", "fri", "sat", "sun")
+                    if day in times]
+        first_range = next(iter(times.values()))[0]
+        start_time, end_time = first_range[0], first_range[1]
+
     applications = payload.get("applications", [])
     rdpi_ids = expand_application_rdpi_ids(applications)
     if mode in {"app_allowlist", "app_blocklist"} and not rdpi_ids:
@@ -169,6 +208,7 @@ def clean_plan(payload: Any, *, plan_id: str = "") -> Dict[str, Any]:
         "startTime": start_time,
         "endTime": end_time,
         "weekdays": weekdays,
+        **({"times": times} if times is not None else {}),
         "mode": mode,
         "applications": clean_apps,
         "applicationRdpiIds": rdpi_ids,
@@ -191,6 +231,26 @@ class ChildGuardCommandStore:
         self.commands_path = Path(data_dir) / "child_guard_commands.json"
         self.lock = threading.RLock()
         self.changed = threading.Condition(self.lock)
+        self._result_observers: List[Callable[[Dict[str, Any]], None]] = []
+
+    def add_result_observer(self, callback: Callable[[Dict[str, Any]], None]) -> None:
+        """Watch every command that reaches a final state.
+
+        The Hub caches child-guard device membership from these results so a
+        later read never has to ask the router.  A waiter that timed out is
+        exactly the case where the result still arrives (through the ack), so
+        the observer runs on the ack path rather than on the response path.
+        """
+        if callable(callback) and callback not in self._result_observers:
+            self._result_observers.append(callback)
+
+    def _notify(self, commands: Iterable[Dict[str, Any]]) -> None:
+        for command in commands:
+            for observer in list(self._result_observers):
+                try:
+                    observer(command)
+                except Exception:  # pragma: no cover - a cache must not break the ack
+                    pass
 
     @staticmethod
     def canonical_router(value: Any) -> str:
@@ -293,6 +353,7 @@ class ChildGuardCommandStore:
             if isinstance(item, dict) and item.get("id")
         }
         count = 0
+        settled: List[Dict[str, Any]] = []
         with self.changed:
             rows = self._load()
             for command in rows:
@@ -315,9 +376,12 @@ class ChildGuardCommandStore:
                         acknowledgement.get("error") or result.get("error") or "agent reported failure"
                     )[:500]
                 count += 1
+                settled.append(dict(command))
             if count:
                 self._save(rows)
                 self.changed.notify_all()
+        # 锁外通知：观察者会去写它自己的 SQLite，不能让 ack 等在它下面。
+        self._notify(settled)
         return count
 
     def result(self, command_id: str) -> Optional[CommandResult]:

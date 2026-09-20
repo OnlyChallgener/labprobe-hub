@@ -8,6 +8,7 @@ from child_guard_service import (
     ChildGuardValidationError,
     clean_plan,
     expand_application_rdpi_ids,
+    validate_uid,
 )
 
 
@@ -21,6 +22,11 @@ def test_catalog_application_expands_to_all_rdpi_ids():
         {"id": "duplicate", "rdpiIds": ["7-1-2-0"]},
     ])
     assert values == ["7-1-2-0", "7-1-2-3", "7-1-2-12", "7-1-2-14"]
+
+
+def test_router_hex_uid_is_normalized_but_custom_uid_is_preserved():
+    assert validate_uid("abcdef0123456789abcdef0123456789") == "ABCDEF0123456789ABCDEF0123456789"
+    assert validate_uid("custom_Device-1") == "custom_Device-1"
 
 
 def test_clean_plan_rejects_application_mode_without_signatures():

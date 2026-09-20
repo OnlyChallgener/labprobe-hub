@@ -16,7 +16,7 @@ from logging.handlers import TimedRotatingFileHandler
 from datetime import datetime, date
 from zoneinfo import ZoneInfo
 from pathlib import Path
-from typing import Any, Dict, List, Optional, Tuple
+from typing import Any, Callable, Dict, List, Optional, Tuple
 
 import yaml
 import requests
@@ -28,12 +28,13 @@ from child_guard_service import (
     ChildGuardCommandStore,
     ChildGuardValidationError,
     clean_plan as clean_child_guard_plan,
+    router_alias as child_guard_router_alias,
     validate_plan_id as validate_child_guard_plan_id,
     validate_uid as validate_child_guard_uid,
 )
 
 BEIJING_TZ = ZoneInfo("Asia/Shanghai")
-APP_VERSION = "0.13.2"
+APP_VERSION = "0.13.5"
 PORT = int(os.environ.get("PORT", "58443"))
 BASE_DIR = Path(os.environ.get("LABPROBE_BASE_DIR", ".")).resolve()
 CONFIG_DIR = Path(os.environ.get("CONFIG_DIR", str(BASE_DIR / "config"))).resolve()
@@ -914,6 +915,15 @@ def update_daily_online_durations(devices: List[Dict[str, Any]], now: Optional[d
     long Hub outage from being counted as confirmed online time. Wireless
     onlinetime/activeTime remains a useful lower-bound seed; wired devices are
     tracked entirely by Hub snapshots.
+
+    Scope: this is *presence* sampling, so ``todayOnlineDurationSec`` and
+    ``daily_online.json`` can only ever answer "has the Hub seen this MAC
+    lately". It is a display aid for the device list and device-history screens
+    and is deliberately **not** a source for 儿童上网 usage numbers: the child
+    guard report reads minute buckets and the firmware counters in
+    :mod:`usage_aggregate` (``/api/router/child-guard/usage``) instead, because a
+    sampled approximation cannot state a natural minute as fact. Never route a
+    child-guard duration through this function.
     """
     now = now or datetime.now(BEIJING_TZ).replace(tzinfo=None)
     if now.tzinfo is not None:
@@ -2963,7 +2973,24 @@ def _child_guard_router(payload: Optional[Dict[str, Any]] = None) -> str:
     return resolve_agent_router(requested) or requested
 
 
-def _child_guard_execute(action: str, payload: Optional[Dict[str, Any]] = None, *, success_status: int = 200):
+def child_guard_usage_router(payload: Optional[Dict[str, Any]] = None) -> str:
+    """Hub 侧 usage 数据的归属键：写入与读取必须用同一个规范化名字。
+
+    中继推送 body/query 里都没有 router（它只会 POST 桶数据），所以写入只能
+    落到 ``primary_router_name()``；App 读取时却常常带 ``?router=Ruijie BE72``。
+    不规范化就会变成两台互不相干的设备。
+    """
+    return child_guard_router_alias(_child_guard_router(payload)) or "router"
+
+
+# usage_aggregate 的 ingest 路由需要同一个键，但它在自己的模块里，所以这里挂
+# 一个显式的钩子而不是让它猜。
+CHILD_GUARD_USAGE_ROUTER: Callable[..., str] = child_guard_usage_router
+
+
+def _child_guard_execute(action: str, payload: Optional[Dict[str, Any]] = None, *,
+                         success_status: int = 200,
+                         enrich: Optional[Callable[[Dict[str, Any], str], Dict[str, Any]]] = None):
     body = payload if isinstance(payload, dict) else {}
     router = _child_guard_router(body)
     command = CHILD_GUARD_COMMANDS.enqueue(router, action, body)
@@ -2973,6 +3000,12 @@ def _child_guard_execute(action: str, payload: Optional[Dict[str, Any]] = None, 
         result = dict(completed.result)
         result.setdefault("ok", True)
         result.setdefault("router", router)
+        _child_guard_remember_devices(action, result, router, body)
+        if enrich is not None:
+            try:
+                result = enrich(result, router)
+            except Exception:  # pragma: no cover - 页面读取不能因为补充字段失败
+                LOGGER.warning("child guard enrich failed for %s", action, exc_info=True)
         return jsonify(result), success_status
     if completed.state == "timeout":
         return jsonify({"ok": False, "router": router, "commandId": command["id"],
@@ -3001,10 +3034,12 @@ def _safe_sync_ip6(macs: Optional[List[str]] = None):
 
 @app.route("/api/router/child-guard/devices", methods=["GET"])
 def api_child_guard_devices():
+    """受管控设备列表。成员关系来自路由器，但 ``todayMinutes`` / ``hasAttention`` /
+    ``online`` 这些统计字段只能由 Hub 的分钟行算出 —— 缺了它们 App 会把
+    ``optInt("todayMinutes", 0)`` 静默显示成 0 分钟。"""
     if not check_read_token():
         return jsonify({"ok": False, "error": "unauthorized"}), 401
-    threading.Thread(target=_safe_sync_ip6, daemon=True).start()
-    return _child_guard_execute("get_users")
+    return _child_guard_execute("get_users", enrich=_child_guard_devices_enriched)
 
 
 
@@ -3111,20 +3146,135 @@ def _child_guard_raw(action: str, payload: Optional[Dict[str, Any]] = None,
     completed = CHILD_GUARD_COMMANDS.wait(command["id"], timeout_seconds=timeout_seconds)
     if completed.state != "done":
         return None
-    return dict(completed.result)
+    result = dict(completed.result)
+    _child_guard_remember_devices(action, result, router, body)
+    return result
+
+
+# --- Hub-side child-guard state (reads never touch the router) ---------------
+
+
+def _child_guard_router_key(router: Optional[str] = None) -> str:
+    """usage/device 表共用的 router 归属键；无请求上下文时用主路由器名。"""
+    if router is not None:
+        return child_guard_router_alias(router) or "router"
+    try:
+        return child_guard_usage_router()
+    except Exception:  # pragma: no cover - 后台线程里没有请求上下文
+        return child_guard_router_alias(primary_router_name()) or "router"
+
+
+def _child_guard_remember_devices(action: str, result: Dict[str, Any],
+                                  router: str,
+                                  payload: Optional[Dict[str, Any]] = None) -> None:
+    """把 uid -> MACs/名称/封禁 写进 Hub 的 SQLite。
+
+    挂载点就是「Hub 确实拿到了一次路由器结果」的地方：``get_users`` 的整表快照、
+    ``add_device`` 的新增成员、``pause_device``/``resume_device`` 的封禁时间、
+    ``remove_device`` 的注销，以及中继异步 ack 回来的同一批结果。之后
+    ``_child_guard_macs_for_uid``、设备列表和 overview 都是纯本地读。
+    """
+    store = _usage_aggregate_store()
+    if store is None or not isinstance(result, dict):
+        return
+    key = child_guard_router_alias(router) or "router"
+    body = payload if isinstance(payload, dict) else {}
+    try:
+        if action == "get_users":
+            devices = result.get("devices")
+            if isinstance(devices, list) and devices:
+                store.remember_guard_devices(key, devices)
+        elif action == "add_device":
+            store.remember_guard_devices(key, [{
+                "uid": result.get("uid") or body.get("uid"),
+                "macs": result.get("macs") or body.get("macs"),
+                "name": result.get("name") or body.get("deviceName") or body.get("name"),
+            }])
+        elif action in ("pause_device", "resume_device"):
+            until = to_int(result.get("blockedUntilEpoch"), 0) or to_int(body.get("untilEpoch"), 0)
+            store.remember_guard_devices(key, [{
+                "uid": result.get("uid") or body.get("uid"),
+                "blocked": action == "pause_device",
+                "blockedUntilEpoch": until if action == "pause_device" else 0,
+            }])
+        elif action == "remove_device":
+            store.forget_guard_device(key, str(result.get("uid") or body.get("uid") or ""))
+    except Exception:  # pragma: no cover - 缓存失败不能拖垮业务响应
+        LOGGER.warning("child guard device cache write failed (%s)", action, exc_info=True)
+
+
+def _child_guard_on_command_result(command: Dict[str, Any]) -> None:
+    """``ChildGuardCommandStore`` 观察者：ack 到达时就落盘。
+
+    等待方超时不代表结果没回来；只在响应路径上落盘会让 Hub 重启后有一段
+    「认不出 uid」的空窗，所以这里也补一份。
+    """
+    if not isinstance(command, dict) or command.get("status") != "done":
+        return
+    result = command.get("result")
+    if not isinstance(result, dict):
+        return
+    _child_guard_remember_devices(
+        str(command.get("action") or ""), result,
+        str(command.get("router") or ""), command.get("payload") or {},
+    )
+
+
+CHILD_GUARD_COMMANDS.add_result_observer(_child_guard_on_command_result)
+
+
+def _child_guard_directory(router: Optional[str] = None) -> List[Dict[str, Any]]:
+    """Hub 已知的受管控设备；空列表意味着「还没见过」，不是「没有设备」。"""
+    store = _usage_aggregate_store()
+    if store is None:
+        return []
+    try:
+        return store.guard_devices(_child_guard_router_key(router))
+    except Exception:  # pragma: no cover - defensive only
+        LOGGER.warning("child guard device cache read failed", exc_info=True)
+        return []
+
+
+_CHILD_GUARD_MACS_CACHE: Dict[str, Tuple[float, List[str]]] = {}
+_CHILD_GUARD_MACS_CACHE_LOCK = threading.RLock()
 
 
 def _child_guard_macs_for_uid(uid: str) -> List[str]:
-    """Resolve a guarded device's MAC list through the router's own user table."""
-    result = _child_guard_raw("get_users")
-    if not result:
-        return []
-    for device in result.get("devices") or []:
-        if isinstance(device, dict) and device.get("uid") == uid:
-            macs = device.get("macs")
-            if isinstance(macs, list):
-                return [str(mac).strip().lower() for mac in macs if str(mac).strip()]
-    return []
+    """uid -> MACs：先查 SQLite，再查 60s 内存缓存，最后才问路由器。
+
+    路由器兜底只给「Hub 从未见过的设备」付这 2 秒，并且结果会立刻落盘，
+    所以一次冷启动之后同样的读取就不再阻塞。
+    """
+    key = _child_guard_router_key()
+    directory = _child_guard_directory(key)
+    for entry in directory:
+        if str(entry.get("uid") or "") == str(uid):
+            macs = [mac for mac in entry.get("macs") or [] if mac]
+            if macs:
+                return macs
+
+    now = time.monotonic()
+    with _CHILD_GUARD_MACS_CACHE_LOCK:
+        cached = _CHILD_GUARD_MACS_CACHE.get(uid)
+    if cached and now - cached[0] < 60.0:
+        return list(cached[1])
+
+    result = _child_guard_raw("get_users", timeout_seconds=2.0)
+    refreshed: Dict[str, Tuple[float, List[str]]] = {}
+    if result and isinstance(result.get("devices"), list):
+        for device in result["devices"]:
+            if not isinstance(device, dict):
+                continue
+            device_uid = str(device.get("uid") or "")
+            device_macs = device.get("macs")
+            if device_uid and isinstance(device_macs, list):
+                cleaned = [str(mac).strip().lower() for mac in device_macs if str(mac).strip()]
+                refreshed[device_uid] = (now, cleaned)
+        with _CHILD_GUARD_MACS_CACHE_LOCK:
+            _CHILD_GUARD_MACS_CACHE.clear()
+            _CHILD_GUARD_MACS_CACHE.update(refreshed)
+    with _CHILD_GUARD_MACS_CACHE_LOCK:
+        return list(_CHILD_GUARD_MACS_CACHE.get(uid, (0.0, []))[1])
 
 
 def _usage_aggregate_store():
@@ -3142,13 +3292,108 @@ def _usage_aggregate_store():
         return None
 
 
+def _child_guard_presence_by_mac(max_age_seconds: int = 1800) -> Optional[Dict[str, bool]]:
+    """设备此刻是否连着路由器：只用 Hub 已经收到的设备快照。
+
+    ``None`` = Hub 这边根本没有可信的在线状态（快照缺失或太久没更新），调用方
+    必须把它当 unknown 交给 App，而不是当「全部离线」。为了一次 ``online``
+    去问路由器正是「打开页面等分钟级」的根因。
+    """
+    state = load_json(DEVICES_FILE, {})
+    if not isinstance(state, dict):
+        return None
+    online = state.get("online")
+    if not isinstance(online, list):
+        return None
+    updated = time_to_epoch(state.get("updatedAt") or state.get("devicesUpdatedAt") or 0)
+    if not updated or time.time() - updated > max(1, max_age_seconds):
+        return None
+    presence: Dict[str, bool] = {}
+    for item in online:
+        if isinstance(item, dict):
+            mac = norm_mac(item.get("mac"))
+            if mac:
+                presence[mac] = True
+    for item in state.get("watched") or []:
+        if not isinstance(item, dict):
+            continue
+        mac = norm_mac(item.get("mac"))
+        if mac:
+            presence.setdefault(mac, bool(item.get("online")))
+    return presence or None
+
+
+def _child_guard_overview_payload(router: Optional[str] = None,
+                                  devices: Optional[List[Dict[str, Any]]] = None) -> Dict[str, Any]:
+    """一次 SQL 读取凑齐整台路由器的孩子上网概览；零路由器流量。"""
+    from usage_aggregate import build_guard_overview
+
+    key = _child_guard_router_key(router)
+    store = _usage_aggregate_store()
+    rows = devices if devices is not None else (
+        (store.guard_devices(key) if store is not None else [])
+    )
+    return build_guard_overview(store, router=key, devices=rows,
+                                presence=_child_guard_presence_by_mac())
+
+
+def _child_guard_devices_enriched(result: Dict[str, Any], router: str) -> Dict[str, Any]:
+    """把 overview 的 per-device 字段并进 ``get_users`` 的设备列表。"""
+    devices = result.get("devices")
+    if not isinstance(devices, list) or not devices:
+        return result
+    overview = _child_guard_overview_payload(router, devices)
+    by_uid = {str(item.get("uid") or ""): item for item in overview.get("devices") or []}
+    merged: List[Dict[str, Any]] = []
+    for device in devices:
+        if not isinstance(device, dict):
+            merged.append(device)
+            continue
+        entry = by_uid.get(str(device.get("uid") or ""), {})
+        item = dict(device)
+        item.setdefault("macs", entry.get("macs") or [])
+        item["todayMinutes"] = int(entry.get("todayMinutes") or 0)
+        item["hasData"] = bool(entry.get("hasData"))
+        item["hasAttention"] = bool(entry.get("hasAttention"))
+        item["activeNow"] = bool(entry.get("activeNow"))
+        if entry.get("online") is not None:
+            item["online"] = bool(entry.get("online"))
+        item["attention"] = entry.get("attention") or {"state": "unknown", "lateNightMinutes": 0, "text": ""}
+        item["lastSampleAt"] = int(entry.get("lastSampleAt") or 0)
+        item["updatedAt"] = int(entry.get("updatedAt") or 0)
+        item["stale"] = bool(entry.get("stale"))
+        merged.append(item)
+    result["devices"] = merged
+    result["generatedAt"] = int(overview.get("generatedAt") or 0)
+    result["lastSampleAt"] = int(overview.get("lastSampleAt") or 0)
+    result["stale"] = bool(overview.get("stale"))
+    return result
+
+
+@app.route("/api/router/child-guard/overview", methods=["GET"])
+def api_child_guard_overview():
+    """孩子上网设备总览：App 打开列表页唯一需要的一次请求。
+
+    以前 App 要为每台设备 fan-out ``plans`` + ``runtime`` + ``usage-report`` +
+    ``usage``，任何一个都可能把读取挂在路由器上。这里全部从 Hub 的分钟行和
+    ``child_guard_device`` 缓存里算，路由器一次都不问。
+    """
+    if not check_read_token():
+        return jsonify({"ok": False, "error": "unauthorized"}), 401
+    router = _child_guard_router()
+    payload = _child_guard_overview_payload(router)
+    payload.update({"ok": True, "router": router})
+    return jsonify(payload)
+
+
 @app.route("/api/router/child-guard/devices/<uid>/usage-report", methods=["GET"])
 def api_child_guard_usage_report(uid: str):
     """官方版式的「上网统计」：在线时间 + 小时柱状图 + 应用时长统计。
 
-    ``source`` says where the numbers came from: ``hub`` (the router pushed
-    aggregates) or ``relay`` (nothing pushed for that day yet, so we asked the
-    router live). The App only needs to render; it never has to care which.
+    纯读 Hub 的 SQLite：打开页面绝不触发重新统计，也不等路由器。
+    ``source`` 说明数字从哪来 —— ``hub``（v3 分钟桶）、``hub-legacy``（升级之前
+    记的秒表）或 ``empty``（那一天什么都没记过，配 ``hasData`` false，App 显示
+    暂无数据而不是 0 分钟）。
     """
     if not check_read_token():
         return jsonify({"ok": False, "error": "unauthorized"}), 401
@@ -3171,7 +3416,7 @@ def api_child_guard_usage_report(uid: str):
         days = int(request.args.get("days") or "1")
     except (TypeError, ValueError):
         days = 1
-    days = max(1, min(days, max(1, usage_keep_days["hourly"])))
+    days = max(1, min(days, max(1, usage_keep_days["minute"], usage_keep_days["hourly"])))
     router = _child_guard_router({"router": request.args.get("router")})
 
     # An explicit macs list is only for verification runs; the App always uses uid.
@@ -3184,11 +3429,10 @@ def api_child_guard_usage_report(uid: str):
         return jsonify({"ok": False, "router": router, "errorCode": "device_not_found",
                         "error": "该设备不在管控名单中"}), 404
 
-    def _live_relay_report() -> Optional[Dict[str, Any]]:
-        return _child_guard_raw("get_usage_stats", {"uid": normalized_uid, "date": date})
-
+    # 没有 live 回调：页面读取不参与统计，等路由器只会让用户看到迟到的数字。
     payload = compose_device_report(
-        _usage_aggregate_store(), macs, date, live=_live_relay_report, range_days=days
+        _usage_aggregate_store(), macs, date,
+        router=child_guard_router_alias(router) or "router", range_days=days,
     )
     payload.update({"ok": True, "uid": normalized_uid, "macs": macs, "router": router})
     return jsonify(payload)
@@ -3238,7 +3482,8 @@ def api_child_guard_devices_collection():
                             "error": f"invalid mac: {mac}"}), 400
         if mac not in macs:
             macs.append(mac)
-    threading.Thread(target=lambda: _safe_sync_ip6(macs), daemon=True).start()
+    with _CHILD_GUARD_MACS_CACHE_LOCK:
+        _CHILD_GUARD_MACS_CACHE.clear()
     return _child_guard_execute("add_device", {"macs": macs,
                                                "deviceName": body.get("deviceName"),
                                                "router": body.get("router")})
@@ -3253,7 +3498,8 @@ def api_child_guard_device_delete(uid: str):
     except ChildGuardValidationError as error:
         return jsonify({"ok": False, "errorCode": "invalid_request", "error": str(error)}), 400
     body = request.get_json(silent=True) or {}
-    threading.Thread(target=lambda: _safe_sync_ip6(), daemon=True).start()
+    with _CHILD_GUARD_MACS_CACHE_LOCK:
+        _CHILD_GUARD_MACS_CACHE.pop(normalized_uid, None)
     return _child_guard_execute("remove_device", {"uid": normalized_uid,
                                                   "router": body.get("router")})
 

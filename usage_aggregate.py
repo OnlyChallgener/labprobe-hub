@@ -1,15 +1,24 @@
 """Long-term aggregate store for Child Internet usage statistics.
 
-This is the table the product actually shows.  Two tables, because the official
-``上网统计`` page needs two different shapes:
+This is the data the product actually shows.  Since v3 the router ships **natural
+minute buckets**, which is the only honest basis for a duration: a minute is
+either active or it is not, so ``08:15`` with five seconds of traffic and
+``08:15`` with fifty-five seconds of traffic are both exactly one minute.
 
-``usage_hourly``      ``(date, mac, hour)``      -> the bar chart / 在线时间
-``usage_daily_app``   ``(date, mac, app)``       -> 应用上网时长统计
+``usage_device_minute``  ``(date, mac, minute)``  -> 在线时间 / 小时柱状图
+``usage_app_minute``     ``(date, mac, app, min)`` -> 应用上网时长统计 + 时段
+``usage_device_traffic`` ``(date, mac)``           -> 设备总流量（固件计数器）
 
-A single ``daily_app_usage`` table (date | mac | app | duration | up | down) is
-**not sufficient**: the official page draws a per-hour bar chart with a ``60``
-minute axis and derives ``在线时间`` by summing those bars, which needs the hour
-dimension.  Everything else about the common advice holds though.
+The legacy tables stay readable so the 10-day history of routers still on v2
+does not go blank, but a day is rendered from **one** basis only: minute rows
+when the router reported them, the old second-accumulating tables otherwise.
+Nothing is ever averaged, blended or extrapolated across the two.
+
+Device traffic is a separate concern from durations and comes exclusively from
+``usage_device_traffic`` — the router's firmware per-device day counters.  The
+per-flow / per-app byte columns of the legacy tables are RDPI-classified flow
+sums; they are a different measurement (only classified traffic, double-counted
+across apps) and are therefore never re-assembled into a device total.
 
 Why this lives on the Hub and not on the router
 -----------------------------------------------
@@ -23,7 +32,19 @@ Why this lives on the Hub and not on the router
 
 Row volume and footprint (measured, not estimated)
 --------------------------------------------------
-Per year, assuming 10 devices x ~30 apps:
+Minute buckets are bounded by the calendar, not by traffic: a device can produce
+at most ``24 x 60 = 1440`` device minutes a day, so the primary table has a hard
+ceiling of
+
+* ``usage_device_minute`` 10 devices x 1440 x 365 = 5 256 000 rows/year
+
+which at the 10-day product window is at most 144 000 rows for ten devices.
+App minutes are bounded by the apps actually used; the same 1440-minute ceiling
+applies per (device, app), and the router only marks an app active in a minute
+when classified traffic for it was actually seen in that minute.
+
+For the two legacy fixed-cardinality summary tables, per year, assuming 10
+devices x ~30 apps:
 
 * ``usage_hourly``    10 x 24 x 365        =  87 600 rows
 * ``usage_daily_app`` 10 x 30 x 365        = 109 500 rows
@@ -31,18 +52,19 @@ Per year, assuming 10 devices x ~30 apps:
   (77 bytes/row; both tables are ``WITHOUT ROWID`` with the primary key as the
   clustering index and no secondary index)
 
-Scaling linearly: 20 devices for a year is ~29 MB, 10 devices for five years is
-~72 MB. So "keep it for years" is fine on a NAS — but the frequently-quoted
-"under 1 MB" is off by more than an order of magnitude, and it is honest to say
-tens of MB. Either way this is nothing next to raw flows (hundreds of GB to
-TB-scale), which is the real reason nobody stores them.
+Session-range volume varies with actual interaction count, so it is not folded
+into that fixed 14.4 MB claim. It is bounded by the same 10-day retention as the
+daily app table. Each row stores only start/end/credited seconds; remote IPs,
+ports and raw flows never reach the Hub.
 
 Retention
 ---------
-The product keeps **10 days**, matching the official App's 上网统计 window
-(今日 / 昨日 / 过去七天 with headroom).  Ten days is therefore the default for
-both tables, and the footprint at that window is trivial: a year's worth of
-rows is 14.4 MB, so 10 days is well under 1 MB per device-set.
+This implementation keeps **10 days** by default, which covers the current App
+reporting window with headroom.  The UI window is not evidence that the vendor
+backend retains only ten days.  The same configurable default applies to all
+three local tables, and the footprint at that window is trivial: a year's worth
+of summary rows is 14.4 MB, so a ten-day summary window is well under 1 MB per
+device-set (session rows vary with real interaction count).
 
 Storage is cheap on a NAS, so the window is a *product* decision, not a
 technical ceiling.  Both windows stay independently overridable
@@ -53,12 +75,14 @@ because the hourly table only feeds the day chart.
 
 Idempotency
 -----------
-The relay pushes **absolute** bucket values, and rows are merged with ``max()``
-rather than ``+``.  Re-pushing the same window (retry, duplicate delivery,
-Hub restart) therefore changes nothing, and a value can never be inflated by
-repeated delivery.  The trade-off is that a counter which legitimately goes
-*down* (relay restarted mid-day and lost its in-memory buckets) is ignored,
-which is the safe direction to fail in.
+Minute rows are a set, not a counter: the router only pushes minutes it has not
+pushed before and the Hub writes them with ``INSERT OR IGNORE``, so a retry, a
+duplicate delivery or a Hub restart cannot double-count a minute.  Traffic rows
+are **absolute** per-day firmware counters and are merged with ``max()`` per
+column, so re-delivery is a no-op and a value can never be inflated by a retry.
+The trade-off for traffic is that a counter which legitimately goes *down*
+(router reboot clears its day counter) is ignored, which avoids inflation but is
+not lossless.
 """
 
 from __future__ import annotations
@@ -67,7 +91,7 @@ import os
 import sqlite3
 import threading
 import time
-from datetime import date as _date, timedelta
+from datetime import date as _date, datetime as _datetime, timedelta
 from pathlib import Path
 from typing import Any, Callable, Dict, Iterable, List, Optional, Sequence
 
@@ -75,8 +99,30 @@ from flask import Blueprint, jsonify, request
 
 DEFAULT_HOURLY_KEEP_DAYS = int(os.environ.get("USAGE_HOURLY_KEEP_DAYS", "10"))
 DEFAULT_DAILY_KEEP_DAYS = int(os.environ.get("USAGE_DAILY_KEEP_DAYS", "10"))
+#: 分钟桶是 v3 的唯一原始记录，保留窗口独立可配，默认与日报表同为 10 天。
+DEFAULT_MINUTE_KEEP_DAYS = int(os.environ.get("USAGE_MINUTE_KEEP_DAYS", "10"))
 
 MAX_ROWS_PER_PUSH = 5000
+
+MINUTE_SECONDS = 60
+#: A day has at most this many minute buckets; more than that is malformed input.
+MAX_MINUTES_PER_ROW = 24 * 60
+#: 家长请注意 window is 00:00-06:00 Beijing time, i.e. hours 0..5.
+LATE_NIGHT_END_HOUR = 6
+#: Epoch bounds outside which a "minute" is garbage, not data (2001 .. 2100).
+MINUTE_EPOCH_FLOOR = 1_000_000_000
+MINUTE_EPOCH_CEILING = 4_102_444_800
+#: Session epochs and minute epochs are router-local (Beijing, UTC+8); the hour
+#: is derived with a fixed +8h offset instead of the Hub's own timezone.
+BEIJING_OFFSET_SQL = "'unixepoch', '+8 hours'"
+#: v3: 一台设备的数据多久没有推进就算「不新鲜」。中继每 30 秒推一次，
+#: 超过这个窗口说明路由侧统计已经停了，页面必须显示为过期而不是 0 分钟。
+STALE_AFTER_SECONDS = 180
+#: 「今日用得偏多」的提醒阈值（分钟），只认真实分钟行。
+ATTENTION_NOTICE_MINUTES = int(os.environ.get("USAGE_ATTENTION_NOTICE_MINUTES", "120"))
+#: 「正在上网」允许的落后量：一个自然分钟只在其结束后才被结算，所以当前分钟
+#: 本来就慢一格，判定时取「本分钟或上一分钟」。
+ACTIVE_NOW_LAG_SECONDS = MINUTE_SECONDS
 
 
 class UsageAggregateError(ValueError):
@@ -90,6 +136,66 @@ def normalize_mac(value: Any) -> str:
     if len(compact) == 12 and all(ch in "0123456789abcdef" for ch in compact):
         return ":".join(compact[i:i + 2] for i in range(0, 12, 2))
     return text
+
+
+def router_key(value: Any) -> str:
+    """The stable router id a write is filed under.
+
+    Ingest has no router in its body (the relay only sends the buckets), so the
+    Hub resolves it once per request and both sides of every read use the same
+    normalized form — ``Ruijie BE72`` and ``BE72`` must not become two devices.
+    """
+    return str(value or "").strip().lower()[:128] or "router"
+
+
+def _router_clause(value: Any) -> tuple[str, List[str]]:
+    """Read-side router filter; an empty value means "any router"."""
+    key = str(value or "").strip().lower()[:128]
+    if not key:
+        return "", []
+    return "router = ? AND ", [key]
+
+
+#: Sentinel mac in ``usage_ingest_meta`` holding "this router pushed at …", so
+#: payload-level freshness is one row lookup instead of a scan over devices.
+ROUTER_META_MAC = "*"
+
+
+def _with_router(rows: Any, router: Any) -> List[Dict[str, Any]]:
+    """Tag every row of a v3 array with the router the push came from.
+
+    The payload has no router field, so the write key has to be attached here;
+    ``router_key`` only sees what the row itself says.
+    """
+    key = router_key(router)
+    prepared: List[Dict[str, Any]] = []
+    for row in rows or []:
+        if not isinstance(row, dict):
+            continue
+        prepared.append({**row, "router": row.get("router") or key})
+    return prepared
+
+
+def _guard_uid(value: Any) -> str:
+    """Normalise a child-guard uid the way ``child_guard_service`` stores it.
+
+    Router-generated uids are 16-byte hex shown in upper case; anything else is
+    kept verbatim.  Both sides of the ``child_guard_device`` table must use this
+    form or a cache hit turns into a router round-trip.
+    """
+    uid = str(value or "").strip()
+    if len(uid) == 32 and all(ch in "0123456789abcdefABCDEF" for ch in uid):
+        return uid.upper()
+    return uid[:128]
+
+
+def _split_macs(value: Any) -> List[str]:
+    """``"aa:bb:..,cc:dd:.."`` -> list of normalized MACs (stored form)."""
+    if isinstance(value, (list, tuple)):
+        raw: Iterable[Any] = value
+    else:
+        raw = str(value or "").replace(";", ",").split(",")
+    return [normalize_mac(item) for item in raw if str(item or "").strip()]
 
 
 def _iso_date(value: Any) -> str:
@@ -116,6 +222,73 @@ def _as_hour(value: Any) -> int:
     if hour > 23:
         raise UsageAggregateError(f"invalid hour: {value!r}")
     return hour
+
+
+def _as_minute_epoch(value: Any) -> int:
+    """Validate one minute-start epoch and snap it to its minute bucket.
+
+    The router sends UTC-aligned minute starts (China is a whole-hour offset, so
+    these are Beijing minute starts too).  Millisecond epochs are rescaled and a
+    stray few seconds is floored onto its minute: that is the bucket the sample
+    belongs to, not an invented duration.
+    """
+    try:
+        if isinstance(value, bool):
+            raise ValueError(value)
+        if isinstance(value, (int, float)):
+            number = int(value)
+        else:
+            number = int(str(value).strip())
+    except (TypeError, ValueError):
+        raise UsageAggregateError(f"invalid minute epoch: {value!r}")
+    if number >= 10_000_000_000:  # milliseconds
+        number //= 1000
+    number -= number % MINUTE_SECONDS
+    if not MINUTE_EPOCH_FLOOR <= number <= MINUTE_EPOCH_CEILING:
+        raise UsageAggregateError(f"minute epoch out of range: {value!r}")
+    return number
+
+
+#: v3 tables that were first created without the ``router`` column.
+_LEGACY_V3_TABLES = {
+    "usage_device_minute": ("mac", "date", "minute_epoch", "updated_at"),
+    "usage_app_minute": ("mac", "date", "app", "minute_epoch", "updated_at"),
+    "usage_device_traffic": ("mac", "date", "tx_bytes", "rx_bytes", "updated_at"),
+}
+
+
+def _migrate_router_columns(conn: sqlite3.Connection) -> None:
+    """Rebuild v3 tables that predate per-router scoping.
+
+    ``CREATE TABLE IF NOT EXISTS`` never changes an existing primary key, so the
+    rows the first v3 revision stored under ``(date, mac, ...)`` are moved into
+    the router-scoped shape once, under the default router name. Reads accept
+    "any router" for a day that has no rows under the requested name, so those
+    rows stay visible instead of silently vanishing from the 10 天 chart.
+    """
+    for table, columns in _LEGACY_V3_TABLES.items():
+        present = {row[1] for row in conn.execute(f"PRAGMA table_info({table})")}
+        if not present or "router" in present:
+            continue
+        conn.execute("BEGIN IMMEDIATE")
+        try:
+            conn.execute(f"ALTER TABLE {table} RENAME TO {table}_pregate")
+            conn.execute(
+                f"CREATE TABLE {table} ("
+                + ", ".join(f"{name} {'INTEGER' if name.endswith(('_epoch', '_bytes', '_at')) else 'TEXT'} NOT NULL"
+                            for name in ("router", *columns))
+                + f", PRIMARY KEY (router, {', '.join(c for c in columns if c != 'updated_at')}))"
+                + " WITHOUT ROWID"
+            )
+            conn.execute(
+                f"INSERT OR IGNORE INTO {table}(router, {', '.join(columns)}) "
+                f"SELECT 'router', {', '.join(columns)} FROM {table}_pregate"
+            )
+            conn.execute(f"DROP TABLE {table}_pregate")
+            conn.execute("COMMIT")
+        except Exception:
+            conn.execute("ROLLBACK")
+            raise
 
 
 class UsageAggregateStore:
@@ -163,8 +336,74 @@ class UsageAggregateStore:
                         updated_at  TEXT    NOT NULL,
                         PRIMARY KEY (date, mac, app)
                     ) WITHOUT ROWID;
+                    CREATE TABLE IF NOT EXISTS usage_app_session (
+                        date         TEXT    NOT NULL,
+                        mac          TEXT    NOT NULL,
+                        app          TEXT    NOT NULL,
+                        start_epoch  INTEGER NOT NULL,
+                        end_epoch    INTEGER NOT NULL,
+                        active_secs  INTEGER NOT NULL DEFAULT 0,
+                        updated_at   TEXT    NOT NULL,
+                        PRIMARY KEY (date, mac, app, start_epoch)
+                    ) WITHOUT ROWID;
+                    /* v3: natural minute buckets. A minute is active or it is
+                       not, so these are sets (INSERT OR IGNORE), never sums. */
+                    CREATE TABLE IF NOT EXISTS usage_device_minute (
+                        router       TEXT    NOT NULL,
+                        mac          TEXT    NOT NULL,
+                        date         TEXT    NOT NULL,
+                        minute_epoch INTEGER NOT NULL,
+                        updated_at   INTEGER NOT NULL,
+                        PRIMARY KEY (router, mac, date, minute_epoch)
+                    ) WITHOUT ROWID;
+                    CREATE TABLE IF NOT EXISTS usage_app_minute (
+                        router       TEXT    NOT NULL,
+                        mac          TEXT    NOT NULL,
+                        date         TEXT    NOT NULL,
+                        app          TEXT    NOT NULL,
+                        minute_epoch INTEGER NOT NULL,
+                        updated_at   INTEGER NOT NULL,
+                        PRIMARY KEY (router, mac, date, app, minute_epoch)
+                    ) WITHOUT ROWID;
+                    /* v3: per-day device totals straight from the firmware
+                       counters. max-merged per column; the byte columns of the
+                       legacy tables are flow sums and are not traffic. */
+                    CREATE TABLE IF NOT EXISTS usage_device_traffic (
+                        router     TEXT    NOT NULL,
+                        mac        TEXT    NOT NULL,
+                        date       TEXT    NOT NULL,
+                        tx_bytes   INTEGER NOT NULL DEFAULT 0,
+                        rx_bytes   INTEGER NOT NULL DEFAULT 0,
+                        updated_at INTEGER NOT NULL,
+                        PRIMARY KEY (router, mac, date)
+                    ) WITHOUT ROWID;
+                    /* When did this device's data last advance? Answered from
+                       one row instead of a minute scan, so the overview stays
+                       cheap. The newest minute epoch is still the source of
+                       truth for ``lastSampleAt``; this is only max-ed with it. */
+                    CREATE TABLE IF NOT EXISTS usage_ingest_meta (
+                        router         TEXT    NOT NULL,
+                        mac            TEXT    NOT NULL,
+                        last_sample_at INTEGER NOT NULL DEFAULT 0,
+                        updated_at     INTEGER NOT NULL DEFAULT 0,
+                        PRIMARY KEY (router, mac)
+                    ) WITHOUT ROWID;
+                    /* uid -> MACs / name / blocked, cached from the child-guard
+                       results the Hub already served. Reads must never ask the
+                       router who the guarded devices are. */
+                    CREATE TABLE IF NOT EXISTS child_guard_device (
+                        router        TEXT    NOT NULL,
+                        uid           TEXT    NOT NULL,
+                        name          TEXT    NOT NULL DEFAULT '',
+                        macs          TEXT    NOT NULL DEFAULT '',
+                        blocked       INTEGER NOT NULL DEFAULT 0,
+                        blocked_until INTEGER NOT NULL DEFAULT 0,
+                        updated_at    INTEGER NOT NULL DEFAULT 0,
+                        PRIMARY KEY (router, uid)
+                    ) WITHOUT ROWID;
                     """
                 )
+                _migrate_router_columns(conn)
             finally:
                 conn.close()
 
@@ -186,6 +425,296 @@ class UsageAggregateStore:
             values=("active_secs", "tx_bytes", "rx_bytes", "sessions"),
         )
 
+    def upsert_sessions(self, rows: Iterable[Dict[str, Any]]) -> int:
+        return self._upsert(
+            table="usage_app_session",
+            rows=rows,
+            keys=("date", "mac", "app", "start_epoch"),
+            values=("end_epoch", "active_secs"),
+        )
+
+    def insert_device_minutes(self, rows: Iterable[Dict[str, Any]], *,
+                              router: Any = None) -> int:
+        """``{"mac","date","minutes":[<minute-start epoch>, ..]}`` -> set insert."""
+        return self._insert_minutes("usage_device_minute", rows, with_app=False,
+                                    router=router)
+
+    def insert_app_minutes(self, rows: Iterable[Dict[str, Any]], *,
+                           router: Any = None) -> int:
+        """``{"mac","date","app","minutes":[..]}`` -> set insert."""
+        return self._insert_minutes("usage_app_minute", rows, with_app=True,
+                                    router=router)
+
+    def upsert_device_traffic(self, rows: Iterable[Dict[str, Any]], *,
+                              router: Any = None) -> int:
+        """Absolute per-day firmware counters; max-merged per column."""
+        return self._upsert(
+            table="usage_device_traffic",
+            rows=_with_router(rows, router),
+            keys=("router", "mac", "date"),
+            values=("tx_bytes", "rx_bytes"),
+            integer_timestamp=True,
+        )
+
+    def ingest_v3(self, body: Dict[str, Any], *, router: Any = None) -> Dict[str, int]:
+        """Store one v3 push: 自然分钟桶 + 固件日字节数 + 样本时间。
+
+        幂等：分钟是集合（``INSERT OR IGNORE``），流量是按列 ``max()``，meta 只
+        往未来走。中继重试同一批不会让任何一个数字变大。
+        """
+        key = router_key(router)
+        generated = _as_count(body.get("generatedAt") or body.get("generated_at"))
+        device_rows = _with_router(body.get("deviceMinutes") or [], key)
+        app_rows = _with_router(body.get("appMinutes") or [], key)
+        stored = {
+            "deviceMinutes": self.insert_device_minutes(device_rows, router=key),
+            "appMinutes": self.insert_app_minutes(app_rows, router=key),
+            "traffic": self.upsert_device_traffic(
+                _with_router(body.get("traffic") or [], key), router=key),
+        }
+        newest: Dict[str, int] = {}
+        for row in (*device_rows, *app_rows):
+            mac = normalize_mac(row.get("mac"))
+            if not mac:
+                continue
+            for value in row.get("minutes") or []:
+                try:
+                    minute = _as_minute_epoch(value)
+                except UsageAggregateError:
+                    continue  # 真正的畸形值在写分钟时已经拒过整个请求了
+                newest[mac] = max(newest.get(mac, 0), minute)
+        for row in body.get("traffic") or []:
+            mac = normalize_mac(row.get("mac")) if isinstance(row, dict) else ""
+            if mac:
+                newest.setdefault(mac, generated)
+        stored["meta"] = self.note_samples(key, newest, generated_at=generated)
+        return stored
+
+    def note_samples(self, router: Any, latest_by_mac: Dict[str, int], *,
+                     generated_at: int = 0) -> int:
+        """``usage_ingest_meta``: 这台设备的数据最后一次推进到什么时候。
+
+        有分钟行本身就能算出来，但 overview 想知道「整台路由器有多新」时不该去
+        扫分钟表；meta 取 ``max(已存, generatedAt, 这批最新分钟)``，只会往前走。
+        """
+        key = router_key(router)
+        now = int(time.time())
+        prepared: List[tuple] = []
+        for mac, latest in (latest_by_mac or {}).items():
+            clean = normalize_mac(mac)
+            if not clean:
+                continue
+            prepared.append((key, clean, max(0, int(latest or 0)), now))
+        if generated_at:
+            # 路由器级别的「最近有过一次推送」，与单台设备是否有新分钟无关。
+            prepared.append((key, ROUTER_META_MAC, max(0, int(generated_at)), now))
+        if not prepared:
+            return 0
+        sql = (
+            "INSERT INTO usage_ingest_meta(router, mac, last_sample_at, updated_at) "
+            "VALUES(?, ?, ?, ?) "
+            "ON CONFLICT(router, mac) DO UPDATE SET "
+            "last_sample_at = max(usage_ingest_meta.last_sample_at, "
+            "excluded.last_sample_at), updated_at = excluded.updated_at"
+        )
+        return self._write(sql, prepared)
+
+    # -- 管控设备目录（uid -> MACs / 名称 / 封禁）---------------------------
+
+    def remember_guard_devices(self, router: Any,
+                               devices: Iterable[Dict[str, Any]]) -> int:
+        """缓存 ``get_users``/``add_device``/``pause_device`` 的结果。
+
+        只带 uid 的增量（pause/resume）不会清空已经存着的 macs 或名称，否则一次
+        封禁操作就会把设备的身份抹掉。
+        """
+        key = router_key(router)
+        now = int(time.time())
+        stored = 0
+        for device in devices or []:
+            if not isinstance(device, dict):
+                continue
+            uid = _guard_uid(device.get("uid"))
+            if not uid:
+                continue
+            macs = device.get("macs")
+            clean_macs = [normalize_mac(mac) for mac in macs if str(mac or "").strip()] \
+                if isinstance(macs, (list, tuple)) else None
+            name = str(device.get("name") or device.get("userDefinedName") or "").strip()[:120]
+            blocked = device.get("blocked")
+            until = _as_count(device.get("blockedUntilEpoch") or device.get("pausedUntilEpoch"))
+            with self._lock:
+                conn = self.connect()
+                try:
+                    existing = conn.execute(
+                        "SELECT name, macs, blocked, blocked_until FROM child_guard_device "
+                        "WHERE router = ? AND uid = ?", (key, uid)).fetchone()
+                    merged_name = name or (str(existing["name"]) if existing else "")
+                    merged_macs = clean_macs if clean_macs is not None else _split_macs(
+                        str(existing["macs"]) if existing else "")
+                    merged_blocked = (
+                        1 if blocked else 0) if blocked is not None else (
+                        int(existing["blocked"]) if existing else 0)
+                    merged_until = until if (blocked is not None or until) else (
+                        int(existing["blocked_until"]) if existing else 0)
+                    conn.execute(
+                        "INSERT INTO child_guard_device"
+                        "(router, uid, name, macs, blocked, blocked_until, updated_at) "
+                        "VALUES(?, ?, ?, ?, ?, ?, ?) "
+                        "ON CONFLICT(router, uid) DO UPDATE SET "
+                        "name = excluded.name, macs = excluded.macs, "
+                        "blocked = excluded.blocked, blocked_until = excluded.blocked_until, "
+                        "updated_at = excluded.updated_at",
+                        (key, uid, merged_name, ",".join(merged_macs),
+                         merged_blocked, merged_until, now),
+                    )
+                finally:
+                    conn.close()
+            stored += 1
+        return stored
+
+    def guard_devices(self, router: Any) -> List[Dict[str, Any]]:
+        """这个路由器下 Hub 已知的全部受管控设备；空表 = Hub 还没见过任何设备。"""
+        key = router_key(router)
+        with self._lock:
+            conn = self.connect()
+            try:
+                rows = conn.execute(
+                    "SELECT uid, name, macs, blocked, blocked_until, updated_at "
+                    "FROM child_guard_device WHERE router = ? ORDER BY uid", (key,)
+                ).fetchall()
+            finally:
+                conn.close()
+        return [
+            {
+                "uid": str(row["uid"]),
+                "name": str(row["name"] or ""),
+                "macs": _split_macs(str(row["macs"] or "")),
+                "blocked": bool(int(row["blocked"] or 0)),
+                "blockedUntilEpoch": int(row["blocked_until"] or 0),
+                "updatedAt": int(row["updated_at"] or 0),
+            }
+            for row in rows
+        ]
+
+    def guard_device(self, router: Any, uid: Any) -> Optional[Dict[str, Any]]:
+        """单台设备的缓存条目；None = Hub 从未见过这个 uid（才允许问路由器）。"""
+        key = router_key(router)
+        wanted = _guard_uid(uid)
+        if not wanted:
+            return None
+        with self._lock:
+            conn = self.connect()
+            try:
+                row = conn.execute(
+                    "SELECT uid, name, macs, blocked, blocked_until, updated_at "
+                    "FROM child_guard_device WHERE router = ? AND uid = ?",
+                    (key, wanted)).fetchone()
+            finally:
+                conn.close()
+        if row is None:
+            return None
+        return {
+            "uid": str(row["uid"]),
+            "name": str(row["name"] or ""),
+            "macs": _split_macs(str(row["macs"] or "")),
+            "blocked": bool(int(row["blocked"] or 0)),
+            "blockedUntilEpoch": int(row["blocked_until"] or 0),
+            "updatedAt": int(row["updated_at"] or 0),
+        }
+
+    def forget_guard_device(self, router: Any, uid: Any) -> int:
+        key = router_key(router)
+        wanted = _guard_uid(uid)
+        if not wanted:
+            return 0
+        with self._lock:
+            conn = self.connect()
+            try:
+                cursor = conn.execute(
+                    "DELETE FROM child_guard_device WHERE router = ? AND uid = ?",
+                    (key, wanted))
+                return cursor.rowcount or 0
+            finally:
+                conn.close()
+
+    def guard_snapshot(self, router: Any, macs: Sequence[str],
+                       date: str) -> Dict[str, Any]:
+        """overview 的全部读取：一个连接、四条语句，问都不问路由器。
+
+        返回的是**原始事实**（分钟列表、每应用分钟数、每 mac 最新分钟、meta），
+        设备级的合并（同一台设备多块网卡在同一分钟只算一次）留给
+        :func:`build_guard_overview`，因为去重必须按设备分组做。
+        """
+        wanted = [normalize_mac(mac) for mac in macs if normalize_mac(mac)]
+        day = _iso_date(date)
+        empty = {
+            "date": day, "minutesByMac": {}, "appsByMac": {}, "latestByMac": {},
+            "metaByMac": {}, "routerLastSampleAt": 0, "routerUpdatedAt": 0,
+        }
+        if not wanted:
+            return empty
+        with self._lock:
+            conn = self.connect()
+            try:
+                snapshot = _guard_read(conn, wanted, day, router)
+                if not any((snapshot["minutesByMac"], snapshot["appsByMac"],
+                            snapshot["latestByMac"], snapshot["metaByMac"])):
+                    # 归属名对不上时退回「任意路由器」，理由同 report()。
+                    snapshot = _guard_read(conn, wanted, day, "")
+            finally:
+                conn.close()
+        return snapshot
+
+    def _insert_minutes(
+        self, table: str, rows: Iterable[Dict[str, Any]], *,
+        with_app: bool, router: Any = None,
+    ) -> int:
+        now = int(time.time())
+        prepared: List[tuple] = []
+        for row in rows:
+            prepared.extend(self._expand_minute_row(
+                row, with_app=with_app, now=now, router=router))
+        columns = ("router", "mac", "date") + (("app",) if with_app else ()) \
+            + ("minute_epoch", "updated_at")
+        placeholders = ", ".join("?" for _ in columns)
+        # The router only pushes minutes it has not pushed before, so this is an
+        # idempotent set insert: a duplicate delivery cannot double-count.
+        sql = (
+            f"INSERT OR IGNORE INTO {table}({', '.join(columns)}) "
+            f"VALUES({placeholders})"
+        )
+        return self._write(sql, prepared)
+
+    @staticmethod
+    def _expand_minute_row(row: Any, *, with_app: bool, now: int,
+                           router: Any = None) -> List[tuple]:
+        if not isinstance(row, dict):
+            return []
+        router = router_key(row.get("router") or router)
+        day = _iso_date(row.get("date"))
+        mac = normalize_mac(row.get("mac"))
+        if not mac:
+            return []
+        app = ""
+        if with_app:
+            app = str(row.get("app") or "").strip()
+            if not app or len(app) > 64:
+                return []
+        raw_minutes = row.get("minutes")
+        if raw_minutes is None:
+            return []
+        if not isinstance(raw_minutes, (list, tuple)):
+            raise UsageAggregateError(f"minutes must be a list: {raw_minutes!r}")
+        unique = sorted({_as_minute_epoch(value) for value in raw_minutes})
+        if len(unique) > MAX_MINUTES_PER_ROW:
+            raise UsageAggregateError(
+                f"row carries {len(unique)} minutes for one day; max {MAX_MINUTES_PER_ROW}"
+            )
+        if with_app:
+            return [(router, mac, day, app, minute, now) for minute in unique]
+        return [(router, mac, day, minute, now) for minute in unique]
+
     def _upsert(
         self,
         *,
@@ -193,8 +722,9 @@ class UsageAggregateStore:
         rows: Iterable[Dict[str, Any]],
         keys: Sequence[str],
         values: Sequence[str],
+        integer_timestamp: bool = False,
     ) -> int:
-        now = _now_text()
+        now: Any = int(time.time()) if integer_timestamp else _now_text()
 
         # Validate everything before touching the database, so a malformed row
         # rejects the whole request instead of leaving a half-applied batch.
@@ -203,8 +733,6 @@ class UsageAggregateStore:
             record = self._prepare_row(row, keys, values, now)
             if record is not None:
                 prepared.append(record)
-        if not prepared:
-            return 0
 
         columns = (*keys, *values, "updated_at")
         placeholders = ", ".join("?" for _ in columns)
@@ -218,7 +746,12 @@ class UsageAggregateStore:
             f"INSERT INTO {table}({', '.join(columns)}) VALUES({placeholders}) "
             f"ON CONFLICT({', '.join(keys)}) DO UPDATE SET {assignments}"
         )
+        return self._write(sql, prepared)
 
+    def _write(self, sql: str, prepared: List[tuple]) -> int:
+        """Run one statement over validated rows in bounded transactions."""
+        if not prepared:
+            return 0
         # Execute in bounded transactions: a relay that has been offline for a
         # year may hand over ~200k buckets, and dropping the tail would be a
         # silent data loss (which an earlier revision did).
@@ -243,7 +776,7 @@ class UsageAggregateStore:
         row: Any,
         keys: Sequence[str],
         values: Sequence[str],
-        now: str,
+        now: Any,
     ) -> Optional[tuple]:
         if not isinstance(row, dict):
             return None
@@ -251,6 +784,11 @@ class UsageAggregateStore:
             "date": _iso_date(row.get("date")),
             "mac": normalize_mac(row.get("mac")),
         }
+        if "router" in keys:
+            # The v3 payload has no router field; the Hub files the row under the
+            # router it received it from (``router_key`` default) so a second
+            # router can never overwrite the first one's day.
+            record["router"] = router_key(row.get("router"))
         if not record["mac"]:
             return None
         if "hour" in keys:
@@ -260,9 +798,19 @@ class UsageAggregateStore:
             if not app or len(app) > 64:
                 return None
             record["app"] = app
+        if "start_epoch" in keys:
+            raw = row.get("start_epoch") if row.get("start_epoch") is not None else row.get("startEpoch")
+            record["start_epoch"] = _as_count(raw)
+            if record["start_epoch"] <= 0:
+                return None
         for field in values:
             raw = row.get(field) if row.get(field) is not None else row.get(_camel(field))
             record[field] = _as_count(raw)
+        if "end_epoch" in values:
+            if record["end_epoch"] < record["start_epoch"]:
+                raise UsageAggregateError("session end precedes start")
+            if record["active_secs"] > record["end_epoch"] - record["start_epoch"]:
+                raise UsageAggregateError("session active time exceeds its range")
         record["updated_at"] = now
         return tuple(record[column] for column in (*keys, *values, "updated_at"))
 
@@ -274,12 +822,15 @@ class UsageAggregateStore:
         today: Optional[str] = None,
         hourly_keep_days: int = DEFAULT_HOURLY_KEEP_DAYS,
         daily_keep_days: int = DEFAULT_DAILY_KEEP_DAYS,
+        minute_keep_days: Optional[int] = None,
     ) -> Dict[str, int]:
         """Drop whole days that fall outside each table's retention window.
 
         ``keep_days`` counts **including today**, so ``10`` keeps today plus the
         nine preceding days.  This matches the relay's own prune, which keeps
-        the newest N distinct dates present in the store.
+        the newest N distinct dates present in the store.  The v3 minute and
+        traffic tables are the primary record, so they keep at least as long as
+        either legacy window unless told otherwise.
         """
         reference = _date.fromisoformat(_iso_date(today)) if today else _date.today()
         # `keep_days - 1` because the window is inclusive of today.
@@ -289,6 +840,9 @@ class UsageAggregateStore:
         daily_cutoff = (
             reference - timedelta(days=max(0, daily_keep_days - 1))
         ).isoformat()
+        minute_keep = int(minute_keep_days or max(
+            hourly_keep_days, daily_keep_days, DEFAULT_DAILY_KEEP_DAYS))
+        minute_cutoff = (reference - timedelta(days=max(0, minute_keep - 1))).isoformat()
         removed: Dict[str, int] = {}
         with self._lock:
             conn = self.connect()
@@ -298,6 +852,17 @@ class UsageAggregateStore:
                 removed["hourly"] = cursor.rowcount or 0
                 cursor = conn.execute("DELETE FROM usage_daily_app WHERE date < ?", (daily_cutoff,))
                 removed["dailyApp"] = cursor.rowcount or 0
+                cursor = conn.execute("DELETE FROM usage_app_session WHERE date < ?", (daily_cutoff,))
+                removed["sessions"] = cursor.rowcount or 0
+                cursor = conn.execute(
+                    "DELETE FROM usage_device_minute WHERE date < ?", (minute_cutoff,))
+                removed["deviceMinutes"] = cursor.rowcount or 0
+                cursor = conn.execute(
+                    "DELETE FROM usage_app_minute WHERE date < ?", (minute_cutoff,))
+                removed["appMinutes"] = cursor.rowcount or 0
+                cursor = conn.execute(
+                    "DELETE FROM usage_device_traffic WHERE date < ?", (minute_cutoff,))
+                removed["traffic"] = cursor.rowcount or 0
                 conn.execute("COMMIT")
             except Exception:
                 conn.execute("ROLLBACK")
@@ -308,82 +873,74 @@ class UsageAggregateStore:
 
     # -- reads -------------------------------------------------------------
 
-    def report(self, macs: Sequence[str], date: str) -> Dict[str, Any]:
-        """The official ``上网统计`` shape: online time, hourly bars, app list."""
+    def report(self, macs: Sequence[str], date: str, router: str = "") -> Dict[str, Any]:
+        """The official ``上网统计`` shape: online minutes, hourly bars, apps.
+
+        One day is rendered from exactly **one** basis: the v3 minute buckets
+        when the router reported any for that day, the legacy
+        second-accumulating tables otherwise.  ``basis`` says which.  Device
+        traffic always comes from the firmware counters, never from flow bytes.
+        ``router`` narrows the read to one router; empty means any.
+
+        纯读 SQLite，附带新鲜度字段（``generatedAt`` / ``lastSampleAt`` /
+        ``stale``）与 ``hasData`` —— 那一天什么都没记过是「暂无数据」，不是 0 分钟。
+        """
         wanted = [normalize_mac(mac) for mac in macs if normalize_mac(mac)]
         day = _iso_date(date)
         if not wanted:
-            return {
-                "date": day, "onlineSeconds": 0, "onlineMinutes": 0,
-                "hourly": [], "apps": [], "macs": [],
-            }
-        placeholders = ", ".join("?" for _ in wanted)
+            return _decorate_report(_empty_report(day, [], basis="none"), None, day)
         with self._lock:
             conn = self.connect()
             try:
-                hourly = conn.execute(
-                    f"""SELECT hour,
-                               SUM(active_secs) AS active_secs,
-                               SUM(tx_bytes)    AS tx_bytes,
-                               SUM(rx_bytes)    AS rx_bytes
-                        FROM usage_hourly
-                        WHERE date = ? AND mac IN ({placeholders})
-                        GROUP BY hour ORDER BY hour""",
-                    (day, *wanted),
-                ).fetchall()
-                apps = conn.execute(
-                    f"""SELECT app,
-                               SUM(active_secs) AS active_secs,
-                               SUM(tx_bytes)    AS tx_bytes,
-                               SUM(rx_bytes)    AS rx_bytes,
-                               SUM(sessions)    AS sessions
-                        FROM usage_daily_app
-                        WHERE date = ? AND mac IN ({placeholders})
-                        GROUP BY app""",
-                    (day, *wanted),
-                ).fetchall()
+                key = str(router or "").strip().lower()[:128]
+                traffic = _traffic_snapshot(conn, wanted, day, day, key)
+                minutes = _minute_snapshot(conn, wanted, day, day, key)
+                meta = _meta_snapshot(conn, wanted, key)
+                latest = _latest_minute(conn, wanted, key)
+                if not (traffic["daily"] or minutes or latest
+                        or (meta or {}).get("lastSampleByMac")
+                        or (meta or {}).get("routerLastSampleAt")):
+                    # 归属键对不上（例如升级前记的行没有 router 名）时按「任意路由
+                    # 器」重读一次，宁可少一个过滤条件也不要让用户看到空白页。
+                    traffic = _traffic_snapshot(conn, wanted, day, day, "")
+                    minutes = _minute_snapshot(conn, wanted, day, day, "")
+                    meta = _meta_snapshot(conn, wanted, "")
+                    latest = _latest_minute(conn, wanted, "")
+                minute_day = minutes.get(day)
+                if minute_day is not None:
+                    report = _minute_report(day, wanted, minute_day, traffic)
+                else:
+                    legacy = _legacy_day_report(conn, wanted, day)
+                    basis = "legacy" if (legacy.get("coverage") or {}).get("hasRecords") else "none"
+                    report = {**legacy, "traffic": traffic, "basis": basis}
+            finally:
+                conn.close()
+        return _decorate_report(report, meta, day, latest=latest)
+
+    def traffic_report(
+        self, macs: Sequence[str], start: str, end: str, router: str = ""
+    ) -> Dict[str, Any]:
+        """Per-day firmware device counters over a window (public read helper)."""
+        wanted = [normalize_mac(mac) for mac in macs if normalize_mac(mac)]
+        first, last = _iso_date(start), _iso_date(end)
+        if not wanted:
+            return _empty_traffic_block()
+        with self._lock:
+            conn = self.connect()
+            try:
+                return _traffic_snapshot(conn, wanted, first, last, router)
             finally:
                 conn.close()
 
-        online_seconds = sum(int(row["active_secs"] or 0) for row in hourly)
-        hourly_rows = [
-            {
-                "hour": int(row["hour"]),
-                "minutes": _to_minutes(int(row["active_secs"] or 0)),
-                "txBytes": int(row["tx_bytes"] or 0),
-                "rxBytes": int(row["rx_bytes"] or 0),
-            }
-            for row in hourly
-        ]
-        app_rows = sorted(
-            (
-                {
-                    "app": str(row["app"]),
-                    "minutes": _to_minutes(int(row["active_secs"] or 0)),
-                    "sessions": int(row["sessions"] or 0),
-                    "txBytes": int(row["tx_bytes"] or 0),
-                    "rxBytes": int(row["rx_bytes"] or 0),
-                }
-                for row in apps
-            ),
-            key=lambda item: (-item["minutes"], item["app"]),
-        )
-        return {
-            "date": day,
-            "onlineSeconds": online_seconds,
-            "onlineMinutes": _to_minutes(online_seconds),
-            "hourly": hourly_rows,
-            "apps": app_rows,
-            "macs": wanted,
-        }
-
-    def daily_totals(self, macs: Sequence[str], start: str, end: str) -> List[Dict[str, Any]]:
+    def daily_totals(
+        self, macs: Sequence[str], start: str, end: str, router: str = ""
+    ) -> List[Dict[str, Any]]:
         """Per-day online minutes across a date range, **gap filled**.
 
         The App draws the 最近10天 chart straight from this, so every date in
         ``[start, end]`` is present — days with no activity come back as zero
         rather than being missing, and the client never has to do date maths or
-        guess how many bars to render.
+        guess how many bars to render.  Each day keeps its own ``basis``.
         """
         wanted = [normalize_mac(mac) for mac in macs if normalize_mac(mac)]
         first = _date.fromisoformat(_iso_date(start))
@@ -392,37 +949,102 @@ class UsageAggregateStore:
             first, last = last, first
         window = [(first + timedelta(days=offset)) for offset in range((last - first).days + 1)]
 
-        seconds: Dict[str, int] = {}
+        minute_days: Dict[str, Dict[str, Any]] = {}
+        seconds: Dict[str, tuple[int, int]] = {}
+        late_ranges: Dict[str, List[Dict[str, Any]]] = {}
         if wanted:
             placeholders = ", ".join("?" for _ in wanted)
             with self._lock:
                 conn = self.connect()
                 try:
+                    minute_days = _minute_snapshot(conn, wanted,
+                                                   first.isoformat(), last.isoformat(),
+                                                   router)
+                    # Legacy rows are only read for days the router never sent
+                    # minute buckets for, so a day can never be counted twice.
                     rows = conn.execute(
-                        f"""SELECT date, SUM(active_secs) AS active_secs
+                        f"""SELECT date,
+                                   SUM(active_secs) AS active_secs,
+                                   SUM(CASE WHEN hour < ? THEN active_secs ELSE 0 END)
+                                       AS late_night_secs
                             FROM usage_hourly
                             WHERE date BETWEEN ? AND ? AND mac IN ({placeholders})
                             GROUP BY date""",
-                        (first.isoformat(), last.isoformat(), *wanted),
+                        (LATE_NIGHT_END_HOUR, first.isoformat(), last.isoformat(), *wanted),
+                    ).fetchall()
+                    # 家长请注意 needs the concrete late-night windows, not just a
+                    # total. Session epochs are router-local (Beijing, UTC+8), so
+                    # the hour is derived with a fixed +8h offset instead of the
+                    # hub's own timezone.
+                    session_rows = conn.execute(
+                        f"""SELECT date, app, start_epoch, end_epoch, active_secs
+                            FROM usage_app_session
+                            WHERE date BETWEEN ? AND ? AND mac IN ({placeholders})
+                              AND CAST(strftime('%H', start_epoch, {BEIJING_OFFSET_SQL})
+                                       AS INTEGER) < ?
+                            ORDER BY date, start_epoch""",
+                        (first.isoformat(), last.isoformat(), *wanted, LATE_NIGHT_END_HOUR),
                     ).fetchall()
                 finally:
                     conn.close()
-            seconds = {str(row["date"]): int(row["active_secs"] or 0) for row in rows}
-
-        return [
-            {
-                "date": day.isoformat(),
-                "onlineSeconds": seconds.get(day.isoformat(), 0),
-                "onlineMinutes": _to_minutes(seconds.get(day.isoformat(), 0)),
+            seconds = {
+                str(row["date"]): (
+                    int(row["active_secs"] or 0),
+                    int(row["late_night_secs"] or 0),
+                )
+                for row in rows
+                if str(row["date"]) not in minute_days
             }
-            for day in window
-        ]
+            for row in session_rows:
+                if str(row["date"]) in minute_days:
+                    continue
+                active = int(row["active_secs"] or 0)
+                late_ranges.setdefault(str(row["date"]), []).append({
+                    "app": str(row["app"]),
+                    "startEpoch": int(row["start_epoch"]),
+                    "endEpoch": int(row["end_epoch"]),
+                    "minutes": _to_minutes(active),
+                })
 
-    def app_totals(self, macs: Sequence[str], start: str, end: str) -> List[Dict[str, Any]]:
+        entries: List[Dict[str, Any]] = []
+        for day in window:
+            key = day.isoformat()
+            minute_day = minute_days.get(key)
+            if minute_day is not None:
+                online_minutes = int(minute_day["onlineMinutes"])
+                late_minutes = int(minute_day["lateNightMinutes"])
+                entries.append({
+                    "date": key,
+                    "onlineSeconds": online_minutes * MINUTE_SECONDS,
+                    "onlineMinutes": online_minutes,
+                    "lateNightSeconds": late_minutes * MINUTE_SECONDS,
+                    "lateNightMinutes": late_minutes,
+                    "lateNightRanges": _late_night_ranges(minute_day),
+                    "coverage": "recorded",
+                    "basis": "minutes",
+                })
+                continue
+            legacy = seconds.get(key, (0, 0))
+            entries.append({
+                "date": key,
+                "onlineSeconds": legacy[0],
+                "onlineMinutes": _to_minutes(legacy[0]),
+                "lateNightSeconds": legacy[1],
+                "lateNightMinutes": _to_minutes(legacy[1]),
+                "lateNightRanges": late_ranges.get(key, []),
+                "coverage": "recorded" if key in seconds else "no_record",
+                "basis": "legacy" if key in seconds else "none",
+            })
+        return entries
+
+    def app_totals(
+        self, macs: Sequence[str], start: str, end: str, router: str = ""
+    ) -> List[Dict[str, Any]]:
         """Per-app totals summed across a date range (the 最近N天 app summary).
 
         Returns the same row shape as :meth:`report`'s ``apps`` so the client can
-        render both tabs with one parser.
+        render both tabs with one parser.  Each day of the window contributes on
+        its own basis: minute buckets where they exist, legacy rows elsewhere.
         """
         wanted = [normalize_mac(mac) for mac in macs if normalize_mac(mac)]
         first = _iso_date(start)
@@ -433,29 +1055,86 @@ class UsageAggregateStore:
         with self._lock:
             conn = self.connect()
             try:
+                minute_days = _minute_snapshot(conn, wanted, first, last, router)
                 rows = conn.execute(
-                    f"""SELECT app,
+                    f"""SELECT date, app,
                                SUM(active_secs) AS active_secs,
                                SUM(tx_bytes)    AS tx_bytes,
                                SUM(rx_bytes)    AS rx_bytes,
                                SUM(sessions)    AS sessions
                         FROM usage_daily_app
                         WHERE date BETWEEN ? AND ? AND mac IN ({placeholders})
-                        GROUP BY app""",
+                        GROUP BY date, app""",
+                    (first, last, *wanted),
+                ).fetchall()
+                session_rows = conn.execute(
+                    f"""SELECT date, app, start_epoch, end_epoch, active_secs
+                        FROM usage_app_session
+                        WHERE date BETWEEN ? AND ? AND mac IN ({placeholders})
+                        ORDER BY date, app, start_epoch""",
                     (first, last, *wanted),
                 ).fetchall()
             finally:
                 conn.close()
+
+        # app -> aggregate over the window; each day contributes on its own
+        # basis, so a day is never counted twice.
+        totals: Dict[str, Dict[str, Any]] = {}
+
+        def slot(app: str) -> Dict[str, Any]:
+            return totals.setdefault(app, {
+                "minutes": 0, "minuteRuns": 0, "sessionRows": 0, "sessionColumn": 0,
+                "txBytes": 0, "rxBytes": 0, "ranges": [],
+            })
+
+        for row in rows:
+            if str(row["date"]) in minute_days:
+                continue
+            entry = slot(str(row["app"]))
+            active_seconds = int(row["active_secs"] or 0)
+            entry["minutes"] += _to_minutes(active_seconds)
+            entry["txBytes"] += int(row["tx_bytes"] or 0)
+            entry["rxBytes"] += int(row["rx_bytes"] or 0)
+            # A day without session rows has no verifiable ranges to count, so
+            # its reported session count falls back to the legacy column.
+            entry["sessionColumn"] += int(row["sessions"] or 0)
+        for row in session_rows:
+            if str(row["date"]) in minute_days:
+                continue
+            entry = slot(str(row["app"]))
+            active_seconds = int(row["active_secs"] or 0)
+            entry["sessionRows"] += 1
+            entry["ranges"].append({
+                "startEpoch": int(row["start_epoch"]),
+                "endEpoch": int(row["end_epoch"]),
+                "activeSeconds": active_seconds,
+                "minutes": _to_minutes(active_seconds),
+            })
+        for day in minute_days.values():
+            for app, data in day["apps"].items():
+                entry = slot(app)
+                entry["minutes"] += int(data["minutes"])
+                entry["minuteRuns"] += len(data["runs"])
+                # The v3 payload carries no per-app bytes: reconstructing them
+                # would be invented data, so they stay 0.
+                entry["ranges"].extend(dict(run) for run in data["runs"])
+        for entry in totals.values():
+            entry["sessions"] = entry["minuteRuns"] + (
+                entry["sessionRows"] or entry["sessionColumn"])
+            entry["sessionRanges"] = sorted(
+                entry["ranges"], key=lambda item: int(item.get("startEpoch") or 0)
+            )
         return sorted(
             (
                 {
-                    "app": str(row["app"]),
-                    "minutes": _to_minutes(int(row["active_secs"] or 0)),
-                    "sessions": int(row["sessions"] or 0),
-                    "txBytes": int(row["tx_bytes"] or 0),
-                    "rxBytes": int(row["rx_bytes"] or 0),
+                    "app": app,
+                    "minutes": entry["minutes"],
+                    "sessions": entry["sessions"],
+                    "sessionRanges": entry["sessionRanges"],
+                    "txBytes": entry["txBytes"],
+                    "rxBytes": entry["rxBytes"],
                 }
-                for row in rows
+                for app, entry in totals.items()
             ),
             key=lambda item: (-item["minutes"], item["app"]),
         )
@@ -467,9 +1146,26 @@ class UsageAggregateStore:
             try:
                 hourly = conn.execute("SELECT COUNT(*) AS n FROM usage_hourly").fetchone()["n"]
                 daily = conn.execute("SELECT COUNT(*) AS n FROM usage_daily_app").fetchone()["n"]
+                sessions = conn.execute("SELECT COUNT(*) AS n FROM usage_app_session").fetchone()["n"]
+                device_minutes = conn.execute(
+                    "SELECT COUNT(*) AS n FROM usage_device_minute").fetchone()["n"]
+                app_minutes = conn.execute(
+                    "SELECT COUNT(*) AS n FROM usage_app_minute").fetchone()["n"]
+                traffic_rows = conn.execute(
+                    "SELECT COUNT(*) AS n FROM usage_device_traffic").fetchone()["n"]
+                guard_rows = conn.execute(
+                    "SELECT COUNT(*) AS n FROM child_guard_device").fetchone()["n"]
+                meta = conn.execute(
+                    "SELECT COUNT(*) AS n, MAX(last_sample_at) AS newest "
+                    "FROM usage_ingest_meta WHERE mac <> '*'").fetchone()
                 span = conn.execute(
                     "SELECT MIN(date) AS lo, MAX(date) AS hi FROM ("
-                    "SELECT date FROM usage_hourly UNION ALL SELECT date FROM usage_daily_app)"
+                    "SELECT date FROM usage_hourly UNION ALL "
+                    "SELECT date FROM usage_daily_app UNION ALL "
+                    "SELECT date FROM usage_app_session UNION ALL "
+                    "SELECT date FROM usage_device_minute UNION ALL "
+                    "SELECT date FROM usage_app_minute UNION ALL "
+                    "SELECT date FROM usage_device_traffic)"
                 ).fetchone()
             finally:
                 conn.close()
@@ -481,6 +1177,13 @@ class UsageAggregateStore:
         return {
             "hourlyRows": int(hourly or 0),
             "dailyAppRows": int(daily or 0),
+            "sessionRows": int(sessions or 0),
+            "deviceMinuteRows": int(device_minutes or 0),
+            "appMinuteRows": int(app_minutes or 0),
+            "trafficRows": int(traffic_rows or 0),
+            "guardDeviceRows": int(guard_rows or 0),
+            "ingestMetaRows": int((meta["n"] if meta else 0) or 0),
+            "lastSampleAt": int((meta["newest"] if meta else 0) or 0),
             "bytesOnDisk": size,
             "firstDate": span["lo"] if span else None,
             "lastDate": span["hi"] if span else None,
@@ -488,7 +1191,649 @@ class UsageAggregateStore:
         }
 
 
+# -- report composition ------------------------------------------------------
+#
+# Every helper below reads what the router actually reported.  Nothing here
+# estimates a duration from bytes, averages a bucket over its neighbours, or
+# fills an empty hour with a plausible value: an hour with no minute rows is 0.
+
+
+def _empty_report(date_value: str, macs: Sequence[str], *, basis: str) -> Dict[str, Any]:
+    """The explicit ``暂无记录`` skeleton: no bars, no invented numbers."""
+    return {
+        "date": date_value,
+        "onlineSeconds": 0,
+        "onlineMinutes": 0,
+        "lateNightSeconds": 0,
+        "lateNightMinutes": 0,
+        "hourly": [],
+        "apps": [],
+        "macs": [normalize_mac(mac) for mac in macs if normalize_mac(mac)],
+        "basis": basis,
+        "traffic": _empty_traffic_block(),
+        "coverage": {"status": "no_record", "hasRecords": False},
+    }
+
+
+def _empty_traffic_block() -> Dict[str, Any]:
+    return {"txBytes": 0, "rxBytes": 0, "totalBytes": 0, "daily": []}
+
+
+def _minute_snapshot(
+    conn: sqlite3.Connection,
+    wanted: Sequence[str],
+    first: str,
+    last: str,
+    router: str = "",
+) -> Dict[str, Dict[str, Any]]:
+    """Minute-bucket facts per day, keyed by the date the router reported.
+
+    Only days that actually have minute rows appear, which is what lets the
+    caller decide the basis per day instead of blending two measurements.
+    ``router`` narrows the read to one router; empty means every router the Hub
+    has heard from, which is what a single-router installation sees anyway.
+    """
+    holders = ", ".join("?" for _ in wanted)
+    clause, prefix = _router_clause(router)
+    window = (*prefix, first, last, *wanted)
+    days: Dict[str, Dict[str, Any]] = {}
+
+    def slot(day: str) -> Dict[str, Any]:
+        return days.setdefault(day, {
+            "hourly": {}, "onlineMinutes": 0, "lateNightMinutes": 0, "apps": {},
+        })
+
+    for row in conn.execute(
+        f"""SELECT date,
+                   CAST(strftime('%H', minute_epoch, {BEIJING_OFFSET_SQL}) AS INTEGER) AS hour,
+                   COUNT(DISTINCT minute_epoch) AS minutes
+            FROM usage_device_minute
+            WHERE {clause}date BETWEEN ? AND ? AND mac IN ({holders})
+            GROUP BY date, hour""",
+        window,
+    ):
+        entry = slot(str(row["date"]))
+        hour = int(row["hour"])
+        minutes = int(row["minutes"] or 0)
+        entry["hourly"][hour] = minutes
+        entry["onlineMinutes"] += minutes
+        if hour < LATE_NIGHT_END_HOUR:
+            entry["lateNightMinutes"] += minutes
+
+    for day, app, runs in _app_minute_runs(conn, wanted, first, last,
+                                           late_night_only=False, router=router):
+        entry = slot(day)
+        data = entry["apps"].setdefault(app, {"minutes": 0, "runs": [], "lateNightRuns": []})
+        data["runs"].extend(runs)
+        data["minutes"] += sum(int(run["minutes"]) for run in runs)
+    for day, app, runs in _app_minute_runs(conn, wanted, first, last,
+                                           late_night_only=True, router=router):
+        entry = slot(day)
+        data = entry["apps"].setdefault(app, {"minutes": 0, "runs": [], "lateNightRuns": []})
+        data["lateNightRuns"].extend(runs)
+    return days
+
+
+def _app_minute_runs(
+    conn: sqlite3.Connection,
+    wanted: Sequence[str],
+    first: str,
+    last: str,
+    *,
+    late_night_only: bool,
+    router: str = "",
+) -> List[tuple]:
+    """Group each app's minute rows into consecutive-minute runs.
+
+    Gaps-and-islands in SQL: inside one (date, app) the n-th distinct minute of
+    an unbroken run is ``first + (n-1) * 60``, so ``minute - row_number * 60``
+    is constant exactly while the minutes step by 60.  Any other step opens a
+    new run, which is why 08:15/08:25/08:35 is three ranges and not one.
+    """
+    holders = ", ".join("?" for _ in wanted)
+    clause, prefix = _router_clause(router)
+    late_filter = (
+        f"AND CAST(strftime('%H', minute_epoch, {BEIJING_OFFSET_SQL}) AS INTEGER)"
+        f" < {LATE_NIGHT_END_HOUR}"
+        if late_night_only else ""
+    )
+    rows = conn.execute(
+        f"""WITH seen AS (
+                SELECT DISTINCT date, app, minute_epoch
+                FROM usage_app_minute
+                WHERE {clause}date BETWEEN ? AND ? AND mac IN ({holders})
+                  {late_filter}
+            ), stepped AS (
+                SELECT date, app, minute_epoch,
+                       minute_epoch - (ROW_NUMBER() OVER (
+                           PARTITION BY date, app ORDER BY minute_epoch
+                       ) * {MINUTE_SECONDS}) AS island
+                FROM seen
+            )
+            SELECT date, app,
+                   COUNT(*) AS minutes,
+                   MIN(minute_epoch) AS first_minute,
+                   MAX(minute_epoch) AS last_minute
+            FROM stepped
+            GROUP BY date, app, island
+            ORDER BY date, app, first_minute""",
+        (*prefix, first, last, *wanted),
+    ).fetchall()
+    grouped: Dict[tuple, List[Dict[str, int]]] = {}
+    for row in rows:
+        minutes = int(row["minutes"] or 0)
+        grouped.setdefault((str(row["date"]), str(row["app"])), []).append({
+            "startEpoch": int(row["first_minute"]),
+            # The run ends at the *end* of its last active minute.
+            "endEpoch": int(row["last_minute"]) + MINUTE_SECONDS,
+            "activeSeconds": minutes * MINUTE_SECONDS,
+            "minutes": minutes,
+        })
+    return [
+        (day, app, runs) for (day, app), runs in sorted(grouped.items())
+    ]
+
+
+def _late_night_ranges(minute_day: Dict[str, Any]) -> List[Dict[str, Any]]:
+    """The 家长请注意 windows, from the same minute rows as everything else."""
+    ranges: List[Dict[str, Any]] = []
+    for app, data in minute_day.get("apps", {}).items():
+        for run in data.get("lateNightRuns") or []:
+            ranges.append({
+                "app": app,
+                "startEpoch": run["startEpoch"],
+                "endEpoch": run["endEpoch"],
+                "minutes": run["minutes"],
+            })
+    return sorted(ranges, key=lambda item: int(item["startEpoch"]))
+
+
+def _minute_report(
+    day: str,
+    wanted: Sequence[str],
+    minute_day: Dict[str, Any],
+    traffic: Dict[str, Any],
+) -> Dict[str, Any]:
+    """The v3 report: every minute count is a count of minute rows."""
+    hourly_minutes = {int(hour): int(minutes) for hour, minutes in minute_day["hourly"].items()}
+    online_minutes = int(minute_day["onlineMinutes"])
+    late_night_minutes = int(minute_day["lateNightMinutes"])
+    apps: Dict[str, Dict[str, Any]] = minute_day["apps"]
+    app_rows = sorted(
+        (
+            {
+                "app": app,
+                "minutes": int(data["minutes"]),
+                "sessions": len(data["runs"]),
+                "sessionRanges": [dict(run) for run in data["runs"]],
+                # The v3 payload has no per-app bytes and nothing else measures
+                # them per app, so they are 0 rather than a reconstruction.
+                "txBytes": 0,
+                "rxBytes": 0,
+            }
+            for app, data in apps.items()
+        ),
+        key=lambda item: (-item["minutes"], item["app"]),
+    )
+    recorded = bool(online_minutes or app_rows)
+    return {
+        "date": day,
+        "onlineSeconds": online_minutes * MINUTE_SECONDS,
+        "onlineMinutes": online_minutes,
+        "lateNightSeconds": late_night_minutes * MINUTE_SECONDS,
+        "lateNightMinutes": late_night_minutes,
+        # A full 24-slot axis; hours without minute rows are 0, never invented.
+        "hourly": [
+            {
+                "hour": hour,
+                "minutes": hourly_minutes.get(hour, 0),
+                "txBytes": 0,
+                "rxBytes": 0,
+            }
+            for hour in range(24)
+        ],
+        "apps": app_rows,
+        "macs": list(wanted),
+        "basis": "minutes",
+        "traffic": traffic,
+        "coverage": {"status": "recorded" if recorded else "no_record",
+                     "hasRecords": recorded},
+    }
+
+
+def _traffic_snapshot(
+    conn: sqlite3.Connection,
+    wanted: Sequence[str],
+    first: str,
+    last: str,
+    router: str = "",
+) -> Dict[str, Any]:
+    """Per-day device traffic, straight from the firmware counters."""
+    holders = ", ".join("?" for _ in wanted)
+    clause, prefix = _router_clause(router)
+    rows = conn.execute(
+        f"""SELECT date, SUM(tx_bytes) AS tx_bytes, SUM(rx_bytes) AS rx_bytes
+            FROM usage_device_traffic
+            WHERE {clause}date BETWEEN ? AND ? AND mac IN ({holders})
+            GROUP BY date ORDER BY date""",
+        (*prefix, first, last, *wanted),
+    ).fetchall()
+    daily: List[Dict[str, Any]] = []
+    total_tx = total_rx = 0
+    for row in rows:
+        tx = int(row["tx_bytes"] or 0)
+        rx = int(row["rx_bytes"] or 0)
+        total_tx += tx
+        total_rx += rx
+        daily.append({
+            "date": str(row["date"]),
+            "txBytes": tx,
+            "rxBytes": rx,
+            # Derived here, never stored, so the three figures cannot disagree.
+            "totalBytes": tx + rx,
+        })
+    return {
+        "txBytes": total_tx,
+        "rxBytes": total_rx,
+        "totalBytes": total_tx + total_rx,
+        "daily": daily,
+    }
+
+
+# -- freshness ---------------------------------------------------------------
+
+
+def _beijing_date(epoch: float) -> str:
+    """The router-local calendar day an epoch falls on (UTC+8, no DST)."""
+    return time.strftime("%Y-%m-%d", time.gmtime(int(epoch) + 8 * 3600))
+
+
+def _minute_floor(epoch: float) -> int:
+    return int(epoch) - int(epoch) % MINUTE_SECONDS
+
+
+def _is_late_night(minute_epoch: int) -> bool:
+    """00:00–05:59 北京时间，与 ``strftime('%H', …, '+8 hours')`` 同一边界。"""
+    return (minute_epoch + 8 * 3600) // MINUTE_SECONDS % 1440 < LATE_NIGHT_END_HOUR * 60
+
+
+def _meta_snapshot(conn: sqlite3.Connection, wanted: Sequence[str],
+                   router: str = "") -> Dict[str, Any]:
+    """``usage_ingest_meta``: 样本到过哪里，以及这台路由器最后一次推算是何时。"""
+    holders = ", ".join("?" for _ in (*wanted, ROUTER_META_MAC))
+    clause, prefix = _router_clause(router)
+    rows = conn.execute(
+        f"""SELECT mac, last_sample_at, updated_at FROM usage_ingest_meta
+            WHERE {clause}mac IN ({holders})""",
+        (*prefix, *wanted, ROUTER_META_MAC),
+    ).fetchall()
+    per_mac: Dict[str, int] = {}
+    router_seen = 0
+    for row in rows:
+        stamp = int(row["last_sample_at"] or 0)
+        mac = str(row["mac"])
+        if mac == ROUTER_META_MAC:
+            router_seen = max(router_seen, stamp)
+        else:
+            per_mac[mac] = max(per_mac.get(mac, 0), stamp)
+    return {"lastSampleByMac": per_mac, "routerLastSampleAt": router_seen}
+
+
+def _latest_minute(conn: sqlite3.Connection, wanted: Sequence[str],
+                   router: str = "") -> Dict[str, int]:
+    """Newest device-minute row per MAC over the whole retained window."""
+    holders = ", ".join("?" for _ in wanted)
+    clause, prefix = _router_clause(router)
+    rows = conn.execute(
+        f"""SELECT mac, MAX(minute_epoch) AS newest FROM usage_device_minute
+            WHERE {clause}mac IN ({holders}) GROUP BY mac""",
+        (*prefix, *wanted),
+    ).fetchall()
+    return {str(row["mac"]): int(row["newest"] or 0) for row in rows}
+
+
+def _decorate_report(
+    report: Dict[str, Any],
+    meta: Optional[Dict[str, Any]],
+    day: str,
+    *,
+    latest: Optional[Dict[str, int]] = None,
+    now: Optional[int] = None,
+) -> Dict[str, Any]:
+    """Attach the fields the App needs to tell 0 分钟 and 暂无数据 apart.
+
+    ``lastSampleAt`` is the newest thing actually observed for these MACs: the
+    sample stamp the relay reported and the newest minute row, whichever is
+    later.  ``stale`` only ever applies to *today* — yesterday's numbers are
+    complete, not out of date, so a past date is never flagged.
+    """
+    stamp = int(now if now is not None else time.time())
+    samples = dict((meta or {}).get("lastSampleByMac") or {})
+    newest = dict(latest or {})
+    macs = [str(mac) for mac in report.get("macs") or []]
+    device_sample = max([*(_value_or_zero(samples, mac) for mac in macs),
+                         *(_value_or_zero(newest, mac) for mac in macs)], default=0)
+    last_sample = max(device_sample, int((meta or {}).get("routerLastSampleAt") or 0))
+    is_today = str(report.get("date") or day) == _beijing_date(stamp)
+    covered = bool((report.get("coverage") or {}).get("hasRecords"))
+    traffic_days = (report.get("traffic") or {}).get("daily") or []
+    online_minutes = int(report.get("onlineMinutes") or 0)
+    newest_minute = max((_value_or_zero(newest, mac) for mac in macs), default=0)
+    return {
+        **report,
+        "generatedAt": stamp,
+        "lastSampleAt": last_sample,
+        "stale": bool(is_today and (last_sample <= 0
+                                    or stamp - last_sample > STALE_AFTER_SECONDS)),
+        "hasData": bool(covered or traffic_days or online_minutes),
+        "todayMinutes": online_minutes,
+        # 一个自然分钟只在其结束后结算，所以「正在上网」看本分钟或上一分钟。
+        "activeNow": bool(is_today and newest_minute
+                          >= _minute_floor(stamp) - ACTIVE_NOW_LAG_SECONDS),
+    }
+
+
+def _value_or_zero(mapping: Dict[str, int], mac: str) -> int:
+    try:
+        return int(mapping.get(mac) or 0)
+    except (TypeError, ValueError):
+        return 0
+
+
+def _guard_read(conn: sqlite3.Connection, wanted: Sequence[str], day: str,
+                router: Any) -> Dict[str, Any]:
+    """The overview's reads on one connection: 分钟行、应用分钟、meta。"""
+    holders = ", ".join("?" for _ in wanted)
+    key = str(router or "").strip().lower()[:128]
+    clause, prefix = _router_clause(key)
+
+    minutes: Dict[str, List[int]] = {}
+    for row in conn.execute(
+        f"""SELECT DISTINCT mac, minute_epoch FROM usage_device_minute
+            WHERE {clause}date = ? AND mac IN ({holders})
+            ORDER BY mac, minute_epoch""",
+        (*prefix, day, *wanted),
+    ):
+        minutes.setdefault(str(row["mac"]), []).append(int(row["minute_epoch"]))
+
+    apps: Dict[str, Dict[str, int]] = {}
+    for row in conn.execute(
+        f"""SELECT mac, app, COUNT(DISTINCT minute_epoch) AS minutes
+            FROM usage_app_minute
+            WHERE {clause}date = ? AND mac IN ({holders})
+            GROUP BY mac, app ORDER BY minutes DESC""",
+        (*prefix, day, *wanted),
+    ):
+        apps.setdefault(str(row["mac"]), {})[str(row["app"])] = int(row["minutes"] or 0)
+
+    latest: Dict[str, int] = {}
+    for row in conn.execute(
+        f"""SELECT mac, MAX(minute_epoch) AS newest FROM usage_device_minute
+            WHERE {clause}mac IN ({holders}) GROUP BY mac""",
+        (*prefix, *wanted),
+    ):
+        latest[str(row["mac"])] = int(row["newest"] or 0)
+
+    seen: Dict[str, int] = {}
+    router_seen = 0
+    meta_holders = ", ".join("?" for _ in (*wanted, ROUTER_META_MAC))
+    for row in conn.execute(
+        f"""SELECT mac, last_sample_at FROM usage_ingest_meta
+            WHERE {clause}mac IN ({meta_holders})""",
+        (*prefix, *wanted, ROUTER_META_MAC),
+    ):
+        stamp = int(row["last_sample_at"] or 0)
+        if str(row["mac"]) == ROUTER_META_MAC:
+            router_seen = max(router_seen, stamp)
+        else:
+            seen[str(row["mac"])] = max(seen.get(str(row["mac"]), 0), stamp)
+
+    return {
+        "date": day,
+        "minutesByMac": minutes,
+        "appsByMac": apps,
+        "latestByMac": latest,
+        "metaByMac": seen,
+        "routerLastSampleAt": router_seen,
+    }
+
+
+def build_guard_overview(
+    store: Optional[UsageAggregateStore],
+    *,
+    router: str = "",
+    devices: Optional[Iterable[Dict[str, Any]]] = None,
+    presence: Optional[Dict[str, bool]] = None,
+    now_epoch: Optional[int] = None,
+    top_app_limit: int = 3,
+) -> Dict[str, Any]:
+    """整台路由器的设备概览：一次 SQL 读取，零路由器流量。
+
+    App 的列表页以前要为每台设备 fan-out plans/runtime/usage-report/usage，其中
+    任何一个都可能把读取挂在路由器上。这里所有数字都来自 Hub 已经收到的分钟行，
+    所以``online`` 只能给不出时才给 ``null``，绝不为了它去问路由器。
+
+    ``devices`` 是 ``child_guard_device`` 的行（``uid`` / ``macs`` / ``name`` /
+    ``blocked`` / ``blockedUntilEpoch`` / ``updatedAt``）；``presence`` 是 Hub 设备
+    快照里的 ``mac -> 是否在线``，``None`` 表示 Hub 这边没有可信的在线状态。
+    """
+    stamp = int(now_epoch if now_epoch is not None else time.time())
+    day = _beijing_date(stamp)
+    rows = [device for device in (devices or []) if isinstance(device, dict)]
+    macs: List[str] = []
+    for device in rows:
+        for mac in _split_macs(device.get("macs")):
+            if mac not in macs:
+                macs.append(mac)
+    snapshot: Dict[str, Any] = {
+        "minutesByMac": {}, "appsByMac": {}, "latestByMac": {}, "metaByMac": {},
+        "routerLastSampleAt": 0,
+    }
+    if store is not None and macs:
+        try:
+            snapshot = store.guard_snapshot(router, macs, day)
+        except Exception:  # pragma: no cover - 概览宁可空着也不要 500
+            snapshot = {**snapshot}
+    minutes_by_mac = snapshot.get("minutesByMac") or {}
+    apps_by_mac = snapshot.get("appsByMac") or {}
+    latest_by_mac = snapshot.get("latestByMac") or {}
+    meta_by_mac = snapshot.get("metaByMac") or {}
+    active_floor = _minute_floor(stamp) - ACTIVE_NOW_LAG_SECONDS
+
+    entries: List[Dict[str, Any]] = []
+    device_last_sample = 0
+    for device in rows:
+        device_macs = [mac for mac in _split_macs(device.get("macs")) if mac]
+        # 同一台设备的两块网卡在同一分钟只算一次：分钟是集合，不是求和。
+        union: set[int] = set()
+        for mac in device_macs:
+            union.update(int(value) for value in minutes_by_mac.get(mac) or [])
+        today_minutes = len(union)
+        late_minutes = sum(1 for minute in union if _is_late_night(minute))
+        app_totals: Dict[str, int] = {}
+        for mac in device_macs:
+            for app, minutes in (apps_by_mac.get(mac) or {}).items():
+                # 多网卡设备只能取 max：分钟按 mac 分组存，跨 mac 求和会把同一分钟
+                # 算两次，宁可少报也不能虚报。
+                app_totals[app] = max(app_totals.get(app, 0), int(minutes or 0))
+        top_apps = [
+            {"app": app, "minutes": minutes}
+            for app, minutes in sorted(
+                app_totals.items(), key=lambda item: (-item[1], item[0])
+            )[:max(1, top_app_limit)]
+        ]
+        seen = max([_value_or_zero(meta_by_mac, mac) for mac in device_macs]
+                   + [_value_or_zero(latest_by_mac, mac) for mac in device_macs],
+                   default=0)
+        device_last_sample = max(device_last_sample, seen)
+        has_rows = bool(union)
+        active_now = any(minute >= active_floor for minute in union)
+        # 「从未有过数据」和「今天还没上网」是两件事，App 显示的文字也不同。
+        has_data = bool(has_rows or seen > 0)
+        entries.append({
+            "uid": str(device.get("uid") or ""),
+            "macs": device_macs,
+            "name": str(device.get("name") or ""),
+            "online": _device_online(device_macs, presence),
+            "activeNow": bool(active_now),
+            "todayMinutes": today_minutes,
+            "hasData": has_data,
+            "topApps": top_apps,
+            "blocked": bool(device.get("blocked")),
+            "blockedUntilEpoch": _as_count(device.get("blockedUntilEpoch")),
+            "attention": _attention_state(today_minutes, late_minutes, has_rows),
+            "lastSampleAt": seen,
+            "stale": bool(seen <= 0 or stamp - seen > STALE_AFTER_SECONDS),
+            "updatedAt": _as_count(device.get("updatedAt")),
+        })
+
+    last_sample = max([device_last_sample,
+                       int(snapshot.get("routerLastSampleAt") or 0)], default=0)
+    return {
+        "router": router_key(router),
+        "date": day,
+        "generatedAt": stamp,
+        "lastSampleAt": last_sample,
+        "stale": bool(last_sample <= 0 or stamp - last_sample > STALE_AFTER_SECONDS),
+        "devices": entries,
+    }
+
+
+def _device_online(device_macs: Sequence[str],
+                   presence: Optional[Dict[str, bool]]) -> Optional[bool]:
+    """Hub 快照里的在线状态；缺信息就是 ``None``（unknown），不是「离线」。"""
+    if presence is None or not device_macs:
+        return None
+    states = [presence.get(mac) for mac in device_macs]
+    if any(state is True for state in states):
+        return True
+    if any(state is None for state in states):
+        return None
+    return False
+
+
+def _attention_state(today_minutes: int, late_minutes: int,
+                     has_rows: bool) -> Dict[str, Any]:
+    """提醒只认真实分钟行；那一天没数据时状态是 unknown，不是「没事」。"""
+    if not has_rows:
+        state, text = "unknown", ""
+    elif late_minutes > 0:
+        state, text = "alert", f"凌晨还在上网（{late_minutes} 分钟）"
+    elif today_minutes >= ATTENTION_NOTICE_MINUTES:
+        state, text = "notice", f"今天已上网 {today_minutes} 分钟"
+    else:
+        state, text = "none", ""
+    return {
+        "state": state,
+        "lateNightMinutes": int(late_minutes),
+        "text": text,
+        "hasAttention": state in ("alert", "notice"),
+    }
+
+
+def _legacy_day_report(
+    conn: sqlite3.Connection, wanted: Sequence[str], day: str
+) -> Dict[str, Any]:
+    """Yesterday's report, from the second-accumulating tables.
+
+    Kept so the 10-day history of routers still on the v2 payload does not go
+    blank.  This is the *only* place ``_to_minutes`` (round seconds to minutes)
+    still runs, and the caller labels it ``basis: "legacy"``.
+    """
+    placeholders = ", ".join("?" for _ in wanted)
+    hourly = conn.execute(
+        f"""SELECT hour,
+                   SUM(active_secs) AS active_secs,
+                   SUM(tx_bytes)    AS tx_bytes,
+                   SUM(rx_bytes)    AS rx_bytes
+            FROM usage_hourly
+            WHERE date = ? AND mac IN ({placeholders})
+            GROUP BY hour ORDER BY hour""",
+        (day, *wanted),
+    ).fetchall()
+    apps = conn.execute(
+        f"""SELECT app,
+                   SUM(active_secs) AS active_secs,
+                   SUM(tx_bytes)    AS tx_bytes,
+                   SUM(rx_bytes)    AS rx_bytes,
+                   SUM(sessions)    AS sessions
+            FROM usage_daily_app
+            WHERE date = ? AND mac IN ({placeholders})
+            GROUP BY app""",
+        (day, *wanted),
+    ).fetchall()
+    sessions = conn.execute(
+        f"""SELECT app, start_epoch, end_epoch, active_secs
+            FROM usage_app_session
+            WHERE date = ? AND mac IN ({placeholders})
+            ORDER BY app, start_epoch""",
+        (day, *wanted),
+    ).fetchall()
+
+    online_seconds = sum(int(row["active_secs"] or 0) for row in hourly)
+    # 家长请注意分析窗口固定为 00:00–06:00 北京时间，与分钟口径同一边界。
+    late_night_seconds = sum(
+        int(row["active_secs"] or 0)
+        for row in hourly
+        if int(row["hour"]) < LATE_NIGHT_END_HOUR
+    )
+    hourly_rows = [
+        {
+            "hour": int(row["hour"]),
+            "minutes": _to_minutes(int(row["active_secs"] or 0)),
+            "txBytes": int(row["tx_bytes"] or 0),
+            "rxBytes": int(row["rx_bytes"] or 0),
+        }
+        for row in hourly
+    ]
+    ranges_by_app: Dict[str, List[Dict[str, int]]] = {}
+    for row in sessions:
+        active_seconds = int(row["active_secs"] or 0)
+        ranges_by_app.setdefault(str(row["app"]), []).append({
+            "startEpoch": int(row["start_epoch"]),
+            "endEpoch": int(row["end_epoch"]),
+            "activeSeconds": active_seconds,
+            "minutes": _to_minutes(active_seconds),
+        })
+
+    app_rows = sorted(
+        (
+            {
+                "app": str(row["app"]),
+                "minutes": _to_minutes(int(row["active_secs"] or 0)),
+                "sessions": len(ranges_by_app.get(str(row["app"]), []))
+                or int(row["sessions"] or 0),
+                "sessionRanges": ranges_by_app.get(str(row["app"]), []),
+                "txBytes": int(row["tx_bytes"] or 0),
+                "rxBytes": int(row["rx_bytes"] or 0),
+            }
+            for row in apps
+        ),
+        key=lambda item: (-item["minutes"], item["app"]),
+    )
+    return {
+        "date": day,
+        "onlineSeconds": online_seconds,
+        "onlineMinutes": _to_minutes(online_seconds),
+        "lateNightSeconds": late_night_seconds,
+        "lateNightMinutes": _to_minutes(late_night_seconds),
+        "hourly": hourly_rows,
+        "apps": app_rows,
+        "macs": list(wanted),
+        "coverage": {
+            "status": "recorded" if hourly or apps or sessions else "no_record",
+            "hasRecords": bool(hourly or apps or sessions),
+        },
+    }
+
+
 def _to_minutes(seconds: int) -> int:
+    """Round accumulated seconds onto minutes.
+
+    Legacy-only: the v2 payload stores seconds, so a day rendered from the old
+    tables has nothing better than this rounding.  Minute-bucket days count rows
+    and never pass through here.
+    """
     return (max(0, seconds) + 30) // 60
 
 
@@ -502,11 +1847,168 @@ def _now_text() -> str:
 
 
 def default_keep_days() -> Dict[str, int]:
-    """The product retention window, in one place for callers that report it."""
+    """The product retention window, in one place for callers that report it.
+
+    ``minute`` is the v3 window: it covers the primary minute/traffic tables, so
+    a reader clamping a ``days`` parameter clamps to the data that actually
+    exists rather than to one of the two legacy summaries.
+    """
     return {
         "hourly": DEFAULT_HOURLY_KEEP_DAYS,
         "dailyApp": DEFAULT_DAILY_KEEP_DAYS,
+        "minute": DEFAULT_MINUTE_KEEP_DAYS,
     }
+
+
+def _live_version(live: Dict[str, Any]) -> int:
+    try:
+        return int(live.get("version") or 0)
+    except (TypeError, ValueError):
+        return 0
+
+
+def _live_traffic_block(live: Dict[str, Any], date_value: str) -> Dict[str, Any]:
+    """The relay's own firmware counters, in the same shape as the hub block."""
+    tx = _as_count(live.get("todayTxBytes") or live.get("txBytes"))
+    rx = _as_count(live.get("todayRxBytes") or live.get("rxBytes"))
+    if not (tx or rx):
+        return _empty_traffic_block()
+    return {
+        "txBytes": tx,
+        "rxBytes": rx,
+        "totalBytes": tx + rx,
+        "daily": [{"date": date_value, "txBytes": tx, "rxBytes": rx, "totalBytes": tx + rx}],
+    }
+
+
+def _minutes_from_live(live: Dict[str, Any]) -> Optional[Dict[str, Any]]:
+    """Adapt a v3 relay live report into the minute-bucket report shape.
+
+    The relay's live reply has minute counts and consecutive-minute runs, not
+    hour bars, so ``hourly`` stays empty: distributing its minutes over the day
+    would mean inventing which hours they fell in.  The next push writes the
+    real minute rows and the Hub-side report has the bars.
+    """
+    online_minutes = _as_count(live.get("onlineMinutes"))
+    apps: List[Dict[str, Any]] = []
+    for row in live.get("apps") or []:
+        if not isinstance(row, dict):
+            continue
+        app = str(row.get("app") or "").strip()
+        if not app:
+            continue
+        runs: List[Dict[str, int]] = []
+        for item in row.get("ranges") or []:
+            if not isinstance(item, dict):
+                continue
+            minutes = _as_count(item.get("minutes"))
+            if minutes <= 0:
+                continue
+            runs.append({
+                "startEpoch": _as_count(item.get("startEpoch")),
+                "endEpoch": _as_count(item.get("endEpoch")),
+                "activeSeconds": minutes * MINUTE_SECONDS,
+                "minutes": minutes,
+            })
+        minutes_total = _as_count(row.get("minutes")) or sum(r["minutes"] for r in runs)
+        apps.append({
+            "app": app,
+            "minutes": minutes_total,
+            "sessions": len(runs),
+            "sessionRanges": runs,
+            "txBytes": 0,
+            "rxBytes": 0,
+        })
+    if not online_minutes and not apps:
+        return None
+    apps.sort(key=lambda item: (-item["minutes"], item["app"]))
+    date_value = str(live.get("date") or "").strip()
+    try:
+        date_value = _iso_date(date_value)
+    except UsageAggregateError:
+        date_value = ""
+    return {
+        "date": date_value,
+        "onlineSeconds": online_minutes * MINUTE_SECONDS,
+        "onlineMinutes": online_minutes,
+        "lateNightSeconds": 0,
+        "lateNightMinutes": 0,
+        "hourly": [],
+        "apps": apps,
+        "macs": [normalize_mac(mac) for mac in live.get("macs") or []],
+        "basis": "minutes",
+        "traffic": _live_traffic_block(live, date_value),
+        "coverage": {"status": "recorded", "hasRecords": True},
+    }
+
+
+def _merge_live_report(
+    report: Dict[str, Any], live: Dict[str, Any]
+) -> Optional[Dict[str, Any]]:
+    """Overlay fresher relay buckets onto a **legacy** hub report for one day.
+
+    Returns None when the live report carries nothing new, so callers keep the
+    original source label. Both sides are absolute counters, so merging is by
+    max and re-delivery stays idempotent.  Only ever called for a day that has
+    no minute rows: a minute-basis report and an hour-basis live report measure
+    different things and must not be blended.
+    """
+    live_hours = {int(row.get("hour", -1)): row for row in live.get("hourly") or []}
+    hub_hours = {int(row.get("hour", -1)): row for row in report.get("hourly") or []}
+
+    fresher = any(hour not in hub_hours for hour in live_hours) or any(
+        int(live_hours[hour].get("minutes") or 0) > int(hub_hours[hour].get("minutes") or 0)
+        for hour in live_hours
+        if hour in hub_hours
+    )
+    live_apps = {str(row.get("app")): row for row in live.get("apps") or []}
+    hub_apps = {str(row.get("app")): row for row in report.get("apps") or []}
+    fresher = fresher or any(
+        str(app) not in hub_apps
+        or int(live_apps[app].get("minutes") or 0) > int(hub_apps[app].get("minutes") or 0)
+        for app in live_apps
+    )
+    if not fresher:
+        return None
+
+    hourly: Dict[int, Dict[str, Any]] = {hour: dict(row) for hour, row in hub_hours.items()}
+    for hour, row in live_hours.items():
+        slot = hourly.setdefault(hour, {"hour": hour, "minutes": 0, "txBytes": 0, "rxBytes": 0})
+        slot["minutes"] = max(int(slot.get("minutes") or 0), int(row.get("minutes") or 0))
+        slot["txBytes"] = max(int(slot.get("txBytes") or 0), int(row.get("txBytes") or 0))
+        slot["rxBytes"] = max(int(slot.get("rxBytes") or 0), int(row.get("rxBytes") or 0))
+
+    apps: Dict[str, Dict[str, Any]] = {app: dict(row) for app, row in hub_apps.items()}
+    for app, row in live_apps.items():
+        slot = apps.setdefault(app, {
+            "app": app, "minutes": 0, "sessions": 0, "sessionRanges": [],
+            "txBytes": 0, "rxBytes": 0,
+        })
+        for field in ("minutes", "sessions", "txBytes", "rxBytes"):
+            slot[field] = max(int(slot.get(field) or 0), int(row.get(field) or 0))
+        ranges = {int(r.get("startEpoch", -1)): r for r in slot.get("sessionRanges") or []}
+        for item in row.get("sessionRanges") or []:
+            key = int(item.get("startEpoch", -1))
+            if key not in ranges or int(item.get("activeSeconds") or 0) > int(ranges[key].get("activeSeconds") or 0):
+                ranges[key] = item
+        slot["sessionRanges"] = [ranges[key] for key in sorted(ranges)]
+
+    hourly_rows = [hourly[hour] for hour in sorted(hourly)]
+    online_minutes = sum(int(row.get("minutes") or 0) for row in hourly_rows)
+    late_night_minutes = sum(
+        int(row.get("minutes") or 0)
+        for row in hourly_rows
+        if int(row.get("hour", 24)) < LATE_NIGHT_END_HOUR
+    )
+    merged = {
+        **report,
+        "hourly": hourly_rows,
+        "apps": sorted(apps.values(), key=lambda item: (-int(item.get("minutes") or 0), str(item.get("app")))),
+        "onlineMinutes": max(int(report.get("onlineMinutes") or 0), online_minutes),
+        "lateNightMinutes": max(int(report.get("lateNightMinutes") or 0), late_night_minutes),
+        "source": "hub+live",
+    }
+    return merged
 
 
 def compose_device_report(
@@ -516,58 +2018,104 @@ def compose_device_report(
     *,
     live: Optional[Callable[[], Optional[Dict[str, Any]]]] = None,
     range_days: int = 1,
+    now: Optional[_datetime] = None,
+    router: str = "",
 ) -> Dict[str, Any]:
     """Pick the best available report for one device on one day.
 
     Precedence, and why:
 
-    1. **Hub aggregates** — they survive router reboots and are what the App
-       should read in steady state.
-    2. **The router live** (`live`) — for a day the relay has not pushed yet:
-       first boot, a device that was just added, or a date older than the
-       retention window.
-    3. **An explicit empty report** — not an error. The App shows 暂无记录
+    1. **Hub minute buckets** (``source`` ``hub+minutes``) — what the v3 router
+       pushes, and the only basis that can state a duration in whole minutes.
+    2. **Hub legacy tables** (``hub+legacy``) — days recorded before the router
+       moved to v3, kept so the 10-day history does not go blank.
+    3. **The router live** (``relay``) — for a day nothing was pushed for yet:
+       first boot, a device that was just added, or a date outside retention.
+    4. **An explicit empty report** — not an error. The App shows 暂无记录
        instead of a failure banner, and the next push fills it in.
 
-    ``source`` always says which of the three produced the numbers, so a
-    mismatch is diagnosable from the App side without server logs.
+    One day never blends two bases: whichever of the four produces the numbers
+    produces all of them, and ``source`` plus ``basis`` say which it was.  No
+    presence sampling and no byte-rate estimate feeds this report — device
+    traffic comes from the firmware counters and nothing else.
 
     ``range_days`` > 1 additionally attaches a gap-filled ``range.days`` series
     (that many days ending on ``date``) for the 最近N天 chart.
+
+    ``now`` exists so a test can pin the freshness cut-off; production callers
+    leave it out and get the wall clock.
+
+    ``router`` scopes the read to one router; empty means every router the Hub
+    has rows for, which is what a single-router installation sees anyway.
     """
     keep = default_keep_days()
     report: Optional[Dict[str, Any]] = None
 
     if store is not None:
         try:
-            candidate = store.report(macs, date)
+            candidate = store.report(macs, date, router)
         except Exception:
             candidate = None
         if candidate and (candidate.get("hourly") or candidate.get("apps")):
-            report = {**candidate, "source": "hub", "keepDays": keep}
+            basis = str(candidate.get("basis") or "legacy")
+            report = {**candidate, "source": f"hub+{basis}", "keepDays": keep}
 
-    if report is None and live is not None:
+    live_report: Optional[Dict[str, Any]] = None
+    # The live probe costs an agent round-trip, so only pay it when the hub
+    # rows for today may be stale: nothing recorded yet, or no active bucket
+    # covering the previous hour. Fresh hub data stands on its own.
+    hub_fresh = False
+    if report is not None:
         try:
-            fallback = live()
+            now_hour = (now or _datetime.now()).hour
+            hours = [
+                int(row.get("hour", -1)) for row in report.get("hourly") or []
+                if int(row.get("minutes") or 0) > 0
+            ]
+            hub_fresh = any(hour >= now_hour - 1 for hour in hours)
         except Exception:
-            fallback = None
-        if fallback and (fallback.get("hourly") or fallback.get("apps")):
+            hub_fresh = False
+    if not hub_fresh and live is not None:
+        try:
+            live_report = live()
+        except Exception:
+            live_report = None
+
+    live_is_minutes = bool(live_report) and _live_version(live_report) >= 3
+    if report is None and live_report is not None:
+        fallback = _minutes_from_live(live_report) if live_is_minutes else live_report
+        if fallback and (fallback.get("hourly") or fallback.get("apps")
+                         or fallback.get("onlineMinutes")):
             report = {**fallback, "source": "relay", "keepDays": keep}
+            report.setdefault("coverage", {"status": "recorded", "hasRecords": True})
+            report.setdefault("basis", "legacy")
+            report.setdefault("traffic", _empty_traffic_block())
 
     if report is None:
-        report = {
-            "date": _iso_date(date),
-            "onlineSeconds": 0,
-            "onlineMinutes": 0,
-            "hourly": [],
-            "apps": [],
-            "macs": [normalize_mac(mac) for mac in macs if normalize_mac(mac)],
-            "source": "empty",
-            "keepDays": keep,
-        }
+        report = {**_empty_report(_iso_date(date), macs, basis="none"),
+                  "source": "empty", "keepDays": keep,
+                  "coverage": {"status": "unavailable", "hasRecords": False}}
+
+    # The hub DB only advances when the relay pushes; if the push pipeline
+    # stalls the App would sit on the same stale numbers forever. When the live
+    # relay has fresher *legacy* buckets for the same day, overlay them (both
+    # sides are absolute counters, so max-merge is idempotent). A minute-basis
+    # report is left alone: its numbers come from rows, and hour buckets cannot
+    # add a minute to a set.
+    if (live_report and not live_is_minutes
+            and live_report.get("date") == report.get("date")
+            and report.get("basis") != "minutes"):
+        merged = _merge_live_report(report, live_report)
+        if merged is not None:
+            report = merged
+
+    # 每条路径都必须带 generatedAt / lastSampleAt / stale / hasData：App 用
+    # ``optInt("todayMinutes", 0)`` 读数，缺字段就等于把「暂无数据」显示成 0 分钟。
+    if "generatedAt" not in report:
+        report = _decorate_report(report, None, _iso_date(date))
 
     if range_days > 1:
-        report["range"] = _range_series(store, macs, date, range_days)
+        report["range"] = _range_series(store, macs, date, range_days, router)
     return report
 
 
@@ -576,30 +2124,45 @@ def _range_series(
     macs: Sequence[str],
     date: str,
     days: int,
+    router: str = "",
 ) -> Dict[str, Any]:
     """Gap-filled daily totals ending on ``date``; empty when no store yet."""
     end = _date.fromisoformat(_iso_date(date))
     start = end - timedelta(days=max(0, days - 1))
     entries: List[Dict[str, Any]] = []
     apps: List[Dict[str, Any]] = []
+    traffic = _empty_traffic_block()
     if store is not None:
+        window = (start.isoformat(), end.isoformat(), router)
         try:
-            entries = store.daily_totals(macs, start.isoformat(), end.isoformat())
-            apps = store.app_totals(macs, start.isoformat(), end.isoformat())
+            entries = store.daily_totals(macs, *window)
+            apps = store.app_totals(macs, *window)
+            traffic = store.traffic_report(macs, *window)
         except Exception:
             entries, apps = [], []
     if not entries:
         # No store (or no rows): still hand back the full window of zeros so the
         # client renders a stable N-bar chart instead of collapsing.
         entries = [
-            {"date": day.isoformat(), "onlineSeconds": 0, "onlineMinutes": 0}
+            {"date": day.isoformat(), "onlineSeconds": 0, "onlineMinutes": 0,
+             "lateNightSeconds": 0, "lateNightMinutes": 0, "lateNightRanges": [],
+             "coverage": "no_record", "basis": "none"}
             for day in (start + timedelta(days=offset) for offset in range((end - start).days + 1))
         ]
+    recorded_days = sum(1 for entry in entries if entry.get("coverage") == "recorded")
     return {
         "days": entries,
         "apps": apps,
+        "traffic": traffic,
         "start": start.isoformat(),
         "end": end.isoformat(),
+        "coverage": {
+            "status": "recorded" if recorded_days == len(entries) else (
+                "partial" if recorded_days else "no_record"
+            ),
+            "recordedDays": recorded_days,
+            "requestedDays": len(entries),
+        },
     }
 
 
@@ -632,6 +2195,23 @@ def install_usage_aggregate(hub: Any, logger: Optional[Callable[..., Any]] = Non
     def _store() -> Optional[UsageAggregateStore]:
         return resolve_store(hub, log)
 
+    def _ingest_router(body: Dict[str, Any]) -> str:
+        """这批数据归属哪台路由器 —— 中继的 v3 body 里没有这个信息，只能 Hub 定。
+
+        中继只知道自己那台路由器，所以 Hub 侧的解析钩子（``CHILD_GUARD_USAGE_ROUTER``）
+        决定归属键；查询串或 body 里显式带了 router 时以它为准。写入与读取必须用
+        同一个键，否则 ``Ruijie BE72`` 和 ``be72`` 会变成两台互不相干的设备。
+        """
+        explicit = str(request.args.get("router") or body.get("router") or "").strip()
+        if not explicit:
+            resolver = getattr(hub, "CHILD_GUARD_USAGE_ROUTER", None)
+            if callable(resolver):
+                try:
+                    explicit = str(resolver(body) or "").strip()
+                except Exception:  # pragma: no cover - 归属失败退回默认键
+                    explicit = ""
+        return router_key(explicit)
+
     @bp.errorhandler(UsageAggregateError)
     def _handle_validation(error: UsageAggregateError):
         return jsonify({"ok": False, "errorCode": "invalid_request", "error": str(error)}), 400
@@ -645,17 +2225,40 @@ def install_usage_aggregate(hub: Any, logger: Optional[Callable[..., Any]] = Non
         if store is None:
             return jsonify({"ok": False, "error": "usage_store_unavailable"}), 503
         body = request.get_json(silent=True) or {}
+        version = _as_count(body.get("version"))
+        router = _ingest_router(body)
+        # v3 ships minute buckets + firmware traffic counters; v2 ships hour/app
+        # second sums.  Both are handled off the same body, so a router that is
+        # mid-upgrade (or one still on v2) keeps working unchanged.
+        minute_counts = {"deviceMinutes": 0, "appMinutes": 0, "traffic": 0, "meta": 0}
+        if version >= 3 or any(
+            body.get(key) for key in ("deviceMinutes", "appMinutes", "traffic")
+        ):
+            minute_counts = store.ingest_v3(body, router=router)
         hours = store.upsert_hourly(body.get("hours") or [])
         apps = store.upsert_daily_app(body.get("apps") or [])
+        sessions = store.upsert_sessions(body.get("sessions") or [])
+        keep_days = _as_count(body.get("keepDays")) or None
         removed = store.prune(
             today=body.get("today"),
-            hourly_keep_days=int(body.get("hourlyKeepDays") or DEFAULT_HOURLY_KEEP_DAYS),
-            daily_keep_days=int(body.get("dailyKeepDays") or DEFAULT_DAILY_KEEP_DAYS),
+            hourly_keep_days=_as_count(body.get("hourlyKeepDays"))
+            or keep_days or DEFAULT_HOURLY_KEEP_DAYS,
+            daily_keep_days=_as_count(body.get("dailyKeepDays"))
+            or keep_days or DEFAULT_DAILY_KEEP_DAYS,
+            minute_keep_days=_as_count(body.get("minuteKeepDays"))
+            or keep_days or DEFAULT_MINUTE_KEEP_DAYS,
         )
         # Aggregates are the only thing that reached disk; raw samples never did.
         return jsonify({
             "ok": True,
-            "upserted": {"hourly": hours, "dailyApp": apps},
+            "version": version,
+            "router": router,
+            "upserted": {
+                "hourly": hours, "dailyApp": apps, "sessions": sessions,
+                "deviceMinutes": minute_counts["deviceMinutes"],
+                "appMinutes": minute_counts["appMinutes"],
+                "traffic": minute_counts["traffic"],
+            },
             "pruned": removed,
             "updatedAt": int(time.time()),
         })
@@ -670,7 +2273,7 @@ def install_usage_aggregate(hub: Any, logger: Optional[Callable[..., Any]] = Non
         date = request.args.get("date") or _date.today().isoformat()
         raw_macs = request.args.get("macs") or ""
         macs = [item for item in raw_macs.replace(";", ",").split(",") if item.strip()]
-        payload = store.report(macs, date)
+        payload = store.report(macs, date, str(request.args.get("router") or ""))
         payload["ok"] = True
         payload["updatedAt"] = int(time.time())
         return jsonify(payload)
@@ -687,6 +2290,8 @@ def install_usage_aggregate(hub: Any, logger: Optional[Callable[..., Any]] = Non
             "ok": True,
             "hourlyKeepDays": DEFAULT_HOURLY_KEEP_DAYS,
             "dailyKeepDays": DEFAULT_DAILY_KEEP_DAYS,
+            "minuteKeepDays": DEFAULT_MINUTE_KEEP_DAYS,
+            "staleAfterSeconds": STALE_AFTER_SECONDS,
         })
         return jsonify(payload)
 

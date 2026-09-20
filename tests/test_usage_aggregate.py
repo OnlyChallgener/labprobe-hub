@@ -3,7 +3,7 @@
 from __future__ import annotations
 
 import sqlite3
-from datetime import date, timedelta
+from datetime import date, datetime, timedelta, timezone
 
 import pytest
 from flask import Flask
@@ -36,6 +36,29 @@ def daily(mac, day, app, secs, sessions=1, tx=0, rx=0):
     return {"date": day, "mac": mac, "app": app,
             "active_secs": secs, "sessions": sessions,
             "tx_bytes": tx, "rx_bytes": rx}
+
+
+def session(mac, day, app, start, end, active):
+    return {"date": day, "mac": mac, "app": app,
+            "startEpoch": start, "endEpoch": end, "activeSecs": active}
+
+
+def bj_minute(day: str, hour: int, minute: int = 0) -> int:
+    """Minute-start epoch for a Beijing wall-clock time (UTC-aligned, as v3 sends)."""
+    moment = datetime.strptime(f"{day} {hour:02d}:{minute:02d}", "%Y-%m-%d %H:%M")
+    return int(moment.replace(tzinfo=timezone(timedelta(hours=8))).timestamp())
+
+
+def device_minutes_row(mac, day, minutes):
+    return {"mac": mac, "date": day, "minutes": list(minutes)}
+
+
+def app_minutes_row(mac, day, app, minutes):
+    return {"mac": mac, "date": day, "app": app, "minutes": list(minutes)}
+
+
+def traffic_row(mac, day, tx, rx):
+    return {"mac": mac, "date": day, "txBytes": tx, "rxBytes": rx, "totalBytes": tx + rx}
 
 
 MAC_A = "da:1f:85:0c:19:fc"
@@ -132,6 +155,369 @@ class TestIngest:
         both = store.report([MAC_A, MAC_B], DAY)
         assert both["apps"][1]["minutes"] == 25  # 600 + 900 merged
 
+    def test_real_session_ranges_override_legacy_flow_count(self, store):
+        store.upsert_hourly([
+            hourly(MAC_A, DAY, 0, 120),
+            hourly(MAC_A, DAY, 1, 60),
+        ])
+        store.upsert_daily_app([daily(MAC_A, DAY, "微信", 180, sessions=99)])
+        rows = [
+            session(MAC_A, DAY, "微信", 1_789_700_000, 1_789_700_120, 60),
+            session(MAC_A, DAY, "微信", 1_789_700_600, 1_789_700_780, 120),
+        ]
+        assert store.upsert_sessions(rows) == 2
+        assert store.upsert_sessions(rows) == 2  # absolute re-push is idempotent
+
+        report = store.report([MAC_A], DAY)
+        app = report["apps"][0]
+        assert app["sessions"] == 2
+        assert app["sessionRanges"] == [
+            {"startEpoch": 1_789_700_000, "endEpoch": 1_789_700_120,
+             "activeSeconds": 60, "minutes": 1},
+            {"startEpoch": 1_789_700_600, "endEpoch": 1_789_700_780,
+             "activeSeconds": 120, "minutes": 2},
+        ]
+        assert report["lateNightSeconds"] == 180
+        assert report["lateNightMinutes"] == 3
+        assert report["coverage"] == {"status": "recorded", "hasRecords": True}
+
+    def test_session_extension_keeps_start_and_maxima(self, store):
+        start = 1_789_700_000
+        store.upsert_sessions([session(MAC_A, DAY, "抖音", start, start + 60, 60)])
+        store.upsert_sessions([session(MAC_A, DAY, "抖音", start, start + 240, 120)])
+        store.upsert_daily_app([daily(MAC_A, DAY, "抖音", 120, sessions=50)])
+        app = store.report([MAC_A], DAY)["apps"][0]
+        assert app["sessions"] == 1
+        assert app["sessionRanges"][0]["endEpoch"] == start + 240
+        assert app["sessionRanges"][0]["activeSeconds"] == 120
+
+
+class TestMinuteIngest:
+    """v3: minutes are a set, so re-delivery cannot double-count them."""
+
+    def test_repushing_the_same_minutes_changes_nothing(self, store):
+        minutes = [bj_minute(DAY, 8, 15), bj_minute(DAY, 8, 16), bj_minute(DAY, 8, 17)]
+        rows = [device_minutes_row(MAC_A, DAY, minutes),
+                app_minutes_row(MAC_A, DAY, "微信", minutes)]
+
+        assert store.insert_device_minutes(rows[:1]) == 3
+        assert store.insert_app_minutes(rows[1:]) == 3
+        first = store.report([MAC_A], DAY)
+        stats = store.stats()
+
+        # Duplicate delivery of the same three minutes, in the same row and in a
+        # separate one: the set insert ignores them all.
+        assert store.insert_device_minutes(rows[:1]) == 3
+        assert store.insert_device_minutes([
+            device_minutes_row(MAC_A, DAY, [minutes[0], minutes[1], minutes[2]])
+        ]) == 3
+        assert store.insert_app_minutes(rows[1:]) == 3
+        again = store.report([MAC_A], DAY)
+
+        assert again["onlineMinutes"] == first["onlineMinutes"] == 3
+        assert again["apps"][0]["minutes"] == 3
+        assert store.stats() == {**stats, "bytesOnDisk": stats["bytesOnDisk"]}
+
+    def test_a_minute_is_counted_whatever_happens_inside_it(self, store):
+        """5 s of traffic and 55 s of traffic in a minute are both one minute."""
+        store.insert_device_minutes([device_minutes_row(MAC_A, DAY, [bj_minute(DAY, 9)])])
+        assert store.report([MAC_A], DAY)["onlineMinutes"] == 1
+        assert store.report([MAC_A], DAY)["onlineSeconds"] == 60
+
+    def test_off_minute_epoch_lands_in_its_own_bucket(self, store):
+        start = bj_minute(DAY, 9)
+        store.insert_device_minutes([
+            device_minutes_row(MAC_A, DAY, [start + 5, start + 55, start + 60])
+        ])
+        assert store.report([MAC_A], DAY)["onlineMinutes"] == 2
+
+    def test_a_full_day_of_minutes_is_the_whole_day(self, store):
+        minutes = [bj_minute(DAY, 0) + offset * 60 for offset in range(24 * 60)]
+        assert store.insert_device_minutes([device_minutes_row(MAC_A, DAY, minutes)]) == 1440
+        report = store.report([MAC_A], DAY)
+        assert report["onlineMinutes"] == 1440
+        assert [row["minutes"] for row in report["hourly"]] == [60] * 24
+
+    def test_more_minutes_than_a_day_has_is_rejected(self, store):
+        minutes = [bj_minute(DAY, 0) + offset * 60 for offset in range(1441)]
+        with pytest.raises(UsageAggregateError):
+            store.insert_device_minutes([device_minutes_row(MAC_A, DAY, minutes)])
+
+    def test_minutes_are_per_mac_and_per_day(self, store):
+        store.insert_device_minutes([
+            device_minutes_row(MAC_A, DAY, [bj_minute(DAY, 8)]),
+            device_minutes_row(MAC_B, DAY, [bj_minute(DAY, 8)]),
+            device_minutes_row(MAC_A, "2026-09-17", [bj_minute("2026-09-17", 8)]),
+        ])
+        assert store.report([MAC_A], DAY)["onlineMinutes"] == 1
+        assert store.report([MAC_A, MAC_B], DAY)["onlineMinutes"] == 1, \
+            "one shared minute across two MACs is still one minute of the card"
+        assert store.report([MAC_A], "2026-09-17")["onlineMinutes"] == 1
+        assert store.report([MAC_A], "2026-09-16")["onlineMinutes"] == 0
+
+
+class TestMinuteReport:
+    def test_hourly_is_a_full_axis_of_real_counts(self, store):
+        morning = [bj_minute(DAY, 8, 15), bj_minute(DAY, 8, 16), bj_minute(DAY, 8, 17)]
+        store.insert_device_minutes([device_minutes_row(MAC_A, DAY, morning)])
+        report = store.report([MAC_A], DAY)
+
+        assert [row["hour"] for row in report["hourly"]] == list(range(24))
+        assert sum(row["minutes"] for row in report["hourly"]) == report["onlineMinutes"] == 3
+        assert report["onlineSeconds"] == 180
+        assert report["hourly"][8] == {"hour": 8, "minutes": 3, "txBytes": 0, "rxBytes": 0}
+        assert report["hourly"][9]["minutes"] == 0, "an empty hour is 0, never invented"
+        assert report["basis"] == "minutes"
+
+    def test_hour_binning_uses_beijing_time_not_the_hub_clock(self, store):
+        # 23:30 Beijing on the requested day is hour 23 no matter what UTC says.
+        store.insert_device_minutes([device_minutes_row(
+            MAC_A, DAY, [bj_minute(DAY, 23, 30), bj_minute(DAY, 0, 5)])])
+        report = store.report([MAC_A], DAY)
+        assert report["hourly"][0]["minutes"] == 1
+        assert report["hourly"][23]["minutes"] == 1
+        assert report["hourly"][1]["minutes"] == 0
+
+    def test_consecutive_minutes_form_one_range_and_gaps_split_them(self, store):
+        run = [bj_minute(DAY, 8, 15), bj_minute(DAY, 8, 16), bj_minute(DAY, 8, 17)]
+        store.insert_app_minutes([app_minutes_row(MAC_A, DAY, "抖音", run)])
+        app = store.report([MAC_A], DAY)["apps"][0]
+        assert app["minutes"] == 3
+        assert app["sessions"] == 1
+        assert app["sessionRanges"] == [{
+            "startEpoch": run[0], "endEpoch": run[-1] + 60, "activeSeconds": 180, "minutes": 3,
+        }]
+
+        gapped = [bj_minute(DAY, 8, 15), bj_minute(DAY, 8, 25), bj_minute(DAY, 8, 35)]
+        store.insert_app_minutes([app_minutes_row(MAC_B, DAY, "抖音", gapped)])
+        both = store.report([MAC_B], DAY)["apps"][0]
+        assert both["minutes"] == 3
+        assert both["sessions"] == 3, "60-second steps only; a gap must split the run"
+        assert [row["minutes"] for row in both["sessionRanges"]] == [1, 1, 1]
+        assert [row["endEpoch"] - row["startEpoch"] for row in both["sessionRanges"]] == [60] * 3
+
+    def test_apps_have_no_invented_bytes_on_the_minute_basis(self, store):
+        store.insert_app_minutes([
+            app_minutes_row(MAC_A, DAY, "微信", [bj_minute(DAY, 12), bj_minute(DAY, 12, 1)]),
+            app_minutes_row(MAC_A, DAY, "小红书", [bj_minute(DAY, 13)]),
+        ])
+        store.upsert_daily_app([daily(MAC_A, DAY, "微信", 9_999, tx=9_999, rx=8_888)])
+        report = store.report([MAC_A], DAY)
+        assert [row["app"] for row in report["apps"]] == ["微信", "小红书"]
+        assert all(row["txBytes"] == 0 and row["rxBytes"] == 0 for row in report["apps"])
+        assert [row["minutes"] for row in report["apps"]] == [2, 1]
+
+    def test_late_night_boundary_is_six_am_beijing(self, store):
+        store.insert_device_minutes([device_minutes_row(MAC_A, DAY, [
+            bj_minute(DAY, 5, 59),   # late night
+            bj_minute(DAY, 5, 58),   # late night
+            bj_minute(DAY, 6, 0),    # not late night
+            bj_minute(DAY, 23, 59),  # not late night: the window ends at 06:00
+        ])])
+        store.insert_app_minutes([app_minutes_row(MAC_A, DAY, "微信", [
+            bj_minute(DAY, 5, 58), bj_minute(DAY, 5, 59), bj_minute(DAY, 6, 0),
+        ])])
+        report = store.report([MAC_A], DAY)
+        assert report["lateNightMinutes"] == 2
+        assert report["lateNightSeconds"] == 120
+        assert report["onlineMinutes"] == 4
+
+        days = store.daily_totals([MAC_A], DAY, DAY)
+        assert days[0]["lateNightRanges"] == [{
+            "app": "微信", "startEpoch": bj_minute(DAY, 5, 58),
+            "endEpoch": bj_minute(DAY, 6, 0), "minutes": 2,
+        }], "the 06:00 minute is outside the window and splits the range"
+
+    def test_empty_day_has_no_bar_array(self, store):
+        report = store.report([MAC_A], DAY)
+        assert report["hourly"] == []
+        assert report["apps"] == []
+        assert report["basis"] == "none"
+        assert report["coverage"] == {"status": "no_record", "hasRecords": False}
+
+
+class TestDeviceTraffic:
+    """Device traffic is the firmware counter, never a sum of flow bytes."""
+
+    def test_traffic_is_max_merged_per_column(self, store):
+        store.upsert_device_traffic([traffic_row(MAC_A, DAY, 1_000, 2_000)])
+        report = store.report([MAC_A], DAY)["traffic"]
+        assert report["totalBytes"] == report["txBytes"] + report["rxBytes"] == 3_000
+
+        # Re-delivery and a lower value change nothing; a higher one is kept.
+        store.upsert_device_traffic([traffic_row(MAC_A, DAY, 1_000, 2_000)])
+        store.upsert_device_traffic([traffic_row(MAC_A, DAY, 900, 1_500)])
+        assert store.report([MAC_A], DAY)["traffic"]["totalBytes"] == 3_000
+
+        store.upsert_device_traffic([traffic_row(MAC_A, DAY, 1_500, 2_000)])
+        merged = store.report([MAC_A], DAY)["traffic"]
+        assert (merged["txBytes"], merged["rxBytes"]) == (1_500, 2_000)
+        assert merged["totalBytes"] == 3_500
+
+    def test_traffic_sums_the_devices_macs_and_lists_days(self, store):
+        store.upsert_device_traffic([
+            traffic_row(MAC_A, DAY, 10, 20),
+            traffic_row(MAC_B, DAY, 5, 7),
+            traffic_row(MAC_A, "2026-09-17", 1, 1),
+        ])
+        window = store.traffic_report([MAC_A, MAC_B], "2026-09-17", DAY)
+        assert window["txBytes"] == 16
+        assert window["rxBytes"] == 28
+        assert window["totalBytes"] == 44
+        assert window["daily"] == [
+            {"date": "2026-09-17", "txBytes": 1, "rxBytes": 1, "totalBytes": 2},
+            {"date": DAY, "txBytes": 15, "rxBytes": 27, "totalBytes": 42},
+        ]
+        for day in window["daily"]:
+            assert day["totalBytes"] == day["txBytes"] + day["rxBytes"]
+
+    def test_traffic_is_zero_without_counters_even_if_flow_bytes_exist(self, store):
+        # The legacy hourly bytes are RDPI flow sums; they must not surface as
+        # the device total, and per-app bytes never add up to one either.
+        store.upsert_hourly([hourly(MAC_A, DAY, 12, 600, tx=500_000, rx=900_000)])
+        store.upsert_daily_app([daily(MAC_A, DAY, "微信", 600, tx=500_000, rx=900_000)])
+        traffic = store.report([MAC_A], DAY)["traffic"]
+        assert traffic == {"txBytes": 0, "rxBytes": 0, "totalBytes": 0, "daily": []}
+
+    def test_traffic_block_is_present_on_both_bases(self, store):
+        store.insert_device_minutes([device_minutes_row(MAC_A, DAY, [bj_minute(DAY, 8)])])
+        store.upsert_device_traffic([traffic_row(MAC_A, DAY, 3, 4)])
+        minute_day = store.report([MAC_A], DAY)
+        store.upsert_hourly([hourly(MAC_A, "2026-09-17", 8, 120)])
+        legacy_day = store.report([MAC_A], "2026-09-17")
+        assert minute_day["basis"] == "minutes"
+        assert legacy_day["basis"] == "legacy"
+        for report in (minute_day, legacy_day):
+            assert report["traffic"]["totalBytes"] == report["traffic"]["txBytes"] + \
+                report["traffic"]["rxBytes"]
+        assert minute_day["traffic"]["totalBytes"] == 7
+        assert legacy_day["traffic"]["totalBytes"] == 0
+
+
+class TestMinuteAndLegacyNeverMix:
+    def test_minute_rows_shadows_the_legacy_numbers_for_the_same_day(self, store):
+        """A day with minute rows must not also add its old second sums."""
+        store.upsert_hourly([hourly(MAC_A, DAY, 8, 40 * 60)])
+        store.upsert_daily_app([daily(MAC_A, DAY, "微信", 40 * 60, sessions=9)])
+        store.insert_device_minutes([device_minutes_row(
+            MAC_A, DAY, [bj_minute(DAY, 8), bj_minute(DAY, 8, 1)])])
+        store.insert_app_minutes([app_minutes_row(MAC_A, DAY, "微信", [bj_minute(DAY, 8)])])
+
+        report = store.report([MAC_A], DAY)
+        assert report["basis"] == "minutes"
+        assert report["onlineMinutes"] == 2, "not 2 + the legacy 40 minutes"
+        assert report["onlineSeconds"] == 120
+        assert report["apps"][0]["minutes"] == 1
+        assert report["apps"][0]["sessions"] == 1
+
+    def test_legacy_only_days_still_report(self, store):
+        store.upsert_hourly([hourly(MAC_A, DAY, 8, 5 * 60)])
+        report = store.report([MAC_A], DAY)
+        assert report["basis"] == "legacy"
+        assert report["onlineMinutes"] == 5
+        assert report["onlineSeconds"] == 300
+
+    def test_range_days_pick_one_basis_each(self, store):
+        store.upsert_hourly([hourly(MAC_A, "2026-09-17", 8, 30 * 60)])
+        store.insert_device_minutes([device_minutes_row(
+            MAC_A, "2026-09-17", [bj_minute("2026-09-17", 8) + offset * 60
+                                  for offset in range(4)])])
+        store.insert_device_minutes([device_minutes_row(
+            MAC_A, DAY, [bj_minute(DAY, 21), bj_minute(DAY, 21, 1)])])
+        days = {row["date"]: row for row in store.daily_totals([MAC_A], "2026-09-16", DAY)}
+        assert days["2026-09-16"] == {
+            "date": "2026-09-16", "onlineSeconds": 0, "onlineMinutes": 0,
+            "lateNightSeconds": 0, "lateNightMinutes": 0, "lateNightRanges": [],
+            "coverage": "no_record", "basis": "none",
+        }
+        assert days["2026-09-17"]["onlineMinutes"] == 4
+        assert days["2026-09-17"]["basis"] == "minutes"
+        assert days[DAY]["onlineMinutes"] == 2
+        assert days[DAY]["basis"] == "minutes"
+
+    def test_range_apps_never_count_a_minute_day_twice(self, store):
+        store.upsert_daily_app([
+            daily(MAC_A, DAY, "微信", 40 * 60, sessions=9),
+            daily(MAC_A, "2026-09-17", "微信", 10 * 60, sessions=2),
+        ])
+        store.insert_app_minutes([app_minutes_row(
+            MAC_A, DAY, "微信", [bj_minute(DAY, 8), bj_minute(DAY, 9)])])
+        apps = store.app_totals([MAC_A], "2026-09-17", DAY)
+        assert apps[0]["app"] == "微信"
+        assert apps[0]["minutes"] == 12, "2 minutes from the v3 day + 10 from the legacy day"
+        assert apps[0]["sessions"] == 4, "two one-minute v3 runs + the legacy day's 2"
+        assert apps[0]["txBytes"] == 0
+
+
+class TestComposeMinuteSources:
+    def test_minute_day_is_labelled_and_never_merged_with_live_hours(self, store):
+        store.insert_device_minutes([device_minutes_row(
+            MAC_A, DAY, [bj_minute(DAY, 8), bj_minute(DAY, 8, 1)])])
+        report = compose_device_report(
+            store, [MAC_A], DAY,
+            live=lambda: {"date": DAY, "hourly": [{"hour": 8, "minutes": 500}],
+                          "apps": [{"app": "微信", "minutes": 500}]},
+            now=datetime(2026, 9, 18, 8, 30),
+        )
+        assert report["source"] == "hub+minutes"
+        assert report["onlineMinutes"] == 2, "hour buckets cannot add minutes to a set"
+        assert report["apps"] == []
+
+    def test_legacy_day_may_still_be_topped_up_by_the_relay(self, store):
+        store.upsert_hourly([hourly(MAC_A, DAY, 8, 60)])
+        report = compose_device_report(
+            store, [MAC_A], DAY,
+            live=lambda: {"date": DAY,
+                          "hourly": [{"hour": 9, "minutes": 5}],
+                          "apps": []},
+            # Late in the day, so the 08:00 hub row is stale and the relay is
+            # worth asking for the missing hour.
+            now=datetime(2026, 9, 18, 23, 0),
+        )
+        assert report["source"] == "hub+live"
+        assert report["onlineMinutes"] == 6
+
+    def test_a_v3_live_report_keeps_the_minute_shape(self, store):
+        start = bj_minute(DAY, 8)
+        report = compose_device_report(
+            store, [MAC_A], DAY,
+            live=lambda: {
+                "version": 3, "date": DAY, "onlineMinutes": 3,
+                "todayTxBytes": 1_000, "todayRxBytes": 2_000, "todayTotalBytes": 3_000,
+                "macs": [MAC_A],
+                "apps": [{"app": "微信", "minutes": 3, "ranges": [
+                    {"startEpoch": start, "endEpoch": start + 180, "minutes": 3}]}],
+            },
+        )
+        assert report["source"] == "relay"
+        assert report["basis"] == "minutes"
+        assert report["onlineMinutes"] == 3
+        assert report["onlineSeconds"] == 180
+        assert report["hourly"] == [], "the live reply has no hour detail to show"
+        assert report["apps"][0]["sessionRanges"][0]["activeSeconds"] == 180
+        assert report["traffic"] == {
+            "txBytes": 1_000, "rxBytes": 2_000, "totalBytes": 3_000,
+            "daily": [{"date": DAY, "txBytes": 1_000, "rxBytes": 2_000, "totalBytes": 3_000}],
+        }
+
+    def test_empty_report_exposes_the_new_keys(self, store):
+        report = compose_device_report(store, [MAC_A], DAY, live=lambda: None)
+        assert report["source"] == "empty"
+        assert report["basis"] == "none"
+        assert report["traffic"] == {"txBytes": 0, "rxBytes": 0, "totalBytes": 0, "daily": []}
+        assert report["coverage"] == {"status": "unavailable", "hasRecords": False}
+
+    def test_range_carries_a_traffic_window(self, store):
+        store.insert_device_minutes([device_minutes_row(MAC_A, DAY, [bj_minute(DAY, 8)])])
+        store.upsert_device_traffic([
+            traffic_row(MAC_A, DAY, 100, 200),
+            traffic_row(MAC_A, "2026-09-17", 1, 2),
+        ])
+        report = compose_device_report(store, [MAC_A], DAY, range_days=2)
+        assert report["range"]["traffic"]["totalBytes"] == 303
+        assert [row["date"] for row in report["range"]["traffic"]["daily"]] == [
+            "2026-09-17", DAY]
+
 
 class TestInputValidation:
     @pytest.mark.parametrize("bad", ["2026-9-18", "18/09/2026", "", "not-a-date", "2026-13-01"])
@@ -152,6 +538,16 @@ class TestInputValidation:
         report = store.report([MAC_A], DAY)
         assert report["onlineSeconds"] == 0
         assert report["hourly"][0]["txBytes"] == 0
+
+    def test_impossible_session_range_is_rejected(self, store):
+        with pytest.raises(UsageAggregateError):
+            store.upsert_sessions([
+                session(MAC_A, DAY, "微信", 100, 90, 10),
+            ])
+        with pytest.raises(UsageAggregateError):
+            store.upsert_sessions([
+                session(MAC_A, DAY, "微信", 100, 110, 11),
+            ])
 
 
 class TestReportFiltering:
@@ -191,7 +587,8 @@ class TestRetention:
         ])
 
         removed = store.prune(today=fresh, hourly_keep_days=400, daily_keep_days=1095)
-        assert removed == {"hourly": 1, "dailyApp": 1}
+        assert removed == {"hourly": 1, "dailyApp": 1, "sessions": 0,
+                           "deviceMinutes": 0, "appMinutes": 0, "traffic": 0}
 
         # the 100-day-old hourly row survives a 400-day hourly window
         assert store.report([MAC_A], recent_hourly)["onlineSeconds"] == 60
@@ -200,7 +597,8 @@ class TestRetention:
     def test_prune_is_a_noop_within_the_window(self, store):
         store.upsert_hourly([hourly(MAC_A, DAY, 12, 60)])
         assert store.prune(today=DAY, hourly_keep_days=400, daily_keep_days=1095) == {
-            "hourly": 0, "dailyApp": 0,
+            "hourly": 0, "dailyApp": 0, "sessions": 0,
+            "deviceMinutes": 0, "appMinutes": 0, "traffic": 0,
         }
 
     def test_ten_days_keeps_today_plus_nine(self, store):
@@ -228,8 +626,10 @@ class TestRetention:
         assert DEFAULT_HOURLY_KEEP_DAYS == 10
         assert DEFAULT_DAILY_KEEP_DAYS == 10
 
-    def test_keep_days_helper_reports_both_windows(self):
-        assert default_keep_days() == {"hourly": 10, "dailyApp": 10}
+    def test_keep_days_helper_reports_every_window(self):
+        # ``minute`` is the v3 window; the App's date picker clamps to it, so it
+        # has to be reported next to the two legacy summaries.
+        assert default_keep_days() == {"hourly": 10, "dailyApp": 10, "minute": 10}
 
 
 class TestComposeDeviceReport:
@@ -248,8 +648,9 @@ class TestComposeDeviceReport:
             calls.append(True)
             return {"hourly": [{"hour": 20, "minutes": 1}], "apps": []}
 
-        report = compose_device_report(store, [MAC_A], DAY, live=live)
-        assert report["source"] == "hub"
+        report = compose_device_report(store, [MAC_A], DAY, live=live,
+                                       now=datetime(2026, 9, 18, 20, 30))
+        assert report["source"] == "hub+legacy", "v2 rows are labelled as such"
         assert report["onlineSeconds"] == 600
         assert calls == [], "the router must not be queried when the Hub has data"
 
@@ -270,7 +671,7 @@ class TestComposeDeviceReport:
         )
         assert report["source"] == "relay"
         assert report["onlineMinutes"] == 2
-        assert report["keepDays"] == {"hourly": 10, "dailyApp": 10}
+        assert default_keep_days() == report["keepDays"]
 
     def test_returns_an_empty_report_rather_than_an_error(self, store):
         report = compose_device_report(store, [MAC_A], DAY, live=lambda: None)
@@ -327,6 +728,21 @@ class TestRangeSeries:
         assert minutes["2026-09-18"] == 10
         assert minutes["2026-09-15"] == 20
         assert minutes["2026-09-14"] == 0, "a quiet day must be present as zero"
+        by_date = {day["date"]: day for day in days}
+        assert by_date["2026-09-18"]["coverage"] == "recorded"
+        assert by_date["2026-09-14"]["coverage"] == "no_record"
+        assert report["range"]["coverage"]["status"] == "partial"
+
+    def test_range_days_include_late_night_minutes(self, store):
+        # 家长请注意 window is 00:00-06:00 Beijing time; hour 23 is not late night.
+        store.upsert_hourly([
+            hourly(MAC_A, "2026-09-18", 1, 600),
+            hourly(MAC_A, "2026-09-18", 14, 1_200),
+            hourly(MAC_A, "2026-09-17", 5, 300),
+        ])
+        days = compose_device_report(store, [MAC_A], DAY, range_days=2)["range"]["days"]
+        assert days[0]["lateNightMinutes"] == 5
+        assert days[1]["lateNightMinutes"] == 10
 
     def test_range_is_absent_unless_requested(self, store):
         store.upsert_hourly([hourly(MAC_A, DAY, 20, 600)])
@@ -443,12 +859,14 @@ class TestBlueprint:
         response = http.post("/api/router/child-guard/usage/ingest", json={
             "hours": [{"date": DAY, "mac": MAC_A, "hour": 12, "activeSecs": 3000}],
             "apps": [{"date": DAY, "mac": MAC_A, "app": "微信", "activeSecs": 4140, "sessions": 9}],
+            "sessions": [session(MAC_A, DAY, "微信", 1_789_700_000, 1_789_700_060, 60)],
             "today": DAY,
         })
         assert response.status_code == 200
         body = response.get_json()
         assert body["ok"] is True
-        assert body["upserted"] == {"hourly": 1, "dailyApp": 1}
+        assert body["upserted"] == {"hourly": 1, "dailyApp": 1, "sessions": 1,
+                                    "deviceMinutes": 0, "appMinutes": 0, "traffic": 0}
 
         report = http.get(
             f"/api/router/child-guard/usage/report?date={DAY}&macs={MAC_A}"
@@ -457,6 +875,94 @@ class TestBlueprint:
         assert report["onlineMinutes"] == 50
         assert report["apps"][0]["app"] == "微信"
         assert report["apps"][0]["minutes"] == 69
+        assert report["apps"][0]["sessions"] == 1
+        assert report["apps"][0]["sessionRanges"][0]["activeSeconds"] == 60
+
+    def test_v3_ingest_then_report_end_to_end(self, client):
+        """A whole v3 push over HTTP: minutes in, minutes + traffic out."""
+        _hub, http = client
+        body = {
+            "version": 3,
+            "keepDays": 10,
+            "today": DAY,
+            "deviceMinutes": [
+                device_minutes_row(MAC_A, DAY, [bj_minute(DAY, 8, m) for m in (15, 16, 17)]),
+            ],
+            "appMinutes": [
+                app_minutes_row(MAC_A, DAY, "抖音", [bj_minute(DAY, 8, m) for m in (15, 16, 17)]),
+            ],
+            "traffic": [traffic_row(MAC_A, DAY, 1_500_000, 2_500_000)],
+        }
+        response = http.post("/api/router/child-guard/usage/ingest", json=body)
+        assert response.status_code == 200
+        pushed = response.get_json()
+        assert pushed["version"] == 3
+        assert pushed["upserted"] == {"hourly": 0, "dailyApp": 0, "sessions": 0,
+                                      "deviceMinutes": 3, "appMinutes": 3, "traffic": 1}
+        assert pushed["pruned"]["deviceMinutes"] == 0
+
+        report = http.get(
+            f"/api/router/child-guard/usage/report?date={DAY}&macs={MAC_A}"
+        ).get_json()
+        assert report["basis"] == "minutes"
+        assert report["onlineMinutes"] == 3
+        assert report["onlineSeconds"] == 180
+        assert report["hourly"][8]["minutes"] == 3
+        assert report["hourly"][9]["minutes"] == 0
+        assert report["apps"] == [{
+            "app": "抖音", "minutes": 3, "sessions": 1,
+            "sessionRanges": [{
+                "startEpoch": bj_minute(DAY, 8, 15),
+                "endEpoch": bj_minute(DAY, 8, 18),
+                "activeSeconds": 180, "minutes": 3,
+            }],
+            "txBytes": 0, "rxBytes": 0,
+        }]
+        assert report["traffic"] == {
+            "txBytes": 1_500_000, "rxBytes": 2_500_000, "totalBytes": 4_000_000,
+            "daily": [{"date": DAY, "txBytes": 1_500_000, "rxBytes": 2_500_000,
+                       "totalBytes": 4_000_000}],
+        }
+
+        # Relay retries: the identical push must not move a single number.
+        retry = http.post("/api/router/child-guard/usage/ingest", json=body).get_json()
+        assert retry["upserted"]["deviceMinutes"] == 3
+        again = http.get(
+            f"/api/router/child-guard/usage/report?date={DAY}&macs={MAC_A}"
+        ).get_json()
+        assert again["onlineMinutes"] == 3
+        assert again["traffic"]["totalBytes"] == 4_000_000
+        status = http.get("/api/router/child-guard/usage/status").get_json()
+        assert status["deviceMinuteRows"] == 3
+        assert status["appMinuteRows"] == 3
+        assert status["trafficRows"] == 1
+
+    def test_v3_and_v2_bodies_share_one_endpoint(self, client):
+        """A router still on v2 posts hours and keeps getting the legacy shape."""
+        _hub, http = client
+        http.post("/api/router/child-guard/usage/ingest", json={
+            "version": 2,
+            "hours": [{"date": DAY, "mac": MAC_A, "hour": 12, "activeSecs": 600}],
+            "today": DAY,
+        })
+        report = http.get(
+            f"/api/router/child-guard/usage/report?date={DAY}&macs={MAC_A}"
+        ).get_json()
+        assert report["basis"] == "legacy"
+        assert report["onlineMinutes"] == 10
+        # The legacy shape is untouched: sparse hour rows, exactly as before v3.
+        assert report["hourly"] == [{"hour": 12, "minutes": 10,
+                                     "txBytes": 0, "rxBytes": 0}]
+        assert report["traffic"]["totalBytes"] == 0
+
+    def test_ingest_rejects_bad_minute_payload(self, client):
+        _hub, http = client
+        response = http.post("/api/router/child-guard/usage/ingest", json={
+            "version": 3,
+            "deviceMinutes": [{"mac": MAC_A, "date": DAY, "minutes": "not-a-list"}],
+        })
+        assert response.status_code == 400
+        assert response.get_json()["errorCode"] == "invalid_request"
 
     def test_ingest_rejects_bad_payload(self, client):
         _hub, http = client
@@ -465,7 +971,6 @@ class TestBlueprint:
         })
         assert response.status_code == 400
         assert response.get_json()["errorCode"] == "invalid_request"
-
     def test_unauthorized_is_rejected(self, client):
         hub, http = client
         hub.hook_ok = False
@@ -488,3 +993,319 @@ class TestBlueprint:
         _hub, http = client
         body = http.get(f"/api/router/child-guard/usage/report?macs={MAC_A}").get_json()
         assert body["date"] == date.today().isoformat()
+
+
+# ---------------------------------------------------------------------------
+# v3 分钟存储 / 设备目录 / overview / 页面读取的纯度
+# ---------------------------------------------------------------------------
+
+import time  # noqa: E402
+
+from usage_aggregate import (  # noqa: E402
+    ATTENTION_NOTICE_MINUTES,
+    MINUTE_SECONDS,
+    STALE_AFTER_SECONDS,
+    build_guard_overview,
+)
+
+UID = "0123456789ABCDEF0123456789ABCDEF"
+ROUTER = "be72"
+
+
+def beijing_date(epoch: int) -> str:
+    """The router-local day an epoch falls on (the Hub box may be elsewhere)."""
+    return time.strftime("%Y-%m-%d", time.gmtime(int(epoch) + 8 * 3600))
+
+
+def floor_minute(epoch: int) -> int:
+    return int(epoch) - int(epoch) % MINUTE_SECONDS
+
+
+def v3_body(day, minutes, *, app_minutes=None, traffic=None, generated=None,
+            mac=MAC_A):
+    """A relay-shaped v3 push: 分钟桶 + 固件日字节数。"""
+    stamp = int(generated if generated is not None else
+                (max(minutes) + 30 if minutes else time.time()))
+    return {
+        "version": 3,
+        "keepDays": 10,
+        "generatedAt": stamp,
+        "deviceMinutes": [{"mac": mac, "date": day, "minutes": list(minutes)}],
+        "appMinutes": ([{"mac": mac, "date": day, "app": "微信",
+                         "minutes": list(app_minutes)}]
+                       if app_minutes is not None else []),
+        "traffic": (traffic if traffic is not None
+                    else [{"mac": mac, "date": day, "txBytes": 123,
+                           "rxBytes": 456, "totalBytes": 579}]),
+    }
+
+
+class TestV3IngestStorage:
+    """What the relay's v3 push does to the tables, and what it cannot do."""
+
+    def test_repeated_push_never_double_counts_a_minute(self, store):
+        day = beijing_date(bj_minute(DAY, 10))
+        minutes = [bj_minute(DAY, 10), bj_minute(DAY, 10) + 60]
+        body = v3_body(day, minutes)
+        store.ingest_v3(body, router=ROUTER)
+        first = store.report([MAC_A], day, ROUTER)
+        for _ in range(3):
+            store.ingest_v3(body, router=ROUTER)
+        again = store.report([MAC_A], day, ROUTER)
+        assert again["onlineMinutes"] == first["onlineMinutes"] == 2
+        assert again["todayMinutes"] == 2
+
+    def test_one_new_minute_moves_today_minutes_by_exactly_one(self, store):
+        day = beijing_date(bj_minute(DAY, 10))
+        store.ingest_v3(v3_body(day, [bj_minute(DAY, 10)]), router=ROUTER)
+        assert store.report([MAC_A], day, ROUTER)["todayMinutes"] == 1
+        store.ingest_v3(v3_body(day, [bj_minute(DAY, 10) + 120]), router=ROUTER)
+        assert store.report([MAC_A], day, ROUTER)["todayMinutes"] == 2
+
+    def test_traffic_days_are_never_summed_into_a_bigger_total(self, store):
+        day = beijing_date(bj_minute(DAY, 10))
+        rows = [{"mac": MAC_A, "date": day, "txBytes": 1000, "rxBytes": 2000,
+                 "totalBytes": 3000}]
+        store.ingest_v3(v3_body(day, [bj_minute(DAY, 10)], traffic=rows), router=ROUTER)
+        # A re-delivery and a *smaller* counter (router reboot) must both leave
+        # the day alone; only real growth moves it.
+        store.ingest_v3(v3_body(day, [], traffic=rows), router=ROUTER)
+        store.ingest_v3(v3_body(day, [], traffic=[{
+            "mac": MAC_A, "date": day, "txBytes": 1, "rxBytes": 1, "totalBytes": 2}]),
+            router=ROUTER)
+        report = store.report([MAC_A], day, ROUTER)
+        assert report["traffic"]["txBytes"] == 1000
+        assert report["traffic"]["rxBytes"] == 2000
+        assert report["traffic"]["totalBytes"] == 3000
+        store.ingest_v3(v3_body(day, [], traffic=[{
+            "mac": MAC_A, "date": day, "txBytes": 1500, "rxBytes": 2000,
+            "totalBytes": 3500}]), router=ROUTER)
+        assert store.report([MAC_A], day, ROUTER)["traffic"]["totalBytes"] == 3500
+
+    def test_sample_time_is_recorded_per_device(self, store):
+        day = beijing_date(bj_minute(DAY, 10))
+        newest = bj_minute(DAY, 10) + 60
+        store.ingest_v3(v3_body(day, [bj_minute(DAY, 10), newest]), router=ROUTER)
+        snapshot = store.guard_snapshot(ROUTER, [MAC_A], day)
+        # 每台设备的 meta 是「它自己的数据推进到哪一分钟」，取分钟本身；载荷的
+        # generatedAt 记在路由器那一行上，所以下一条才是 newest + 30。
+        assert snapshot["metaByMac"][MAC_A] == newest
+        assert snapshot["latestByMac"][MAC_A] == newest
+        assert snapshot["routerLastSampleAt"] == newest + 30
+
+    def test_two_routers_keep_their_own_rows(self, store):
+        day = beijing_date(bj_minute(DAY, 10))
+        store.ingest_v3(v3_body(day, [bj_minute(DAY, 10)]), router=ROUTER)
+        store.ingest_v3(v3_body(day, [bj_minute(DAY, 10), bj_minute(DAY, 11)],
+                                mac=MAC_B), router="other")
+        assert store.report([MAC_A], day, ROUTER)["todayMinutes"] == 1
+        assert store.report([MAC_B], day, "other")["todayMinutes"] == 2
+        # A router name the Hub has never filed rows under still reads, because
+        # an empty result is more likely a naming mismatch than a real zero.
+        assert store.report([MAC_A], day, "Ruijie BE72")["todayMinutes"] == 1
+
+
+class TestV3ReportFields:
+    """The keys the App reads with silent defaults must always be there."""
+
+    def test_report_states_freshness_and_data_presence(self, store):
+        now = floor_minute(time.time())
+        day = beijing_date(now)
+        store.ingest_v3(v3_body(day, [now, now - 60], generated=now), router=ROUTER)
+        report = store.report([MAC_A], day, ROUTER)
+        assert report["hasData"] is True
+        assert report["todayMinutes"] == report["onlineMinutes"] == 2
+        assert report["lastSampleAt"] == now
+        assert report["stale"] is False
+        assert report["activeNow"] is True
+        assert report["generatedAt"] >= now
+
+    def test_a_day_with_nothing_recorded_says_no_data_not_zero_minutes(self, store):
+        report = store.report([MAC_A], "2026-09-18", ROUTER)
+        assert report["hasData"] is False
+        assert report["todayMinutes"] == 0
+        assert report["onlineMinutes"] == 0
+
+    def test_a_stalled_pipeline_is_stale_not_zero_minutes(self, store):
+        now = floor_minute(time.time())
+        day = beijing_date(now)
+        idle = bj_minute(day, 0)  # 午夜的一格：数据是真的，但早已不再推进
+        if now - idle < STALE_AFTER_SECONDS:  # pragma: no cover - 午夜三分钟内
+            pytest.skip("too close to midnight to distinguish stale")
+        store.ingest_v3(v3_body(day, [idle], generated=idle), router=ROUTER)
+        report = store.report([MAC_A], day, ROUTER)
+        assert report["hasData"] is True
+        assert report["todayMinutes"] == 1
+        assert report["stale"] is True
+
+    def test_a_past_day_is_never_marked_stale(self, store):
+        store.insert_device_minutes([device_minutes_row(
+            MAC_A, DAY, [bj_minute(DAY, 20)])])
+        report = store.report([MAC_A], DAY)
+        assert report["stale"] is False
+        assert report["activeNow"] is False
+        assert report["hasData"] is True
+
+    def test_the_minute_window_is_what_callers_clamp_to(self):
+        assert default_keep_days()["minute"] >= 1
+        assert set(default_keep_days()) == {"hourly", "dailyApp", "minute"}
+
+
+class TestGuardDeviceDirectory:
+    """uid -> MACs/名称/封禁 lives in SQLite so reads never ask the router."""
+
+    def test_devices_round_trip(self, store):
+        assert store.guard_devices(ROUTER) == []
+        store.remember_guard_devices(ROUTER, [
+            {"uid": UID.lower(), "macs": ["DA-1F-85-0C-19-FC"], "name": "电脑"},
+        ])
+        rows = store.guard_devices(ROUTER)
+        assert [row["uid"] for row in rows] == [UID]
+        assert rows[0]["macs"] == [MAC_A]
+        assert rows[0]["name"] == "电脑"
+        assert rows[0]["blocked"] is False
+        assert store.guard_device(ROUTER, UID.lower())["macs"] == [MAC_A]
+        assert store.guard_device(ROUTER, "another") is None
+
+    def test_a_blocked_only_update_keeps_the_identity(self, store):
+        store.remember_guard_devices(ROUTER, [
+            {"uid": UID, "macs": [MAC_A], "name": "电脑"}])
+        store.remember_guard_devices(ROUTER, [
+            {"uid": UID, "blocked": True, "blockedUntilEpoch": 1789862400}])
+        row = store.guard_device(ROUTER, UID)
+        assert (row["macs"], row["name"]) == ([MAC_A], "电脑")
+        assert row["blocked"] is True and row["blockedUntilEpoch"] == 1789862400
+        store.remember_guard_devices(ROUTER, [{"uid": UID, "blocked": False}])
+        assert store.guard_device(ROUTER, UID)["blocked"] is False
+
+    def test_devices_are_scoped_per_router(self, store):
+        store.remember_guard_devices(ROUTER, [{"uid": UID, "macs": [MAC_A]}])
+        assert store.guard_devices("other") == []
+
+    def test_forget_drops_only_that_uid(self, store):
+        store.remember_guard_devices(ROUTER, [
+            {"uid": UID, "macs": [MAC_A]}, {"uid": "OTHERUID", "macs": [MAC_B]}])
+        assert store.forget_guard_device(ROUTER, UID.lower()) == 1
+        assert [row["uid"] for row in store.guard_devices(ROUTER)] == ["OTHERUID"]
+
+
+class TestGuardOverview:
+    """One set of SQL reads, zero router traffic, honest unknowns."""
+
+    def build(self, store, devices, *, now_epoch, presence=None, router=ROUTER):
+        return build_guard_overview(store, router=router, devices=devices,
+                                    presence=presence, now_epoch=now_epoch)
+
+    def test_a_device_with_no_rows_is_unknown_not_all_clear(self, store):
+        reference = bj_minute(DAY, 13)
+        day = beijing_date(reference)
+        rows = [{"uid": UID, "macs": [MAC_A], "name": "电脑", "blocked": False,
+                 "blockedUntilEpoch": 0, "updatedAt": reference}]
+        payload = self.build(store, rows, now_epoch=reference + 30)
+        device = payload["devices"][0]
+        assert device["hasData"] is False
+        assert device["todayMinutes"] == 0
+        assert device["attention"]["state"] == "unknown"
+        assert device["attention"]["hasAttention"] is False
+        assert device["online"] is None
+        assert device["stale"] is True
+        assert payload["stale"] is True and payload["lastSampleAt"] == 0
+
+    def test_a_minute_in_the_current_bucket_is_active_now(self, store):
+        reference = bj_minute(DAY, 13)
+        day = beijing_date(reference)
+        store.ingest_v3(v3_body(day, [reference]), router=ROUTER)
+        rows = [{"uid": UID, "macs": [MAC_A], "name": "电脑"}]
+        device = self.build(store, rows, now_epoch=reference + 5,
+                            presence={MAC_A: True})["devices"][0]
+        assert device["activeNow"] is True
+        assert device["todayMinutes"] == 1
+        assert device["hasData"] is True
+        assert device["attention"]["state"] == "none"
+        assert device["online"] is True
+        assert device["stale"] is False
+
+    def test_the_previous_bucket_also_counts_as_active(self, store):
+        reference = bj_minute(DAY, 13)
+        day = beijing_date(reference)
+        store.ingest_v3(v3_body(day, [reference]), router=ROUTER)
+        # 分钟要等它结束才结算，所以本分钟还没有行时上一格就算「正在上网」。
+        device = self.build(store, [{"uid": UID, "macs": [MAC_A]}],
+                            now_epoch=reference + MINUTE_SECONDS + 59)["devices"][0]
+        assert device["activeNow"] is True
+
+    def test_two_macs_of_one_device_share_a_minute_once(self, store):
+        reference = bj_minute(DAY, 13)
+        day = beijing_date(reference)
+        store.ingest_v3(v3_body(day, [reference]), router=ROUTER)
+        store.ingest_v3(v3_body(day, [reference], mac=MAC_B), router=ROUTER)
+        device = self.build(
+            store, [{"uid": UID, "macs": [MAC_A, MAC_B]}],
+            now_epoch=reference + 5)["devices"][0]
+        assert device["todayMinutes"] == 1
+
+    def test_late_night_minutes_are_an_alert(self, store):
+        reference = bj_minute(DAY, 13)
+        day = beijing_date(reference)
+        late = bj_minute(day, 2, 5)
+        store.ingest_v3(v3_body(day, [late, late + 60], app_minutes=[late]),
+                        router=ROUTER)
+        device = self.build(store, [{"uid": UID, "macs": [MAC_A]}],
+                            now_epoch=reference + 5)["devices"][0]
+        assert device["attention"]["state"] == "alert"
+        assert device["attention"]["lateNightMinutes"] == 2
+        assert device["attention"]["hasAttention"] is True
+        assert "凌晨" in device["attention"]["text"]
+        assert device["activeNow"] is False
+
+    def test_a_long_day_crosses_the_notice_threshold(self, store):
+        reference = bj_minute(DAY, 23)
+        day = beijing_date(reference)
+        minutes = [bj_minute(day, 9) + offset * MINUTE_SECONDS
+                   for offset in range(ATTENTION_NOTICE_MINUTES)]
+        store.ingest_v3(v3_body(day, minutes), router=ROUTER)
+        device = self.build(store, [{"uid": UID, "macs": [MAC_A]}],
+                            now_epoch=reference + 5)["devices"][0]
+        assert device["todayMinutes"] == ATTENTION_NOTICE_MINUTES
+        assert device["attention"]["state"] == "notice"
+        assert device["attention"]["hasAttention"] is True
+
+    def test_top_apps_come_from_the_app_minute_rows(self, store):
+        reference = bj_minute(DAY, 13)
+        day = beijing_date(reference)
+        store.insert_app_minutes([
+            app_minutes_row(MAC_A, day, "微信", [reference, reference + 60]),
+            app_minutes_row(MAC_A, day, "抖音", [reference]),
+        ], router=ROUTER)
+        store.insert_device_minutes([device_minutes_row(MAC_A, day, [reference])],
+                                    router=ROUTER)
+        device = self.build(store, [{"uid": UID, "macs": [MAC_A]}],
+                            now_epoch=reference + 5)["devices"][0]
+        assert device["topApps"] == [{"app": "微信", "minutes": 2},
+                                      {"app": "抖音", "minutes": 1}]
+
+    def test_presence_unknown_is_reported_as_none_not_offline(self, store):
+        reference = bj_minute(DAY, 13)
+        rows = [{"uid": UID, "macs": [MAC_A, MAC_B]}]
+        online = self.build(store, rows, now_epoch=reference + 5,
+                            presence={MAC_A: False, MAC_B: True})["devices"][0]
+        assert online["online"] is True
+        missing = self.build(store, rows, now_epoch=reference + 5,
+                             presence={MAC_A: False})["devices"][0]
+        assert missing["online"] is None
+        off = self.build(store, rows, now_epoch=reference + 5,
+                         presence={MAC_A: False, MAC_B: False})["devices"][0]
+        assert off["online"] is False
+
+    def test_the_router_is_never_part_of_an_overview(self, store):
+        class NoStore:
+            def guard_snapshot(self, *args, **kwargs):
+                raise AssertionError("overview must read SQLite only")
+
+        with pytest.raises(AssertionError):
+            NoStore().guard_snapshot(ROUTER, [MAC_A], DAY)
+        payload = build_guard_overview(None, router=ROUTER,
+                                        devices=[{"uid": UID, "macs": [MAC_A]}],
+                                        now_epoch=bj_minute(DAY, 13))
+        assert payload["devices"][0]["todayMinutes"] == 0
+
