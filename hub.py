@@ -34,7 +34,7 @@ from child_guard_service import (
 )
 
 BEIJING_TZ = ZoneInfo("Asia/Shanghai")
-APP_VERSION = "0.13.5"
+APP_VERSION = "0.13.6"
 PORT = int(os.environ.get("PORT", "58443"))
 BASE_DIR = Path(os.environ.get("LABPROBE_BASE_DIR", ".")).resolve()
 CONFIG_DIR = Path(os.environ.get("CONFIG_DIR", str(BASE_DIR / "config"))).resolve()
