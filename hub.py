@@ -3198,6 +3198,29 @@ def api_child_guard_plans(uid: str):
                                                  "router": body.get("router")}, success_status=201)
 
 
+@app.route("/api/router/child-guard/devices/<uid>/plans/enabled-all", methods=["POST"])
+def api_child_guard_plans_enabled_all(uid: str):
+    """一台设备的开关一次写完它所有计划。
+
+    逐条发 ``set_plan_enabled`` 看着等价，实际每条写都要中继跑一轮
+    ``/etc/init.d/child_guard reload`` —— 真机 40 秒以上，还会先把 iptables 的
+    child_guard 链拆下来。四台设备各两条规则就是 8 次写、路由器连续 busy 一分多钟，
+    这期间所有 Hub 请求都卡住，界面上反复弹「儿童守护请求失败」。
+    """
+    if not check_app_token():
+        return jsonify({"ok": False, "error": "unauthorized"}), 401
+    try:
+        normalized_uid = validate_child_guard_uid(uid)
+    except ChildGuardValidationError as error:
+        return jsonify({"ok": False, "errorCode": "invalid_request", "error": str(error)}), 400
+    body = request.get_json(silent=True) or {}
+    return _child_guard_execute("set_all_plans_enabled", {
+        "uid": normalized_uid,
+        "enabled": bool(body.get("enabled")),
+        "router": body.get("router"),
+    })
+
+
 @app.route("/api/router/child-guard/devices/<uid>/plans/<plan_id>", methods=["PUT", "DELETE"])
 def api_child_guard_plan_item(uid: str, plan_id: str):
     if not check_app_token():
@@ -3366,7 +3389,8 @@ def _child_guard_remember_plans(store: Any, key: str, action: str,
     uid = result.get("uid") or body.get("uid")
     if not str(uid or "").strip():
         return
-    if action == "get_plans":
+    if action in ("get_plans", "set_all_plans_enabled"):
+        # 「全设备开关」一次写完，回的就是这台设备的完整计划快照，和 get_plans 同源。
         plans = result.get("plans")
         if isinstance(plans, list):
             store.remember_guard_plans(key, uid, [p for p in plans if isinstance(p, dict)])

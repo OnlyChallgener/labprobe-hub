@@ -1468,6 +1468,53 @@ fn runtime_mapping(uid: &str, user_show: &Value, policy_show: &Value) -> Value {
     })
 }
 
+/// 总览页那个「全设备上网计划」开关：一台设备一次写完它所有计划。
+///
+/// 以前是按计划逐条发 `set_plan_enabled`，而一条写就是一次 `child_guard reload`
+/// —— 那轮 reload 真机要 40 秒以上，还会先把 iptables 的 child_guard 链拆下来。
+/// 四台设备各两条规则就是 8 次写、两三轮 reload，路由器连续 busy 一分多钟，期间
+/// Hub 的请求全卡住，界面上就是反复弹「儿童守护请求失败」。`write_user` 本来就是
+/// 整条 user 全量重写，所以一次写完和写 N 次落到的最终状态完全一样。
+fn set_all_plans_enabled(payload: &Value) -> Result<Value> {
+    let uid = payload
+        .get("uid")
+        .and_then(Value::as_str)
+        .ok_or_else(|| anyhow!("missing uid"))?;
+    let enabled = payload
+        .get("enabled")
+        .and_then(Value::as_bool)
+        .ok_or_else(|| anyhow!("missing enabled"))?;
+    let before = load_snapshot()?;
+    let existing = policies_for(&before, uid);
+    if existing.is_empty() {
+        // 这台设备本来就没有计划，开关对它没有可写的东西 —— 这不是错误。
+        return Ok(json!({"ok": true, "uid": uid, "changed": 0, "rollback": "not_needed"}));
+    }
+    let policies = existing
+        .iter()
+        .map(|policy| policy_with_enabled(policy, &before, enabled))
+        .collect::<Vec<_>>();
+    if policies == existing {
+        // 已经是目标状态：别再触发一轮 reload。
+        return Ok(json!({"ok": true, "uid": uid, "changed": 0, "rollback": "not_needed"}));
+    }
+    let first = policies[0].name.clone();
+    let fallback = payload.get("plan");
+    transactional_write(
+        &before,
+        || write_user(&before, uid, &policies, fallback),
+        || verify_policy(uid, &first, true, None),
+        |snapshot| snapshot_user_restore(snapshot, uid),
+    )?;
+    Ok(json!({
+        "ok": true,
+        "uid": uid,
+        "changed": policies.len(),
+        "plans": policies.iter().map(|policy| plan_value(policy, &before)).collect::<Vec<_>>(),
+        "rollback": "not_needed",
+    }))
+}
+
 fn mutate_plan(action: &str, payload: &Value) -> Result<Value> {
     let uid = payload
         .get("uid")
@@ -1617,6 +1664,56 @@ fn verify_device_block(uid: &str, timestamp: u64) -> Result<()> {
         }
         thread::sleep(Duration::from_secs(1));
     }
+}
+
+/// 临时放行：写 UCI 的 `pause`，由 reload 里的 `pause_add` 落到
+/// `child_guard_skip` ipset（真机实测 `/usr/lib/lua/child_guard_reload.lua:618`
+/// 定义、`:994` 由 reload 逐用户调用）。撤销是固件自己的 `runat` 一次性定时器
+/// 干的（`runat_add(uid.."_skip", …, endtime, 3)`），中继不再排第二次；`0` = 立刻
+/// 取消放行。
+///
+/// 走 `uci set` 而不是 `dev_sta set -m child_pause`：后者的入参格式没有文档
+/// （实测只回 "UF: param is invalid"），而 reload 明确就是读这两个 option。
+///
+/// 固件限制「endtime 不能晚于明天零点」（超出直接回 "endtime unsupport"），那条
+/// 判断放在 Hub —— 只有那边知道北京时间；这里只挡已经过期和查无此机。
+fn device_pass(payload: &Value) -> Result<Value> {
+    let uid = payload
+        .get("uid")
+        .and_then(Value::as_str)
+        .ok_or_else(|| anyhow!("missing uid"))?;
+    let endtime = payload.get("untilEpoch").and_then(Value::as_u64).unwrap_or(0);
+    let snapshot = load_snapshot()?;
+    let section = snapshot
+        .user(uid)
+        .ok_or_else(|| anyhow!("device not found"))?
+        .name
+        .clone();
+    if endtime != 0 && endtime <= now_epoch() {
+        bail!("pass end time already passed");
+    }
+    set_device_pause(&section, endtime)?;
+    verify_device_pause(&section, endtime)?;
+    trigger_reload();
+    Ok(json!({"ok": true, "uid": uid, "passUntilEpoch": endtime, "rollback": "not_needed"}))
+}
+
+fn set_device_pause(section: &str, endtime: u64) -> Result<()> {
+    command_output("uci", &["-q", "set", &format!("{CONFIG}.{section}.pause={endtime}")])?;
+    command_output("uci", &["-q", "commit", CONFIG])?;
+    Ok(())
+}
+
+fn verify_device_pause(section: &str, endtime: u64) -> Result<()> {
+    let current = load_snapshot()?
+        .named(section)
+        .and_then(|user| user.options.get("pause"))
+        .and_then(|value| value.parse::<u64>().ok())
+        .unwrap_or(0);
+    if current != endtime {
+        bail!("child_guard pause did not land");
+    }
+    Ok(())
 }
 
 /// Guard membership management: the App's "select devices to guard" page maps
@@ -1982,11 +2079,13 @@ pub fn execute(action: &str, payload: &Value) -> Value {
         "create_plan" | "update_plan" | "delete_plan" | "set_plan_enabled" => {
             mutate_plan(action, payload)
         }
+        "set_all_plans_enabled" => set_all_plans_enabled(payload),
         "get_usage" => usage_report(payload),
         "get_usage_stats" => usage_stats_report(payload),
         "list_devices" => list_lan_devices(),
         "add_device" | "remove_device" => mutate_membership(action, payload),
         "pause_device" | "resume_device" => device_pause(action, payload),
+        "set_device_pass" => device_pass(payload),
         _ => bail!("unsupported child_guard action"),
     })();
     result.unwrap_or_else(|error| {
