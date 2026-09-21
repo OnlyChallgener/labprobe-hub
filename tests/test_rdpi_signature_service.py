@@ -205,6 +205,28 @@ def test_remove_drops_by_index_or_name_and_reports_a_miss():
     assert extra["ok"] is False
 
 
+def test_wps_like_rule_without_protocol_gets_it_backfilled():
+    """官方库有些 host 规则没有 protocol 字段（WPS Office 就是这样），只补域名没用。"""
+    official = {"index": "8-118-1-0", "name": "WPS Office",
+                "rules": [{"hosts": ["wpscdn.cn", "qwps.cn", "wps.cn"]}]}
+    merged, extra = service.apply_curated_extensions({"apps": [official]})
+    rule = merged["apps"][0]["rules"][0]
+    assert rule["protocol"] == "host", "缺 protocol 的主机规则不会被引擎当主机规则评估"
+    assert "kdocs.cn" in rule["hosts"]
+    assert any("补 protocol=host" in line for line in extra["enhancedApps"])
+
+
+def test_new_entries_only_use_hosts_the_engine_can_actually_match():
+    """新补的四个条目：裸域、无通配、无点号前缀，且都不收共享平台域。"""
+    for index in ("9-221-1-0", "9-222-1-0", "9-223-1-0"):
+        patch = service.CURATED_SIGNATURE_EXTENSIONS[index]
+        for host in patch["hosts"]:
+            assert not host.startswith((".", "*")) and "*" not in host, host
+    # 裸 360.cn 会把奇虎全线（浏览器/安全卫士/云盘）卷进儿童手表，明确不收。
+    assert "360.cn" not in service.CURATED_SIGNATURE_EXTENSIONS["9-221-1-0"]["hosts"]
+    assert "360.cn" not in service.CURATED_SIGNATURE_EXTENSIONS["9-222-1-0"]["hosts"]
+
+
 def test_curated_bundle_adds_missing_entries_last_without_touching_official_ones():
     official = {"index": "18-1-1-0", "name": "淘宝", "rules": [{"protocol": "host", "hosts": ["taobao.com"]}]}
     db = {"apps": [official]}
@@ -271,6 +293,40 @@ def test_an_emptied_host_rule_is_removed_not_left_invalid():
     removed, gone, skipped = service.apply_removals(apps)
     assert skipped == [] and removed == 1
     assert [r["hosts"] for r in apps[0]["rules"]] == [["cfg.imtt.qq.com"]]
+
+
+def test_drop_protocols_removes_the_rule_but_keeps_the_entry():
+    """支付宝那条 UDP payload 规则会把 429MB 的 UU远程流判成自己。摘规则而不是摘条目。"""
+    apps = [{"index": "18-4-1-0", "name": "支付宝", "rules": [
+        {"protocol": "host", "hosts": ["mobilegw.alipay.com"]},
+        {"protocol": "udp", "payloads": [{"stage": 0, "pos": 1, "length": 5,
+                                          "payload": "00 00 00 01 12"}]},
+        {"protocol": "user-agent", "user-agents": ["%E6%94%AF%E4%BB%98%E5%AE%9D"]},
+    ]}]
+    removed, gone, skipped = service.apply_removals(apps)
+    assert (removed, skipped) == (0, [])
+    assert [r["protocol"] for r in apps[0]["rules"]] == ["host", "user-agent"]
+    assert gone == ["支付宝 (18-4-1-0 摘掉 1 条 udp 规则)"]
+
+
+def test_drop_protocols_refuses_to_strip_the_last_matcher():
+    apps = [{"index": "18-4-1-0", "name": "支付宝", "rules": [
+        {"protocol": "udp", "payloads": [{"stage": 0, "pos": 1, "length": 5,
+                                          "payload": "00 00 00 01 12"}]}]}]
+    removed, gone, skipped = service.apply_removals(apps)
+    assert (removed, gone) == (0, [])
+    assert skipped and "18-4-1-0" in skipped[0]
+    assert len(apps[0]["rules"]) == 1, "只剩这一条规则时必须保留，不能清空条目"
+
+
+def test_uu_remote_signature_matches_how_the_engine_actually_reads_hosts():
+    """UU远程条目：主机必须是裸域 —— 这台引擎按后缀匹配，前导点和通配都不生效。"""
+    patch = service.CURATED_SIGNATURE_EXTENSIONS["9-220-1-0"]
+    assert patch["name"] == "UU远程"
+    for host in patch["hosts"]:
+        assert not host.startswith((".", "*")), host
+        assert "*" not in host, host
+    assert set(patch["hosts"]) == {"uuyc.163.com", "gameviewer.com", "mofang.163.com"}
 
 
 def test_bundle_against_the_real_official_db_moves_alibaba_infra_off_dingtalk():

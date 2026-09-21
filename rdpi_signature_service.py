@@ -398,6 +398,67 @@ CURATED_SIGNATURE_EXTENSIONS: Dict[str, Dict[str, Any]] = {
             "mijia.ai",
         ],
     },
+    # UU远程（网易远程桌面）。触发原因不是「缺一个应用」而是抓包抓出来的误判：
+    # 电脑没装支付宝也没开浏览器，一条 429MB 的 UDP 流却被记成 支付宝 18-4-1-0。
+    # 三个主机都实测可解析（uuyc.163.com→59.111.44.89、gameviewer.com→42.186.215.27、
+    # mofang.163.com→60.188.233.209）。只写裸域：这台引擎按域名后缀匹配，
+    # 参考稿里的前导点 `.uuyc.163.com` 和通配一样是不生效的。
+    # 参考稿的第二条规则是 protocol=tcp 同时带 hosts+payloads —— 全库 1100 条规则里
+    # 这种形状出现 0 次，引擎不接受的形态不能猜，所以不收，只留主机匹配。
+    "9-220-1-0": {
+        "name": "UU远程",
+        "category": "工具/远程",
+        "hosts": [
+            "uuyc.163.com",
+            "gameviewer.com",
+            "mofang.163.com",
+        ],
+    },
+    # WPS Office：库里原有 8-118-1-0 只有 wpscdn/qwps/wps 三个域名，而且它的主机规则
+    # 没有 protocol 字段（见下面的补 protocol 逻辑）—— 域名不够 + 规则形态不对，两件事
+    # 一起造成「WPS 完全不命中」。补的是金山文档自家云协作域名，全部实测可解析，
+    # 且线上库里没有别的条目占着它们。
+    # 没收 wpsip.com：解析到 185.199.108.153（GitHub Pages 段），归属无法确认。
+    "8-118-1-0": {
+        "name": "WPS Office",
+        "category": "办公",
+        "hosts": [
+            "kdocs.cn",
+            "account.wps.cn",
+            "docer.kdocs.cn",
+            "kfp.kdocs.cn",
+            "365.wps.cn",
+        ],
+    },
+    # 360 两个应用刻意只收各自的官方子域，不收裸 `360.cn`：那是奇虎全线共用域，
+    # 绑给谁都会把 360浏览器 / 安全卫士 / 云盘 一起卷进来，和当初裸 `alicdn.com`
+    # 记成云闪付是同一类错。共享平台域（api/open/app/cloud.360.cn）因此宁可落
+    # 未识别，也不猜给某一家 —— 代价是儿童手表走平台域的那部分不计入它自己。
+    "9-221-1-0": {
+        "name": "360儿童卫士",
+        "category": "智能家居",
+        "hosts": [
+            "kids.360.cn",
+        ],
+    },
+    "9-222-1-0": {
+        "name": "360智慧生活",
+        "category": "智能家居",
+        "hosts": [
+            "home.360.cn",
+            "life.360.cn",
+        ],
+    },
+    # 亲宝宝：2020 年品牌启用了新域名 qinbaobao.com，老域名 qbaobei.com 仍在服务
+    # （app.qbaobei.com 实测解析到 122.10.42.170），两个都是它自己的，都收。
+    "9-223-1-0": {
+        "name": "亲宝宝",
+        "category": "社交",
+        "hosts": [
+            "qinbaobao.com",
+            "qbaobei.com",
+        ],
+    },
     # 阿里CDN 是**阿里系的兜底桶**（2026-09-21 定的规则）：淘宝 / 支付宝 / 钉钉 /
     # 优酷视频 / 阿里云盘 / 夸克 / 饿了么 / 菜鸟 这些有独立条目的继续按自己显示，
     # 没有独立条目的阿里系应用（闲鱼、高德、飞猪、一淘、1688、阿里妈妈…）落到这里。
@@ -703,6 +764,13 @@ CURATED_SIGNATURE_REMOVALS: Dict[str, Any] = {
     # 卷进来记成阿里CDN。合并是只追加的，改特征表里的名单删不掉已经落到路由器上的
     # 那一行，必须在这里显式摘掉，再由下面的白名单换成精确子域。
     "9-217-1-0": ["alicdn.com"],
+    # 支付宝的 UDP payload 规则（stage 0 / pos 1 / "00 00 00 01 12"）在实测中吃下了
+    # UU远程的隧道流：抓 300 个 UDP 包，其中 3 个从载荷第 4 字节起就是这 5 个字节
+    # （`81 cd 00 03 | 00 00 00 01 12 | 52 a8 …`，UU 的 RTCP 帧）。一条 429MB / 46.7 万
+    # 包的流因此整条记成 支付宝，而那台电脑没装支付宝也没开浏览器 —— 引擎只要命中
+    # 一个包就给整条流定性，1% 的命中率足够。
+    # 支付宝真正的识别来自 3 个 alipay 主机 + user-agent，摘掉 UDP 不影响它认自己。
+    "18-4-1-0": {"drop_protocols": ["udp"]},
 }
 
 
@@ -732,6 +800,23 @@ def apply_removals(apps: List[Dict[str, Any]]) -> tuple:
             continue
         name = str(app.get("name") or idx)
         if isinstance(spec, dict):
+            drop_protocols = {str(p).strip().lower() for p in spec.get("drop_protocols") or []}
+            if drop_protocols:
+                # 摘整条协议规则（不是摘主机）：支付宝那条误判就是 payload 规则造成的，
+                # 主机清单动它不着。摘完必须还剩至少一个匹配子，否则整库过不了校验。
+                rules = app.get("rules") or []
+                kept = [r for r in rules
+                        if str(r.get("protocol") or "").strip().lower() not in drop_protocols]
+                if len(kept) == len(rules):
+                    continue
+                if not any(_has_matcher(r) for r in kept):
+                    skipped.append(f"{name} ({idx} 摘掉 {'/'.join(sorted(drop_protocols))} "
+                                   f"规则后没有匹配子了，保留)")
+                    continue
+                app["rules"] = kept
+                removed_apps.append(f"{name} ({idx} 摘掉 {len(rules) - len(kept)} 条 "
+                                    f"{'/'.join(sorted(drop_protocols))} 规则)")
+                continue
             expected = str(spec.get("delete_if_named") or "")
             if name != expected:
                 # 编号在线上库里被谁占着，只有路由器自己知道；名字对不上就不动手。
@@ -847,8 +932,15 @@ def apply_curated_extensions(db: Dict[str, Any]) -> Tuple[Optional[Dict[str, Any
                 added_here += 1
 
         host_rule["hosts"] = current_hosts
+        if not str(host_rule.get("protocol") or "").strip():
+            # 官方库里 WPS Office 的主机规则压根没有 protocol 字段（全库 55 条这种）。
+            # 只补主机不改 protocol，规则还是不会被当主机规则评估 —— 「WPS 特征坏了」
+            # 就是这个形状，不是域名不够。
+            host_rule["protocol"] = "host"
+            enhanced_apps.append(f"{patch['name']} (+{added_here} 域名，补 protocol=host)")
+        else:
+            enhanced_apps.append(f"{patch['name']} (+{added_here} 域名)")
         total_hosts_added += added_here
-        enhanced_apps.append(f"{patch['name']} (+{added_here} 域名)")
 
     stats = {
         "totalHostsAdded": total_hosts_added,
