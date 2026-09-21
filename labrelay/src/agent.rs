@@ -1548,7 +1548,7 @@ async fn sync_rdpi(client: &Client, config: &AgentConfig) -> Result<()> {
 
     let snapshot = tokio::task::spawn_blocking(move || crate::rdpi::changed_snapshot(now))
         .await
-        .map_err(|error| anyhow::anyhow!("rdpi read task panicked: {error}"))?;
+        .map_err(|error| anyhow::anyhow!("rdpi read task panicked: {error}"))??;
     let snapshot = match snapshot {
         Some(value) => value,
         // 文件没变，什么都不用发。

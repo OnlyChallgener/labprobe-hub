@@ -1841,15 +1841,12 @@ fn ensure_runtime_user_macs(uid: &str, macs: &[String]) -> Result<()> {
 /// Lua 偶尔会漏推 mac，所以运行时问得到时仍补一次，但补不上也不判失败。
 fn verify_user_presence(uid: &str, should_exist: bool, macs: &[String]) -> Result<()> {
     let deadline = Instant::now() + VERIFY_TIMEOUT;
-    let mut repaired = false;
     loop {
         let snapshot = load_snapshot()?;
         if snapshot.user(uid).is_some() == should_exist {
-            if should_exist && !macs.is_empty() && !repaired {
-                repaired = true;
-                if runtime_user_object(uid).is_some() {
-                    let _ = ensure_runtime_user_macs(uid, macs);
-                }
+            // Lua 偶尔漏推 mac：运行时问得到就补一次，问不到或补不上都不判失败。
+            if should_exist && !macs.is_empty() && runtime_user_object(uid).is_some() {
+                let _ = ensure_runtime_user_macs(uid, macs);
             }
             return Ok(());
         }
