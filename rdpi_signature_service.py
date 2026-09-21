@@ -376,11 +376,43 @@ CURATED_SIGNATURE_EXTENSIONS: Dict[str, Dict[str, Any]] = {
     # 了支付应用。
     # `alicdn.com` 以前被 `钉钉_alicdn`（位置 296）整片占着，摘掉之后才轮得到这里；
     # 优酷自己的 `ykimg.alicdn.com` 排在库前面，继续归优酷，不抢。
+    # 菜鸟：用户列在「有独立特征」那一档里，但线上库审计下来 `cainiao.com` 是无主
+    # 的 —— 属于「可能有漏掉」，这里补上独立条目，不并进 阿里CDN。
+    "9-218-1-0": {
+        "name": "菜鸟",
+        "category": "生活/物流",
+        "hosts": [
+            "cainiao.com",
+            "cainiao.cn",
+            "guoguo-app.com",
+        ],
+    },
+    # 阿里CDN 是**阿里系的兜底桶**（2026-09-21 定的规则）：淘宝 / 支付宝 / 钉钉 /
+    # 优酷视频 / 阿里云盘 / 夸克 / 饿了么 / 菜鸟 这些有独立条目的继续按自己显示，
+    # 没有独立条目的阿里系应用（闲鱼、高德、飞猪、一淘、1688、阿里妈妈…）落到这里。
+    #
+    # CDN 边缘主机只放行精确子域，不整片兜 `alicdn.com`：实测公共 DNS
+    # 114.114.114.114 也被记成了阿里CDN，说明裸后缀会把「查询过某个 alicdn 名字」
+    # 的流一起卷进来。名单取自官方库里 `钉钉_alicdn` 原本占着的那些主机 —— 主机是
+    # 真的，只是不该记在钉钉名下。`ykimg.alicdn.com` / `liangcang-material.alicdn.com`
+    # 官方已绑给优酷，不抢。
     "9-217-1-0": {
         "name": "阿里CDN",
         "category": "网络服务/CDN",
         "hosts": [
-            "alicdn.com",
+            "at.alicdn.com",
+            "g.alicdn.com",
+            "gw.alicdn.com",
+            "gtms04.alicdn.com",
+            "hudong.alicdn.com",
+            "img.alicdn.com",
+            "o.alicdn.com",
+            "tbexpand.alicdn.com",
+            "goofish.com",
+            "amap.com",
+            "fliggy.com",
+            "etao.com",
+            "tanx.com",
             "aliyuncs.com",
             "aliyun.com",
             "alibaba.com",

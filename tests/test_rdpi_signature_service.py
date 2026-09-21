@@ -308,11 +308,14 @@ def test_bundle_against_the_real_official_db_moves_alibaba_infra_off_dingtalk():
     assert "cfg.imtt.qq.com" in meeting and "dp3.qq.com" not in meeting
     # 淘宝官方库里根本没有，必须新建出来。
     assert "淘宝" in [app["name"] for app in merged["apps"]]
-    # 阿里CDN 兜住 alicdn：这是它以前从来没命中过的原因。编号必须落在自定义段，
-    # 不能占 18-4-3-0 —— 路由器上那个编号是一条重复的云闪付。
+    # 阿里CDN 兜住阿里 CDN 边缘主机：这是它以前从来没命中过的原因。只放行精确
+    # 子域，不整片兜 `alicdn.com`；编号必须落在自定义段，不能占 18-4-3-0 ——
+    # 路由器上那个编号是一条重复的云闪付。
     alibaba_cdn = next(a for a in merged["apps"] if a["name"] == "阿里CDN")
     assert alibaba_cdn["index"].startswith("9-"), alibaba_cdn["index"]
-    assert "alicdn.com" in alibaba_cdn["rules"][0]["hosts"]
+    cdn_hosts = alibaba_cdn["rules"][0]["hosts"]
+    assert "img.alicdn.com" in cdn_hosts and "gw.alicdn.com" in cdn_hosts
+    assert "alicdn.com" not in cdn_hosts, "整片兜裸域会把查询过 alicdn 的流也算进来"
     assert extra["totalHostsRemoved"] > 0 and extra["removalSkipped"] == []
     # 改完的库必须仍然合法：不能引入任何官方库原本没有的非法条目，否则路由器会
     # 拒绝写入并回滚整库。
@@ -348,8 +351,14 @@ def test_the_requested_apps_all_arrive_in_the_bundle():
     names = {app["name"] for app in merged["apps"]}
     for wanted in ("淘宝", "阿里CDN", "饿了么", "番茄免费小说", "西瓜视频", "醒图",
                    "海尔智家", "美的美居", "TP-LINK物联", "三角洲行动",
-                   "山姆会员商店", "小爱同学", "企业微信", "百度"):
+                   "山姆会员商店", "小爱同学", "企业微信", "百度", "菜鸟"):
         assert wanted in names, wanted
+    # 有独立条目的阿里系不能被 阿里CDN 兜走；没有的才进兜底桶。
+    cdn_hosts = set(next(a for a in merged["apps"] if a["name"] == "阿里CDN")["rules"][0]["hosts"])
+    for independent in ("优酷视频", "钉钉", "支付宝", "阿里云盘", "夸克", "饿了么", "菜鸟", "淘宝"):
+        entry = next(a for a in merged["apps"] if a["name"] == independent)
+        overlap = set(entry["rules"][0]["hosts"]) & cdn_hosts
+        assert not overlap, f"{independent} 的域名被 阿里CDN 抢了：{sorted(overlap)}"
     # 企业微信官方有条目但主机字段是个残缺 token，补进来的真域名必须落在同一条上。
     wecom = next(a for a in merged["apps"] if a["name"] == "企业微信")
     assert wecom["index"] == "8-1-3-0"
