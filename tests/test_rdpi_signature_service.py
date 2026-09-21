@@ -413,3 +413,14 @@ def test_a_new_app_never_lands_on_an_index_the_router_already_uses():
     merged, _extra = service.apply_curated_extensions({"apps": taken})
     indexes = [a["index"] for a in merged["apps"]]
     assert len(indexes) == len(set(indexes)), "同一个编号出现了两次"
+
+
+def test_a_host_already_deployed_can_be_stripped_again():
+    """合并只追加，改特征表删不掉已经落到路由器上的域名，必须能摘回来。"""
+    deployed = {"index": "9-217-1-0", "name": "阿里CDN",
+                "rules": [{"protocol": "host",
+                           "hosts": ["alicdn.com", "aliyuncs.com", "mmstat.com"]}]}
+    merged, _extra = service.apply_curated_extensions({"apps": [deployed]})
+    hosts = merged["apps"][0]["rules"][0]["hosts"]
+    assert "alicdn.com" not in hosts, "裸域还在，公共 DNS 会被记成阿里CDN"
+    assert "img.alicdn.com" in hosts and "aliyuncs.com" in hosts
