@@ -207,6 +207,13 @@ def validate_signature_object(obj: Any) -> Dict[str, Any]:
                         or item["max"] < 0):
                     raise ValueError("RDPI port_limit entries require non-negative integer min/max")
 
+        if "hosts" in rule_entry and "payloads" not in rule_entry:
+            # 官方库里每一条 host 规则都带 `payloads`（哪怕是空数组）。实测：少这个键，
+            # 引擎解析到该条就中断，**它之后所有条目的域名规则一起失效** —— 2026-09-21
+            # 那次「补 protocol=host」只补了 protocol，结果整库识别停摆，直到把库换回
+            # 旧快照才恢复。宁可替它补一个空数组，也不能留下这种形状。
+            rule_entry["payloads"] = []
+
         has_matcher = any(
             isinstance(rule_entry.get(field), list) and bool(rule_entry[field])
             for field in ("hosts", "payloads", "payload_length", "http-gets", "http-posts", "user-agents")
@@ -1012,6 +1019,10 @@ def apply_curated_extensions(db: Dict[str, Any]) -> Tuple[Optional[Dict[str, Any
                 added_here += 1
 
         host_rule["hosts"] = current_hosts
+        # 同 validate_signature_object 里那条：动过的 host 规则必须带 payloads，
+        # 缺了会让引擎在这条之后停止解析域名规则（整库识别停摆的实际原因）。
+        had_payloads_key = "payloads" in host_rule
+        host_rule.setdefault("payloads", [])
         note = ""
         if not str(host_rule.get("protocol") or "").strip():
             # 官方库里 WPS Office 的主机规则压根没有 protocol 字段（全库 55 条这种）。
@@ -1019,6 +1030,8 @@ def apply_curated_extensions(db: Dict[str, Any]) -> Tuple[Optional[Dict[str, Any
             # 就是这个形状，不是域名不够。
             host_rule["protocol"] = "host"
             note = "，补 protocol=host"
+        if not had_payloads_key:
+            note += "，补 payloads"
         extra_here = _append_extra_rules(rules, patch)
         if extra_here:
             note += f"，另加 {extra_here} 条端口规则"

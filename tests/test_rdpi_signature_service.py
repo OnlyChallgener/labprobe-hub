@@ -263,6 +263,23 @@ def test_curated_bundle_skips_the_write_when_nothing_is_new():
     assert extra["totalRulesAdded"] == 0
 
 
+def test_host_rules_always_carry_a_payloads_key():
+    """引擎解析到缺 payloads 的 host 规则就中断，之后所有域名规则一起失效（实测）。"""
+    result = validate_signature_object({
+        "index": "8-118-1-0", "name": "WPS Office",
+        "rules": [{"protocol": "host", "hosts": ["kdocs.cn"]}],
+    })
+    assert result["rules"][0]["payloads"] == []
+
+    patched, _ = service.apply_curated_extensions({"apps": [
+        {"index": "8-118-1-0", "name": "WPS Office",
+         "rules": [{"hosts": ["wps.cn"]}]},
+    ]})
+    rule = patched["apps"][0]["rules"][0]
+    assert rule["protocol"] == "host"
+    assert rule["payloads"] == []
+
+
 def test_port_rule_lands_on_its_entry_and_is_idempotent():
     patched, extra = service.apply_curated_extensions(_full_bundle_db(with_extra_rules=False))
     expected = sum(bool(patch.get("extra_rules"))

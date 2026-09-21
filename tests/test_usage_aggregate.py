@@ -1279,6 +1279,7 @@ import time  # noqa: E402
 
 from usage_aggregate import (  # noqa: E402
     ATTENTION_NOTICE_MINUTES,
+    LATE_NIGHT_END_HOUR,
     MINUTE_SECONDS,
     build_guard_overview,
 )
@@ -1388,8 +1389,16 @@ class TestV3IngestStorage:
 class TestV3ReportFields:
     """The keys the App reads with silent defaults must always be there."""
 
+    @staticmethod
+    def _skip_night_window(now: float) -> None:
+        """拿"现在"造分钟时，0-6 点会落进夜间口径 —— 只有设备分钟、没有应用归属的段
+        按设计不计数（2026-09-21 实测：凌晨 236MB 流量对 0 分钟就是这条规则）。"""
+        if datetime.fromtimestamp(now, BEIJING).hour < LATE_NIGHT_END_HOUR:
+            pytest.skip("night window excludes device-only minutes by design")
+
     def test_report_states_freshness_and_data_presence(self, store):
         now = floor_minute(time.time())
+        self._skip_night_window(now)
         day = beijing_date(now)
         store.ingest_v3(v3_body(day, run_from(now - 120, DAY_MIN_RUN_MINUTES),
                                 generated=now), router=ROUTER)
@@ -1409,6 +1418,7 @@ class TestV3ReportFields:
 
     def test_a_stalled_pipeline_is_stale_not_zero_minutes(self, store):
         now = floor_minute(time.time())
+        self._skip_night_window(now)
         # 六到八分钟前的一段真实使用：数据是真的，但早已不再推进。
         idle = run_from(now - 480, DAY_MIN_RUN_MINUTES)
         day = beijing_date(idle[0])
