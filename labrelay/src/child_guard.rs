@@ -1199,6 +1199,41 @@ fn sync_child_guard_ip6_block_router() {
     }
 }
 
+/// `ipset list` 的 Members 段。成员行尾随逗号，去掉才是 MAC 本体。
+fn parse_ipset_members(text: &str) -> Vec<String> {
+    let mut members = Vec::new();
+    let mut inside = false;
+    for line in text.lines() {
+        if line.starts_with("Members:") {
+            inside = true;
+            continue;
+        }
+        if !inside {
+            continue;
+        }
+        let value = line.trim().trim_end_matches(',').to_lowercase();
+        if value.is_empty() {
+            break;
+        }
+        members.push(value);
+    }
+    members.sort();
+    members
+}
+
+/// IPv6 降级审计的状态就等于 `child_guard_ip6_block` 的成员。路由器本地问 ipset，
+/// 比 Hub 反向 SSH 进来问稳得多 —— 真机 2026-09-20 SSH 端口一变，那两个接口就全 500。
+fn ip6_audit_status() -> Result<Value> {
+    let output = command_output("ipset", &["list", "child_guard_ip6_block"]).unwrap_or_default();
+    let members = parse_ipset_members(&output);
+    Ok(json!({
+        "ok": true,
+        "activeMembers": members,
+        "count": members.len(),
+        "enabled": !members.is_empty(),
+    }))
+}
+
 /// `/etc/init.d/child_guard reload` 其实是 `restart`：`child_guard_stop` 先把
 /// iptables 的 child_guard 链拆下来，`child_guard_start` 再挂回去，然后 lua 把
 /// UCI 里的用户/策略逐条 `ubus call sniffer.user add` 推给 sniffer。真机实测这一
@@ -2097,6 +2132,11 @@ pub fn execute(action: &str, payload: &Value) -> Value {
         "add_device" | "remove_device" => mutate_membership(action, payload),
         "pause_device" | "resume_device" => device_pause(action, payload),
         "set_device_pass" => device_pass(payload),
+        "ip6_audit_sync" => {
+            sync_child_guard_ip6_block_router();
+            ip6_audit_status()
+        }
+        "ip6_audit_status" => ip6_audit_status(),
         _ => bail!("unsupported child_guard action"),
     })();
     result.unwrap_or_else(|error| {
@@ -2357,5 +2397,16 @@ config user 'router_uid'
     fn a_deleted_policy_settles_once_uci_drops_it() {
         assert!(policy_is_settled(false, true, false));
         assert!(!policy_is_settled(true, true, false));
+    }
+
+    #[test]
+    fn ipset_members_are_read_without_their_trailing_commas() {
+        let text = "set name child_guard_ip6_block\nType hash:mac\nMembers:\n\tAA:BB:CC:DD:EE:FF,\n\t11:22:33:44:55:66\n\n";
+        assert_eq!(
+            parse_ipset_members(text),
+            vec!["11:22:33:44:55:66".to_string(), "aa:bb:cc:dd:ee:ff".to_string()]
+        );
+        // ipset 不存在时输出没有 Members 段，等于「没在用 IPv6 降级」，不是错误。
+        assert!(parse_ipset_members("ipset v6: No such set").is_empty());
     }
 }

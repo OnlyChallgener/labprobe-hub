@@ -1560,12 +1560,58 @@ async fn sync_rdpi(client: &Client, config: &AgentConfig) -> Result<()> {
     let body = serde_json::json!({
         "router": config.router_name,
         "apps": apps,
+        "dbText": snapshot.get("dbText").cloned().unwrap_or(Value::Null),
         "readAtEpoch": snapshot.get("readAtEpoch").cloned().unwrap_or(Value::from(now)),
         "fingerprint": mark,
     });
     post_json(client, config, "/api/router/rdpi/ingest", &body).await?;
     crate::rdpi::note_pushed(mark);
     log_line(config, "INFO", &format!("rdpi db pushed: {count} apps"));
+    Ok(())
+}
+
+/// Hub 下发的特征库写入。和读一样走出站通道，Hub 不再反向 SSH 进路由器。
+async fn sync_rdpi_commands(client: &Client, config: &AgentConfig, state: &mut AgentState) -> Result<()> {
+    let router = url_encode(&config.router_name);
+    let root = get_json(
+        client,
+        config,
+        &format!("/api/router/rdpi/commands?router={}&limit=5", router),
+    )
+    .await?;
+    let commands = root
+        .get("commands")
+        .and_then(Value::as_array)
+        .cloned()
+        .unwrap_or_default();
+    if commands.is_empty() {
+        return Ok(());
+    }
+    let mut acknowledgements = Vec::new();
+    for command in commands {
+        let id = command.get("id").and_then(Value::as_str).unwrap_or("").to_string();
+        let action = command.get("action").and_then(Value::as_str).unwrap_or("").to_string();
+        let payload = command.get("payload").cloned().unwrap_or_else(|| json!({}));
+        let action_for_worker = action.clone();
+        let result = tokio::task::spawn_blocking(move || crate::rdpi::execute(&action_for_worker, &payload))
+            .await
+            .unwrap_or_else(|error| json!({"ok": false, "errorCode": "adapter_panic", "error": error.to_string()}));
+        let text = redact(&result.to_string(), &config.hook_token);
+        log_line(config, "INFO", &format!("rdpi command {action}: {text}"));
+        acknowledgements.push(json!({
+            "id": id,
+            "ok": result.get("ok").and_then(Value::as_bool).unwrap_or(false),
+            "result": result,
+        }));
+    }
+    post_json(
+        client,
+        config,
+        &format!("/api/router/rdpi/ack?router={}", router),
+        &json!({"acks": acknowledgements}),
+    )
+    .await?;
+    state.last_command_at = now_epoch();
     Ok(())
 }
 
@@ -2121,6 +2167,11 @@ pub async fn run(args: &[String], once: bool) -> Result<()> {
             if let Err(error) = sync_rdpi(&client, &config).await {
                 let text = redact(&format!("rdpi sync: {:#}", error), &config.hook_token);
                 log_limited(&config, &mut state, "WARN", "rdpi-sync", &text);
+            }
+            if let Err(error) = sync_rdpi_commands(&client, &config, &mut state).await {
+                let text = redact(&format!("rdpi command: {:#}", error), &config.hook_token);
+                log_limited(&config, &mut state, "WARN", "rdpi-command", &text);
+                errors.push(text);
             }
             last_status_at = now;
         }
