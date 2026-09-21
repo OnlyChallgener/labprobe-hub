@@ -351,7 +351,7 @@ def test_the_requested_apps_all_arrive_in_the_bundle():
     names = {app["name"] for app in merged["apps"]}
     for wanted in ("淘宝", "阿里CDN", "饿了么", "番茄免费小说", "西瓜视频", "醒图",
                    "海尔智家", "美的美居", "TP-LINK物联", "三角洲行动",
-                   "山姆会员商店", "小爱同学", "企业微信", "百度", "菜鸟"):
+                   "山姆会员商店", "小爱同学", "企业微信", "百度", "菜鸟", "米家"):
         assert wanted in names, wanted
     # 有独立条目的阿里系不能被 阿里CDN 兜走；没有的才进兜底桶。
     cdn_hosts = set(next(a for a in merged["apps"] if a["name"] == "阿里CDN")["rules"][0]["hosts"])
