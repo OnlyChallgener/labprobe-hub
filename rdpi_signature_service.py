@@ -42,7 +42,7 @@ STANDARD_RDPI_TEMPLATE: Dict[str, Any] = {
             {
                 "protocol": "host",
                 "hosts": [
-                    "*.customgame.com",
+                    "customgame.com",
                     "login.customgame.cn"
                 ]
             },
@@ -292,22 +292,24 @@ def remove_signature_from_db(db: Dict[str, Any], target_index_or_name: str) -> T
     return db, {"deleted": target, "totalCount": len(kept)}
 
 
+# 引擎按**裸域名后缀**匹配（官方库 1093 个主机里没有一个带 `*`），所以这里一律
+# 只写裸域名：`img.example.com` 这种精确主机名也照写，通配写法是永远不会命中的
+# 死规则，留着只会让人误以为已经覆盖了整个域。
+# 共享基础设施域名（阿里 alicdn/mmstat、字节 snssdk/zijieapi/pstatp/bytecdn、
+# 腾讯 gtimg/qpic/dldir1、小米 mi.com、百度 bdstatic/bcebos、个推 getui/gepush）
+# 一律不写：绑上去会把别的应用流量错记过来。
 CURATED_SIGNATURE_EXTENSIONS: Dict[str, Dict[str, Any]] = {
     "10-1-2-0": {
         "name": "微信视频号",
         "category": "短视频/直播",
         "hosts": [
-            "*.vweixinfp.tc.qq.com",
             "vweixinfp.tc.qq.com",
-            "*.channels.weixin.qq.com",
             "channels.weixin.qq.com",
-            "*.wxapp.tc.qq.com",
             "wxapp.tc.qq.com",
             "finderv1.video.qq.com",
             "finderd1p.video.qq.com",
             "finder.video.qq.com",
-            "*.finder.video.qq.com",
-            "*.live.weixin.qq.com",
+            "live.weixin.qq.com",
             "voipfinderliveplay.wxqcloud.qq.com",
         ],
     },
@@ -316,13 +318,10 @@ CURATED_SIGNATURE_EXTENSIONS: Dict[str, Dict[str, Any]] = {
         "category": "即时通讯/音视频通话",
         "hosts": [
             "weixin.qq.com",
-            "*.weixin.qq.com",
-            "*.wechat.com",
             "szshort.weixin.qq.com",
             "szextshort.weixin.qq.com",
             "szminorshort.weixin.qq.com",
-            "*.qpic.cn",
-            "*.wx.qlogo.cn",
+            "wx.qlogo.cn",
         ],
     },
     "10-5-1-0": {
@@ -330,18 +329,11 @@ CURATED_SIGNATURE_EXTENSIONS: Dict[str, Dict[str, Any]] = {
         "category": "短视频/直播",
         "hosts": [
             "amemv.com",
-            "*.amemv.com",
             "douyincdn.com",
-            "*.douyincdn.com",
             "douyinpic.com",
-            "*.douyinpic.com",
             "douyinvod.com",
-            "*.douyinvod.com",
             "douyin.com",
-            "*.douyin.com",
-            "*.douyinstatic.com",
-            "*.zijieapi.com",
-            "*.snssdk.com",
+            "douyinstatic.com",
         ],
     },
     "10-146-1-0": {
@@ -349,17 +341,12 @@ CURATED_SIGNATURE_EXTENSIONS: Dict[str, Dict[str, Any]] = {
         "category": "短视频/直播",
         "hosts": [
             "gifshow.com",
-            "*.gifshow.com",
             "kuaishou.com",
-            "*.kuaishou.com",
             "yximgs.com",
-            "*.yximgs.com",
             "ksapisrv.com",
-            "*.ksapisrv.com",
             "kwai.com",
-            "*.kwai.com",
-            "*.kwimgs.com",
-            "*.kwaicdn.com",
+            "kwimgs.com",
+            "kwaicdn.com",
         ],
     },
     "18-158-1-0": {
@@ -367,13 +354,9 @@ CURATED_SIGNATURE_EXTENSIONS: Dict[str, Dict[str, Any]] = {
         "category": "综合电商",
         "hosts": [
             "yangkeduo.com",
-            "*.yangkeduo.com",
             "pinduoduo.com",
-            "*.pinduoduo.com",
             "pddpic.com",
-            "*.pddpic.com",
-            "*.hutaojie.com",
-            "*.pinduoduo.net",
+            "pinduoduo.net",
         ],
     },
     "18-159-1-0": {
@@ -381,41 +364,32 @@ CURATED_SIGNATURE_EXTENSIONS: Dict[str, Dict[str, Any]] = {
         "category": "综合电商",
         "hosts": [
             "360buy.com",
-            "*.360buy.com",
             "jd.com",
-            "*.jd.com",
             "360buyimg.com",
-            "*.360buyimg.com",
-            "*.jd.hk",
-            "*.jcloud.com",
+            "jd.hk",
         ],
     },
     # 阿里CDN：官方特征库把 appid 绑死在自家编号体系里（18-4-1 支付宝、
     # 18-4-2 淘宝、7-4-1 阿里云盘、8-4-1-x 钉钉），阿里系共用 `*-4-*` 段。
-    # 官方没有"阿里CDN"这个条目，于是按同一编号规则占 18-4-3-0，只收官方
-    # **没有明确归属**的阿里域名：`*.alicdn.com`/`tanx.com`/`tbcdn.cn` 官方已
-    # 绑给淘宝，钉钉/优酷各自绑了自己的 alicdn 子域，这些一律不抢，让明确
-    # 的应用继续按官方归属显示，剩下的阿里基础设施流量落到 阿里CDN。
+    # 官方没有"阿里CDN"这个条目，于是按同一编号规则占 18-4-3-0，收官方**没有明确
+    # 归属**的阿里基础设施域名。`alicdn.com` 原来被 `钉钉_alicdn` 整片占着（见
+    # CURATED_SIGNATURE_REMOVALS），摘掉之后由这里兜住；优酷自己的
+    # `ykimg.alicdn.com` 排在库前面，继续归优酷，不抢。
+    # 引擎只认裸域名后缀，`*.x.com` 这种写法在官方库里一条都没有（1093 个主机、
+    # 零个带 `*`），所以每个通配项都必须配一个裸域名，否则那条规则是死的。
     "18-4-3-0": {
         "name": "阿里CDN",
         "category": "网络服务/CDN",
         "hosts": [
+            "alicdn.com",
             "aliyuncs.com",
-            "*.aliyuncs.com",
             "aliyun.com",
-            "*.aliyun.com",
             "alibaba.com",
-            "*.alibaba.com",
             "alibabausercontent.com",
-            "*.alibabausercontent.com",
             "mmstat.com",
-            "*.mmstat.com",
             "aliapp.org",
-            "*.aliapp.org",
             "alimama.com",
-            "*.alimama.com",
             "1688.com",
-            "*.1688.com",
         ],
     },
     "18-4-2-0": {
@@ -423,13 +397,13 @@ CURATED_SIGNATURE_EXTENSIONS: Dict[str, Dict[str, Any]] = {
         "category": "综合电商",
         "hosts": [
             "taobao.com",
-            "*.taobao.com",
             "tbcdn.cn",
-            "*.tbcdn.cn",
             "tmall.com",
-            "*.tmall.com",
-            "*.alicdn.com",
-            "*.tbcache.com",
+            "tbcache.com",
+            "taobaocdn.com",
+            "m.taobao.com",
+            "acs.m.taobao.com",
+            "gw.taobao.com",
         ],
     },
     # 官方特征库没有条目的应用，占用 9-* 自定义编号段（官方 db 未使用 9 开头
@@ -440,7 +414,6 @@ CURATED_SIGNATURE_EXTENSIONS: Dict[str, Dict[str, Any]] = {
         "category": "AI/聊天",
         "hosts": [
             "doubao.com",
-            "*.doubao.com",
         ],
     },
     "9-202-1-0": {
@@ -448,7 +421,6 @@ CURATED_SIGNATURE_EXTENSIONS: Dict[str, Dict[str, Any]] = {
         "category": "AI/聊天",
         "hosts": [
             "deepseek.com",
-            "*.deepseek.com",
         ],
     },
     "9-203-1-0": {
@@ -456,9 +428,7 @@ CURATED_SIGNATURE_EXTENSIONS: Dict[str, Dict[str, Any]] = {
         "category": "新闻/资讯",
         "hosts": [
             "toutiao.com",
-            "*.toutiao.com",
             "toutiaocdn.com",
-            "*.toutiaocdn.com",
         ],
     },
     "9-204-1-0": {
@@ -466,9 +436,7 @@ CURATED_SIGNATURE_EXTENSIONS: Dict[str, Dict[str, Any]] = {
         "category": "综合电商",
         "hosts": [
             "vipshop.com",
-            "*.vipshop.com",
             "vip.com",
-            "*.vip.com",
         ],
     },
     "9-205-1-0": {
@@ -476,7 +444,6 @@ CURATED_SIGNATURE_EXTENSIONS: Dict[str, Dict[str, Any]] = {
         "category": "生活/物流",
         "hosts": [
             "sf-express.com",
-            "*.sf-express.com",
         ],
     },
     # 夸克浏览器（UC/阿里系）：官方库只有 `pp.uc.cn`（归给豌豆荚），
@@ -486,12 +453,258 @@ CURATED_SIGNATURE_EXTENSIONS: Dict[str, Dict[str, Any]] = {
         "category": "工具/浏览器",
         "hosts": [
             "quark.cn",
-            "*.quark.cn",
             "myquark.cn",
-            "*.myquark.cn",
+        ],
+    },
+    # 下面这批是 2026-09-21 新增的：官方库里根本没有这些应用。域名全部只用
+    # **裸域名**（引擎按裸域名后缀匹配，官方库 1093 个主机里没有一个带 `*`），
+    # 并且只收各应用独占的域名 —— 阿里 alicdn/mmstat、字节 snssdk/pstatp/
+    # bytecdn、腾讯 gtimg/qpic/dldir1、小米 mi.com、百度 bdstatic/bcebos 这些
+    # 共享基础设施一律不写，否则会把别的应用流量错记过来。
+    # 企业微信官方有条目（8-1-3-0），但它的主机字段是个残缺的 `wework` token，
+    # 按 name 命中后直接往官方条目里补真域名，不另建编号。
+    "8-1-3-0": {
+        "name": "企业微信",
+        "category": "办公协作",
+        "hosts": [
+            "work.weixin.qq.com",
+            "qyapi.weixin.qq.com",
+            "wwcdn.weixin.qq.com",
+            "wework.qpic.cn",
+        ],
+    },
+    # 百度 App：官方 7-3-2-0 竟然不含 `www.baidu.com`，而 `baidu.com` 这个裸后缀
+    # 会把百度网盘/贴吧/地图一起吞掉，所以只补精确主机名。`tieba.baidu.com` 官方
+    # 已经绑给百度贴吧（7-3-1-0），不再抢。
+    "7-3-2-0": {
+        "name": "百度",
+        "category": "工具/搜索",
+        "hosts": [
+            "www.baidu.com",
+            "news.baidu.com",
+        ],
+    },
+    "9-207-1-0": {
+        "name": "饿了么",
+        "category": "生活/外卖",
+        "hosts": [
+            "ele.me",
+            "elemecdn.com",
+            "elemecdn.cn",
+            "elenet.me",
+            "eleme.cn",
+            "eleme.com.cn",
+            "ele.to",
+            "youcaishop.cn",
+            "xyzele.com",
+            "fengniaopaotui.cn",
+            "fengniaozhongbao.cn",
+        ],
+    },
+    "9-208-1-0": {
+        "name": "番茄免费小说",
+        "category": "阅读/资讯",
+        "hosts": [
+            "fqnovel.com",
+            "fqnovelstatic.com",
+            "fqnovelpic.com",
+            "fqnovelvod.com",
+            "fqnovelop.com",
+            "fanqiesdk.com",
+            "fanqiesdkpic.com",
+            "fanqiesdkstatic.com",
+            "fanqieopen.com",
+            "fanqiecopyright.com",
+            "changdunovel.com",
+            "novelfm.com",
+            "novelfmpic.com",
+            "novelfmstatic.com",
+        ],
+    },
+    "9-209-1-0": {
+        "name": "西瓜视频",
+        "category": "短视频/直播",
+        "hosts": [
+            "ixigua.com",
+            "ixiguavideo.com",
+            "xiguaapp.com",
+            "xiguavideo.cn",
+            "xiguavideo.net",
+            "xiguashipin.cn",
+            "365yg.com",
+            "bdxiguaimg.com",
+            "bdxiguavod.com",
+            "bdxiguastatic.com",
+        ],
+    },
+    # 醒图是字节的美图工具，独占域名只有 retouchpics.com。`xitu.io` 是稀土掘金，
+    # 不是醒图 —— 网上不少规则表把它当成醒图，抄过来会把开发者社区记成修图软件。
+    "9-210-1-0": {
+        "name": "醒图",
+        "category": "影像/剪辑",
+        "hosts": [
+            "retouchpics.com",
+        ],
+    },
+    "9-211-1-0": {
+        "name": "海尔智家",
+        "category": "智能家居",
+        "hosts": [
+            "haier.net",
+            "ehaier.com",
+            "haige.com",
+        ],
+    },
+    # 美的美居：`mics.me` 是它废弃的旧云（已 NXDOMAIN），别照抄网上还在传的规则。
+    "9-212-1-0": {
+        "name": "美的美居",
+        "category": "智能家居",
+        "hosts": [
+            "smartmidea.net",
+            "appsmb.com",
+            "midea.com",
+        ],
+    },
+    # TP-LINK 物联：`tplinkwifi.net` / `tplinklogin.net` 是局域网管理页，绑进来
+    # 会把内网流量算成 App 使用，故意不写。
+    "9-213-1-0": {
+        "name": "TP-LINK物联",
+        "category": "智能家居",
+        "hosts": [
+            "tp-link.com.cn",
+            "tplink.com.cn",
+            "tplinkcloud.com.cn",
+            "tplinkiot.com",
+        ],
+    },
+    # 三角洲行动：腾讯 GCloud 的节点域名是 `*.500638030-x-y.gcloudsvcs.com`
+    # 这种按标题分配的形态，只能写完整节点名；绑 `gcloudsvcs.com` 后缀会把一整
+    # 片腾讯游戏都记成它。`df-gcloud.*.tcdnos.com` 是共享 CDN，同样不绑。
+    "9-214-1-0": {
+        "name": "三角洲行动",
+        "category": "游戏",
+        "hosts": [
+            "df.qq.com",
+            "dir.500638030-2-1.gcloudsvcs.com",
+            "puffer.500638030-11-1.gcloudsvcs.com",
+        ],
+    },
+    "9-215-1-0": {
+        "name": "山姆会员商店",
+        "category": "综合电商",
+        "hosts": [
+            "samsclub.cn",
+            "samsclub.com.cn",
+        ],
+    },
+    # 小爱同学没有可用的独占域名：它跑在小米共用云上（mi.com / io.mi.com /
+    # mistat.xiaomi.com 同时服务米家、小爱音箱、系统服务），绑进来会把米家记成
+    # 小爱。下面三个是已注册但未经真机验证的候选，命中不了只会显示未识别，不会
+    # 抢别的应用；等一次真机抓包再定。
+    "9-216-1-0": {
+        "name": "小爱同学",
+        "category": "智能家居",
+        "hosts": [
+            "xiaoaiassist.com",
+            "xiaomixiaoai.com",
+            "micoce.com.cn",
         ],
     },
 }
+
+
+#: 官方库里抢别家域名的条目 —— 只往官方条目里**补**域名修不好误识别，必须能把错的
+#: 域名摘掉。每条都在 2026-09-21 对着提取出来的官方库（472 条）逐条核对过。
+#: 值是主机名列表表示只摘这些主机；值是 ``"*"`` 表示整条删除（它的全部匹配子都是
+#: 别家的域名，留着就一定会误判）。
+CURATED_SIGNATURE_REMOVALS: Dict[str, Any] = {
+    # 钉钉_alipay 的三个主机全是支付宝的，而它排在数组第 300 位，真正的支付宝
+    # 兜底条目 18-4-1-14 在第 433 位 —— 「支付宝被记成钉钉」就是这么来的。
+    "8-4-1-11": "*",
+    # 官方库把阿里系的 CDN 和埋点域名整片绑给了钉钉：`钉钉_alicdn`（位置 296）
+    # 占了 img/gw/o/at/g/alibaba 等 8 个 alicdn 主机，`钉钉_mmstat`（位置 299）
+    # 占了 4 个 mmstat 埋点主机。淘宝/天猫/闲鱼/饿了么的图片和埋点流量因此全被记
+    # 成钉钉，而排在库尾的 阿里CDN 一条都拿不到 —— 这就是「阿里CDN 从来没识别过」
+    # 的原因。这两条里没有任何钉钉自己的域名，整条删掉。
+    # 注意：「数组位置靠前的规则优先」是 2026-09-21 从 支付宝→钉钉 这个现象推出来
+    # 的假设，还没在固件上实测过；模拟流量验证跑通才算确认。
+    "8-4-1-6": "*",
+    "8-4-1-10": "*",
+    # 飞书_other 收的是字节跳动公共基础设施域名，同时服务抖音/今日头条/西瓜；
+    # api.feelgood.cn 才是飞书自己的（feelgood 是 Lark 的内部代号），保留。
+    "8-5-1-4": [
+        "cdn-tos.bytegoofy.com", "cdn-tos.bytescm.com", "hera.byteimg.com",
+        "i.snssdk.com", "mcs.snssdk.com", "mon.zijieapi.com",
+        "security.snssdk.com", "short.ibytedapm.com", "vcs.zijieapi.com",
+        "zeus.byteimg.com",
+    ],
+    # 腾讯会议_login 里除 imtt 之外全是腾讯全线共用的信标/长连接域名，会把微信、
+    # QQ、视频号的后台流量记成腾讯会议。imtt 才是腾讯会议的 SDK 命名空间。
+    "8-1-1-1": [
+        "android.rqd.qq.com", "oth.str.beacon.qq.com", "otheve.beacon.qq.com",
+        "dp3.qq.com", "h.trace.qq.com", "p.l.qq.com", "sdk.e.qq.com",
+        "tangram.e.qq.com", "tdid.m.qq.com", "ten.sngapm.qq.com",
+        "us.l.qq.com", "work.medialab.qq.com",
+    ],
+    # 微软的 CDN 域名出现在腾讯会议条目里，明显是抄错的。
+    "8-1-1-4": ["vo.msecnd.net"],
+    # 这条唯一的主机是微软登录域名，摘掉就没有任何匹配子了，只能整条删。
+    "8-1-1-5": "*",
+    # 安全教育平台_null_relation 四个主机全是个推/gepush 推送 SDK —— 任何用个推的
+    # App 都会被记成安全教育平台。
+    "8-81-1-15": "*",
+}
+
+
+#: 校验器认的这些字段里至少有一个非空，规则才算有匹配子 —— 与
+#: ``validate_signature_object`` 的判定保持一致，别在这里放宽。
+_MATCHER_FIELDS = ("hosts", "payloads", "payload_length", "http-gets",
+                   "http-posts", "user-agents")
+
+
+def _has_matcher(rule: Dict[str, Any]) -> bool:
+    return any(isinstance(rule.get(field), list) and rule[field] for field in _MATCHER_FIELDS)
+
+
+def apply_removals(apps: List[Dict[str, Any]]) -> tuple:
+    """按 :data:`CURATED_SIGNATURE_REMOVALS` 摘主机 / 删条目，返回三项统计。
+
+    只按 index 精确匹配，不按 name —— 官方库的 name 有重名和 ``_weak_relation``
+    后缀变体。摘完一个匹配子都不剩的条目会被跳过而不是清空，否则整库过不了
+    ``validate_signature_object``，路由器那边还会回滚。
+    """
+    removed_hosts = 0
+    removed_apps: List[str] = []
+    skipped: List[str] = []
+    for idx, spec in CURATED_SIGNATURE_REMOVALS.items():
+        app = next((a for a in apps if a.get("index") == idx), None)
+        if app is None:
+            continue
+        name = str(app.get("name") or idx)
+        if spec == "*":
+            apps.remove(app)
+            removed_apps.append(f"{name} ({idx} 整条删除)")
+            continue
+        drop = set(spec)
+        rules = app.get("rules") or []
+        host_rule = next((r for r in rules if r.get("hosts")), None)
+        if host_rule is None:
+            skipped.append(f"{name} ({idx} 没有主机规则)")
+            continue
+        left = [h for h in host_rule["hosts"] if h not in drop]
+        if len(left) == len(host_rule["hosts"]):
+            continue                      # 这条里没有要摘的主机
+        if left:
+            removed_hosts += len(host_rule["hosts"]) - len(left)
+            host_rule["hosts"] = left
+            continue
+        # 摘空了：留着一条空规则整库就过不了校验，只能整条撤掉。
+        if any(r is not host_rule and _has_matcher(r) for r in rules):
+            removed_hosts += len(host_rule["hosts"])
+            rules.remove(host_rule)
+        else:
+            skipped.append(f"{name} ({idx} 摘完就没有匹配子了，保留)")
+    return removed_hosts, removed_apps, skipped
 
 
 def apply_curated_extensions(db: Dict[str, Any]) -> Tuple[Optional[Dict[str, Any]], Dict[str, Any]]:
@@ -502,8 +715,11 @@ def apply_curated_extensions(db: Dict[str, Any]) -> Tuple[Optional[Dict[str, Any
     """
     apps = list(db.get("apps") or [])
 
+    # 先摘再补：删掉的条目不该在下一轮按 name 撞上别的补丁。
+    hosts_removed, removed_apps, removal_skipped = apply_removals(apps)
+
     total_hosts_added = 0
-    enhanced_apps: List[str] = []
+    enhanced_apps: List[str] = list(removed_apps)
 
     for idx, patch in CURATED_SIGNATURE_EXTENSIONS.items():
         app = next((a for a in apps if a.get("index") == idx or a.get("name") == patch["name"]), None)
@@ -538,9 +754,16 @@ def apply_curated_extensions(db: Dict[str, Any]) -> Tuple[Optional[Dict[str, Any
         total_hosts_added += added_here
         enhanced_apps.append(f"{patch['name']} (+{added_here} 域名)")
 
-    stats = {"totalHostsAdded": total_hosts_added, "enhancedApps": enhanced_apps, "totalApps": len(apps)}
-    if not total_hosts_added:
-        # 一个域名都没新增，就别让路由器白热重载一次。
+    stats = {
+        "totalHostsAdded": total_hosts_added,
+        "totalHostsRemoved": hosts_removed,
+        "removedApps": removed_apps,
+        "removalSkipped": removal_skipped,
+        "enhancedApps": enhanced_apps,
+        "totalApps": len(apps),
+    }
+    if not total_hosts_added and not hosts_removed and not removed_apps:
+        # 一个域名都没变化，就别让路由器白热重载一次。
         return None, {**stats, "ok": True, "message": "高频特征包已是最新状态"}
     db["apps"] = apps
     return db, stats

@@ -412,6 +412,43 @@ class TestMinuteReport:
         assert report["onlineMinutes"] == 0
         assert report["apps"] == []
 
+    def test_short_payment_and_ai_sessions_still_count(self, store):
+        """扫码付款、搜一下、问一句 AI：白天一分钟就是真实使用，不该被门槛抹掉。"""
+        isolated = [bj_minute(DAY, 10), bj_minute(DAY, 14), bj_minute(DAY, 16)]
+        store.insert_device_minutes([device_minutes_row(MAC_A, DAY, isolated)])
+        store.insert_app_minutes([
+            app_minutes_row(MAC_A, DAY, "支付宝", isolated),
+            app_minutes_row(MAC_A, DAY, "微信支付", isolated),
+            app_minutes_row(MAC_A, DAY, "DeepSeek", isolated),
+            app_minutes_row(MAC_A, DAY, "baiduAPP", isolated),
+            app_minutes_row(MAC_A, DAY, "抖音", isolated),
+        ])
+        report = store.report([MAC_A], DAY)
+        apps = {row["app"]: row for row in report["apps"]}
+        assert "抖音" not in apps, "普通应用的一分钟孤段照旧按白天 3 分钟门槛过滤"
+        for name in ("支付宝", "微信支付", "DeepSeek", "百度"):
+            assert apps[name]["minutes"] == 3, name
+            assert apps[name]["sessions"] == 3, name
+        assert "baiduAPP" not in apps, "入库名先归一成「百度」，再按短交互放行"
+        assert report["onlineMinutes"] == 3, "设备时长必须认这些分钟，不能只出现在应用列表里"
+
+    def test_a_bank_app_matches_by_suffix(self, store):
+        minutes = [bj_minute(DAY, 11)]
+        store.insert_device_minutes([device_minutes_row(MAC_A, DAY, minutes)])
+        store.insert_app_minutes([app_minutes_row(MAC_A, DAY, "中国工商银行", minutes)])
+        assert store.report([MAC_A], DAY)["apps"][0]["minutes"] == 1
+
+    def test_instant_use_apps_are_relaxed_around_the_clock(self, store):
+        """短交互应用全天都按 1 分钟放行；夜间「必须有应用归属」这条不放。"""
+        isolated = [bj_minute(DAY, 2), bj_minute(DAY, 3, 30)]
+        store.insert_device_minutes([device_minutes_row(
+            MAC_A, DAY, [*isolated, bj_minute(DAY, 4)])])
+        store.insert_app_minutes([app_minutes_row(MAC_A, DAY, "支付宝", isolated)])
+        report = store.report([MAC_A], DAY)
+        assert report["lateNightMinutes"] == 2, "凌晨扫一次码就是一分钟，不该被抹掉"
+        assert report["onlineMinutes"] == 2, "04:00 那一格只有后台字节，仍然不算"
+        assert report["apps"][0]["sessions"] == 2
+
     def test_night_tolerates_a_wider_hole_than_day(self, store):
         """夜里一次真实使用被重分类切得更碎，容差比白天宽。"""
         empty = NIGHT_MERGE_GAP_MINUTES  # 刚好落在容差内的空分钟数
@@ -427,6 +464,17 @@ class TestMinuteReport:
         store.insert_app_minutes([app_minutes_row(MAC_B, DAY, "微信", split)])
         other = store.report([MAC_B], DAY)["apps"][0]
         assert other["sessions"] == 2, "超出夜间容差就得断开"
+
+    def test_baidu_app_is_reported_under_its_chinese_name(self, store):
+        """中继按 `_` 截断后剩下 `baiduAPP`，家长端要看到的是「百度」。"""
+        store.insert_app_minutes([
+            app_minutes_row(MAC_A, DAY, "baiduAPP",
+                            run_from(bj_minute(DAY, 9), DAY_MIN_RUN_MINUTES)),
+            app_minutes_row(MAC_A, DAY, "百度网盘",
+                            run_from(bj_minute(DAY, 10), DAY_MIN_RUN_MINUTES)),
+        ])
+        assert [row["app"] for row in store.report([MAC_A], DAY)["apps"]] == \
+            ["百度", "百度网盘"], "百度网盘是另一个应用，不能并进来"
 
     def test_empty_day_has_no_bar_array(self, store):
         report = store.report([MAC_A], DAY)

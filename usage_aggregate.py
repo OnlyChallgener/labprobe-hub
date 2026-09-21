@@ -122,6 +122,30 @@ NIGHT_MERGE_GAP_MINUTES = int(os.environ.get("USAGE_NIGHT_MERGE_GAP_MINUTES", "4
 #: 规则把它们全部剔除，而 00:01-01:11 刷抖音那种真实使用一段都还有 27 分钟。
 NIGHT_MIN_RUN_MINUTES = int(os.environ.get("USAGE_NIGHT_MIN_RUN_MINUTES", "5"))
 DAY_MIN_RUN_MINUTES = int(os.environ.get("USAGE_DAY_MIN_RUN_MINUTES", "3"))
+#: 打开就是为了完成一次短交互的应用：扫码付款、搜一下、问一句 AI。这种一分钟就
+#: 是真实使用，套 3 分钟 / 5 分钟的连续段门槛会把整段抹掉，所以它们全天都单独放行。
+#: 夜间仍然要求「有应用归属」——7 小时 51 分那个根因是未识别的后台字节，不在这里
+#: 放行，也不会被放回来。
+INSTANT_USE_MIN_RUN_MINUTES = int(os.environ.get("USAGE_INSTANT_MIN_RUN_MINUTES", "1"))
+INSTANT_USE_APPS = frozenset(os.environ.get(
+    "USAGE_INSTANT_USE_APPS",
+    # 百度的官方特征条目就叫 baiduAPP，两个名字都要认。
+    "支付宝,微信支付,云闪付,百度,baiduAPP,百度贴吧,DeepSeek,豆包,夸克,Kimi,元宝,即梦"
+).split(","))
+#: 银行类 App 名字各异，按后缀统一放行。
+INSTANT_USE_SUFFIXES = ("银行", "支付")
+
+
+def _is_instant_use(app: str) -> bool:
+    name = str(app or "").strip()
+    return name in INSTANT_USE_APPS or any(name.endswith(s) for s in INSTANT_USE_SUFFIXES)
+
+
+def _min_run_minutes(app: str, *, night: bool) -> int:
+    """这个应用在这一段该按多长的连续段门槛计。短交互应用全天都放行到 1 分钟。"""
+    if _is_instant_use(app):
+        return INSTANT_USE_MIN_RUN_MINUTES
+    return NIGHT_MIN_RUN_MINUTES if night else DAY_MIN_RUN_MINUTES
 #: A day has at most this many minute buckets; more than that is malformed input.
 MAX_MINUTES_PER_ROW = 24 * 60
 #: 家长请注意 window is 00:00-06:00 Beijing time, i.e. hours 0..5.
@@ -1365,6 +1389,21 @@ def _beijing_hour(minute_epoch: int) -> int:
     return ((int(minute_epoch) + 8 * 3600) // 3600) % 24
 
 
+#: RDPI 的官方 name 直接来自固件特征库，命名并不统一：百度 App 在库里叫
+#: ``baiduAPP_homePage`` / ``baiduAPP_search``，中继按 ``_`` 截断后只剩
+#: ``baiduAPP``，家长端就显示成了一个英文串。这里在读取时归一，老数据和新数据
+#: 一起生效，不需要动中继也不需要重装 App。
+#: 只归一已经核对过的：``百度网盘`` / ``百度贴吧`` 是另外两个应用，不能并进来。
+APP_DISPLAY_ALIASES: Dict[str, str] = {
+    "baiduAPP": "百度",
+}
+
+
+def display_app_name(app: Any) -> str:
+    name = str(app or "").strip()
+    return APP_DISPLAY_ALIASES.get(name, name)
+
+
 def _minute_runs(minutes: Iterable[int], gap_minutes: int) -> List[List[int]]:
     """把分钟戳切成连续段：中间空了超过 ``gap_minutes`` 个空分钟就断成两段。"""
     ordered = sorted({int(value) for value in minutes})
@@ -1427,10 +1466,14 @@ def _qualifying_usage(
         unique = {int(value) for value in values}
         night = {m for m in unique if _beijing_hour(m) < LATE_NIGHT_END_HOUR}
         night_runs = _kept_runs(night, gap_minutes=NIGHT_MERGE_GAP_MINUTES,
-                                min_run_minutes=NIGHT_MIN_RUN_MINUTES)
+                                min_run_minutes=_min_run_minutes(app, night=True))
         day_runs = _kept_runs(unique - night, gap_minutes=DAY_MERGE_GAP_MINUTES,
-                              min_run_minutes=DAY_MIN_RUN_MINUTES)
+                              min_run_minutes=_min_run_minutes(app, night=False))
         counted.update(m for run in night_runs for m in run)
+        if _is_instant_use(app):
+            # 短交互应用的分钟也要进设备时长，否则应用列表里写着 1 分钟、上面的
+            # 「今日上网时长」却一分都不涨。夜间那部分已经由 night_runs 带进来了。
+            counted.update(m for run in day_runs for m in run)
         kept = night_runs + day_runs
         if not kept:
             continue
@@ -1487,7 +1530,7 @@ def _minute_snapshot(
         window,
     ):
         apps.setdefault(str(row["date"]), {}).setdefault(
-            str(row["app"]), set()).add(int(row["minute_epoch"]))
+            display_app_name(row["app"]), set()).add(int(row["minute_epoch"]))
 
     days: Dict[str, Dict[str, Any]] = {}
     for day in sorted(set(device) | set(apps)):
@@ -1727,7 +1770,7 @@ def _guard_read(conn: sqlite3.Connection, wanted: Sequence[str], day: str,
         (*prefix, day, *wanted),
     ):
         apps.setdefault(str(row["mac"]), {}).setdefault(
-            str(row["app"]), []).append(int(row["minute_epoch"]))
+            display_app_name(row["app"]), []).append(int(row["minute_epoch"]))
 
     latest: Dict[str, int] = {}
     for row in conn.execute(
