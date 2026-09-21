@@ -9,8 +9,12 @@ import pytest
 from flask import Flask
 
 from usage_aggregate import (
+    DAY_MERGE_GAP_MINUTES,
+    DAY_MIN_RUN_MINUTES,
     DEFAULT_DAILY_KEEP_DAYS,
     DEFAULT_HOURLY_KEEP_DAYS,
+    NIGHT_MERGE_GAP_MINUTES,
+    NIGHT_MIN_RUN_MINUTES,
     UsageAggregateError,
     UsageAggregateStore,
     compose_device_report,
@@ -47,6 +51,11 @@ def bj_minute(day: str, hour: int, minute: int = 0) -> int:
     """Minute-start epoch for a Beijing wall-clock time (UTC-aligned, as v3 sends)."""
     moment = datetime.strptime(f"{day} {hour:02d}:{minute:02d}", "%Y-%m-%d %H:%M")
     return int(moment.replace(tzinfo=timezone(timedelta(hours=8))).timestamp())
+
+
+def run_from(start: int, count: int) -> list:
+    """从 ``start`` 起连续 ``count`` 个自然分钟。"""
+    return [start + offset * 60 for offset in range(count)]
 
 
 def device_minutes_row(mac, day, minutes):
@@ -220,23 +229,44 @@ class TestMinuteIngest:
 
     def test_a_minute_is_counted_whatever_happens_inside_it(self, store):
         """5 s of traffic and 55 s of traffic in a minute are both one minute."""
-        store.insert_device_minutes([device_minutes_row(MAC_A, DAY, [bj_minute(DAY, 9)])])
-        assert store.report([MAC_A], DAY)["onlineMinutes"] == 1
-        assert store.report([MAC_A], DAY)["onlineSeconds"] == 60
+        store.insert_device_minutes([device_minutes_row(
+            MAC_A, DAY, run_from(bj_minute(DAY, 9), DAY_MIN_RUN_MINUTES))])
+        report = store.report([MAC_A], DAY)
+        assert report["onlineMinutes"] == DAY_MIN_RUN_MINUTES
+        assert report["onlineSeconds"] == DAY_MIN_RUN_MINUTES * 60
 
     def test_off_minute_epoch_lands_in_its_own_bucket(self, store):
         start = bj_minute(DAY, 9)
         store.insert_device_minutes([
-            device_minutes_row(MAC_A, DAY, [start + 5, start + 55, start + 60])
+            device_minutes_row(MAC_A, DAY,
+                               [start + 5, start + 55] + run_from(start + 60, 2))
         ])
-        assert store.report([MAC_A], DAY)["onlineMinutes"] == 2
+        assert store.report([MAC_A], DAY)["onlineMinutes"] == 3
 
     def test_a_full_day_of_minutes_is_the_whole_day(self, store):
         minutes = [bj_minute(DAY, 0) + offset * 60 for offset in range(24 * 60)]
         assert store.insert_device_minutes([device_minutes_row(MAC_A, DAY, minutes)]) == 1440
+        # 夜间那一半要有应用归属才算上网，所以把整晚的应用分钟也补上。
+        assert store.insert_app_minutes([
+            app_minutes_row(MAC_A, DAY, "微信", minutes[:6 * 60])]) == 360
         report = store.report([MAC_A], DAY)
         assert report["onlineMinutes"] == 1440
         assert [row["minutes"] for row in report["hourly"]] == [60] * 24
+
+    def test_unattributed_night_minutes_are_never_online_time(self, store):
+        """睡眠设备的固件字节差值每分钟都过门槛：夜间没有应用归属就不算上网。
+
+        这就是 2026-09-21 那个「才 8 点就统计到 7 小时 51 分」的根因。
+        """
+        night = [bj_minute(DAY, 0) + offset * 60 for offset in range(6 * 60)]
+        store.insert_device_minutes([device_minutes_row(MAC_A, DAY, night)])
+        report = store.report([MAC_A], DAY)
+        assert report["onlineMinutes"] == 0
+        assert report["lateNightMinutes"] == 0
+        assert [row["minutes"] for row in report["hourly"][:6]] == [0] * 6, \
+            "整晚满格的小时柱就是家长端看到的那条假曲线"
+        assert report["coverage"]["hasRecords"] is True, \
+            "路由器确实记过这些分钟，只是不计入时长，不是「暂无记录」"
 
     def test_more_minutes_than_a_day_has_is_rejected(self, store):
         minutes = [bj_minute(DAY, 0) + offset * 60 for offset in range(1441)]
@@ -245,14 +275,15 @@ class TestMinuteIngest:
 
     def test_minutes_are_per_mac_and_per_day(self, store):
         store.insert_device_minutes([
-            device_minutes_row(MAC_A, DAY, [bj_minute(DAY, 8)]),
-            device_minutes_row(MAC_B, DAY, [bj_minute(DAY, 8)]),
-            device_minutes_row(MAC_A, "2026-09-17", [bj_minute("2026-09-17", 8)]),
+            device_minutes_row(MAC_A, DAY, run_from(bj_minute(DAY, 8), DAY_MIN_RUN_MINUTES)),
+            device_minutes_row(MAC_B, DAY, run_from(bj_minute(DAY, 8), DAY_MIN_RUN_MINUTES)),
+            device_minutes_row(MAC_A, "2026-09-17",
+                               run_from(bj_minute("2026-09-17", 8), DAY_MIN_RUN_MINUTES)),
         ])
-        assert store.report([MAC_A], DAY)["onlineMinutes"] == 1
-        assert store.report([MAC_A, MAC_B], DAY)["onlineMinutes"] == 1, \
+        assert store.report([MAC_A], DAY)["onlineMinutes"] == DAY_MIN_RUN_MINUTES
+        assert store.report([MAC_A, MAC_B], DAY)["onlineMinutes"] == DAY_MIN_RUN_MINUTES, \
             "one shared minute across two MACs is still one minute of the card"
-        assert store.report([MAC_A], "2026-09-17")["onlineMinutes"] == 1
+        assert store.report([MAC_A], "2026-09-17")["onlineMinutes"] == DAY_MIN_RUN_MINUTES
         assert store.report([MAC_A], "2026-09-16")["onlineMinutes"] == 0
 
 
@@ -271,30 +302,36 @@ class TestMinuteReport:
 
     def test_hour_binning_uses_beijing_time_not_the_hub_clock(self, store):
         # 23:30 Beijing on the requested day is hour 23 no matter what UTC says.
+        night = run_from(bj_minute(DAY, 0, 5), NIGHT_MIN_RUN_MINUTES)
         store.insert_device_minutes([device_minutes_row(
-            MAC_A, DAY, [bj_minute(DAY, 23, 30), bj_minute(DAY, 0, 5)])])
+            MAC_A, DAY,
+            night + run_from(bj_minute(DAY, 23, 30), DAY_MIN_RUN_MINUTES))])
+        store.insert_app_minutes([app_minutes_row(MAC_A, DAY, "微信", night)])
         report = store.report([MAC_A], DAY)
-        assert report["hourly"][0]["minutes"] == 1
-        assert report["hourly"][23]["minutes"] == 1
+        assert report["hourly"][0]["minutes"] == NIGHT_MIN_RUN_MINUTES
+        assert report["hourly"][23]["minutes"] == DAY_MIN_RUN_MINUTES
         assert report["hourly"][1]["minutes"] == 0
 
     def test_consecutive_minutes_form_one_range_and_gaps_split_them(self, store):
-        run = [bj_minute(DAY, 8, 15), bj_minute(DAY, 8, 16), bj_minute(DAY, 8, 17)]
+        run = run_from(bj_minute(DAY, 8, 15), DAY_MIN_RUN_MINUTES)
         store.insert_app_minutes([app_minutes_row(MAC_A, DAY, "抖音", run)])
         app = store.report([MAC_A], DAY)["apps"][0]
-        assert app["minutes"] == 3
+        assert app["minutes"] == DAY_MIN_RUN_MINUTES
         assert app["sessions"] == 1
         assert app["sessionRanges"] == [{
-            "startEpoch": run[0], "endEpoch": run[-1] + 60, "activeSeconds": 180, "minutes": 3,
+            "startEpoch": run[0], "endEpoch": run[-1] + 60,
+            "activeSeconds": DAY_MIN_RUN_MINUTES * 60, "minutes": DAY_MIN_RUN_MINUTES,
         }]
 
-        gapped = [bj_minute(DAY, 8, 15), bj_minute(DAY, 8, 25), bj_minute(DAY, 8, 35)]
+        gapped = (run_from(bj_minute(DAY, 8, 15), DAY_MIN_RUN_MINUTES)
+                  + run_from(bj_minute(DAY, 8, 25), DAY_MIN_RUN_MINUTES)
+                  + run_from(bj_minute(DAY, 8, 35), DAY_MIN_RUN_MINUTES))
         store.insert_app_minutes([app_minutes_row(MAC_B, DAY, "抖音", gapped)])
         both = store.report([MAC_B], DAY)["apps"][0]
-        assert both["minutes"] == 3
-        assert both["sessions"] == 3, "空 9 分钟远超容差，必须断开"
-        assert [row["minutes"] for row in both["sessionRanges"]] == [1, 1, 1]
-        assert [row["endEpoch"] - row["startEpoch"] for row in both["sessionRanges"]] == [60] * 3
+        assert both["minutes"] == 3 * DAY_MIN_RUN_MINUTES
+        assert both["sessions"] == 3, "空 7 分钟远超容差，必须断开"
+        assert ([row["minutes"] for row in both["sessionRanges"]]
+                == [DAY_MIN_RUN_MINUTES] * 3)
 
     def test_a_two_minute_hole_stays_one_range_but_loses_no_minute(self, store):
         """固件周期性重分类长连接 → 真实分钟之间会缺一两格。
@@ -304,49 +341,92 @@ class TestMinuteReport:
         仍然是 3 分钟。
         """
         minutes = [bj_minute(DAY, 8, 15), bj_minute(DAY, 8, 16),
-                   bj_minute(DAY, 8, 18), bj_minute(DAY, 8, 22), bj_minute(DAY, 8, 23)]
+                   bj_minute(DAY, 8, 18), bj_minute(DAY, 8, 22), bj_minute(DAY, 8, 23),
+                   bj_minute(DAY, 8, 24)]
         store.insert_app_minutes([app_minutes_row(MAC_A, DAY, "微信", minutes)])
         app = store.report([MAC_A], DAY)["apps"][0]
-        assert app["minutes"] == 5
-        assert [row["minutes"] for row in app["sessionRanges"]] == [3, 2]
+        assert app["minutes"] == 6
+        assert [row["minutes"] for row in app["sessionRanges"]] == [3, 3]
         assert app["sessionRanges"][0]["startEpoch"] == minutes[0]
         assert app["sessionRanges"][0]["endEpoch"] == minutes[2] + 60
         assert app["sessionRanges"][0]["activeSeconds"] == 180
-        # 缺 3 格（08:19/20/21）就断开：容差是「最多跨过两个空分钟」。
+        # 缺 3 格（08:19/20/21）就断开：白天的容差是「最多跨过两个空分钟」。
         assert app["sessionRanges"][1]["startEpoch"] == minutes[3]
         assert app["sessions"] == 2
 
     def test_apps_have_no_invented_bytes_on_the_minute_basis(self, store):
         store.insert_app_minutes([
-            app_minutes_row(MAC_A, DAY, "微信", [bj_minute(DAY, 12), bj_minute(DAY, 12, 1)]),
-            app_minutes_row(MAC_A, DAY, "小红书", [bj_minute(DAY, 13)]),
+            app_minutes_row(MAC_A, DAY, "微信", run_from(bj_minute(DAY, 12), 4)),
+            app_minutes_row(MAC_A, DAY, "小红书",
+                            run_from(bj_minute(DAY, 13), DAY_MIN_RUN_MINUTES)),
         ])
         store.upsert_daily_app([daily(MAC_A, DAY, "微信", 9_999, tx=9_999, rx=8_888)])
         report = store.report([MAC_A], DAY)
         assert [row["app"] for row in report["apps"]] == ["微信", "小红书"]
         assert all(row["txBytes"] == 0 and row["rxBytes"] == 0 for row in report["apps"])
-        assert [row["minutes"] for row in report["apps"]] == [2, 1]
+        assert [row["minutes"] for row in report["apps"]] == [4, DAY_MIN_RUN_MINUTES]
 
     def test_late_night_boundary_is_six_am_beijing(self, store):
+        # 一次跨过 06:00 的使用：夜里那 6 格算深夜，06:00 起的 3 格算白天。
+        app_minutes = (run_from(bj_minute(DAY, 5, 54), 6)
+                       + run_from(bj_minute(DAY, 6, 0), DAY_MIN_RUN_MINUTES))
         store.insert_device_minutes([device_minutes_row(MAC_A, DAY, [
-            bj_minute(DAY, 5, 59),   # late night
-            bj_minute(DAY, 5, 58),   # late night
-            bj_minute(DAY, 6, 0),    # not late night
-            bj_minute(DAY, 23, 59),  # not late night: the window ends at 06:00
+            *app_minutes,
+            bj_minute(DAY, 23, 59),  # 孤零零一格，够不到白天的门檻
         ])])
-        store.insert_app_minutes([app_minutes_row(MAC_A, DAY, "微信", [
-            bj_minute(DAY, 5, 58), bj_minute(DAY, 5, 59), bj_minute(DAY, 6, 0),
-        ])])
+        store.insert_app_minutes([app_minutes_row(MAC_A, DAY, "微信", app_minutes)])
         report = store.report([MAC_A], DAY)
-        assert report["lateNightMinutes"] == 2
-        assert report["lateNightSeconds"] == 120
-        assert report["onlineMinutes"] == 4
+        assert report["lateNightMinutes"] == 6
+        assert report["lateNightSeconds"] == 360
+        assert report["onlineMinutes"] == 9, "6 格深夜 + 3 格白天，23:59 那格不计"
+        assert report["hourly"][6]["minutes"] == DAY_MIN_RUN_MINUTES, \
+            "06:00 起是白天，但照样计入小时柱"
+        assert report["hourly"][23]["minutes"] == 0
 
-        days = store.daily_totals([MAC_A], DAY, DAY)
-        assert days[0]["lateNightRanges"] == [{
-            "app": "微信", "startEpoch": bj_minute(DAY, 5, 58),
-            "endEpoch": bj_minute(DAY, 6, 0), "minutes": 2,
-        }], "the 06:00 minute is outside the window and splits the range"
+        app = report["apps"][0]
+        assert app["minutes"] == 9
+        assert app["sessions"] == 2, "06:00 那一格在窗口外，时段必须断开"
+        expected = [{"app": "微信", "startEpoch": bj_minute(DAY, 5, 54),
+                     "endEpoch": bj_minute(DAY, 6, 0), "minutes": 6}]
+        assert report["lateNightRanges"] == expected, \
+            "单日报告也得带深夜时段，App 读的就是顶层这个字段"
+        assert store.daily_totals([MAC_A], DAY, DAY)[0]["lateNightRanges"] == expected
+
+    def test_a_short_night_wake_is_not_usage_time(self, store):
+        """整晚的保活唤醒都是 1 分钟孤段：一条都不算深夜上网。"""
+        wakes = [bj_minute(DAY, 1, 0), bj_minute(DAY, 2, 30), bj_minute(DAY, 3, 45)]
+        store.insert_device_minutes([device_minutes_row(MAC_A, DAY, wakes)])
+        store.insert_app_minutes([app_minutes_row(MAC_A, DAY, "微信", wakes)])
+        report = store.report([MAC_A], DAY)
+        assert report["lateNightMinutes"] == 0
+        assert report["onlineMinutes"] == 0
+        assert report["apps"] == [], "不足 NIGHT_MIN_RUN_MINUTES 的段不展示"
+        assert report["lateNightRanges"] == []
+        assert report["coverage"]["hasRecords"] is True
+
+    def test_a_short_day_run_is_dropped_from_stats_and_display(self, store):
+        minutes = run_from(bj_minute(DAY, 9), DAY_MIN_RUN_MINUTES - 1)
+        store.insert_device_minutes([device_minutes_row(MAC_A, DAY, minutes)])
+        store.insert_app_minutes([app_minutes_row(MAC_A, DAY, "抖音", minutes)])
+        report = store.report([MAC_A], DAY)
+        assert report["onlineMinutes"] == 0
+        assert report["apps"] == []
+
+    def test_night_tolerates_a_wider_hole_than_day(self, store):
+        """夜里一次真实使用被重分类切得更碎，容差比白天宽。"""
+        empty = NIGHT_MERGE_GAP_MINUTES  # 刚好落在容差内的空分钟数
+        joined = (run_from(bj_minute(DAY, 1, 0), NIGHT_MIN_RUN_MINUTES)
+                  + run_from(bj_minute(DAY, 1, 5 + empty), NIGHT_MIN_RUN_MINUTES))
+        store.insert_app_minutes([app_minutes_row(MAC_A, DAY, "微信", joined)])
+        app = store.report([MAC_A], DAY)["apps"][0]
+        assert app["sessions"] == 1, "跨得过空分钟就还是一段"
+        assert app["minutes"] == 2 * NIGHT_MIN_RUN_MINUTES
+
+        split = (run_from(bj_minute(DAY, 3, 0), NIGHT_MIN_RUN_MINUTES)
+                 + run_from(bj_minute(DAY, 3, 6 + empty), NIGHT_MIN_RUN_MINUTES))
+        store.insert_app_minutes([app_minutes_row(MAC_B, DAY, "微信", split)])
+        other = store.report([MAC_B], DAY)["apps"][0]
+        assert other["sessions"] == 2, "超出夜间容差就得断开"
 
     def test_empty_day_has_no_bar_array(self, store):
         report = store.report([MAC_A], DAY)
@@ -417,17 +497,18 @@ class TestDeviceTraffic:
 class TestMinuteAndLegacyNeverMix:
     def test_minute_rows_shadows_the_legacy_numbers_for_the_same_day(self, store):
         """A day with minute rows must not also add its old second sums."""
+        run = run_from(bj_minute(DAY, 8), DAY_MIN_RUN_MINUTES)
         store.upsert_hourly([hourly(MAC_A, DAY, 8, 40 * 60)])
         store.upsert_daily_app([daily(MAC_A, DAY, "微信", 40 * 60, sessions=9)])
-        store.insert_device_minutes([device_minutes_row(
-            MAC_A, DAY, [bj_minute(DAY, 8), bj_minute(DAY, 8, 1)])])
-        store.insert_app_minutes([app_minutes_row(MAC_A, DAY, "微信", [bj_minute(DAY, 8)])])
+        store.insert_device_minutes([device_minutes_row(MAC_A, DAY, run)])
+        store.insert_app_minutes([app_minutes_row(MAC_A, DAY, "微信", run)])
 
         report = store.report([MAC_A], DAY)
         assert report["basis"] == "minutes"
-        assert report["onlineMinutes"] == 2, "not 2 + the legacy 40 minutes"
-        assert report["onlineSeconds"] == 120
-        assert report["apps"][0]["minutes"] == 1
+        assert report["onlineMinutes"] == DAY_MIN_RUN_MINUTES, \
+            f"not {DAY_MIN_RUN_MINUTES} + the legacy 40 minutes"
+        assert report["onlineSeconds"] == DAY_MIN_RUN_MINUTES * 60
+        assert report["apps"][0]["minutes"] == DAY_MIN_RUN_MINUTES
         assert report["apps"][0]["sessions"] == 1
 
     def test_legacy_only_days_still_report(self, store):
@@ -443,7 +524,7 @@ class TestMinuteAndLegacyNeverMix:
             MAC_A, "2026-09-17", [bj_minute("2026-09-17", 8) + offset * 60
                                   for offset in range(4)])])
         store.insert_device_minutes([device_minutes_row(
-            MAC_A, DAY, [bj_minute(DAY, 21), bj_minute(DAY, 21, 1)])])
+            MAC_A, DAY, run_from(bj_minute(DAY, 21), DAY_MIN_RUN_MINUTES))])
         days = {row["date"]: row for row in store.daily_totals([MAC_A], "2026-09-16", DAY)}
         assert days["2026-09-16"] == {
             "date": "2026-09-16", "onlineSeconds": 0, "onlineMinutes": 0,
@@ -452,7 +533,7 @@ class TestMinuteAndLegacyNeverMix:
         }
         assert days["2026-09-17"]["onlineMinutes"] == 4
         assert days["2026-09-17"]["basis"] == "minutes"
-        assert days[DAY]["onlineMinutes"] == 2
+        assert days[DAY]["onlineMinutes"] == DAY_MIN_RUN_MINUTES
         assert days[DAY]["basis"] == "minutes"
 
     def test_range_apps_never_count_a_minute_day_twice(self, store):
@@ -461,18 +542,19 @@ class TestMinuteAndLegacyNeverMix:
             daily(MAC_A, "2026-09-17", "微信", 10 * 60, sessions=2),
         ])
         store.insert_app_minutes([app_minutes_row(
-            MAC_A, DAY, "微信", [bj_minute(DAY, 8), bj_minute(DAY, 9)])])
+            MAC_A, DAY, "微信", run_from(bj_minute(DAY, 8), DAY_MIN_RUN_MINUTES))])
         apps = store.app_totals([MAC_A], "2026-09-17", DAY)
         assert apps[0]["app"] == "微信"
-        assert apps[0]["minutes"] == 12, "2 minutes from the v3 day + 10 from the legacy day"
-        assert apps[0]["sessions"] == 4, "two one-minute v3 runs + the legacy day's 2"
+        assert apps[0]["minutes"] == DAY_MIN_RUN_MINUTES + 10, \
+            "v3 那天的一段 + legacy 那天的 10 分钟"
+        assert apps[0]["sessions"] == 3, "v3 的一段 + legacy 那天的 2 次"
         assert apps[0]["txBytes"] == 0
 
 
 class TestComposeMinuteSources:
     def test_minute_day_is_labelled_and_never_merged_with_live_hours(self, store):
         store.insert_device_minutes([device_minutes_row(
-            MAC_A, DAY, [bj_minute(DAY, 8), bj_minute(DAY, 8, 1)])])
+            MAC_A, DAY, run_from(bj_minute(DAY, 8), DAY_MIN_RUN_MINUTES))])
         report = compose_device_report(
             store, [MAC_A], DAY,
             live=lambda: {"date": DAY, "hourly": [{"hour": 8, "minutes": 500}],
@@ -480,7 +562,8 @@ class TestComposeMinuteSources:
             now=datetime(2026, 9, 18, 8, 30),
         )
         assert report["source"] == "hub+minutes"
-        assert report["onlineMinutes"] == 2, "hour buckets cannot add minutes to a set"
+        assert report["onlineMinutes"] == DAY_MIN_RUN_MINUTES, \
+            "hour buckets cannot add minutes to a set"
         assert report["apps"] == []
 
     def test_legacy_day_may_still_be_topped_up_by_the_relay(self, store):
@@ -1024,7 +1107,6 @@ import time  # noqa: E402
 from usage_aggregate import (  # noqa: E402
     ATTENTION_NOTICE_MINUTES,
     MINUTE_SECONDS,
-    STALE_AFTER_SECONDS,
     build_guard_overview,
 )
 from child_guard_schedule import BEIJING, WEEKDAY_KEYS  # noqa: E402
@@ -1066,22 +1148,23 @@ class TestV3IngestStorage:
 
     def test_repeated_push_never_double_counts_a_minute(self, store):
         day = beijing_date(bj_minute(DAY, 10))
-        minutes = [bj_minute(DAY, 10), bj_minute(DAY, 10) + 60]
+        minutes = run_from(bj_minute(DAY, 10), 4)
         body = v3_body(day, minutes)
         store.ingest_v3(body, router=ROUTER)
         first = store.report([MAC_A], day, ROUTER)
         for _ in range(3):
             store.ingest_v3(body, router=ROUTER)
         again = store.report([MAC_A], day, ROUTER)
-        assert again["onlineMinutes"] == first["onlineMinutes"] == 2
-        assert again["todayMinutes"] == 2
+        assert again["onlineMinutes"] == first["onlineMinutes"] == 4
+        assert again["todayMinutes"] == 4
 
     def test_one_new_minute_moves_today_minutes_by_exactly_one(self, store):
         day = beijing_date(bj_minute(DAY, 10))
-        store.ingest_v3(v3_body(day, [bj_minute(DAY, 10)]), router=ROUTER)
-        assert store.report([MAC_A], day, ROUTER)["todayMinutes"] == 1
-        store.ingest_v3(v3_body(day, [bj_minute(DAY, 10) + 120]), router=ROUTER)
-        assert store.report([MAC_A], day, ROUTER)["todayMinutes"] == 2
+        base = run_from(bj_minute(DAY, 10), DAY_MIN_RUN_MINUTES)
+        store.ingest_v3(v3_body(day, base), router=ROUTER)
+        assert store.report([MAC_A], day, ROUTER)["todayMinutes"] == DAY_MIN_RUN_MINUTES
+        store.ingest_v3(v3_body(day, [base[-1] + 60]), router=ROUTER)
+        assert store.report([MAC_A], day, ROUTER)["todayMinutes"] == DAY_MIN_RUN_MINUTES + 1
 
     def test_traffic_days_are_never_summed_into_a_bigger_total(self, store):
         day = beijing_date(bj_minute(DAY, 10))
@@ -1116,14 +1199,17 @@ class TestV3IngestStorage:
 
     def test_two_routers_keep_their_own_rows(self, store):
         day = beijing_date(bj_minute(DAY, 10))
-        store.ingest_v3(v3_body(day, [bj_minute(DAY, 10)]), router=ROUTER)
-        store.ingest_v3(v3_body(day, [bj_minute(DAY, 10), bj_minute(DAY, 11)],
+        store.ingest_v3(v3_body(day, run_from(bj_minute(DAY, 10),
+                                              DAY_MIN_RUN_MINUTES)), router=ROUTER)
+        store.ingest_v3(v3_body(day, run_from(bj_minute(DAY, 10), DAY_MIN_RUN_MINUTES)
+                                + run_from(bj_minute(DAY, 11), DAY_MIN_RUN_MINUTES),
                                 mac=MAC_B), router="other")
-        assert store.report([MAC_A], day, ROUTER)["todayMinutes"] == 1
-        assert store.report([MAC_B], day, "other")["todayMinutes"] == 2
+        assert store.report([MAC_A], day, ROUTER)["todayMinutes"] == DAY_MIN_RUN_MINUTES
+        assert (store.report([MAC_B], day, "other")["todayMinutes"]
+                == 2 * DAY_MIN_RUN_MINUTES)
         # A router name the Hub has never filed rows under still reads, because
         # an empty result is more likely a naming mismatch than a real zero.
-        assert store.report([MAC_A], day, "Ruijie BE72")["todayMinutes"] == 1
+        assert store.report([MAC_A], day, "Ruijie BE72")["todayMinutes"] == DAY_MIN_RUN_MINUTES
 
 
 class TestV3ReportFields:
@@ -1132,10 +1218,11 @@ class TestV3ReportFields:
     def test_report_states_freshness_and_data_presence(self, store):
         now = floor_minute(time.time())
         day = beijing_date(now)
-        store.ingest_v3(v3_body(day, [now, now - 60], generated=now), router=ROUTER)
+        store.ingest_v3(v3_body(day, run_from(now - 120, DAY_MIN_RUN_MINUTES),
+                                generated=now), router=ROUTER)
         report = store.report([MAC_A], day, ROUTER)
         assert report["hasData"] is True
-        assert report["todayMinutes"] == report["onlineMinutes"] == 2
+        assert report["todayMinutes"] == report["onlineMinutes"] == DAY_MIN_RUN_MINUTES
         assert report["lastSampleAt"] == now
         assert report["stale"] is False
         assert report["activeNow"] is True
@@ -1149,14 +1236,15 @@ class TestV3ReportFields:
 
     def test_a_stalled_pipeline_is_stale_not_zero_minutes(self, store):
         now = floor_minute(time.time())
-        day = beijing_date(now)
-        idle = bj_minute(day, 0)  # 午夜的一格：数据是真的，但早已不再推进
-        if now - idle < STALE_AFTER_SECONDS:  # pragma: no cover - 午夜三分钟内
+        # 六到八分钟前的一段真实使用：数据是真的，但早已不再推进。
+        idle = run_from(now - 480, DAY_MIN_RUN_MINUTES)
+        day = beijing_date(idle[0])
+        if beijing_date(now) != day:  # pragma: no cover - 午夜几分钟内
             pytest.skip("too close to midnight to distinguish stale")
-        store.ingest_v3(v3_body(day, [idle], generated=idle), router=ROUTER)
+        store.ingest_v3(v3_body(day, idle, generated=idle[-1]), router=ROUTER)
         report = store.report([MAC_A], day, ROUTER)
         assert report["hasData"] is True
-        assert report["todayMinutes"] == 1
+        assert report["todayMinutes"] == DAY_MIN_RUN_MINUTES
         assert report["stale"] is True
 
     def test_a_past_day_is_never_marked_stale(self, store):
@@ -1295,12 +1383,13 @@ class TestGuardOverview:
     def test_a_minute_in_the_current_bucket_is_active_now(self, store):
         reference = bj_minute(DAY, 13)
         day = beijing_date(reference)
-        store.ingest_v3(v3_body(day, [reference]), router=ROUTER)
+        minutes = run_from(reference - (DAY_MIN_RUN_MINUTES - 1) * 60, DAY_MIN_RUN_MINUTES)
+        store.ingest_v3(v3_body(day, minutes), router=ROUTER)
         rows = [{"uid": UID, "macs": [MAC_A], "name": "电脑"}]
         device = self.build(store, rows, now_epoch=reference + 5,
                             presence={MAC_A: True})["devices"][0]
         assert device["activeNow"] is True
-        assert device["todayMinutes"] == 1
+        assert device["todayMinutes"] == DAY_MIN_RUN_MINUTES
         assert device["hasData"] is True
         assert device["attention"]["state"] == "none"
         assert device["online"] is True
@@ -1318,26 +1407,40 @@ class TestGuardOverview:
     def test_two_macs_of_one_device_share_a_minute_once(self, store):
         reference = bj_minute(DAY, 13)
         day = beijing_date(reference)
-        store.ingest_v3(v3_body(day, [reference]), router=ROUTER)
-        store.ingest_v3(v3_body(day, [reference], mac=MAC_B), router=ROUTER)
+        minutes = run_from(reference, DAY_MIN_RUN_MINUTES)
+        store.ingest_v3(v3_body(day, minutes), router=ROUTER)
+        store.ingest_v3(v3_body(day, minutes, mac=MAC_B), router=ROUTER)
         device = self.build(
             store, [{"uid": UID, "macs": [MAC_A, MAC_B]}],
             now_epoch=reference + 5)["devices"][0]
-        assert device["todayMinutes"] == 1
+        assert device["todayMinutes"] == DAY_MIN_RUN_MINUTES, \
+            "两块网卡报同一分钟，设备时长只多一格"
 
     def test_late_night_minutes_are_an_alert(self, store):
         reference = bj_minute(DAY, 13)
         day = beijing_date(reference)
-        late = bj_minute(day, 2, 5)
-        store.ingest_v3(v3_body(day, [late, late + 60], app_minutes=[late]),
-                        router=ROUTER)
+        late = run_from(bj_minute(day, 2, 5), NIGHT_MIN_RUN_MINUTES)
+        store.ingest_v3(v3_body(day, late, app_minutes=late), router=ROUTER)
         device = self.build(store, [{"uid": UID, "macs": [MAC_A]}],
                             now_epoch=reference + 5)["devices"][0]
         assert device["attention"]["state"] == "alert"
-        assert device["attention"]["lateNightMinutes"] == 2
+        assert device["attention"]["lateNightMinutes"] == NIGHT_MIN_RUN_MINUTES
         assert device["attention"]["hasAttention"] is True
         assert "凌晨" in device["attention"]["text"]
         assert device["activeNow"] is False
+
+    def test_a_night_keepalive_wake_is_not_an_alert(self, store):
+        """整晚的保活唤醒都是孤零零一两格：既不是时长，也不是「凌晨还在上网」。"""
+        reference = bj_minute(DAY, 13)
+        day = beijing_date(reference)
+        wakes = [bj_minute(day, 1, 0), bj_minute(day, 2, 30), bj_minute(day, 3, 45)]
+        store.ingest_v3(v3_body(day, wakes, app_minutes=wakes[:2]), router=ROUTER)
+        device = self.build(store, [{"uid": UID, "macs": [MAC_A]}],
+                            now_epoch=reference + 5)["devices"][0]
+        assert device["attention"]["state"] == "none"
+        assert device["attention"]["lateNightMinutes"] == 0
+        assert device["todayMinutes"] == 0
+        assert device["hasData"] is True, "记过分钟，只是没到计入口径"
 
     def test_a_long_day_crosses_the_notice_threshold(self, store):
         reference = bj_minute(DAY, 23)
@@ -1354,16 +1457,18 @@ class TestGuardOverview:
     def test_top_apps_come_from_the_app_minute_rows(self, store):
         reference = bj_minute(DAY, 13)
         day = beijing_date(reference)
+        wechat = run_from(bj_minute(DAY, 11), 4)
+        douyin = run_from(bj_minute(DAY, 12), DAY_MIN_RUN_MINUTES)
         store.insert_app_minutes([
-            app_minutes_row(MAC_A, day, "微信", [reference, reference + 60]),
-            app_minutes_row(MAC_A, day, "抖音", [reference]),
+            app_minutes_row(MAC_A, day, "微信", wechat),
+            app_minutes_row(MAC_A, day, "抖音", douyin),
         ], router=ROUTER)
-        store.insert_device_minutes([device_minutes_row(MAC_A, day, [reference])],
+        store.insert_device_minutes([device_minutes_row(MAC_A, day, wechat + douyin)],
                                     router=ROUTER)
         device = self.build(store, [{"uid": UID, "macs": [MAC_A]}],
                             now_epoch=reference + 5)["devices"][0]
-        assert device["topApps"] == [{"app": "微信", "minutes": 2},
-                                      {"app": "抖音", "minutes": 1}]
+        assert device["topApps"] == [{"app": "微信", "minutes": 4},
+                                     {"app": "抖音", "minutes": DAY_MIN_RUN_MINUTES}]
 
     def test_presence_unknown_is_reported_as_none_not_offline(self, store):
         reference = bj_minute(DAY, 13)

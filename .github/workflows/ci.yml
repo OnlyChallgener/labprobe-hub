@@ -54,7 +54,7 @@ jobs:
       - name: Verify release versions
         run: |
           set -e
-          grep -q 'HUB_VERSION = "0.13.7"' hub_entry.py
+          grep -q 'HUB_VERSION = "0.13.8"' hub_entry.py
           grep -q 'create_router_blueprint_v1' hub_entry.py
           grep -q 'create_ai_blueprint' hub_entry.py
           grep -q 'install_hub0934_fixes(hub)' hub_entry.py
@@ -118,6 +118,6 @@ jobs:
         # check that proves the image is self-contained.  It is deliberately run
         # against the built image, not the working tree.
         run: |
-          docker build --pull=false -t labprobe-hub:v0.13.7 .
-          docker run --rm --entrypoint python labprobe-hub:v0.13.7 -c \
-            'import hub_entry, child_guard_service, assistant, router_core, hub0934_fixes, hub0935_sync_fix, labrelay_sync_patch; print("Hub 0.13.7 imports OK")'
+          docker build --pull=false -t labprobe-hub:v0.13.8 .
+          docker run --rm --entrypoint python labprobe-hub:v0.13.8 -c \
+            'import hub_entry, child_guard_service, assistant, router_core, hub0934_fixes, hub0935_sync_fix, labrelay_sync_patch; print("Hub 0.13.8 imports OK")'

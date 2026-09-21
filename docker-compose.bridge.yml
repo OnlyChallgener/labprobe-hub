@@ -54,7 +54,7 @@ services:
       retries: 5
 
   labprobe-hub:
-    image: ${LABPROBE_IMAGE:-onlychallgener/labprobe-hub:v0.13.7}
+    image: ${LABPROBE_IMAGE:-onlychallgener/labprobe-hub:v0.13.8}
     build:
       context: .
       dockerfile: Dockerfile

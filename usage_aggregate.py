@@ -94,7 +94,7 @@ import threading
 import time
 from datetime import date as _date, datetime as _datetime, timedelta
 from pathlib import Path
-from typing import Any, Callable, Dict, Iterable, List, Optional, Sequence
+from typing import Any, Callable, Dict, Iterable, List, Mapping, Optional, Sequence, Set
 
 from flask import Blueprint, jsonify, request
 
@@ -111,7 +111,17 @@ MINUTE_SECONDS = 60
 #: 相邻时段之间允许跨过这么多个「空分钟」仍然算同一段。固件会周期性地把一条长
 #: 连接重新分类一次，于是微信的一条通话会被记成 08:15、08:16、(缺 08:17)、08:18
 #: —— 时长还是真实的那三分钟，只是不再被拆成两段显示。
-RUN_MERGE_GAP_MINUTES = 2
+#: 白天容差：实测（2026-09-20 BE72 微信 135 分钟）53 个洞是 1 个空分钟、23 个是
+#: 2 个，所以 2 足够把一次真实使用拼回一段。
+DAY_MERGE_GAP_MINUTES = int(os.environ.get("USAGE_DAY_MERGE_GAP_MINUTES", "2"))
+#: 夜间容差：夜里一次真实使用被重分类切得更碎，容差太小会把一个 5 分钟段拆成两
+#: 段 3 分钟，再被 ``NIGHT_MIN_RUN_MINUTES`` 整段误杀。
+NIGHT_MERGE_GAP_MINUTES = int(os.environ.get("USAGE_NIGHT_MERGE_GAP_MINUTES", "4"))
+#: 不足这么长的连续段既不计入时长，也不出现在时段列表里。夜间 5 分钟是实测拐点
+#: （2026-09-21 BE72）：00:00-05:59 有 65 段只有 1 分钟，全是保活/推送唤醒，这条
+#: 规则把它们全部剔除，而 00:01-01:11 刷抖音那种真实使用一段都还有 27 分钟。
+NIGHT_MIN_RUN_MINUTES = int(os.environ.get("USAGE_NIGHT_MIN_RUN_MINUTES", "5"))
+DAY_MIN_RUN_MINUTES = int(os.environ.get("USAGE_DAY_MIN_RUN_MINUTES", "3"))
 #: A day has at most this many minute buckets; more than that is malformed input.
 MAX_MINUTES_PER_ROW = 24 * 60
 #: 家长请注意 window is 00:00-06:00 Beijing time, i.e. hours 0..5.
@@ -1350,6 +1360,99 @@ def _empty_traffic_block() -> Dict[str, Any]:
     return {"txBytes": 0, "rxBytes": 0, "totalBytes": 0, "daily": []}
 
 
+def _beijing_hour(minute_epoch: int) -> int:
+    """分钟戳所属的北京小时，与 ``BEIJING_OFFSET_SQL`` 同一套换算。"""
+    return ((int(minute_epoch) + 8 * 3600) // 3600) % 24
+
+
+def _minute_runs(minutes: Iterable[int], gap_minutes: int) -> List[List[int]]:
+    """把分钟戳切成连续段：中间空了超过 ``gap_minutes`` 个空分钟就断成两段。"""
+    ordered = sorted({int(value) for value in minutes})
+    runs: List[List[int]] = []
+    current: List[int] = []
+    limit = MINUTE_SECONDS * (int(gap_minutes) + 1)
+    for value in ordered:
+        if current and value - current[-1] > limit:
+            runs.append(current)
+            current = []
+        current.append(value)
+    if current:
+        runs.append(current)
+    return runs
+
+
+def _run_row(run: List[int]) -> Dict[str, Any]:
+    """一段连续使用的展示行。时段结束在最后一个活跃分钟的末尾。"""
+    return {
+        "startEpoch": min(run),
+        "endEpoch": max(run) + MINUTE_SECONDS,
+        # 一个自然分钟只能确认「这一分钟里有过流量」，确认不了它占了多少秒。按
+        # 秒计真实跨度要等中继把分钟内的首末活跃窗口一起报上来。
+        "activeSeconds": len(run) * MINUTE_SECONDS,
+        "minutes": len(run),
+    }
+
+
+def _kept_runs(minutes: Iterable[int], *, gap_minutes: int,
+               min_run_minutes: int) -> List[List[int]]:
+    return [run for run in _minute_runs(minutes, gap_minutes)
+            if len(run) >= min_run_minutes]
+
+
+def _qualifying_usage(
+    device_minutes: Iterable[int],
+    app_minutes: Mapping[str, Iterable[int]],
+) -> Dict[str, Any]:
+    """一天的分钟行 -> 家长端计入统计的分钟。列表页与详情页共用这一份口径。
+
+    夜间（00:00-05:59）只认「有应用归属、且这一段连续到
+    ``NIGHT_MIN_RUN_MINUTES``」的分钟。设备分钟在夜间不能用：中继按固件的每 IP
+    字节差值判定活跃，门槛是整分钟 1KB 或一条新连接，睡眠中的手机每分钟都过，
+    实测（2026-09-21 BE72）00:00-05:59 有 75% 的分钟根本没有应用归属。
+
+    白天（06:00-23:59）仍按设备分钟计，只丢掉整段不足 ``DAY_MIN_RUN_MINUTES``
+    的——RDPI 认不出的真实使用（浏览器、PC 游戏、新装应用）不能一并抹掉。
+
+    被过滤掉的分钟彻底丢弃，不另立「后台活动」池。
+    """
+    unique_device = {int(value) for value in device_minutes}
+    night_device = {m for m in unique_device if _beijing_hour(m) < LATE_NIGHT_END_HOUR}
+    counted = {m for run in _kept_runs(unique_device - night_device,
+                                       gap_minutes=DAY_MERGE_GAP_MINUTES,
+                                       min_run_minutes=DAY_MIN_RUN_MINUTES)
+               for m in run}
+
+    apps: Dict[str, Dict[str, Any]] = {}
+    for app, values in app_minutes.items():
+        unique = {int(value) for value in values}
+        night = {m for m in unique if _beijing_hour(m) < LATE_NIGHT_END_HOUR}
+        night_runs = _kept_runs(night, gap_minutes=NIGHT_MERGE_GAP_MINUTES,
+                                min_run_minutes=NIGHT_MIN_RUN_MINUTES)
+        day_runs = _kept_runs(unique - night, gap_minutes=DAY_MERGE_GAP_MINUTES,
+                              min_run_minutes=DAY_MIN_RUN_MINUTES)
+        counted.update(m for run in night_runs for m in run)
+        kept = night_runs + day_runs
+        if not kept:
+            continue
+        apps[app] = {
+            "minutes": len({m for run in kept for m in run}),
+            "runs": [_run_row(run) for run in kept],
+            "lateNightRuns": [_run_row(run) for run in night_runs],
+        }
+
+    hourly: Dict[int, int] = {}
+    for value in counted:
+        hour = _beijing_hour(value)
+        hourly[hour] = hourly.get(hour, 0) + 1
+    return {
+        "hourly": hourly,
+        "onlineMinutes": len(counted),
+        "lateNightMinutes": sum(count for hour, count in hourly.items()
+                                if hour < LATE_NIGHT_END_HOUR),
+        "apps": apps,
+    }
+
+
 def _minute_snapshot(
     conn: sqlite3.Connection,
     wanted: Sequence[str],
@@ -1363,120 +1466,36 @@ def _minute_snapshot(
     caller decide the basis per day instead of blending two measurements.
     ``router`` narrows the read to one router; empty means every router the Hub
     has heard from, which is what a single-router installation sees anyway.
+
+    过滤口径全在 :func:`_qualifying_usage`，和 ``/overview`` 用的是同一个函数：
+    列表页的「凌晨还在上网」和详情页的夜间时长不能是两个数。
     """
     holders = ", ".join("?" for _ in wanted)
     clause, prefix = _router_clause(router)
     window = (*prefix, first, last, *wanted)
-    days: Dict[str, Dict[str, Any]] = {}
-
-    def slot(day: str) -> Dict[str, Any]:
-        return days.setdefault(day, {
-            "hourly": {}, "onlineMinutes": 0, "lateNightMinutes": 0, "apps": {},
-        })
-
+    device: Dict[str, Set[int]] = {}
     for row in conn.execute(
-        f"""SELECT date,
-                   CAST(strftime('%H', minute_epoch, {BEIJING_OFFSET_SQL}) AS INTEGER) AS hour,
-                   COUNT(DISTINCT minute_epoch) AS minutes
-            FROM usage_device_minute
-            WHERE {clause}date BETWEEN ? AND ? AND mac IN ({holders})
-            GROUP BY date, hour""",
+        f"""SELECT DISTINCT date, minute_epoch FROM usage_device_minute
+            WHERE {clause}date BETWEEN ? AND ? AND mac IN ({holders})""",
         window,
     ):
-        entry = slot(str(row["date"]))
-        hour = int(row["hour"])
-        minutes = int(row["minutes"] or 0)
-        entry["hourly"][hour] = minutes
-        entry["onlineMinutes"] += minutes
-        if hour < LATE_NIGHT_END_HOUR:
-            entry["lateNightMinutes"] += minutes
+        device.setdefault(str(row["date"]), set()).add(int(row["minute_epoch"]))
+    apps: Dict[str, Dict[str, Set[int]]] = {}
+    for row in conn.execute(
+        f"""SELECT DISTINCT date, app, minute_epoch FROM usage_app_minute
+            WHERE {clause}date BETWEEN ? AND ? AND mac IN ({holders})""",
+        window,
+    ):
+        apps.setdefault(str(row["date"]), {}).setdefault(
+            str(row["app"]), set()).add(int(row["minute_epoch"]))
 
-    for day, app, runs in _app_minute_runs(conn, wanted, first, last,
-                                           late_night_only=False, router=router):
-        entry = slot(day)
-        data = entry["apps"].setdefault(app, {"minutes": 0, "runs": [], "lateNightRuns": []})
-        data["runs"].extend(runs)
-        data["minutes"] += sum(int(run["minutes"]) for run in runs)
-    for day, app, runs in _app_minute_runs(conn, wanted, first, last,
-                                           late_night_only=True, router=router):
-        entry = slot(day)
-        data = entry["apps"].setdefault(app, {"minutes": 0, "runs": [], "lateNightRuns": []})
-        data["lateNightRuns"].extend(runs)
+    days: Dict[str, Dict[str, Any]] = {}
+    for day in sorted(set(device) | set(apps)):
+        usage = _qualifying_usage(device.get(day, ()), apps.get(day, {}))
+        usage["rawMinutes"] = len(device.get(day, ())) + sum(
+            len(minutes) for minutes in apps.get(day, {}).values())
+        days[day] = usage
     return days
-
-
-def _app_minute_runs(
-    conn: sqlite3.Connection,
-    wanted: Sequence[str],
-    first: str,
-    last: str,
-    *,
-    late_night_only: bool,
-    router: str = "",
-) -> List[tuple]:
-    """Group each app's minute rows into consecutive-minute runs.
-
-    Gaps-and-islands in SQL: a new run starts wherever the step from the
-    previous minute is bigger than ``RUN_MERGE_GAP_MINUTES`` empty minutes.
-    08:15/08:25/08:35 is still three ranges; 08:15/08:16/(08:17)/08:18 is one.
-
-    The tolerance only ever joins **displayed** ranges.  ``minutes`` stays
-    ``COUNT(*)`` of the real active minutes, so a run shown as 08:15–08:19
-    still reports 3 分钟 — the missing minute is never invented.  Measured on
-    the live BE72 (2026-09-20, 微信 135 分钟): 53 gaps were one empty minute and
-    23 were two, which is why the firmware's periodic re-classification of a
-    long-lived flow used to print ~75 "sessions" for one WeChat call.
-    """
-    holders = ", ".join("?" for _ in wanted)
-    clause, prefix = _router_clause(router)
-    late_filter = (
-        f"AND CAST(strftime('%H', minute_epoch, {BEIJING_OFFSET_SQL}) AS INTEGER)"
-        f" < {LATE_NIGHT_END_HOUR}"
-        if late_night_only else ""
-    )
-    rows = conn.execute(
-        f"""WITH seen AS (
-                SELECT DISTINCT date, app, minute_epoch
-                FROM usage_app_minute
-                WHERE {clause}date BETWEEN ? AND ? AND mac IN ({holders})
-                  {late_filter}
-            ), stepped AS (
-                SELECT date, app, minute_epoch,
-                       CASE WHEN minute_epoch - LAG(minute_epoch) OVER (
-                                PARTITION BY date, app ORDER BY minute_epoch
-                            ) > ? THEN 1 ELSE 0 END AS opens_island
-                FROM seen
-            ), islanded AS (
-                SELECT date, app, minute_epoch,
-                       SUM(opens_island) OVER (
-                           PARTITION BY date, app ORDER BY minute_epoch
-                           ROWS BETWEEN UNBOUNDED PRECEDING AND CURRENT ROW
-                       ) AS island
-                FROM stepped
-            )
-            SELECT date, app,
-                   COUNT(*) AS minutes,
-                   MIN(minute_epoch) AS first_minute,
-                   MAX(minute_epoch) AS last_minute
-            FROM islanded
-            GROUP BY date, app, island
-            ORDER BY date, app, first_minute""",
-        (*prefix, first, last, *wanted,
-         MINUTE_SECONDS * (RUN_MERGE_GAP_MINUTES + 1)),
-    ).fetchall()
-    grouped: Dict[tuple, List[Dict[str, int]]] = {}
-    for row in rows:
-        minutes = int(row["minutes"] or 0)
-        grouped.setdefault((str(row["date"]), str(row["app"])), []).append({
-            "startEpoch": int(row["first_minute"]),
-            # The run ends at the *end* of its last active minute.
-            "endEpoch": int(row["last_minute"]) + MINUTE_SECONDS,
-            "activeSeconds": minutes * MINUTE_SECONDS,
-            "minutes": minutes,
-        })
-    return [
-        (day, app, runs) for (day, app), runs in sorted(grouped.items())
-    ]
 
 
 def _late_night_ranges(minute_day: Dict[str, Any]) -> List[Dict[str, Any]]:
@@ -1520,13 +1539,17 @@ def _minute_report(
         ),
         key=lambda item: (-item["minutes"], item["app"]),
     )
-    recorded = bool(online_minutes or app_rows)
+    # 「路由器那天记过分钟行」和「过滤后还剩多少」是两件事：一整晚只有保活唤醒
+    # 的一天是 0 分钟，不是「暂无记录」。
+    recorded = bool(minute_day.get("rawMinutes") or online_minutes or app_rows)
     return {
         "date": day,
         "onlineSeconds": online_minutes * MINUTE_SECONDS,
         "onlineMinutes": online_minutes,
         "lateNightSeconds": late_night_minutes * MINUTE_SECONDS,
         "lateNightMinutes": late_night_minutes,
+        # App 的单日视图直接读顶层这个字段，缺了它「深夜时段」列表就永远是空的。
+        "lateNightRanges": _late_night_ranges(minute_day),
         # A full 24-slot axis; hours without minute rows are 0, never invented.
         "hourly": [
             {
@@ -1595,11 +1618,6 @@ def _beijing_date(epoch: float) -> str:
 
 def _minute_floor(epoch: float) -> int:
     return int(epoch) - int(epoch) % MINUTE_SECONDS
-
-
-def _is_late_night(minute_epoch: int) -> bool:
-    """00:00–05:59 北京时间，与 ``strftime('%H', …, '+8 hours')`` 同一边界。"""
-    return (minute_epoch + 8 * 3600) // MINUTE_SECONDS % 1440 < LATE_NIGHT_END_HOUR * 60
 
 
 def _meta_snapshot(conn: sqlite3.Connection, wanted: Sequence[str],
@@ -1701,15 +1719,15 @@ def _guard_read(conn: sqlite3.Connection, wanted: Sequence[str], day: str,
     ):
         minutes.setdefault(str(row["mac"]), []).append(int(row["minute_epoch"]))
 
-    apps: Dict[str, Dict[str, int]] = {}
+    apps: Dict[str, Dict[str, List[int]]] = {}
     for row in conn.execute(
-        f"""SELECT mac, app, COUNT(DISTINCT minute_epoch) AS minutes
-            FROM usage_app_minute
+        f"""SELECT DISTINCT mac, app, minute_epoch FROM usage_app_minute
             WHERE {clause}date = ? AND mac IN ({holders})
-            GROUP BY mac, app ORDER BY minutes DESC""",
+            ORDER BY mac, app, minute_epoch""",
         (*prefix, day, *wanted),
     ):
-        apps.setdefault(str(row["mac"]), {})[str(row["app"])] = int(row["minutes"] or 0)
+        apps.setdefault(str(row["mac"]), {}).setdefault(
+            str(row["app"]), []).append(int(row["minute_epoch"]))
 
     latest: Dict[str, int] = {}
     for row in conn.execute(
@@ -1798,29 +1816,32 @@ def build_guard_overview(
     for device in rows:
         device_macs = [mac for mac in _split_macs(device.get("macs")) if mac]
         # 同一台设备的两块网卡在同一分钟只算一次：分钟是集合，不是求和。
-        union: set[int] = set()
+        raw_device: Set[int] = set()
         for mac in device_macs:
-            union.update(int(value) for value in minutes_by_mac.get(mac) or [])
-        today_minutes = len(union)
-        late_minutes = sum(1 for minute in union if _is_late_night(minute))
-        app_totals: Dict[str, int] = {}
+            raw_device.update(int(value) for value in minutes_by_mac.get(mac) or [])
+        raw_apps: Dict[str, Set[int]] = {}
         for mac in device_macs:
             for app, minutes in (apps_by_mac.get(mac) or {}).items():
-                # 多网卡设备只能取 max：分钟按 mac 分组存，跨 mac 求和会把同一分钟
-                # 算两次，宁可少报也不能虚报。
-                app_totals[app] = max(app_totals.get(app, 0), int(minutes or 0))
+                raw_apps.setdefault(str(app), set()).update(
+                    int(value) for value in minutes)
+        # 和详情页同一个函数：列表页的「凌晨还在上网」不能和点进去的夜间时长是
+        # 两个数。
+        usage = _qualifying_usage(raw_device, raw_apps)
+        today_minutes = int(usage["onlineMinutes"])
+        late_minutes = int(usage["lateNightMinutes"])
         top_apps = [
-            {"app": app, "minutes": minutes}
-            for app, minutes in sorted(
-                app_totals.items(), key=lambda item: (-item[1], item[0])
+            {"app": app, "minutes": data["minutes"]}
+            for app, data in sorted(
+                usage["apps"].items(), key=lambda item: (-item[1]["minutes"], item[0])
             )[:max(1, top_app_limit)]
         ]
         seen = max([_value_or_zero(meta_by_mac, mac) for mac in device_macs]
                    + [_value_or_zero(latest_by_mac, mac) for mac in device_macs],
                    default=0)
         device_last_sample = max(device_last_sample, seen)
-        has_rows = bool(union)
-        active_now = any(minute >= active_floor for minute in union)
+        has_rows = bool(raw_device or raw_apps)
+        # 「此刻在不在上网」是物理事实，用未过滤的分钟判断：过滤只决定时长怎么算。
+        active_now = any(minute >= active_floor for minute in raw_device)
         # 「从未有过数据」和「今天还没上网」是两件事，App 显示的文字也不同。
         has_data = bool(has_rows or seen > 0)
         uid = _guard_uid(device.get("uid"))
