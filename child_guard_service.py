@@ -15,7 +15,7 @@ import time
 from dataclasses import dataclass
 from datetime import datetime
 from pathlib import Path
-from typing import Any, Callable, Dict, Iterable, List, Optional
+from typing import Any, Callable, Dict, Iterable, List, Optional, Set
 
 
 _UID_RE = re.compile(r"^[A-Za-z0-9_-]{6,128}$")
@@ -25,7 +25,7 @@ _TIME_RE = re.compile(r"^(?:[01]\d|2[0-3]):[0-5]\d$")
 _WEEKDAYS = {"mon", "tue", "wed", "thu", "fri", "sat", "sun"}
 _WEEKDAY_NUMBERS = {"1": "mon", "2": "tue", "3": "wed", "4": "thu", "5": "fri", "6": "sat", "7": "sun"}
 _MODES = {"internet_window", "app_allowlist", "app_blocklist"}
-_ACTIONS = {
+CHILD_GUARD_ACTIONS = {
     "get_capabilities",
     "get_users",
     "get_plans",
@@ -43,6 +43,8 @@ _ACTIONS = {
     "remove_device",
     "pause_device",
     "resume_device",
+    "ip6_audit_sync",
+    "ip6_audit_status",
 }
 
 
@@ -226,11 +228,17 @@ class CommandResult:
     error: str = ""
 
 
-class ChildGuardCommandStore:
-    """Small durable queue using the same polling/ack pattern as other Agent jobs."""
+class RouterCommandStore:
+    """一个功能一条出站命令队列：Hub 入队，agent 领走执行再 ack。
 
-    def __init__(self, data_dir: Path):
-        self.commands_path = Path(data_dir) / "child_guard_commands.json"
+    特征库写入用的是同一套机制，只是换了落盘文件和动作白名单 —— 每个功能各抄一份
+    队列代码，迟早各自漂移出不同的 ack 语义。
+    """
+
+    def __init__(self, data_dir: Path, filename: str = "child_guard_commands.json",
+                 actions: Optional[Set[str]] = None):
+        self.commands_path = Path(data_dir) / filename
+        self.actions = CHILD_GUARD_ACTIONS if actions is None else set(actions)
         self.lock = threading.RLock()
         self.changed = threading.Condition(self.lock)
         self._result_observers: List[Callable[[Dict[str, Any]], None]] = []
@@ -268,8 +276,8 @@ class ChildGuardCommandStore:
         _write_json(self.commands_path, {"commands": list(rows)[-500:]})
 
     def enqueue(self, router: Any, action: str, payload: Optional[Dict[str, Any]] = None) -> Dict[str, Any]:
-        if action not in _ACTIONS:
-            raise ChildGuardValidationError("unsupported child guard action")
+        if action not in self.actions:
+            raise ChildGuardValidationError(f"unsupported action: {action}")
         command = {
             "id": secrets.token_hex(12),
             "router": self.canonical_router(router),

@@ -1,34 +1,19 @@
-"""RDPI Custom Application Signature Manager for Ruijie / Reyee routers.
+"""RDPI 自定义应用特征：校验、合并、算卡片数字。
 
-Supports reading, validating, adding, and removing custom application signatures
-in `/usr/share/ndpi/db.default.json` with hot-reload via `ubus send rdpi_reinit`.
+这里只管「一份合法的 `/usr/share/ndpi/db.default.json` 应该长什么样」。文件的读和写
+都在路由器上：agent 把整库推上来（`hub.py` 的 `/api/router/rdpi/ingest`），要改就把
+合并后的整库作为一条 `write_db` 命令下发回去。这个模块不再自己连路由器 —— 以前它用
+paramiko 反向 SSH 进来，host/端口写死在默认值里，路由器一重拨就整块失效。
 """
 
 from __future__ import annotations
 
-import base64
 import copy
 import json
-import os
 import re
 from typing import Any, Dict, List, Optional, Tuple
-import paramiko
-from paramiko.transport import Transport
-from paramiko.rsakey import RSAKey
-from cryptography.hazmat.primitives import hashes
-
-# Enable legacy ssh-rsa host key support for router Dropbear SSH
-RSAKey.HASHES["ssh-rsa"] = hashes.SHA1
-Transport._key_info["ssh-rsa"] = RSAKey
-Transport._preferred_keys = ("ssh-rsa", "rsa-sha2-512", "rsa-sha2-256", "ssh-ed25519")
-
-DEFAULT_ROUTER_HOST = os.getenv("ROUTER_SSH_HOST", "111.23.167.108")
-DEFAULT_ROUTER_PORT = int(os.getenv("ROUTER_SSH_PORT", "13512"))
-DEFAULT_ROUTER_USER = os.getenv("ROUTER_SSH_USER", "root")
-DEFAULT_ROUTER_PASS = os.getenv("ROUTER_SSH_PASS", "Re238950")
 
 REMOTE_DB_PATH = "/usr/share/ndpi/db.default.json"
-REMOTE_BAK_PATH = "/usr/share/ndpi/db.default.json.bak"
 _INDEX_RE = re.compile(r"^\d+-\d+-\d+-\d+$")
 
 # These values are observed in the supplied BE72/Reyee db.default.json.  Do
@@ -85,117 +70,6 @@ STANDARD_RDPI_TEMPLATE: Dict[str, Any] = {
         ]
     }
 }
-
-
-def _get_ssh_client() -> paramiko.SSHClient:
-    client = paramiko.SSHClient()
-    client.set_missing_host_key_policy(paramiko.AutoAddPolicy())
-    client.connect(
-        DEFAULT_ROUTER_HOST,
-        port=DEFAULT_ROUTER_PORT,
-        username=DEFAULT_ROUTER_USER,
-        password=DEFAULT_ROUTER_PASS,
-        timeout=10,
-    )
-    return client
-
-
-def _remote_exec(client: paramiko.SSHClient, command: str) -> Tuple[str, str]:
-    stdin, stdout, stderr = client.exec_command(command)
-    out = stdout.read().decode("utf-8", errors="replace").strip()
-    err = stderr.read().decode("utf-8", errors="replace").strip()
-    channel = getattr(stdout, "channel", None)
-    recv_exit_status = getattr(channel, "recv_exit_status", None)
-    if callable(recv_exit_status):
-        exit_status = recv_exit_status()
-        if exit_status and not err:
-            err = f"remote command exited with status {exit_status}"
-    return out, err
-
-
-def load_router_rdpi_db(client: Optional[paramiko.SSHClient] = None) -> Dict[str, Any]:
-    close_client = False
-    if client is None:
-        client = _get_ssh_client()
-        close_client = True
-    try:
-        out, err = _remote_exec(client, f"cat {REMOTE_DB_PATH}")
-        if not out:
-            raise RuntimeError(f"Failed to read {REMOTE_DB_PATH}: {err}")
-        return json.loads(out)
-    finally:
-        if close_client:
-            client.close()
-
-
-def save_router_rdpi_db(
-    db_data: Dict[str, Any],
-    client: Optional[paramiko.SSHClient] = None,
-    reload_rdpi: bool = True,
-) -> str:
-    close_client = False
-    if client is None:
-        client = _get_ssh_client()
-        close_client = True
-    rollback_path = "/tmp/db.default.json.rollback"
-    temp_path = "/tmp/db.default.json.tmp"
-    written = False
-    try:
-        # Keep the historical .bak for operators, but use a fresh transaction
-        # backup for this write.  A stale .bak cannot safely roll back a failed
-        # hot reload.
-        _, err_backup = _remote_exec(client, f"cp {REMOTE_DB_PATH} {rollback_path} && cp {REMOTE_DB_PATH} {REMOTE_BAK_PATH}")
-        if err_backup:
-            raise RuntimeError(f"Failed to backup {REMOTE_DB_PATH}: {err_backup}")
-
-        content_bytes = json.dumps(db_data, ensure_ascii=False, indent=2).encode("utf-8")
-        stdin, stdout, stderr = client.exec_command(f"cat > {temp_path}")
-        stdin.write(content_bytes)
-        stdin.channel.shutdown_write()
-        err_stream = stderr.read().decode("utf-8", errors="replace").strip()
-        if err_stream:
-            raise RuntimeError(f"Failed to stream remote db: {err_stream}")
-
-        out_mv, err_mv = _remote_exec(client, f"cp {temp_path} {REMOTE_DB_PATH} && rm -f {temp_path}")
-        if err_mv:
-            raise RuntimeError(f"Failed to write remote db: {err_mv}")
-        written = True
-
-        # Verify the exact JSON object that the router accepted before asking
-        # the daemon to reload it.  This catches truncated writes and router
-        # filesystem/proxy surprises without touching a real router in tests.
-        readback, readback_err = _remote_exec(client, f"cat {REMOTE_DB_PATH}")
-        if readback_err:
-            raise RuntimeError(f"Failed to read back {REMOTE_DB_PATH}: {readback_err}")
-        try:
-            readback_obj = json.loads(readback)
-        except (TypeError, ValueError) as exc:
-            raise RuntimeError(f"Router returned invalid JSON for {REMOTE_DB_PATH}") from exc
-        if readback_obj != db_data:
-            raise RuntimeError(f"Router read-back mismatch for {REMOTE_DB_PATH}")
-
-        msg = "Saved successfully."
-        if reload_rdpi:
-            reload_msg, reload_err = _remote_exec(client, "ubus -t 3 send 'rdpi_reinit'")
-            if reload_err:
-                raise RuntimeError(f"RDPI hot-reload failed: {reload_err}")
-            msg += f" (Hot-reload triggered: {reload_msg})"
-        return msg
-    except Exception as exc:
-        if written:
-            # Restore both the file and the running RDPI process.  Preserve the
-            # original failure while making rollback failure explicit.
-            _, rollback_err = _remote_exec(
-                client,
-                f"cp {rollback_path} {REMOTE_DB_PATH} && ubus -t 3 send 'rdpi_reinit'",
-            )
-            if rollback_err:
-                raise RuntimeError(f"{exc}; rollback failed: {rollback_err}") from exc
-        raise
-    finally:
-        _remote_exec(client, f"rm -f {temp_path} {rollback_path}")
-        if close_client:
-            client.close()
 
 
 def validate_signature_object(obj: Any) -> Dict[str, Any]:
@@ -380,80 +254,42 @@ def summarize_rdpi_db(db: Dict[str, Any]) -> Dict[str, Any]:
     }
 
 
-def get_rdpi_signatures_summary() -> Dict[str, Any]:
-    """Returns official count, custom count, custom rules list, and template."""
-    client = _get_ssh_client()
-    try:
-        return summarize_rdpi_db(load_router_rdpi_db(client))
-    finally:
-        client.close()
+def merge_signature_into_db(db: Dict[str, Any], payload: Any) -> Tuple[Dict[str, Any], Dict[str, Any]]:
+    """把一条自定义特征合进整库，返回 (新库, 给界面的字段)。
 
-
-def add_or_update_rdpi_signature(payload: Any) -> Dict[str, Any]:
-    """Validates and appends/updates custom signature into router RDPI DB."""
+    只合并、不落盘 —— 落盘是 agent 的 `write_db` 命令。校验失败抛 ValueError。
+    """
     signature = validate_signature_object(payload)
-    client = _get_ssh_client()
-    try:
-        db = load_router_rdpi_db(client)
-        apps = db.get("apps", [])
+    apps = list(db.get("apps") or [])
 
-        idx = signature["index"]
-        name = signature["name"]
-        existing = next((a for a in apps if a.get("index") == idx or a.get("name") == name), None)
+    idx = signature["index"]
+    name = signature["name"]
+    existing = next((a for a in apps if a.get("index") == idx or a.get("name") == name), None)
 
-        db_signature = {key: copy.deepcopy(value) for key, value in signature.items() if key != "custom"}
-        if existing:
-            # Update only fields represented by the imported official shape;
-            # retain existing official optional fields (for example ``note``)
-            # when the incoming payload does not mention them.
-            existing.update(db_signature)
-            action_desc = "updated"
-        else:
-            apps.append(db_signature)
-            action_desc = "added"
+    db_signature = {key: copy.deepcopy(value) for key, value in signature.items() if key != "custom"}
+    if existing is not None:
+        # 只更新官方形态里有的字段；导入没提到的（例如 `note`）保留路由器上的原值。
+        existing.update(db_signature)
+        action = "updated"
+    else:
+        apps.append(db_signature)
+        action = "added"
 
-        db["apps"] = apps
-        msg = save_router_rdpi_db(db, client=client, reload_rdpi=True)
-
-        return {
-            "ok": True,
-            "action": action_desc,
-            "index": idx,
-            "name": name,
-            "message": msg,
-            "totalCount": len(apps),
-        }
-    finally:
-        client.close()
+    db["apps"] = apps
+    return db, {"action": action, "index": idx, "name": name, "totalCount": len(apps)}
 
 
-def delete_rdpi_signature(target_index_or_name: str) -> Dict[str, Any]:
-    """Deletes signature matching index or name and reloads RDPI."""
-    target = target_index_or_name.strip()
+def remove_signature_from_db(db: Dict[str, Any], target_index_or_name: str) -> Tuple[Optional[Dict[str, Any]], Dict[str, Any]]:
+    """按 index 或 name 删掉一条；没删到就返回 (None, 说明)。"""
+    target = str(target_index_or_name or "").strip()
     if not target:
         raise ValueError("Target index or name is required")
-
-    client = _get_ssh_client()
-    try:
-        db = load_router_rdpi_db(client)
-        apps = db.get("apps", [])
-        before = len(apps)
-        apps = [a for a in apps if a.get("index") != target and a.get("name") != target]
-        after = len(apps)
-
-        if before == after:
-            return {"ok": False, "error": f"No signature found matching '{target}'"}
-
-        db["apps"] = apps
-        msg = save_router_rdpi_db(db, client=client, reload_rdpi=True)
-        return {
-            "ok": True,
-            "deleted": target,
-            "message": msg,
-            "totalCount": len(apps),
-        }
-    finally:
-        client.close()
+    apps = db.get("apps") or []
+    kept = [a for a in apps if a.get("index") != target and a.get("name") != target]
+    if len(kept) == len(apps):
+        return None, {"ok": False, "error": f"No signature found matching '{target}'"}
+    db["apps"] = kept
+    return db, {"deleted": target, "totalCount": len(kept)}
 
 
 CURATED_SIGNATURE_EXTENSIONS: Dict[str, Dict[str, Any]] = {
@@ -658,159 +494,53 @@ CURATED_SIGNATURE_EXTENSIONS: Dict[str, Dict[str, Any]] = {
 }
 
 
-def apply_curated_signature_bundle(client: Optional[paramiko.SSHClient] = None) -> Dict[str, Any]:
-    """Applies curated high-frequency signatures (WeChat Channels, Douyin, Kuaishou, PDD, JD, Taobao) and reloads RDPI."""
-    close_client = False
-    if client is None:
-        client = _get_ssh_client()
-        close_client = True
-    try:
-        db = load_router_rdpi_db(client)
-        apps = db.get("apps", [])
+def apply_curated_extensions(db: Dict[str, Any]) -> Tuple[Optional[Dict[str, Any]], Dict[str, Any]]:
+    """把策划好的高频域名并进官方条目，返回 (新库, 给界面的字段)；没有新东西就 (None, 说明)。
 
-        total_hosts_added = 0
-        enhanced_apps = []
-
-        for idx, patch in CURATED_SIGNATURE_EXTENSIONS.items():
-            app = next((a for a in apps if a.get("index") == idx or a.get("name") == patch["name"]), None)
-            if not app:
-                # Not in the official library yet: create the entry in the exact
-                # shape the official db uses (index/name/rules only — `custom`
-                # is API metadata and must never land in the router database,
-                # and `payloads: []` mirrors the official host rules such as
-                # 淘宝 18-4-2-0). Appended last so the official, more specific
-                # entries keep winning the match.
-                new_app = {
-                    "index": idx,
-                    "name": patch["name"],
-                    "rules": [{"protocol": "host", "hosts": list(patch["hosts"]), "payloads": []}],
-                }
-                apps.append(new_app)
-                total_hosts_added += len(patch["hosts"])
-                enhanced_apps.append(f"{patch['name']} (新增规则 {len(patch['hosts'])} 域名)")
-                continue
-
-            rules = app.setdefault("rules", [])
-            host_rule = next((r for r in rules if "hosts" in r), None)
-            if not host_rule:
-                host_rule = {"protocol": "host", "hosts": [], "payloads": []}
-                rules.insert(0, host_rule)
-
-            current_hosts = host_rule.get("hosts", [])
-            added_here = 0
-            for h in patch["hosts"]:
-                if h not in current_hosts:
-                    current_hosts.append(h)
-                    added_here += 1
-
-            host_rule["hosts"] = current_hosts
-            total_hosts_added += added_here
-            enhanced_apps.append(f"{patch['name']} (+{added_here} 域名)")
-
-        db["apps"] = apps
-        msg = save_router_rdpi_db(db, client=client, reload_rdpi=True)
-
-        return {
-            "ok": True,
-            "totalHostsAdded": total_hosts_added,
-            "enhancedApps": enhanced_apps,
-            "message": msg,
-            "totalApps": len(apps),
-        }
-    finally:
-        if close_client:
-            client.close()
-
-
-def sync_child_guard_ip6_block(macs: Optional[List[str]] = None, client: Optional[paramiko.SSHClient] = None) -> Dict[str, Any]:
-    """Syncs guarded device MACs into router `child_guard_ip6_block` ipset.
-
-    Forces dual-stack apps (WeChat, Douyin, etc.) on guarded devices to seamlessly
-    fallback to IPv4, allowing `sniffer.ko` to capture 100% of their DPI flows.
+    官方条目一律不删，只往它的 host 规则里补域名。新增的条目排在最后，让官方那些
+    更具体的规则继续优先命中。
     """
-    close_client = False
-    if client is None:
-        client = _get_ssh_client()
-        close_client = True
-    try:
-        target_macs = set()
-        if macs:
-            for m in macs:
-                clean = str(m or "").strip().lower()
-                if re.fullmatch(r"^[0-9a-f]{2}(:[0-9a-f]{2}){5}$", clean):
-                    target_macs.add(clean)
+    apps = list(db.get("apps") or [])
 
-        # If no explicit macs provided, read from router UCI
-        if not target_macs:
-            out_uci, _ = _remote_exec(client, "uci show child_guard | grep '\\.mac='")
-            for line in out_uci.splitlines():
-                if "=" in line:
-                    val = line.split("=", 1)[1].strip("'\" ")
-                    for item in val.split():
-                        clean = item.strip().lower()
-                        if re.fullmatch(r"^[0-9a-f]{2}(:[0-9a-f]{2}){5}$", clean):
-                            target_macs.add(clean)
+    total_hosts_added = 0
+    enhanced_apps: List[str] = []
 
-        # Ensure ipset exists
-        _remote_exec(client, "ipset create child_guard_ip6_block hash:mac 2>/dev/null")
+    for idx, patch in CURATED_SIGNATURE_EXTENSIONS.items():
+        app = next((a for a in apps if a.get("index") == idx or a.get("name") == patch["name"]), None)
+        if not app:
+            # 官方库里还没有这一条：按官方 db 的形状新建（只有 index/name/rules ——
+            # `custom` 是接口元数据，绝不能落进路由器数据库；`payloads: []` 对齐淘宝
+            # 18-4-2-0 这类官方 host 规则）。
+            new_app = {
+                "index": idx,
+                "name": patch["name"],
+                "rules": [{"protocol": "host", "hosts": list(patch["hosts"]), "payloads": []}],
+            }
+            apps.append(new_app)
+            total_hosts_added += len(patch["hosts"])
+            enhanced_apps.append(f"{patch['name']} (新增规则 {len(patch['hosts'])} 域名)")
+            continue
 
-        # Add each target mac
-        for mac in sorted(target_macs):
-            _remote_exec(client, f"ipset add child_guard_ip6_block {mac} 2>/dev/null")
+        rules = app.setdefault("rules", [])
+        host_rule = next((r for r in rules if "hosts" in r), None)
+        if not host_rule:
+            host_rule = {"protocol": "host", "hosts": [], "payloads": []}
+            rules.insert(0, host_rule)
 
-        # Force guarded WAN traffic onto IPv4 (where RDPI can identify it)
-        # without breaking LAN-local IPv6 or replies headed back to the device.
-        _remote_exec(client, "ip6tables -D FORWARD -m set --match-set child_guard_ip6_block dst -j REJECT --reject-with icmp6-adm-prohibited 2>/dev/null || true")
-        _remote_exec(client, "ip6tables -D FORWARD -m set --match-set child_guard_ip6_block src -j REJECT --reject-with icmp6-adm-prohibited 2>/dev/null || true")
-        _remote_exec(client, "ip6tables -C FORWARD ! -o br-lan -m set --match-set child_guard_ip6_block src -j REJECT --reject-with icmp6-adm-prohibited 2>/dev/null || ip6tables -I FORWARD 1 ! -o br-lan -m set --match-set child_guard_ip6_block src -j REJECT --reject-with icmp6-adm-prohibited")
+        current_hosts = host_rule.get("hosts", [])
+        added_here = 0
+        for host in patch["hosts"]:
+            if host not in current_hosts:
+                current_hosts.append(host)
+                added_here += 1
 
-        # Fetch active members
-        out_list, _ = _remote_exec(client, "ipset list child_guard_ip6_block")
-        members = []
-        capture = False
-        for line in out_list.splitlines():
-            if line.startswith("Members:"):
-                capture = True
-                continue
-            if capture and line.strip():
-                members.append(line.strip().lower())
+        host_rule["hosts"] = current_hosts
+        total_hosts_added += added_here
+        enhanced_apps.append(f"{patch['name']} (+{added_here} 域名)")
 
-        return {
-            "ok": True,
-            "syncedMacs": sorted(target_macs),
-            "activeMembers": sorted(members),
-            "count": len(members),
-            "message": f"IPv6 降级审计已生效，共同步 {len(members)} 台受守护设备",
-        }
-    finally:
-        if close_client:
-            client.close()
-
-
-def get_child_guard_ip6_block_status(client: Optional[paramiko.SSHClient] = None) -> Dict[str, Any]:
-    """Returns current active members of `child_guard_ip6_block`."""
-    close_client = False
-    if client is None:
-        client = _get_ssh_client()
-        close_client = True
-    try:
-        out_list, _ = _remote_exec(client, "ipset list child_guard_ip6_block 2>/dev/null")
-        members = []
-        capture = False
-        for line in out_list.splitlines():
-            if line.startswith("Members:"):
-                capture = True
-                continue
-            if capture and line.strip():
-                members.append(line.strip().lower())
-
-        return {
-            "ok": True,
-            "activeMembers": sorted(members),
-            "count": len(members),
-            "enabled": len(members) > 0,
-        }
-    finally:
-        if close_client:
-            client.close()
-
+    stats = {"totalHostsAdded": total_hosts_added, "enhancedApps": enhanced_apps, "totalApps": len(apps)}
+    if not total_hosts_added:
+        # 一个域名都没新增，就别让路由器白热重载一次。
+        return None, {**stats, "ok": True, "message": "高频特征包已是最新状态"}
+    db["apps"] = apps
+    return db, stats

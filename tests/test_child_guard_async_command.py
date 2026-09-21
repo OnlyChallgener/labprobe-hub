@@ -8,11 +8,11 @@ import re
 from pathlib import Path
 
 import hub
-from child_guard_service import ChildGuardCommandStore, _ACTIONS
+from child_guard_service import RouterCommandStore
 
 
 def _prepare(monkeypatch, tmp_path):
-    monkeypatch.setattr(hub, "CHILD_GUARD_COMMANDS", ChildGuardCommandStore(tmp_path))
+    monkeypatch.setattr(hub, "CHILD_GUARD_COMMANDS", RouterCommandStore(tmp_path))
     monkeypatch.setattr(hub, "CHILD_GUARD_SYNC_WAIT_SECONDS", 0.0)
     monkeypatch.setattr(hub, "notify_agent_commands_changed", lambda *a, **k: None)
     monkeypatch.setattr(hub, "_child_guard_remember_devices", lambda *a, **k: None)
@@ -61,13 +61,21 @@ def test_every_enqueued_action_is_whitelisted():
     """路由器支持一个新动作，不等于 Hub 允许入队它。
 
     2026-09-21 实测：``set_all_plans_enabled`` 已经写进中继的 dispatch，Hub 路由
-    却在 ``enqueue`` 就被 ``unsupported child guard action`` 抛出去，接口直接 500，
-    App 点「全设备上网计划」必然失败回弹。动作白名单和路由调用点分处两个文件，
-    没有测试就一定会再次漂移。
+    却在 ``enqueue`` 就被 ``unsupported action`` 抛出去，接口直接 500，App 点
+    「全设备上网计划」必然失败回弹。动作白名单和路由调用点分处两个文件，靠人记住
+    一定会再漏，所以扫 hub.py 的调用点来对账。
     """
     source = Path(hub.__file__).read_text(encoding="utf-8")
-    enqueued = set(re.findall(r'_child_guard_execute\(\s*"([a-z_]+)"', source))
-    enqueued |= set(re.findall(r'CHILD_GUARD_COMMANDS\.enqueue\([A-Za-z_]+,\s*"([a-z_]+)"', source))
-    assert enqueued, "hub.py 里一个 _child_guard_execute 调用都没扫到，扫描式断言本身失效了"
-    missing = sorted(enqueued - _ACTIONS)
-    assert not missing, f"hub.py 入队了 _ACTIONS 之外的动作，接口会 500：{missing}"
+
+    def enqueued(*patterns: str) -> set:
+        return {hit for pattern in patterns for hit in re.findall(pattern, source)}
+
+    guard = enqueued(r'_child_guard_execute\(\s*"([a-z_]+)"',
+                     r'CHILD_GUARD_COMMANDS\.enqueue\([^,]+,\s*"([a-z_]+)"')
+    assert guard, "hub.py 里一个入队调用都没扫到，扫描式断言本身失效了"
+    missing = sorted(guard - hub.CHILD_GUARD_COMMANDS.actions)
+    assert not missing, f"hub.py 入队了白名单之外的儿童上网动作，接口会 500：{missing}"
+
+    rdpi = enqueued(r'RDPI_COMMANDS\.enqueue\([^,]+,\s*"([a-z_]+)"')
+    assert rdpi == {"write_db"}, f"特征库命令通道的调用点变了，核对一下：{rdpi}"
+    assert not rdpi - hub.RDPI_COMMANDS.actions, "特征库动作没进白名单，接口会 500"

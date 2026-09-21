@@ -8,7 +8,7 @@ Hub 前面那台 Lucky 反代在第几秒就回一整页 502 HTML，而 ``get_pl
 import time
 
 import hub
-from child_guard_service import ChildGuardCommandStore
+from child_guard_service import RouterCommandStore
 from usage_aggregate import UsageAggregateStore
 
 UID = "0123456789ABCDEF0123456789ABCDEF"
@@ -24,7 +24,7 @@ def _aggregate(tmp_path):
 
 
 def _prepare(monkeypatch, tmp_path, aggregate):
-    monkeypatch.setattr(hub, "CHILD_GUARD_COMMANDS", ChildGuardCommandStore(tmp_path))
+    monkeypatch.setattr(hub, "CHILD_GUARD_COMMANDS", RouterCommandStore(tmp_path))
     monkeypatch.setattr(hub, "CHILD_GUARD_SYNC_WAIT_SECONDS", 0.0)
     monkeypatch.setattr(hub, "notify_agent_commands_changed", lambda *a, **k: None)
     monkeypatch.setattr(hub, "check_read_token", lambda: True)

@@ -6,8 +6,6 @@ from pathlib import Path
 import pytest
 from rdpi_signature_service import (
     STANDARD_RDPI_TEMPLATE,
-    delete_rdpi_signature,
-    save_router_rdpi_db,
     validate_signature_object,
 )
 import rdpi_signature_service as service
@@ -167,90 +165,64 @@ def test_supplied_official_883_rules_round_trip_except_14_empty_placeholders():
     assert len(rejected) == 14
 
 
-class _FakeChannel:
-    def shutdown_write(self):
-        return None
+def _signature(index="999-1-1-0", name="自定义", host="b.com"):
+    return {"index": index, "name": name, "rules": [{"protocol": "host", "hosts": [host]}]}
 
 
-class _FakeStdin:
-    def __init__(self):
-        self.channel = _FakeChannel()
-
-    def write(self, _data):
-        return None
-
-
-class _FakeStream:
-    def __init__(self, value=""):
-        self.value = value
-
-    def read(self):
-        return self.value.encode()
+def test_merge_appends_and_keeps_top_level_fields():
+    db = {"apps": [{"index": "1-1-1-0", "name": "官方", "rules": []}], "version": "2.1"}
+    merged, extra = service.merge_signature_into_db(db, _signature())
+    assert extra == {"action": "added", "index": "999-1-1-0", "name": "自定义", "totalCount": 2}
+    # 中继按原文逐字节核对，顶层少一个 version 都算写坏。
+    assert merged["version"] == "2.1"
+    # `custom` 是接口元数据，绝不能落进路由器数据库。
+    assert "custom" not in merged["apps"][-1]
 
 
-class _FakeClient:
-    def __init__(self, readback, reload_error=""):
-        self.readback = readback
-        self.reload_error = reload_error
-        self.closed = False
-        self.commands = []
-
-    def exec_command(self, command):
-        self.commands.append(command)
-        return _FakeStdin(), _FakeStream(), _FakeStream()
-
-    def close(self):
-        self.closed = True
+def test_merge_updates_in_place_and_keeps_fields_the_payload_omits():
+    db = {"apps": [{**_signature(), "note": "留着"}]}
+    merged, extra = service.merge_signature_into_db(db, _signature(host="c.com"))
+    assert extra["action"] == "updated"
+    assert len(merged["apps"]) == 1
+    assert merged["apps"][0]["note"] == "留着"
+    assert merged["apps"][0]["rules"][0]["hosts"] == ["c.com"]
 
 
-def _fake_remote_exec(client, command):
-    client.commands.append(command)
-    if command == f"cat {service.REMOTE_DB_PATH}":
-        return client.readback, ""
-    if command == "ubus -t 3 send 'rdpi_reinit'":
-        return "", client.reload_error
-    return "", ""
+def test_merge_rejects_an_invalid_signature_before_any_write():
+    with pytest.raises(ValueError, match="Invalid RDPI index format"):
+        service.merge_signature_into_db({"apps": []}, _signature(index="nope"))
 
 
-def test_save_reads_back_exact_json(monkeypatch):
-    db = {"apps": [{"index": "999-1-1-0", "name": "x", "rules": []}], "version": "test"}
-    client = _FakeClient(json.dumps(db))
-    monkeypatch.setattr(service, "_remote_exec", _fake_remote_exec)
-    assert "Saved successfully" in save_router_rdpi_db(db, client=client)
-    assert any(f"cat {service.REMOTE_DB_PATH}" == c for c in client.commands)
+def test_remove_drops_by_index_or_name_and_reports_a_miss():
+    db = {"apps": [_signature(name="第一个"), _signature(index="999-1-1-1", name="第二个")]}
+    merged, extra = service.remove_signature_from_db(db, "第二个")
+    assert extra == {"deleted": "第二个", "totalCount": 1}
+    assert [app["name"] for app in merged["apps"]] == ["第一个"]
+
+    missed, extra = service.remove_signature_from_db(merged, "999-9-9-9")
+    assert missed is None
+    assert extra["ok"] is False
 
 
-def test_save_rolls_back_after_hot_reload_failure(monkeypatch):
-    db = {"apps": [], "version": "test"}
-    client = _FakeClient(json.dumps(db), reload_error="reinit failed")
-    monkeypatch.setattr(service, "_remote_exec", _fake_remote_exec)
-    with pytest.raises(RuntimeError, match="hot-reload failed"):
-        save_router_rdpi_db(db, client=client)
-    assert any("rollback" in c and "rdpi_reinit" in c for c in client.commands)
+def test_curated_bundle_adds_missing_entries_last_without_touching_official_ones():
+    official = {"index": "18-1-1-0", "name": "淘宝", "rules": [{"protocol": "host", "hosts": ["taobao.com"]}]}
+    db = {"apps": [official]}
+    merged, extra = service.apply_curated_extensions(db)
+    assert merged is not None
+    assert extra["totalHostsAdded"] > 0
+    # 官方条目一个字不改，新增的排最后，让更具体的官方规则继续优先命中。
+    assert merged["apps"][0] == official
+    assert merged["apps"][-1]["rules"][0]["payloads"] == []
+    assert all("custom" not in app for app in merged["apps"])
 
 
-def test_save_rolls_back_after_readback_mismatch(monkeypatch):
-    db = {"apps": [], "version": "test"}
-    client = _FakeClient('{"apps": [], "version": "old"}')
-    monkeypatch.setattr(service, "_remote_exec", _fake_remote_exec)
-    with pytest.raises(RuntimeError, match="read-back mismatch"):
-        save_router_rdpi_db(db, client=client)
-    assert any("rollback" in c and "rdpi_reinit" in c for c in client.commands)
-
-
-def test_delete_closes_client_without_undefined_close_client(monkeypatch):
-    class Client:
-        closed = False
-
-        def close(self):
-            self.closed = True
-
-    client = Client()
-    monkeypatch.setattr(service, "_get_ssh_client", lambda: client)
-    monkeypatch.setattr(service, "load_router_rdpi_db", lambda _client: {
-        "apps": [{"index": "999-1-1-0", "name": "x", "rules": []}]
-    })
-    monkeypatch.setattr(service, "save_router_rdpi_db", lambda *_args, **_kwargs: "saved")
-    result = delete_rdpi_signature("999-1-1-0")
-    assert result["ok"] is True
-    assert client.closed is True
+def test_curated_bundle_skips_the_write_when_nothing_is_new():
+    db = {"apps": [
+        {"index": index, "name": patch["name"],
+         "rules": [{"protocol": "host", "hosts": list(patch["hosts"]), "payloads": []}]}
+        for index, patch in service.CURATED_SIGNATURE_EXTENSIONS.items()
+    ]}
+    merged, extra = service.apply_curated_extensions(db)
+    # 一个域名都没新增就不该让路由器白热重载一次。
+    assert merged is None
+    assert extra["totalHostsAdded"] == 0

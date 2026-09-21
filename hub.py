@@ -25,7 +25,7 @@ import paho.mqtt.client as mqtt
 from flask import Flask, request, jsonify, g
 from labprobe_storage import SQLiteStore
 from child_guard_service import (
-    ChildGuardCommandStore,
+    RouterCommandStore,
     ChildGuardValidationError,
     clean_plan as clean_child_guard_plan,
     router_alias as child_guard_router_alias,
@@ -92,7 +92,7 @@ DATA_LOCK_BYPASS_PREFIXES = (
 REFRESH_RUNNING = False
 STATUS_REFRESH_TTL_SEC = int(os.environ.get("STATUS_REFRESH_TTL_SEC", "180"))
 STORE = SQLiteStore(DATA_DIR, BACKUPS_DIR, DB_PATH)
-CHILD_GUARD_COMMANDS = ChildGuardCommandStore(DATA_DIR)
+CHILD_GUARD_COMMANDS = RouterCommandStore(DATA_DIR)
 UPDATE_REPOSITORY_ROOT = (os.environ.get("UPDATE_REPOSITORY_ROOT") or "").strip().rstrip("/") or "https://lab.net86.dynv6.net:27772"
 AGENT_MANIFEST_URL = f"{UPDATE_REPOSITORY_ROOT}/agent/latest.json"
 AGENT_INSTALLER_URL = f"{UPDATE_REPOSITORY_ROOT}/agent/install.sh"
@@ -3150,14 +3150,6 @@ def api_child_guard_capabilities():
     return _child_guard_execute("get_capabilities")
 
 
-def _safe_sync_ip6(macs: Optional[List[str]] = None):
-    try:
-        from rdpi_signature_service import sync_child_guard_ip6_block
-        sync_child_guard_ip6_block(macs)
-    except Exception as e:
-        LOGGER.warning("Failed to auto-sync child_guard_ip6_block: %s", e)
-
-
 @app.route("/api/router/child-guard/devices", methods=["GET"])
 def api_child_guard_devices():
     """受管控设备列表。成员关系来自路由器，但 ``todayMinutes`` / ``hasAttention`` /
@@ -3419,7 +3411,7 @@ def _child_guard_remember_plans(store: Any, key: str, action: str,
 
 
 def _child_guard_on_command_result(command: Dict[str, Any]) -> None:
-    """``ChildGuardCommandStore`` 观察者：ack 到达时就落盘。
+    """``RouterCommandStore`` 观察者：ack 到达时就落盘。
 
     等待方超时不代表结果没回来；只在响应路径上落盘会让 Hub 重启后有一段
     「认不出 uid」的空窗，所以这里也补一份。
@@ -3771,8 +3763,12 @@ def api_router_child_guard_ack():
 
 #: 路由器 agent 出站推进来的 RDPI 库副本。
 RDPI_ROUTER_DB_FILE = DATA_DIR / "rdpi_router_db.json"
-#: agent 每 5 分钟推一次；副本超过这个时长就当作没有，退回原来的 SSH 读法。
+#: agent 每 5 分钟推一次，写完 Hub 也立刻刷新这份副本；超过这个时长就是中继掉了或者
+#: 版本太旧 —— 卡片宁可说读不到，也不拿旧数据装作正常。
 RDPI_SNAPSHOT_MAX_AGE_SECONDS = 900
+#: 特征库写入只是路由器本地的一次文件操作，而命令在 5 秒一轮的状态循环里就被领走。
+RDPI_WRITE_WAIT_SECONDS = 15.0
+RDPI_COMMANDS = RouterCommandStore(DATA_DIR, "rdpi_commands.json", {"write_db"})
 
 
 @app.route("/api/router/rdpi/ingest", methods=["POST"])
@@ -3780,24 +3776,54 @@ def api_router_rdpi_ingest():
     """路由器 agent 把本机 `/usr/share/ndpi/db.default.json` 推上来。
 
     以前是 Hub 用 paramiko **反向 SSH 进路由器**去 `cat` 这个文件，host 和端口还是
-    写死的默认值（`rdpi_signature_service.py:25-26`）。路由器一重拨，公网 IP 和 SSH
-    端口全变，特征库当场读不到 —— 2026-09-20 就是这样断的。agent 本来就跑在路由器上、
-    走的是它自己发起的出站隧道，不需要谁进来连它。
+    写死的默认值。路由器一重拨，公网 IP 和 SSH 端口全变，特征库当场读不到 ——
+    真机 2026-09-20 就是这样断的。agent 本来就跑在路由器上，走它自己发起的出站隧道。
+
+    `dbText` 是文件原文：顶层除了 `apps` 还有 `version`，合并时只回写 apps 会把它丢掉。
+    0.2.63 及更早的中继只推 `apps` —— 够算卡片数字，但不能拿来整库写回。
     """
     if not check_hook_token():
         return jsonify({"ok": False, "error": "unauthorized"}), 401
     body = request.get_json(silent=True) or {}
+    db_text = str(body.get("dbText") or "")
     apps = body.get("apps")
+    if db_text:
+        try:
+            parsed = json.loads(db_text)
+        except ValueError:
+            return jsonify({"ok": False, "error": "dbText is not valid JSON"}), 400
+        apps = parsed.get("apps") if isinstance(parsed, dict) else None
     if not isinstance(apps, list) or not apps:
         return jsonify({"ok": False, "error": "apps must be a non-empty list"}), 400
     save_json(RDPI_ROUTER_DB_FILE, {
         "apps": apps,
+        "dbText": db_text,
         "router": str(body.get("router") or ""),
         "fingerprint": to_int(body.get("fingerprint"), 0),
         "readAtEpoch": to_int(body.get("readAtEpoch"), 0),
         "receivedAt": int(time.time()),
     })
-    return jsonify({"ok": True, "stored": len(apps)}), 202
+    return jsonify({"ok": True, "stored": len(apps), "verbatim": bool(db_text)}), 202
+
+
+@app.route("/api/router/rdpi/commands", methods=["GET"])
+def api_router_rdpi_commands():
+    if not check_hook_token():
+        return jsonify({"ok": False, "error": "bad hook token"}), 401
+    router = RDPI_COMMANDS.canonical_router(request.args.get("router") or primary_router_name())
+    limit = max(1, min(20, to_int(request.args.get("limit"), 10) or 10))
+    return jsonify({"ok": True, "commands": RDPI_COMMANDS.take(router, limit),
+                    "serverEpoch": int(time.time())})
+
+
+@app.route("/api/router/rdpi/ack", methods=["POST"])
+def api_router_rdpi_ack():
+    if not check_hook_token():
+        return jsonify({"ok": False, "error": "bad hook token"}), 401
+    body = request.get_json(silent=True) or {}
+    router = RDPI_COMMANDS.canonical_router(
+        request.args.get("router") or body.get("router") or primary_router_name())
+    return jsonify({"ok": True, "acknowledged": RDPI_COMMANDS.acknowledge(router, body.get("acks", []))})
 
 
 def _rdpi_router_snapshot() -> Optional[Dict[str, Any]]:
@@ -3811,24 +3837,79 @@ def _rdpi_router_snapshot() -> Optional[Dict[str, Any]]:
     return record
 
 
+def _rdpi_remember_write(db_text: str, result: Dict[str, Any], previous: Dict[str, Any]) -> None:
+    """写入成功后马上把副本换成刚写进去的内容，卡片不用等下一轮推送。
+
+    指纹拿不到就沿用旧的那个：下次写入会被中继判成「副本过期」而拒绝，方向是安全的。
+    """
+    try:
+        apps = (json.loads(db_text) or {}).get("apps") or []
+    except ValueError:  # pragma: no cover - 写入前已经解析过一遍
+        return
+    now = int(time.time())
+    save_json(RDPI_ROUTER_DB_FILE, {
+        "apps": apps,
+        "dbText": db_text,
+        "router": previous.get("router") or primary_router_name(),
+        "fingerprint": to_int(result.get("fingerprint"), to_int(previous.get("fingerprint"), 0)),
+        "readAtEpoch": now,
+        "receivedAt": now,
+    })
+
+
+def _rdpi_apply(mutate: Callable[[Dict[str, Any]], Tuple[Optional[Dict[str, Any]], Dict[str, Any]]]):
+    """在 agent 推来的整库副本上做一遍纯合并，再把结果作为命令交回路由器落地。
+
+    Hub 不再自己连路由器：合并在这里，写文件、逐字节回读核对和 `rdpi_reinit` 热重载
+    都在中继（`labrelay/src/rdpi.rs`）。中继按指纹拒绝在旧副本上动笔。
+    """
+    snapshot = _rdpi_router_snapshot()
+    if snapshot is None:
+        return jsonify({"ok": False, "errorCode": "library_unavailable",
+                        "error": "还没拿到路由器当前的特征库副本，稍后再试一次"}), 409
+    db_text = str(snapshot.get("dbText") or "")
+    if not db_text:
+        return jsonify({"ok": False, "errorCode": "relay_too_old",
+                        "error": "路由器中继没有上报特征库原文，升级到 labrelay 0.2.64 后再试"}), 409
+    try:
+        db = json.loads(db_text)
+    except ValueError:
+        return jsonify({"ok": False, "errorCode": "library_unavailable",
+                        "error": "特征库副本不是合法 JSON，等下一轮同步再试"}), 409
+    merged, extra = mutate(db)
+    if merged is None:
+        return jsonify(extra)
+    text = json.dumps(merged, ensure_ascii=False, indent=2)
+    command = RDPI_COMMANDS.enqueue(primary_router_name(), "write_db", {
+        "dbText": text,
+        "expectedFingerprint": to_int(snapshot.get("fingerprint"), 0),
+    })
+    notify_agent_commands_changed()
+    completed = RDPI_COMMANDS.wait(command["id"], timeout_seconds=RDPI_WRITE_WAIT_SECONDS)
+    result = dict(completed.result)
+    if completed.state == "done" and result.get("ok"):
+        _rdpi_remember_write(text, result, snapshot)
+        return jsonify({"ok": True, "message": str(result.get("message") or "已写入路由器并触发热重载"), **extra})
+    if completed.state in {"timeout", "delivered", "pending"}:
+        return jsonify({"ok": False, "pending": True, "commandId": command["id"], "errorCode": "router_timeout",
+                        "error": "路由器还在写特征库，稍后刷新看结果"}), 409
+    return jsonify({"ok": False, "errorCode": str(result.get("errorCode") or "agent_failed"),
+                    "error": completed.error or str(result.get("error") or "特征库写入失败")}), 409
+
+
 @app.route("/api/router/rdpi/signatures", methods=["GET"])
 def api_router_rdpi_signatures_get():
     if not check_app_token():
         return jsonify({"ok": False, "error": "unauthorized"}), 401
-    try:
-        from rdpi_signature_service import get_rdpi_signatures_summary, summarize_rdpi_db
-        snapshot = _rdpi_router_snapshot()
-        if snapshot is not None:
-            summary = summarize_rdpi_db({"apps": snapshot["apps"]})
-            summary["source"] = "agent"
-            summary["readAtEpoch"] = to_int(snapshot.get("readAtEpoch"), 0)
-            return jsonify(summary)
-        # 还没有 agent 副本（中继版本太旧，或刚重启还没轮到推）：先别把卡片打死。
-        summary = get_rdpi_signatures_summary()
-        summary["source"] = "ssh"
-        return jsonify(summary)
-    except Exception as e:
-        return jsonify({"ok": False, "error": str(e)}), 500
+    from rdpi_signature_service import summarize_rdpi_db
+    snapshot = _rdpi_router_snapshot()
+    if snapshot is None:
+        return jsonify({"ok": False, "errorCode": "library_unavailable",
+                        "error": "还没从路由器拿到特征库副本：中继在线的话等一轮同步，否则检查中继版本"}), 409
+    summary = summarize_rdpi_db({"apps": snapshot.get("apps") or []})
+    summary["source"] = "agent"
+    summary["readAtEpoch"] = to_int(snapshot.get("readAtEpoch"), 0)
+    return jsonify(summary)
 
 
 @app.route("/api/router/rdpi/signatures", methods=["POST"])
@@ -3838,65 +3919,61 @@ def api_router_rdpi_signatures_post():
     body = request.get_json(silent=True)
     if not body:
         return jsonify({"ok": False, "error": "missing or invalid JSON body"}), 400
+    from rdpi_signature_service import merge_signature_into_db
     try:
-        from rdpi_signature_service import add_or_update_rdpi_signature
-        result = add_or_update_rdpi_signature(body)
-        return jsonify(result)
-    except Exception as e:
-        return jsonify({"ok": False, "error": str(e)}), 400
+        return _rdpi_apply(lambda db: merge_signature_into_db(db, body))
+    except Exception as error:
+        return jsonify({"ok": False, "error": str(error)}), 400
 
 
 @app.route("/api/router/rdpi/signatures/<target>", methods=["DELETE"])
 def api_router_rdpi_signatures_delete(target: str):
     if not check_app_token():
         return jsonify({"ok": False, "error": "unauthorized"}), 401
+    from rdpi_signature_service import remove_signature_from_db
     try:
-        from rdpi_signature_service import delete_rdpi_signature
-        result = delete_rdpi_signature(target)
-        return jsonify(result)
-    except Exception as e:
-        return jsonify({"ok": False, "error": str(e)}), 500
+        return _rdpi_apply(lambda db: remove_signature_from_db(db, target))
+    except Exception as error:
+        return jsonify({"ok": False, "error": str(error)}), 400
 
 
 @app.route("/api/router/rdpi/signatures/bundle", methods=["POST"])
 def api_router_rdpi_signatures_bundle():
-    """Apply curated high-frequency signatures bundle (WeChat Video Channels, Douyin, Kuaishou, PDD, JD, Taobao)."""
+    """把策划过的高频应用特征（微信视频号、抖音、快手、拼多多、京东、淘宝）并进官方条目。"""
     if not check_app_token():
         return jsonify({"ok": False, "error": "unauthorized"}), 401
+    from rdpi_signature_service import apply_curated_extensions
     try:
-        from rdpi_signature_service import apply_curated_signature_bundle
-        result = apply_curated_signature_bundle()
-        return jsonify(result)
-    except Exception as e:
-        return jsonify({"ok": False, "error": str(e)}), 500
+        return _rdpi_apply(apply_curated_extensions)
+    except Exception as error:
+        return jsonify({"ok": False, "error": str(error)}), 500
 
 
 @app.route("/api/router/child-guard/ip6-audit/sync", methods=["POST"])
 def api_child_guard_ip6_audit_sync():
-    """Synchronize guarded device MACs into router `child_guard_ip6_block`."""
+    """路由器上的 `child_guard_ip6_block` 由中继自己重建，Hub 不再连进路由器。
+
+    显式传 `macs` 不再单独采纳：设备写操作先落 UCI，中继再从 UCI 取全集，比按调用方
+    临时给的列表补更不容易漏。
+    """
     if not check_app_token():
         return jsonify({"ok": False, "error": "unauthorized"}), 401
     body = request.get_json(silent=True) or {}
-    macs = body.get("macs")
-    try:
-        from rdpi_signature_service import sync_child_guard_ip6_block
-        result = sync_child_guard_ip6_block(macs=macs if isinstance(macs, list) else None)
-        return jsonify(result)
-    except Exception as e:
-        return jsonify({"ok": False, "error": str(e)}), 500
+    return _child_guard_execute(
+        "ip6_audit_sync", {"router": body.get("router")},
+        enrich=lambda result, router: {
+            **result,
+            "syncedMacs": result.get("activeMembers") or [],
+            "message": f"IPv6 降级审计已生效，共同步 {result.get('count') or 0} 台受守护设备",
+        })
 
 
 @app.route("/api/router/child-guard/ip6-audit/status", methods=["GET"])
 def api_child_guard_ip6_audit_status():
-    """Query current status of `child_guard_ip6_block`."""
+    """`child_guard_ip6_block` 的成员 —— 路由器本地问 ipset。"""
     if not check_read_token():
         return jsonify({"ok": False, "error": "unauthorized"}), 401
-    try:
-        from rdpi_signature_service import get_child_guard_ip6_block_status
-        result = get_child_guard_ip6_block_status()
-        return jsonify(result)
-    except Exception as e:
-        return jsonify({"ok": False, "error": str(e)}), 500
+    return _child_guard_execute("ip6_audit_status", {"router": request.args.get("router")})
 
 
 

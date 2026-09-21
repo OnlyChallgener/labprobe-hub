@@ -4,7 +4,7 @@ import time
 import pytest
 
 from child_guard_service import (
-    ChildGuardCommandStore,
+    RouterCommandStore,
     ChildGuardValidationError,
     clean_plan,
     expand_application_rdpi_ids,
@@ -59,7 +59,7 @@ def test_plan_contract_keeps_device_hint_and_catalog_metadata():
 
 
 def test_command_queue_delivers_and_acknowledges(tmp_path):
-    store = ChildGuardCommandStore(tmp_path)
+    store = RouterCommandStore(tmp_path)
     command = store.enqueue("BE72", "get_capabilities", {})
     delivered = store.take("BE72")
     assert delivered[0]["id"] == command["id"]
@@ -74,7 +74,7 @@ def test_command_queue_delivers_and_acknowledges(tmp_path):
 
 
 def test_wait_wakes_after_agent_ack(tmp_path):
-    store = ChildGuardCommandStore(tmp_path)
+    store = RouterCommandStore(tmp_path)
     command = store.enqueue("BE72", "get_users", {})
 
     def worker():
