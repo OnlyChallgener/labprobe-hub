@@ -421,6 +421,18 @@ CURATED_SIGNATURE_EXTENSIONS: Dict[str, Dict[str, Any]] = {
     # 参考稿里的前导点 `.uuyc.163.com` 和通配一样是不生效的。
     # 参考稿的第二条规则是 protocol=tcp 同时带 hosts+payloads —— 全库 1100 条规则里
     # 这种形状出现 0 次，引擎不接受的形态不能猜，所以不收，只留主机匹配。
+    # 官方表达 HTTP 方法用的是 http-posts / http-gets 专用键（全库 2 / 182 条），而
+    # 没有任何一条规则的 payload 里出现过 "POST "，混写的后果按最可能的解释是主机条件
+    # 被忽略、只剩包内容 —— 那会把全屋明文 POST 都认成 UU远程。
+    #
+    # 但只有主机规则等于认不到：2026-09-21 实测，反复建联断联的 25 秒里这台电脑经路由
+    # 器的 DNS 查询 0 包（客户端拿缓存/内置 IP 直连），60 秒 TLS 里也没有 SNI，3987 行
+    # 抓包按可读字符扫没有任何主机名 —— 载荷全加密。隧道流因此一条都落不到 UU远程。
+    # 于是加下面这条端口规则去探引擎吃不吃 port_limit：形状照库里唯一的先例
+    # 4-1-3-2 英雄联盟PC_Gaming（port_limit + payload_length，payloads 留空），端口取
+    # 实测的中继端口 2481/2482/2581（那一刻全屋只有这台电脑在用），包长 42 是抓包里
+    # 出现最多的长度之一。覆盖率是已知短板：同一时刻这台电脑 19 条 UDP 流里只有 6 条
+    # 落在这三个端口，其余走高位 P2P 端口（还见过 2480），所以这条最多标到三分之一。
     "9-220-1-0": {
         "name": "UU远程",
         "category": "工具/远程",
@@ -428,6 +440,15 @@ CURATED_SIGNATURE_EXTENSIONS: Dict[str, Dict[str, Any]] = {
             "uuyc.163.com",
             "gameviewer.com",
             "mofang.163.com",
+        ],
+        "extra_rules": [
+            {
+                "protocol": "udp",
+                "hosts": [],
+                "payloads": [],
+                "port_limit": [{"min": 2481, "max": 2482}, {"min": 2581, "max": 2581}],
+                "payload_length": [{"stage": 0, "length": 42}],
+            },
         ],
     },
     # WPS Office：库里原有 8-118-1-0 只有 wpscdn/qwps/wps 三个域名，而且它的主机规则
@@ -898,6 +919,29 @@ def _free_custom_index(apps: List[Dict[str, Any]], wanted: str, fallback: str) -
     raise ValueError(f"没有可用的自定义编号给 {wanted}")
 
 
+_RULE_SHAPE_KEYS = ("protocol", "hosts", "payloads", "payload_length", "port_limit")
+
+
+def _rule_shape(rule: Dict[str, Any]) -> str:
+    """规则的稳定指纹：只看匹配子，note 之类注释字段不算。"""
+    return json.dumps({key: rule.get(key) for key in _RULE_SHAPE_KEYS}, sort_keys=True)
+
+
+def _append_extra_rules(rules: List[Dict[str, Any]], patch: Dict[str, Any]) -> int:
+    """把补丁里的非主机规则（端口 / 包长那类）追加进去，同形状已存在就不重复加。
+
+    整库下发是每次刷新都会跑的，所以这一步必须幂等 —— 否则每热重载一次就往条目里塞
+    一条重复规则，路由器迟早拒收。
+    """
+    added = 0
+    for extra in patch.get("extra_rules") or []:
+        if any(_rule_shape(existing) == _rule_shape(extra) for existing in rules):
+            continue
+        rules.append(dict(extra))
+        added += 1
+    return added
+
+
 def apply_curated_extensions(db: Dict[str, Any]) -> Tuple[Optional[Dict[str, Any]], Dict[str, Any]]:
     """把策划好的高频域名并进官方条目，返回 (新库, 给界面的字段)；没有新东西就 (None, 说明)。
 
@@ -910,6 +954,7 @@ def apply_curated_extensions(db: Dict[str, Any]) -> Tuple[Optional[Dict[str, Any
     hosts_removed, removed_apps, removal_skipped = apply_removals(apps)
 
     total_hosts_added = 0
+    extra_rules_added = 0
     enhanced_apps: List[str] = list(removed_apps)
 
     for idx, patch in CURATED_SIGNATURE_EXTENSIONS.items():
@@ -929,9 +974,12 @@ def apply_curated_extensions(db: Dict[str, Any]) -> Tuple[Optional[Dict[str, Any
                 "name": patch["name"],
                 "rules": [{"protocol": "host", "hosts": list(patch["hosts"]), "payloads": []}],
             }
+            extra_here = _append_extra_rules(new_app["rules"], patch)
             apps.append(new_app)
             total_hosts_added += len(patch["hosts"])
-            enhanced_apps.append(f"{patch['name']} (新增规则 {len(patch['hosts'])} 域名)")
+            extra_rules_added += extra_here
+            detail = f"{len(patch['hosts'])} 域名" + (f" + {extra_here} 条端口规则" if extra_here else "")
+            enhanced_apps.append(f"{patch['name']} (新增规则 {detail})")
             continue
 
         rules = app.setdefault("rules", [])
@@ -948,25 +996,30 @@ def apply_curated_extensions(db: Dict[str, Any]) -> Tuple[Optional[Dict[str, Any
                 added_here += 1
 
         host_rule["hosts"] = current_hosts
+        note = ""
         if not str(host_rule.get("protocol") or "").strip():
             # 官方库里 WPS Office 的主机规则压根没有 protocol 字段（全库 55 条这种）。
             # 只补主机不改 protocol，规则还是不会被当主机规则评估 —— 「WPS 特征坏了」
             # 就是这个形状，不是域名不够。
             host_rule["protocol"] = "host"
-            enhanced_apps.append(f"{patch['name']} (+{added_here} 域名，补 protocol=host)")
-        else:
-            enhanced_apps.append(f"{patch['name']} (+{added_here} 域名)")
+            note = "，补 protocol=host"
+        extra_here = _append_extra_rules(rules, patch)
+        if extra_here:
+            note += f"，另加 {extra_here} 条端口规则"
+        enhanced_apps.append(f"{patch['name']} (+{added_here} 域名{note})")
         total_hosts_added += added_here
+        extra_rules_added += extra_here
 
     stats = {
         "totalHostsAdded": total_hosts_added,
         "totalHostsRemoved": hosts_removed,
+        "totalRulesAdded": extra_rules_added,
         "removedApps": removed_apps,
         "removalSkipped": removal_skipped,
         "enhancedApps": enhanced_apps,
         "totalApps": len(apps),
     }
-    if not total_hosts_added and not hosts_removed and not removed_apps:
+    if not total_hosts_added and not hosts_removed and not removed_apps and not extra_rules_added:
         # 一个域名都没变化，就别让路由器白热重载一次。
         return None, {**stats, "ok": True, "message": "高频特征包已是最新状态"}
     db["apps"] = apps

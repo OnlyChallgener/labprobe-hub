@@ -244,16 +244,50 @@ def test_curated_bundle_adds_missing_entries_last_without_touching_official_ones
     assert all("custom" not in app for app in merged["apps"])
 
 
+def _full_bundle_db(with_extra_rules: bool):
+    """造一份「每个补丁都已经落库」的库，用来验证幂等。"""
+    apps = []
+    for index, patch in service.CURATED_SIGNATURE_EXTENSIONS.items():
+        rules = [{"protocol": "host", "hosts": list(patch["hosts"]), "payloads": []}]
+        if with_extra_rules:
+            rules += json.loads(json.dumps(patch.get("extra_rules") or []))
+        apps.append({"index": index, "name": patch["name"], "rules": rules})
+    return {"apps": apps}
+
+
 def test_curated_bundle_skips_the_write_when_nothing_is_new():
-    db = {"apps": [
-        {"index": index, "name": patch["name"],
-         "rules": [{"protocol": "host", "hosts": list(patch["hosts"]), "payloads": []}]}
-        for index, patch in service.CURATED_SIGNATURE_EXTENSIONS.items()
-    ]}
-    merged, extra = service.apply_curated_extensions(db)
+    merged, extra = service.apply_curated_extensions(_full_bundle_db(with_extra_rules=True))
     # 一个域名都没新增就不该让路由器白热重载一次。
     assert merged is None
     assert extra["totalHostsAdded"] == 0
+    assert extra["totalRulesAdded"] == 0
+
+
+def test_port_rule_lands_on_its_entry_and_is_idempotent():
+    patched, extra = service.apply_curated_extensions(_full_bundle_db(with_extra_rules=False))
+    expected = sum(bool(patch.get("extra_rules"))
+                   for patch in service.CURATED_SIGNATURE_EXTENSIONS.values())
+    assert expected == 1
+    assert extra["totalRulesAdded"] == expected
+
+    uu = next(app for app in patched["apps"] if app["index"] == "9-220-1-0")
+    # 端口规则加在主机规则后面，原有的三个域名一个字不动。
+    assert uu["rules"][0]["hosts"] == list(service.CURATED_SIGNATURE_EXTENSIONS["9-220-1-0"]["hosts"])
+    port_rule = uu["rules"][-1]
+    assert port_rule["protocol"] == "udp"
+    assert port_rule["payloads"] == []
+    assert {"min": 2481, "max": 2482} in port_rule["port_limit"]
+    assert port_rule["payload_length"] == [{"stage": 0, "length": 42}]
+    # 端口规则的匹配子只有 payload_length 能过校验器的「至少一个匹配子」，
+    # 所以这条一旦哪天被摘掉 payload_length，整库就写不进路由器了。
+    for app in patched["apps"]:
+        validate_signature_object(app)
+
+    again, second = service.apply_curated_extensions(json.loads(json.dumps(patched)))
+    # 整库下发每次刷新都要跑一遍：第二次必须判「无新增」，否则每热重载一次就多塞一条
+    # 重复规则，路由器迟早拒收。
+    assert again is None
+    assert second["totalRulesAdded"] == 0
 
 
 # -- 摘除官方库里抢别家域名的条目 ---------------------------------------------
