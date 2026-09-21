@@ -1,17 +1,27 @@
 //! RDPI 特征库的出站同步。
 //!
-//! 以前是 Hub 用 paramiko **反向 SSH 进路由器**去 `cat` 这个文件
-//! （`rdpi_signature_service.py:25-30` 里 host/port 还是写死的默认值）。路由器一重拨，
-//! 公网 IP 和 SSH 端口就全变，特征库立刻读不到 —— 真机 2026-09-20 就是这样断的，
-//! 而且 agent 本来就跑在路由器上、走出站隧道，根本不需要谁进来连它。
+//! 以前是 Hub 用 paramiko **反向 SSH 进路由器**去 `cat` 这个文件，host 和 SSH 端口
+//! 还是写在源码默认值里。路由器一重拨，两个都变，特征库立刻读不到 —— 真机
+//! 2026-09-20 就是这样断的，而且 agent 本来就跑在路由器上、走出站隧道，根本不需要
+//! 谁进来连它。
 //!
-//! 这里负责「读 + 变了才推」，也负责 Hub 下发的那一次整库写入。哪些算自定义特征
-//! 的判断留在 Hub，免得两边各写一套规则然后慢慢长得不一样。
+//! 这里负责「读 + 推副本」（内容变了就推，没变但推得太久也重推），也负责 Hub 下发的
+//! 那一次整库写入。哪些算自定义特征的判断留在 Hub，免得两边各写一套规则然后慢慢长得
+//! 不一样。
 
 use anyhow::{anyhow, bail, Context, Result};
 use serde_json::{json, Value};
 use std::process::Command;
 use std::sync::atomic::{AtomicU64, Ordering};
+use std::time::{SystemTime, UNIX_EPOCH};
+
+/// 写入成功后要把「什么时候推的」也记下来。
+fn now_epoch() -> u64 {
+    SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .map(|value| value.as_secs())
+        .unwrap_or(0)
+}
 
 /// 固件的 RDPI 库；和 Hub 侧 `REMOTE_DB_PATH` 保持一致。
 pub const ROUTER_DB_PATH: &str = "/usr/share/ndpi/db.default.json";
@@ -183,7 +193,7 @@ fn write_db(payload: &Value) -> Result<Value> {
     let _ = shell(&format!("rm -f {TEMP_PATH} {ROLLBACK_PATH}"));
 
     let mark = fingerprint(db_text);
-    note_pushed(mark);
+    note_pushed(mark, now_epoch());
     Ok(json!({
         "ok": true,
         "apps": apps.len(),
