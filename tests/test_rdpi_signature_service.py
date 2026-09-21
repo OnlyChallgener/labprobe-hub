@@ -308,9 +308,11 @@ def test_bundle_against_the_real_official_db_moves_alibaba_infra_off_dingtalk():
     assert "cfg.imtt.qq.com" in meeting and "dp3.qq.com" not in meeting
     # 淘宝官方库里根本没有，必须新建出来。
     assert "淘宝" in [app["name"] for app in merged["apps"]]
-    # 阿里CDN 兜住 alicdn：这是它以前从来没命中过的原因。
-    alicdn = by_index["18-4-3-0"]["rules"][0]["hosts"]
-    assert "alicdn.com" in alicdn
+    # 阿里CDN 兜住 alicdn：这是它以前从来没命中过的原因。编号必须落在自定义段，
+    # 不能占 18-4-3-0 —— 路由器上那个编号是一条重复的云闪付。
+    alibaba_cdn = next(a for a in merged["apps"] if a["name"] == "阿里CDN")
+    assert alibaba_cdn["index"].startswith("9-"), alibaba_cdn["index"]
+    assert "alicdn.com" in alibaba_cdn["rules"][0]["hosts"]
     assert extra["totalHostsRemoved"] > 0 and extra["removalSkipped"] == []
     # 改完的库必须仍然合法：不能引入任何官方库原本没有的非法条目，否则路由器会
     # 拒绝写入并回滚整库。
@@ -352,3 +354,53 @@ def test_the_requested_apps_all_arrive_in_the_bundle():
     wecom = next(a for a in merged["apps"] if a["name"] == "企业微信")
     assert wecom["index"] == "8-1-3-0"
     assert "work.weixin.qq.com" in wecom["rules"][0]["hosts"]
+
+
+def test_same_app_family_only_accepts_the_app_itself_and_its_derivatives():
+    assert service._same_app_family("抖音系列", "抖音")
+    assert service._same_app_family("微信_other", "微信")
+    assert service._same_app_family("淘宝", "淘宝")
+    assert not service._same_app_family("云闪付", "阿里CDN")
+    assert not service._same_app_family("支付宝", "钉钉")
+
+
+def test_a_taken_index_never_absorbs_an_unrelated_patch():
+    """编号被不相干的条目占着时另找空位，绝不把域名并进别人家。"""
+    occupant = {"index": "9-217-1-0", "name": "别的支付",
+                "rules": [{"protocol": "host", "hosts": ["pay.example.com"]}]}
+    merged, _extra = service.apply_curated_extensions({"apps": [occupant]})
+    by_index = {a["index"]: a for a in merged["apps"]}
+    assert by_index["9-217-1-0"]["rules"][0]["hosts"] == ["pay.example.com"], \
+        "不相干的条目被并进了我们的 CDN 域名"
+    created = [a for a in merged["apps"] if a["name"] == "阿里CDN"]
+    assert created and created[0]["index"] != "9-217-1-0"
+    assert created[0]["index"].startswith("9-"), created[0]["index"]
+
+
+def test_deletion_by_index_is_refused_when_the_name_does_not_match():
+    """只按编号删条目同样危险：名字对不上就不许删。"""
+    apps = [{"index": "18-4-3-0", "name": "某个正经应用",
+             "rules": [{"protocol": "host", "hosts": ["x.com"]}]}]
+    removed, gone, skipped = service.apply_removals(apps)
+    assert gone == [] and skipped and "18-4-3-0" in skipped[0]
+    assert len(apps) == 1
+
+
+def test_index_match_still_enhances_a_derived_official_name():
+    """`抖音系列` 就是 抖音 的官方派生条目，按编号合并进它，不能再建一条重名应用。"""
+    official = {"index": "10-5-1-0", "name": "抖音系列",
+                "rules": [{"protocol": "host", "hosts": ["iesdouyin.com"]}]}
+    merged, _extra = service.apply_curated_extensions({"apps": [official]})
+    douyin = [a for a in merged["apps"] if a["index"] == "10-5-1-0"]
+    assert len(douyin) == 1
+    hosts = douyin[0]["rules"][0]["hosts"]
+    assert "iesdouyin.com" in hosts and "amemv.com" in hosts
+    assert not [a for a in merged["apps"] if a["name"] == "抖音"]
+
+
+def test_a_new_app_never_lands_on_an_index_the_router_already_uses():
+    taken = [{"index": f"9-{slot}-1-0", "name": f"占位{slot}",
+              "rules": [{"protocol": "host", "hosts": ["x.com"]}]} for slot in range(200, 220)]
+    merged, _extra = service.apply_curated_extensions({"apps": taken})
+    indexes = [a["index"] for a in merged["apps"]]
+    assert len(indexes) == len(set(indexes)), "同一个编号出现了两次"

@@ -369,15 +369,14 @@ CURATED_SIGNATURE_EXTENSIONS: Dict[str, Dict[str, Any]] = {
             "jd.hk",
         ],
     },
-    # 阿里CDN：官方特征库把 appid 绑死在自家编号体系里（18-4-1 支付宝、
-    # 18-4-2 淘宝、7-4-1 阿里云盘、8-4-1-x 钉钉），阿里系共用 `*-4-*` 段。
-    # 官方没有"阿里CDN"这个条目，于是按同一编号规则占 18-4-3-0，收官方**没有明确
-    # 归属**的阿里基础设施域名。`alicdn.com` 原来被 `钉钉_alicdn` 整片占着（见
-    # CURATED_SIGNATURE_REMOVALS），摘掉之后由这里兜住；优酷自己的
-    # `ykimg.alicdn.com` 排在库前面，继续归优酷，不抢。
-    # 引擎只认裸域名后缀，`*.x.com` 这种写法在官方库里一条都没有（1093 个主机、
-    # 零个带 `*`），所以每个通配项都必须配一个裸域名，否则那条规则是死的。
-    "18-4-3-0": {
+    # 阿里CDN：官方库把阿里系基础设施散在 钉钉_aliyuncs / 钉钉_alibaba / 钉钉_taobao
+    # 这些派生条目里，正主（淘宝/天猫/闲鱼/饿了么）反而没有归属，于是 阿里CDN 兜住
+    # 没有明确应用的阿里域名。编号用 9-217-1-0 —— 自定义段，线上库里确认过是空的；
+    # 原来写的 18-4-3-0 在路由器上是一条重复的 云闪付，按编号合并就把 CDN 域名塞进
+    # 了支付应用。
+    # `alicdn.com` 以前被 `钉钉_alicdn`（位置 296）整片占着，摘掉之后才轮得到这里；
+    # 优酷自己的 `ykimg.alicdn.com` 排在库前面，继续归优酷，不抢。
+    "9-217-1-0": {
         "name": "阿里CDN",
         "category": "网络服务/CDN",
         "hosts": [
@@ -653,6 +652,10 @@ CURATED_SIGNATURE_REMOVALS: Dict[str, Any] = {
     # 安全教育平台_null_relation 四个主机全是个推/gepush 推送 SDK —— 任何用个推的
     # App 都会被记成安全教育平台。
     "8-81-1-15": "*",
+    # 线上路由器有一条重复的 云闪付 占在 18-4-3-0（真正的在 18-156-1-0）。它是早先
+    # 下发留下的产物，上一轮又按 index 把 alicdn/mmstat 等 9 个阿里域名并了进来 ——
+    # 支付应用不该兜 CDN 流量。删的时候必须核对名字：只按编号动手是这一批问题的根源。
+    "18-4-3-0": {"delete_if_named": "云闪付"},
 }
 
 
@@ -681,6 +684,15 @@ def apply_removals(apps: List[Dict[str, Any]]) -> tuple:
         if app is None:
             continue
         name = str(app.get("name") or idx)
+        if isinstance(spec, dict):
+            expected = str(spec.get("delete_if_named") or "")
+            if name != expected:
+                # 编号在线上库里被谁占着，只有路由器自己知道；名字对不上就不动手。
+                skipped.append(f"{name} ({idx} 不是 {expected}，保留)")
+                continue
+            apps.remove(app)
+            removed_apps.append(f"{name} ({idx} 整条删除)")
+            continue
         if spec == "*":
             apps.remove(app)
             removed_apps.append(f"{name} ({idx} 整条删除)")
@@ -707,6 +719,37 @@ def apply_removals(apps: List[Dict[str, Any]]) -> tuple:
     return removed_hosts, removed_apps, skipped
 
 
+def _same_app_family(official_name: str, wanted_name: str) -> bool:
+    """官方条目是不是就是我们要增强的那个应用。
+
+    官方库会把一个应用拆成 `抖音系列` / `微信_other` / `优酷视频_weak_relation`
+    这种派生名，中继按 `_` 截断后显示成主应用名。只认这三种关系，别的都算不相
+    干 —— 路由器上的 18-4-3-0 是一条重复的 云闪付，早先按 index 直接合并把
+    alicdn/mmstat 塞进了支付应用，把阿里 CDN 流量全记成了云闪付。
+    """
+    official = str(official_name or "").strip()
+    wanted = str(wanted_name or "").strip()
+    return (official == wanted
+            or official.startswith(wanted + "系列")
+            or official.startswith(wanted + "_"))
+
+
+def _free_custom_index(apps: List[Dict[str, Any]], wanted: str, fallback: str) -> str:
+    """给一个新应用挑一个路由器上真的没被占用的编号。
+
+    编号只能对着**线上库**分配：提取出来的官方固件库是 472 条，路由器上是 486 条
+    （历次下发新增的），拿固件库判断「这个编号是空的」会撞车。
+    """
+    taken = {str(a.get("index")) for a in apps}
+    if fallback not in taken:
+        return fallback
+    for slot in range(217, 400):
+        candidate = f"9-{slot}-1-0"
+        if candidate not in taken:
+            return candidate
+    raise ValueError(f"没有可用的自定义编号给 {wanted}")
+
+
 def apply_curated_extensions(db: Dict[str, Any]) -> Tuple[Optional[Dict[str, Any]], Dict[str, Any]]:
     """把策划好的高频域名并进官方条目，返回 (新库, 给界面的字段)；没有新东西就 (None, 说明)。
 
@@ -722,13 +765,19 @@ def apply_curated_extensions(db: Dict[str, Any]) -> Tuple[Optional[Dict[str, Any
     enhanced_apps: List[str] = list(removed_apps)
 
     for idx, patch in CURATED_SIGNATURE_EXTENSIONS.items():
-        app = next((a for a in apps if a.get("index") == idx or a.get("name") == patch["name"]), None)
+        # 先认「同编号且同族」的官方条目（10-5-1-0 在路由器上叫 抖音系列），再按
+        # 名字认；两个都不满足就当新应用建，编号再对着线上库挑一次真空位。
+        app = next((a for a in apps
+                    if a.get("index") == idx
+                    and _same_app_family(a.get("name"), patch["name"])), None)
+        if app is None:
+            app = next((a for a in apps if a.get("name") == patch["name"]), None)
         if not app:
             # 官方库里还没有这一条：按官方 db 的形状新建（只有 index/name/rules ——
-            # `custom` 是接口元数据，绝不能落进路由器数据库；`payloads: []` 对齐淘宝
-            # 18-4-2-0 这类官方 host 规则）。
+            # `custom` 是接口元数据，绝不能落进路由器数据库；`payloads: []` 对齐
+            # 官方 host 规则）。
             new_app = {
-                "index": idx,
+                "index": _free_custom_index(apps, patch["name"], idx),
                 "name": patch["name"],
                 "rules": [{"protocol": "host", "hosts": list(patch["hosts"]), "payloads": []}],
             }
