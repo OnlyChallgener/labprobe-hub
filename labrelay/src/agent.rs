@@ -1565,7 +1565,7 @@ async fn sync_rdpi(client: &Client, config: &AgentConfig) -> Result<()> {
         "fingerprint": mark,
     });
     post_json(client, config, "/api/router/rdpi/ingest", &body).await?;
-    crate::rdpi::note_pushed(mark);
+    crate::rdpi::note_pushed(mark, now);
     log_line(config, "INFO", &format!("rdpi db pushed: {count} apps"));
     Ok(())
 }

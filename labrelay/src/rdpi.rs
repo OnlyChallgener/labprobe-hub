@@ -22,6 +22,16 @@ const BACKUP_PATH: &str = "/usr/share/ndpi/db.default.json.bak";
 
 /// 上一次成功推送时文件的指纹。0 = 从没推过。
 static PUSHED_FINGERPRINT: AtomicU64 = AtomicU64::new(0);
+/// 上一次成功推送的时刻。Hub 把超过 15 分钟的副本当作没有，所以「文件没变」不等于
+/// 「不用推」—— 真机 2026-09-21 就是这样：改了两次特征库之后安静了 45 分钟，卡片
+/// 直接变成读不到，因为中继觉得没东西可推。
+static LAST_PUSHED_AT: AtomicU64 = AtomicU64::new(0);
+const KEEP_FRESH_SECONDS: u64 = 600;
+
+/// 该不该推一份副本给 Hub。
+fn should_push(mark: u64, pushed_mark: u64, last_pushed_at: u64, now: u64) -> bool {
+    mark != pushed_mark || now.saturating_sub(last_pushed_at) >= KEEP_FRESH_SECONDS
+}
 
 /// FNV-1a。只用来判断「文件有没有变」，不当校验和用。
 fn fingerprint(text: &str) -> u64 {
@@ -33,11 +43,16 @@ fn fingerprint(text: &str) -> u64 {
     hash
 }
 
-/// 内容没变就返回 `None`，调用方连 HTTP 都不必发。
+/// 内容没变、但上一次成功推送已经隔了太久，也要重推 —— 见 `should_push`。
 pub fn changed_snapshot(now_epoch: u64) -> Result<Option<Value>> {
     let text = std::fs::read_to_string(ROUTER_DB_PATH)?;
     let mark = fingerprint(&text);
-    if mark == PUSHED_FINGERPRINT.load(Ordering::Relaxed) {
+    if !should_push(
+        mark,
+        PUSHED_FINGERPRINT.load(Ordering::Relaxed),
+        LAST_PUSHED_AT.load(Ordering::Relaxed),
+        now_epoch,
+    ) {
         return Ok(None);
     }
     let db: Value = serde_json::from_str(&text)?;
@@ -57,8 +72,9 @@ fn json_empty_array() -> Value {
 }
 
 /// 只有 Hub 收下了才记账，失败下一轮会自己重推。
-pub fn note_pushed(mark: u64) {
+pub fn note_pushed(mark: u64, now_epoch: u64) {
     PUSHED_FINGERPRINT.store(mark, Ordering::Relaxed);
+    LAST_PUSHED_AT.store(now_epoch, Ordering::Relaxed);
 }
 
 fn shell(command: &str) -> Result<String> {
@@ -178,7 +194,18 @@ fn write_db(payload: &Value) -> Result<Value> {
 
 #[cfg(test)]
 mod tests {
-    use super::{fingerprint, write_is_stale};
+    use super::{fingerprint, should_push, write_is_stale};
+
+    #[test]
+    fn an_unchanged_library_still_gets_resent_before_the_hub_drops_it() {
+        // 真机 2026-09-21：改完特征库后 45 分钟没人再动文件，中继不再推，Hub 的
+        // 副本过了 15 分钟被判过期，卡片变成「读不到」。
+        assert!(should_push(7, 7, 1_000, 1_700));
+        assert!(!should_push(7, 7, 1_000, 1_300));
+        assert!(should_push(8, 7, 1_000, 1_010));
+        // 从没推过。
+        assert!(should_push(7, 0, 0, 1));
+    }
 
     #[test]
     fn same_bytes_hash_the_same_way() {
