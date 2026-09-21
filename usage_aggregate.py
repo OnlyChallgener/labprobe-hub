@@ -308,6 +308,22 @@ def _migrate_router_columns(conn: sqlite3.Connection) -> None:
             raise
 
 
+#: 老库补新列用的清单：``CREATE TABLE IF NOT EXISTS`` 不会改已存在的表。
+_ADDED_COLUMNS = {
+    "child_guard_device": (("pass_until", "INTEGER NOT NULL DEFAULT 0"),),
+}
+
+
+def _migrate_added_columns(conn: sqlite3.Connection) -> None:
+    for table, columns in _ADDED_COLUMNS.items():
+        present = {row[1] for row in conn.execute(f"PRAGMA table_info({table})")}
+        if not present:
+            continue
+        for name, declaration in columns:
+            if name not in present:
+                conn.execute(f"ALTER TABLE {table} ADD COLUMN {name} {declaration}")
+
+
 class UsageAggregateStore:
     """SQLite-backed aggregate tables. Lives beside the main Hub database."""
 
@@ -415,6 +431,7 @@ class UsageAggregateStore:
                         macs          TEXT    NOT NULL DEFAULT '',
                         blocked       INTEGER NOT NULL DEFAULT 0,
                         blocked_until INTEGER NOT NULL DEFAULT 0,
+                        pass_until    INTEGER NOT NULL DEFAULT 0,
                         updated_at    INTEGER NOT NULL DEFAULT 0,
                         PRIMARY KEY (router, uid)
                     ) WITHOUT ROWID;
@@ -429,6 +446,7 @@ class UsageAggregateStore:
                     """
                 )
                 _migrate_router_columns(conn)
+                _migrate_added_columns(conn)
             finally:
                 conn.close()
 
@@ -567,13 +585,17 @@ class UsageAggregateStore:
                 if isinstance(macs, (list, tuple)) else None
             name = _guard_name(device.get("name")) or _guard_name(device.get("userDefinedName"))
             blocked = device.get("blocked")
-            until = _as_count(device.get("blockedUntilEpoch") or device.get("pausedUntilEpoch"))
+            until = _as_count(device.get("blockedUntilEpoch"))
+            # 「临时放行」用的是固件的 pause，「禁网」用的是 block —— 两个相反的
+            # 状态。以前把 pausedUntilEpoch 兜进 blockedUntilEpoch，放行中会被显示
+            # 成禁网中，所以各存各的列。
+            passed = device.get("pausedUntilEpoch")
             with self._lock:
                 conn = self.connect()
                 try:
                     existing = conn.execute(
-                        "SELECT name, macs, blocked, blocked_until FROM child_guard_device "
-                        "WHERE router = ? AND uid = ?", (key, uid)).fetchone()
+                        "SELECT name, macs, blocked, blocked_until, pass_until "
+                        "FROM child_guard_device WHERE router = ? AND uid = ?", (key, uid)).fetchone()
                     merged_name = name or (str(existing["name"]) if existing else "")
                     merged_macs = clean_macs if clean_macs is not None else _split_macs(
                         str(existing["macs"]) if existing else "")
@@ -582,16 +604,19 @@ class UsageAggregateStore:
                         int(existing["blocked"]) if existing else 0)
                     merged_until = until if (blocked is not None or until) else (
                         int(existing["blocked_until"]) if existing else 0)
+                    merged_pass = _as_count(passed) if passed is not None else (
+                        int(existing["pass_until"]) if existing else 0)
                     conn.execute(
                         "INSERT INTO child_guard_device"
-                        "(router, uid, name, macs, blocked, blocked_until, updated_at) "
-                        "VALUES(?, ?, ?, ?, ?, ?, ?) "
+                        "(router, uid, name, macs, blocked, blocked_until, pass_until, updated_at) "
+                        "VALUES(?, ?, ?, ?, ?, ?, ?, ?) "
                         "ON CONFLICT(router, uid) DO UPDATE SET "
                         "name = excluded.name, macs = excluded.macs, "
                         "blocked = excluded.blocked, blocked_until = excluded.blocked_until, "
+                        "pass_until = excluded.pass_until, "
                         "updated_at = excluded.updated_at",
                         (key, uid, merged_name, ",".join(merged_macs),
-                         merged_blocked, merged_until, now),
+                         merged_blocked, merged_until, merged_pass, now),
                     )
                 finally:
                     conn.close()
@@ -605,7 +630,7 @@ class UsageAggregateStore:
             conn = self.connect()
             try:
                 rows = conn.execute(
-                    "SELECT uid, name, macs, blocked, blocked_until, updated_at "
+                    "SELECT uid, name, macs, blocked, blocked_until, pass_until, updated_at "
                     "FROM child_guard_device WHERE router = ? ORDER BY uid", (key,)
                 ).fetchall()
             finally:
@@ -617,6 +642,7 @@ class UsageAggregateStore:
                 "macs": _split_macs(str(row["macs"] or "")),
                 "blocked": bool(int(row["blocked"] or 0)),
                 "blockedUntilEpoch": int(row["blocked_until"] or 0),
+                "passUntilEpoch": int(row["pass_until"] or 0),
                 "updatedAt": int(row["updated_at"] or 0),
             }
             for row in rows
@@ -708,7 +734,7 @@ class UsageAggregateStore:
             conn = self.connect()
             try:
                 row = conn.execute(
-                    "SELECT uid, name, macs, blocked, blocked_until, updated_at "
+                    "SELECT uid, name, macs, blocked, blocked_until, pass_until, updated_at "
                     "FROM child_guard_device WHERE router = ? AND uid = ?",
                     (key, wanted)).fetchone()
             finally:
@@ -721,6 +747,7 @@ class UsageAggregateStore:
             "macs": _split_macs(str(row["macs"] or "")),
             "blocked": bool(int(row["blocked"] or 0)),
             "blockedUntilEpoch": int(row["blocked_until"] or 0),
+            "passUntilEpoch": int(row["pass_until"] or 0),
             "updatedAt": int(row["updated_at"] or 0),
         }
 
@@ -1807,8 +1834,15 @@ def build_guard_overview(
             "todayMinutes": today_minutes,
             "hasData": has_data,
             "topApps": top_apps,
-            "blocked": bool(device.get("blocked")),
-            "blockedUntilEpoch": _as_count(device.get("blockedUntilEpoch")),
+            # 临时放行走的是固件的 skip 通道：pause 期间 block 不生效。所以「此刻是否
+            # 被禁网」必须同时看两个字段 —— 只读 block 会出现界面上「禁网中」、孩子
+            # 实际能上网的反向假象。
+            "blocked": bool(device.get("blocked")) and _as_count(device.get("passUntilEpoch")) <= stamp,
+            "blockedUntilEpoch": (
+                0 if _as_count(device.get("passUntilEpoch")) > stamp
+                else _as_count(device.get("blockedUntilEpoch"))
+            ),
+            "passUntilEpoch": _as_count(device.get("passUntilEpoch")),
             "planCount": schedule["planCount"],
             "schedule": schedule["schedule"],
             "currentRange": schedule["currentRange"],

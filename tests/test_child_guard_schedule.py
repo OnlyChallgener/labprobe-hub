@@ -2,7 +2,16 @@
 
 from datetime import datetime, timedelta, timezone
 
-from child_guard_schedule import BEIJING, WEEKDAY_KEYS, plan_day_ranges, schedule_state
+import pytest
+
+from child_guard_schedule import (
+    BEIJING,
+    WEEKDAY_KEYS,
+    clean_pass_until,
+    pass_deadline,
+    plan_day_ranges,
+    schedule_state,
+)
 
 
 def _epoch(year: int, month: int, day: int, hour: int, minute: int) -> int:
@@ -117,3 +126,28 @@ def test_malformed_times_are_ignored_instead_of_raising():
     state = schedule_state([broken], _epoch(2026, 9, 20, 12, 0))
     assert state["schedule"] == "blocked"
     assert state["planCount"] == 1
+
+
+def test_pass_presets_become_absolute_deadlines_and_cancel_is_zero():
+    now = _epoch(2026, 9, 20, 12, 0)
+    assert clean_pass_until("10m", now) == now + 600
+    assert clean_pass_until("30m", now) == now + 1800
+    assert clean_pass_until("1h", now) == now + 3600
+    assert clean_pass_until("cancel", now) == 0
+
+
+def test_today_pass_ends_at_beijing_midnight_tonight():
+    now = _epoch(2026, 9, 20, 12, 0)
+    assert clean_pass_until("today", now) == _epoch(2026, 9, 21, 0, 0)
+    # 固件的硬上限就是这个数：再晚一秒它就整条拒收（实测 endtime unsupport）。
+    assert pass_deadline(now) == _epoch(2026, 9, 21, 0, 0)
+
+
+def test_a_pass_near_midnight_is_clamped_instead_of_rejected_by_the_firmware():
+    now = _epoch(2026, 9, 20, 23, 30)
+    assert clean_pass_until("1h", now) == _epoch(2026, 9, 21, 0, 0) - 1
+
+
+def test_an_unknown_pass_preset_is_refused_before_it_reaches_the_router():
+    with pytest.raises(ValueError):
+        clean_pass_until("99h", _epoch(2026, 9, 20, 12, 0))

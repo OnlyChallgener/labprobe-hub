@@ -100,6 +100,22 @@ def test_runtime_blocked_state_comes_from_the_device_cache(monkeypatch, tmp_path
     assert runtime["blockedUntilEpoch"] > int(time.time())
 
 
+def test_a_live_pass_window_answers_runtime_as_allowed(monkeypatch, tmp_path):
+    """禁网中 + 放行中 = 此刻能上网。读接口不能只抄 block。"""
+    aggregate = _aggregate(tmp_path)
+    now = int(time.time())
+    aggregate.remember_guard_devices(ROUTER, [
+        {"uid": UID, "macs": ["1A:9C:C5:C5:B7:BB"], "name": "Mate60",
+         "blocked": True, "blockedUntilEpoch": now + 600, "pausedUntilEpoch": now + 300}])
+    client, asked = _prepare(monkeypatch, tmp_path, aggregate)
+    runtime = client.get(RUNTIME_PATH).get_json()["runtime"]
+    assert asked == []
+    assert runtime["blocked"] is False and runtime["blockedUntilEpoch"] == 0
+    assert runtime["passUntilEpoch"] == now + 300
+    # 缓存里的 block 本身没被动过：放行一到点，禁网继续。
+    assert aggregate.guard_device(ROUTER, UID)["blockedUntilEpoch"] == now + 600
+
+
 def test_runtime_for_an_unknown_device_falls_back_to_the_router(monkeypatch, tmp_path):
     client, asked = _prepare(monkeypatch, tmp_path, _aggregate(tmp_path))
     client.get(RUNTIME_PATH)

@@ -24,6 +24,7 @@ import dns.resolver
 import paho.mqtt.client as mqtt
 from flask import Flask, request, jsonify, g
 from labprobe_storage import SQLiteStore
+from child_guard_schedule import clean_pass_until
 from child_guard_service import (
     RouterCommandStore,
     ChildGuardValidationError,
@@ -3085,12 +3086,17 @@ def _child_guard_runtime_snapshot(key: str, uid: str) -> Optional[Dict[str, Any]
     row = store.guard_device(key, uid) if store is not None else None
     if not row:
         return None
+    passed = int(row.get("passUntilEpoch") or 0)
+    on_pass = passed > int(time.time())
     return {
         "uid": uid,
         "runtime": {
             "uid": row.get("uid") or uid,
-            "blocked": bool(row.get("blocked")),
-            "blockedUntilEpoch": int(row.get("blockedUntilEpoch") or 0),
+            # 放行期间固件的 skip ipset 让 block 不生效，所以「此刻能不能上网」必须
+            # 同时看两个字段，不能只抄 block。
+            "blocked": bool(row.get("blocked")) and not on_pass,
+            "blockedUntilEpoch": 0 if on_pass else int(row.get("blockedUntilEpoch") or 0),
+            "passUntilEpoch": passed,
         },
         "updatedAt": int(row.get("updatedAt") or 0),
     }
@@ -3360,6 +3366,13 @@ def _child_guard_remember_devices(action: str, result: Dict[str, Any],
                 "uid": result.get("uid") or body.get("uid"),
                 "blocked": action == "pause_device",
                 "blockedUntilEpoch": until if action == "pause_device" else 0,
+            }])
+        elif action == "set_device_pass":
+            # 只更新放行截止时间：block 是另一件事，不能顺手改写。
+            store.remember_guard_devices(key, [{
+                "uid": result.get("uid") or body.get("uid"),
+                "pausedUntilEpoch": to_int(result.get("passUntilEpoch"),
+                                           to_int(body.get("untilEpoch"), 0)),
             }])
         elif action == "remove_device":
             store.forget_guard_device(key, str(result.get("uid") or body.get("uid") or ""))
@@ -3689,6 +3702,26 @@ def api_child_guard_device_action(uid: str, action: str):
     if action == "pause" and body.get("untilEpoch") is not None:
         operation["untilEpoch"] = max(0, to_int(body.get("untilEpoch"), 0))
     return _child_guard_execute(f"{action}_device", operation)
+
+
+@app.route("/api/router/child-guard/devices/<uid>/pass", methods=["POST"])
+def api_child_guard_device_pass(uid: str):
+    """临时放行：走固件自己的 pause 通道（``child_guard_skip`` ipset + runat 自动撤销）。
+
+    以前想放行只能改计划或者禁网后手动恢复。时长换算必须发生在 Hub：中继在路由器上
+    算不出「今天还剩多久」，而固件对 pause 的截止时间有硬上限（明天零点），超了整条
+    命令会被直接拒收。
+    """
+    if not check_app_token():
+        return jsonify({"ok": False, "error": "unauthorized"}), 401
+    try:
+        normalized_uid = validate_child_guard_uid(uid)
+        body = request.get_json(silent=True) or {}
+        until = clean_pass_until(body.get("preset"), int(time.time()))
+    except ValueError as error:
+        return jsonify({"ok": False, "errorCode": "invalid_request", "error": str(error)}), 400
+    return _child_guard_execute("set_device_pass", {
+        "uid": normalized_uid, "untilEpoch": until, "router": body.get("router")})
 
 
 @app.route("/api/router/child-guard/devices/candidates", methods=["GET"])

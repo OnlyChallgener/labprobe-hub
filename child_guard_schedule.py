@@ -200,3 +200,34 @@ def _blocked_now(todays: Sequence[Mapping[str, Any]], minute: int) -> Optional[D
         "end": _label(min(ends)) if ends else _DAY_END,
         "kind": "block",
     }
+
+
+#: 界面上的临时放行时长预设（秒）。固件只认绝对截止时间。
+PASS_PRESET_SECONDS = {"10m": 600, "30m": 1800, "1h": 3600}
+
+
+def pass_deadline(now_epoch: int) -> int:
+    """北京时间「明天零点」—— 固件的 pause 硬上限（超过直接回 endtime unsupport）。"""
+    stamp = datetime.fromtimestamp(int(now_epoch), BEIJING)
+    tomorrow = stamp.replace(hour=0, minute=0, second=0, microsecond=0) + timedelta(days=1)
+    return int(tomorrow.timestamp())
+
+
+def clean_pass_until(preset: Any, now_epoch: int) -> int:
+    """把「放行多久」换算成绝对截止时间（epoch 秒）；``cancel`` 返回 0。
+
+    换算只能发生在 Hub：中继在路由器上算不出「今天还剩多久」，而 23:30 点
+    「放行 1 小时」会被固件整条拒收 —— 贴到今天结束更诚实，也比报错强。
+    """
+    now = max(0, int(now_epoch))
+    deadline = pass_deadline(now)
+    key = str(preset or "").strip().lower()
+    if key == "cancel":
+        return 0
+    if key == "today":
+        return deadline
+    seconds = PASS_PRESET_SECONDS.get(key)
+    if seconds is None:
+        raise ValueError("未知的放行时长，请重新选择")
+    until = now + seconds
+    return deadline - 1 if until >= deadline else until

@@ -5,6 +5,7 @@
 """
 
 import re
+import time
 from pathlib import Path
 
 import hub
@@ -55,6 +56,27 @@ def test_command_status_rejects_malformed_and_unknown_ids(monkeypatch, tmp_path)
     client = _prepare(monkeypatch, tmp_path)
     assert client.get("/api/router/child-guard/command/nope").status_code == 400
     assert client.get(f"/api/router/child-guard/command/{'a' * 24}").status_code == 404
+
+
+def test_a_pass_request_carries_the_deadline_the_hub_computed(monkeypatch, tmp_path):
+    """App 只说「放行 30 分钟」：绝对截止时间由 Hub 换算，中继只收 epoch。"""
+    client = _prepare(monkeypatch, tmp_path)
+    monkeypatch.setattr(hub, "check_app_token", lambda: True)
+    response = client.post(f"/api/router/child-guard/devices/{'A' * 32}/pass",
+                           json={"preset": "30m"})
+    assert response.status_code == 202
+    command = hub.CHILD_GUARD_COMMANDS.take("router", 5)[0]
+    assert command["action"] == "set_device_pass"
+    remaining = command["payload"]["untilEpoch"] - int(time.time())
+    assert 1700 <= remaining <= 1800
+
+
+def test_an_unknown_pass_preset_never_reaches_the_router(monkeypatch, tmp_path):
+    client = _prepare(monkeypatch, tmp_path)
+    monkeypatch.setattr(hub, "check_app_token", lambda: True)
+    response = client.post(f"/api/router/child-guard/devices/{'A' * 32}/pass", json={"preset": "99h"})
+    assert response.status_code == 400
+    assert hub.CHILD_GUARD_COMMANDS.take("router", 5) == []
 
 
 def test_every_enqueued_action_is_whitelisted():

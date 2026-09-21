@@ -1199,6 +1199,19 @@ class TestGuardDeviceDirectory:
         store.remember_guard_devices(ROUTER, [{"uid": UID, "blocked": False}])
         assert store.guard_device(ROUTER, UID)["blocked"] is False
 
+    def test_a_pass_window_has_its_own_column_and_a_block_only_update_keeps_it(self, store):
+        store.remember_guard_devices(ROUTER, [
+            {"uid": UID, "macs": [MAC_A], "blocked": True, "blockedUntilEpoch": 1789862400}])
+        store.remember_guard_devices(ROUTER, [{"uid": UID, "pausedUntilEpoch": 1789866000}])
+        row = store.guard_device(ROUTER, UID)
+        # 「禁到 22:00」和「放行到 23:00」是两件事：一个把另一个抹掉，界面上就会
+        # 出现放行中还显示禁网中（或反过来）。
+        assert (row["blocked"], row["blockedUntilEpoch"]) == (True, 1789862400)
+        assert row["passUntilEpoch"] == 1789866000
+        store.remember_guard_devices(ROUTER, [{"uid": UID, "pausedUntilEpoch": 0}])
+        assert store.guard_device(ROUTER, UID)["passUntilEpoch"] == 0
+        assert store.guard_device(ROUTER, UID)["blockedUntilEpoch"] == 1789862400
+
     def test_devices_are_scoped_per_router(self, store):
         store.remember_guard_devices(ROUTER, [{"uid": UID, "macs": [MAC_A]}])
         assert store.guard_devices("other") == []
