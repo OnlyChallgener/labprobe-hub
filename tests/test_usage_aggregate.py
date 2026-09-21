@@ -58,6 +58,20 @@ def run_from(start: int, count: int) -> list:
     return [start + offset * 60 for offset in range(count)]
 
 
+def with_evidence(row: dict, values: list) -> dict:
+    """给一行分钟挂上 v4 的四条并列证据数组（按分钟顺序对齐）。
+
+    每条形如 ``(up, down, windows, new_flows)``。中继一个 window 就是一个带
+    ≥256B payload 的 5 秒采样窗口，所以 ``windows=8`` 读作「这一分钟有约 40 秒在传」。
+    """
+    out = dict(row)
+    out["up"] = [value[0] for value in values]
+    out["down"] = [value[1] for value in values]
+    out["win"] = [value[2] for value in values]
+    out["flow"] = [value[3] for value in values]
+    return out
+
+
 def device_minutes_row(mac, day, minutes):
     return {"mac": mac, "date": day, "minutes": list(minutes)}
 
@@ -464,6 +478,79 @@ class TestMinuteReport:
         store.insert_app_minutes([app_minutes_row(MAC_B, DAY, "微信", split)])
         other = store.report([MAC_B], DAY)["apps"][0]
         assert other["sessions"] == 2, "超出夜间容差就得断开"
+
+    def test_a_night_run_without_any_uplink_is_not_usage(self, store):
+        """整段没有一次像样的上行 = 设备在收东西，不是有人在用。"""
+        minutes = run_from(bj_minute(DAY, 2, 0), NIGHT_MIN_RUN_MINUTES)
+        heartbeat = [(200, 4_000_000, 1, 0) for _ in minutes]
+        store.insert_app_minutes([with_evidence(
+            app_minutes_row(MAC_A, DAY, "微信", minutes), heartbeat)])
+        report = store.report([MAC_A], DAY)
+        assert report["apps"] == [], "整段没有上行，这个应用今天夜里就没被用过"
+        assert report["lateNightMinutes"] == 0, "4GB 下行、每次 200B 上行，是推送不是熬夜"
+
+    def test_a_night_run_that_sent_anything_counts(self, store):
+        """同一段，只要有一分钟真的上行过，就是人在用。"""
+        minutes = run_from(bj_minute(DAY, 2, 0), NIGHT_MIN_RUN_MINUTES)
+        evidence = [(200, 50_000, 1, 0)] * (len(minutes) - 1) + [(30_000, 50_000, 6, 1)]
+        store.insert_app_minutes([with_evidence(
+            app_minutes_row(MAC_A, DAY, "微信", minutes), evidence)])
+        app = store.report([MAC_A], DAY)["apps"][0]
+        assert app["minutes"] == NIGHT_MIN_RUN_MINUTES
+
+    def test_night_instant_use_needs_thirty_seconds_and_uplink(self, store):
+        """凌晨扫码：一两秒的心跳不算，真打开用了几十秒才算。
+
+        两分钟分开写：分钟行是集合，同一分钟重投会被 IGNORE 掉，证据不会更新。
+        """
+        tap = bj_minute(DAY, 3, 20)
+        store.insert_app_minutes([with_evidence(
+            app_minutes_row(MAC_B, DAY, "支付宝", [tap]), [(300, 9_000, 1, 1)])])
+        report = store.report([MAC_B], DAY)
+        assert report["lateNightMinutes"] == 0, \
+            "一个窗口 + 300B 上行，是分推送，不是孩子起来扫码"
+        # 被夜间门槛拒掉的分钟绝不能改天白名单混进白天 —— 白天门槛只有 3 分钟，
+        # 而且凌晨根本没有"白天"。
+        assert report["onlineMinutes"] == 0
+
+        used = bj_minute(DAY, 3, 25)
+        store.insert_app_minutes([with_evidence(
+            app_minutes_row(MAC_B, DAY, "支付宝", [used]), [(24_000, 180_000, 8, 1)])])
+        assert store.report([MAC_B], DAY)["lateNightMinutes"] == 1
+
+    def test_minutes_without_evidence_keep_the_old_verdict(self, store):
+        """v3 中继写的行没有证据：必须照旧口径计，否则升级会把昨天的数字改小。"""
+        minutes = run_from(bj_minute(DAY, 2, 0), NIGHT_MIN_RUN_MINUTES)
+        store.insert_app_minutes([app_minutes_row(MAC_A, DAY, "微信", minutes)])
+        app = store.report([MAC_A], DAY)["apps"][0]
+        assert app["minutes"] == NIGHT_MIN_RUN_MINUTES, "全 0 是「未知」，不是「没上行」"
+
+    def test_evidence_is_stored_per_minute_and_survives_a_repush(self, store):
+        minutes = [bj_minute(DAY, 10, 0), bj_minute(DAY, 10, 1)]
+        row = with_evidence(device_minutes_row(MAC_A, DAY, minutes),
+                            [(1_000, 20_000, 4, 1), (2_000, 30_000, 7, 0)])
+        assert store.insert_device_minutes([row]) == 2
+        # 重复投递同一分钟不能把数字改大：分钟是集合。
+        assert store.insert_device_minutes([row]) == 2
+        with store.connect() as conn:
+            stored = conn.execute(
+                "SELECT minute_epoch, up_bytes, down_bytes, windows, new_flows"
+                " FROM usage_device_minute ORDER BY minute_epoch").fetchall()
+        assert [tuple(row_) for row_ in stored] == [
+            (minutes[0], 1_000, 20_000, 4, 1), (minutes[1], 2_000, 30_000, 7, 0)]
+
+    def test_a_short_evidence_array_does_not_shift_the_other_minutes(self, store):
+        """证据数组比分钟数组短（坏包）时，缺的那几分钟按未知处理，
+        绝不能把后面的证据挪到前面的分钟上。"""
+        minutes = [bj_minute(DAY, 11, 0), bj_minute(DAY, 11, 1)]
+        row = dict(device_minutes_row(MAC_A, DAY, minutes))
+        row.update({"up": [5_000], "down": [90_000], "win": [9], "flow": [2]})
+        store.insert_device_minutes([row])
+        with store.connect() as conn:
+            stored = conn.execute(
+                "SELECT minute_epoch, up_bytes, windows FROM usage_device_minute"
+                " ORDER BY minute_epoch").fetchall()
+        assert [tuple(r) for r in stored] == [(minutes[0], 5_000, 9), (minutes[1], 0, 0)]
 
     def test_baidu_app_is_reported_under_its_chinese_name(self, store):
         """中继按 `_` 截断后剩下 `baiduAPP`，家长端要看到的是「百度」。"""

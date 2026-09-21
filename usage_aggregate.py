@@ -94,7 +94,7 @@ import threading
 import time
 from datetime import date as _date, datetime as _datetime, timedelta
 from pathlib import Path
-from typing import Any, Callable, Dict, Iterable, List, Mapping, Optional, Sequence, Set
+from typing import Any, Callable, Dict, Iterable, List, Mapping, Optional, Sequence, Set, Tuple
 
 from flask import Blueprint, jsonify, request
 
@@ -300,6 +300,84 @@ def _as_minute_epoch(value: Any) -> int:
     return number
 
 
+#: 中继 v4 随每分钟一起上报的四列证据，以及它们在 payload 里的短名。
+_EVIDENCE_FIELDS = (("up", "up_bytes"), ("down", "down_bytes"),
+                    ("win", "windows"), ("flow", "new_flows"))
+
+
+def _u64_list(value: Any) -> List[int]:
+    """One evidence column: non-negative ints, positionally aligned with minutes."""
+    if not isinstance(value, (list, tuple)):
+        return []
+    out: List[int] = []
+    for item in value:
+        try:
+            if isinstance(item, bool):
+                raise ValueError(item)
+            out.append(max(0, int(float(item))))
+        except (TypeError, ValueError):
+            out.append(0)
+    return out
+
+
+def _minute_evidence(row: Any) -> Dict[int, Tuple[int, int, int, int]]:
+    """``{"minutes":[..], "up":[..], "down":[..], "win":[..], "flow":[..]}`` -> 按分钟对齐。
+
+    按分钟值对齐而不是按数组下标：下面还要去重排序，一旦下标错位，某分钟的字节就
+    记到另一分钟头上了。同一分钟重复出现时每列取最大值（中继不会这么发，防的是坏包）。
+
+    返回里没有的分钟 = 证据未知（v3 中继、或这一行根本没带数组），调用方必须把它
+    当成「没测到」，不能当成「零字节」。
+    """
+    if not isinstance(row, dict):
+        return {}
+    marks = row.get("minutes")
+    if not isinstance(marks, (list, tuple)):
+        return {}
+    columns = [_u64_list(row.get(short)) for short, _ in _EVIDENCE_FIELDS]
+    if not any(columns):
+        return {}
+    merged: Dict[int, List[int]] = {}
+    for index, value in enumerate(marks):
+        try:
+            minute = _as_minute_epoch(value)
+        except UsageAggregateError:
+            continue
+        slot = merged.setdefault(minute, [0, 0, 0, 0])
+        for column, values in enumerate(columns):
+            if index < len(values):
+                slot[column] = max(slot[column], values[index])
+    return {minute: (values[0], values[1], values[2], values[3])
+            for minute, values in merged.items()}
+
+
+def _row_evidence(row: Any) -> Optional[Tuple[int, int, int, int]]:
+    """一条分钟行的证据；中继没测过就是 None。
+
+    v3 中继写的行四列全 0，而 v4 的活跃分钟必然 up+down>0（活跃判定本身就要求
+    字节）。所以全 0 只能读成「未知」，不能读成「零字节」—— 否则这次上线会把昨天
+    已经报出去的数字改小，用户看到的是「昨天的统计自己变了」。
+    """
+    try:
+        values = (int(row["up_bytes"] or 0), int(row["down_bytes"] or 0),
+                  int(row["windows"] or 0), int(row["new_flows"] or 0))
+    except (IndexError, KeyError):
+        return None
+    return values if any(values) else None
+
+
+def _evidence_map(minutes: Any) -> Dict[int, Optional[Tuple[int, int, int, int]]]:
+    """接受 ``{minute: evidence}`` 或旧的裸分钟集合，统一成带证据的映射。
+
+    裸集合里的分钟一律按「未知」处理，口径与 v3 完全一致，所以历史数据和现有测试
+    不会因为加了证据这一层而改变结论。
+    """
+    if isinstance(minutes, Mapping):
+        return {int(minute): (tuple(values) if values and any(values) else None)
+                for minute, values in minutes.items()}
+    return {int(minute): None for minute in minutes}
+
+
 #: v3 tables that were first created without the ``router`` column.
 _LEGACY_V3_TABLES = {
     "usage_device_minute": ("mac", "date", "minute_epoch", "updated_at"),
@@ -343,8 +421,18 @@ def _migrate_router_columns(conn: sqlite3.Connection) -> None:
 
 
 #: 老库补新列用的清单：``CREATE TABLE IF NOT EXISTS`` 不会改已存在的表。
+_EVIDENCE_COLUMNS = (
+    ("up_bytes", "INTEGER NOT NULL DEFAULT 0"),
+    ("down_bytes", "INTEGER NOT NULL DEFAULT 0"),
+    ("windows", "INTEGER NOT NULL DEFAULT 0"),
+    ("new_flows", "INTEGER NOT NULL DEFAULT 0"),
+)
 _ADDED_COLUMNS = {
     "child_guard_device": (("pass_until", "INTEGER NOT NULL DEFAULT 0"),),
+    # v4：分钟桶带上中继已经算好的证据。老行是 0，含义是「未知」而不是「零字节」，
+    # 规则据此退回 v3 口径，绝不拿没有测过的东西当测量值。
+    "usage_device_minute": _EVIDENCE_COLUMNS,
+    "usage_app_minute": _EVIDENCE_COLUMNS,
 }
 
 
@@ -413,13 +501,20 @@ class UsageAggregateStore:
                         updated_at   TEXT    NOT NULL,
                         PRIMARY KEY (date, mac, app, start_epoch)
                     ) WITHOUT ROWID;
-                    /* v3: natural minute buckets. A minute is active or it is
-                       not, so these are sets (INSERT OR IGNORE), never sums. */
+                    /* v4: a minute is still a set member, but it now carries the
+                       evidence that made it count — the split bytes and the
+                       5-second sampling facts from the relay. All four are 0 for
+                       rows written by a v3 relay, which means "unknown", not
+                       "zero bytes": the rules must fall back, never conclude. */
                     CREATE TABLE IF NOT EXISTS usage_device_minute (
                         router       TEXT    NOT NULL,
                         mac          TEXT    NOT NULL,
                         date         TEXT    NOT NULL,
                         minute_epoch INTEGER NOT NULL,
+                        up_bytes     INTEGER NOT NULL DEFAULT 0,
+                        down_bytes   INTEGER NOT NULL DEFAULT 0,
+                        windows      INTEGER NOT NULL DEFAULT 0,
+                        new_flows    INTEGER NOT NULL DEFAULT 0,
                         updated_at   INTEGER NOT NULL,
                         PRIMARY KEY (router, mac, date, minute_epoch)
                     ) WITHOUT ROWID;
@@ -429,6 +524,10 @@ class UsageAggregateStore:
                         date         TEXT    NOT NULL,
                         app          TEXT    NOT NULL,
                         minute_epoch INTEGER NOT NULL,
+                        up_bytes     INTEGER NOT NULL DEFAULT 0,
+                        down_bytes   INTEGER NOT NULL DEFAULT 0,
+                        windows      INTEGER NOT NULL DEFAULT 0,
+                        new_flows    INTEGER NOT NULL DEFAULT 0,
                         updated_at   INTEGER NOT NULL,
                         PRIMARY KEY (router, mac, date, app, minute_epoch)
                     ) WITHOUT ROWID;
@@ -841,7 +940,7 @@ class UsageAggregateStore:
             prepared.extend(self._expand_minute_row(
                 row, with_app=with_app, now=now, router=router))
         columns = ("router", "mac", "date") + (("app",) if with_app else ()) \
-            + ("minute_epoch", "updated_at")
+            + ("minute_epoch",) + tuple(name for _, name in _EVIDENCE_FIELDS) + ("updated_at",)
         placeholders = ", ".join("?" for _ in columns)
         # The router only pushes minutes it has not pushed before, so this is an
         # idempotent set insert: a duplicate delivery cannot double-count.
@@ -876,9 +975,14 @@ class UsageAggregateStore:
             raise UsageAggregateError(
                 f"row carries {len(unique)} minutes for one day; max {MAX_MINUTES_PER_ROW}"
             )
+        evidence = _minute_evidence(row)
         if with_app:
-            return [(router, mac, day, app, minute, now) for minute in unique]
-        return [(router, mac, day, minute, now) for minute in unique]
+            head: Tuple[Any, ...] = (router, mac, day, app)
+        else:
+            head = (router, mac, day)
+        # 没有证据的分钟补 0，含义是「未知」；规则里 0 只会让判断退回旧口径。
+        return [(*head, minute, *evidence.get(minute, (0, 0, 0, 0)), now)
+                for minute in unique]
 
     def _upsert(
         self,
@@ -1438,9 +1542,38 @@ def _kept_runs(minutes: Iterable[int], *, gap_minutes: int,
             if len(run) >= min_run_minutes]
 
 
+#: 夜间即时应用的证据门槛。一个 window = 一个带 ≥256B payload 的 5 秒采样窗口，
+#: 所以 6 个约等于「这一分钟里至少 30 秒真在传东西」；心跳包一个窗口就完事。
+NIGHT_INSTANT_MIN_WINDOWS = int(os.environ.get("USAGE_NIGHT_INSTANT_MIN_WINDOWS", "6"))
+#: 夜间算「有人在用」的上行门槛：设备主动发过东西，而不是只被推送、被备份、被更新。
+NIGHT_MIN_UP_BYTES = int(os.environ.get("USAGE_NIGHT_MIN_UP_BYTES", str(10 * 1024)))
+
+
+def _instant_minute_counts(evidence: Optional[Tuple[int, int, int, int]]) -> bool:
+    """即时应用（支付/搜索）的夜间单分钟门槛。None = 中继没测过 -> 退回旧口径。"""
+    if evidence is None:
+        return True
+    up, _down, windows, _flows = evidence
+    return windows >= NIGHT_INSTANT_MIN_WINDOWS and up >= NIGHT_MIN_UP_BYTES
+
+
+def _run_has_uplink(run: Sequence[int],
+                    evidence_by_minute: Mapping[int, Optional[Tuple[int, int, int, int]]]) -> bool:
+    """普通应用的夜间段门槛：整段里至少有一分钟设备真的上行过。
+
+    段内只要有一分钟没有证据（v3 写的行），就当作未知放行 —— 拿「没测到」当
+    「没发生」，会把升级当天的数字凭空砍一截。
+    """
+    minutes = list(run)
+    if any(evidence_by_minute.get(minute) is None for minute in minutes):
+        return True
+    return any((evidence_by_minute[minute] or (0, 0, 0, 0))[0] >= NIGHT_MIN_UP_BYTES
+               for minute in minutes)
+
+
 def _qualifying_usage(
-    device_minutes: Iterable[int],
-    app_minutes: Mapping[str, Iterable[int]],
+    device_minutes: Any,
+    app_minutes: Mapping[str, Any],
 ) -> Dict[str, Any]:
     """一天的分钟行 -> 家长端计入统计的分钟。列表页与详情页共用这一份口径。
 
@@ -1452,9 +1585,15 @@ def _qualifying_usage(
     白天（06:00-23:59）仍按设备分钟计，只丢掉整段不足 ``DAY_MIN_RUN_MINUTES``
     的——RDPI 认不出的真实使用（浏览器、PC 游戏、新装应用）不能一并抹掉。
 
+    中继 v4 起，每个分钟还带着它自己的证据（上下行字节、5 秒窗口数、新连接数），
+    于是夜间还能再问一句「这台设备那会儿真的在发东西吗」：即时应用要单分钟够
+    ``NIGHT_INSTANT_MIN_WINDOWS`` 且上行过 ``NIGHT_MIN_UP_BYTES``，普通应用要整段
+    里出现过上行。没有证据的行（v3 中继、升级前写的历史）一律退回上面那套旧口径。
+
     被过滤掉的分钟彻底丢弃，不另立「后台活动」池。
     """
-    unique_device = {int(value) for value in device_minutes}
+    device_map = _evidence_map(device_minutes)
+    unique_device = set(device_map)
     night_device = {m for m in unique_device if _beijing_hour(m) < LATE_NIGHT_END_HOUR}
     counted = {m for run in _kept_runs(unique_device - night_device,
                                        gap_minutes=DAY_MERGE_GAP_MINUTES,
@@ -1463,14 +1602,22 @@ def _qualifying_usage(
 
     apps: Dict[str, Dict[str, Any]] = {}
     for app, values in app_minutes.items():
-        unique = {int(value) for value in values}
+        evidence = _evidence_map(values)
+        unique = set(evidence)
         night = {m for m in unique if _beijing_hour(m) < LATE_NIGHT_END_HOUR}
-        night_runs = _kept_runs(night, gap_minutes=NIGHT_MERGE_GAP_MINUTES,
+        instant = _is_instant_use(app)
+        # 证据门槛只能筛「夜间段要不要算」，绝不能把筛掉的分钟挪回白天：
+        # 白天的集合是从下面 unique - night 来的，所以 night 本身保持原样。
+        candidates = ({m for m in night if _instant_minute_counts(evidence.get(m))}
+                      if instant else night)
+        night_runs = _kept_runs(candidates, gap_minutes=NIGHT_MERGE_GAP_MINUTES,
                                 min_run_minutes=_min_run_minutes(app, night=True))
         day_runs = _kept_runs(unique - night, gap_minutes=DAY_MERGE_GAP_MINUTES,
                               min_run_minutes=_min_run_minutes(app, night=False))
+        if not instant:
+            night_runs = [run for run in night_runs if _run_has_uplink(run, evidence)]
         counted.update(m for run in night_runs for m in run)
-        if _is_instant_use(app):
+        if instant:
             # 短交互应用的分钟也要进设备时长，否则应用列表里写着 1 分钟、上面的
             # 「今日上网时长」却一分都不涨。夜间那部分已经由 night_runs 带进来了。
             counted.update(m for run in day_runs for m in run)
@@ -1516,26 +1663,28 @@ def _minute_snapshot(
     holders = ", ".join("?" for _ in wanted)
     clause, prefix = _router_clause(router)
     window = (*prefix, first, last, *wanted)
-    device: Dict[str, Set[int]] = {}
+    device: Dict[str, Dict[int, Optional[Tuple[int, int, int, int]]]] = {}
     for row in conn.execute(
-        f"""SELECT DISTINCT date, minute_epoch FROM usage_device_minute
+        f"""SELECT DISTINCT date, minute_epoch, up_bytes, down_bytes, windows, new_flows
+            FROM usage_device_minute
             WHERE {clause}date BETWEEN ? AND ? AND mac IN ({holders})""",
         window,
     ):
-        device.setdefault(str(row["date"]), set()).add(int(row["minute_epoch"]))
-    apps: Dict[str, Dict[str, Set[int]]] = {}
+        device.setdefault(str(row["date"]), {})[int(row["minute_epoch"])] = _row_evidence(row)
+    apps: Dict[str, Dict[str, Dict[int, Optional[Tuple[int, int, int, int]]]]] = {}
     for row in conn.execute(
-        f"""SELECT DISTINCT date, app, minute_epoch FROM usage_app_minute
+        f"""SELECT DISTINCT date, app, minute_epoch, up_bytes, down_bytes, windows, new_flows
+            FROM usage_app_minute
             WHERE {clause}date BETWEEN ? AND ? AND mac IN ({holders})""",
         window,
     ):
         apps.setdefault(str(row["date"]), {}).setdefault(
-            display_app_name(row["app"]), set()).add(int(row["minute_epoch"]))
+            display_app_name(row["app"]), {})[int(row["minute_epoch"])] = _row_evidence(row)
 
     days: Dict[str, Dict[str, Any]] = {}
     for day in sorted(set(device) | set(apps)):
-        usage = _qualifying_usage(device.get(day, ()), apps.get(day, {}))
-        usage["rawMinutes"] = len(device.get(day, ())) + sum(
+        usage = _qualifying_usage(device.get(day, {}), apps.get(day, {}))
+        usage["rawMinutes"] = len(device.get(day, {})) + sum(
             len(minutes) for minutes in apps.get(day, {}).values())
         days[day] = usage
     return days
@@ -1753,24 +1902,26 @@ def _guard_read(conn: sqlite3.Connection, wanted: Sequence[str], day: str,
     key = str(router or "").strip().lower()[:128]
     clause, prefix = _router_clause(key)
 
-    minutes: Dict[str, List[int]] = {}
+    minutes: Dict[str, Dict[int, Optional[Tuple[int, int, int, int]]]] = {}
     for row in conn.execute(
-        f"""SELECT DISTINCT mac, minute_epoch FROM usage_device_minute
+        f"""SELECT DISTINCT mac, minute_epoch, up_bytes, down_bytes, windows, new_flows
+            FROM usage_device_minute
             WHERE {clause}date = ? AND mac IN ({holders})
             ORDER BY mac, minute_epoch""",
         (*prefix, day, *wanted),
     ):
-        minutes.setdefault(str(row["mac"]), []).append(int(row["minute_epoch"]))
+        minutes.setdefault(str(row["mac"]), {})[int(row["minute_epoch"])] = _row_evidence(row)
 
-    apps: Dict[str, Dict[str, List[int]]] = {}
+    apps: Dict[str, Dict[str, Dict[int, Optional[Tuple[int, int, int, int]]]]] = {}
     for row in conn.execute(
-        f"""SELECT DISTINCT mac, app, minute_epoch FROM usage_app_minute
+        f"""SELECT DISTINCT mac, app, minute_epoch, up_bytes, down_bytes, windows, new_flows
+            FROM usage_app_minute
             WHERE {clause}date = ? AND mac IN ({holders})
             ORDER BY mac, app, minute_epoch""",
         (*prefix, day, *wanted),
     ):
         apps.setdefault(str(row["mac"]), {}).setdefault(
-            display_app_name(row["app"]), []).append(int(row["minute_epoch"]))
+            display_app_name(row["app"]), {})[int(row["minute_epoch"])] = _row_evidence(row)
 
     latest: Dict[str, int] = {}
     for row in conn.execute(
@@ -1802,6 +1953,25 @@ def _guard_read(conn: sqlite3.Connection, wanted: Sequence[str], day: str,
         "metaByMac": seen,
         "routerLastSampleAt": router_seen,
     }
+
+
+def _merge_minutes(target: Dict[int, Optional[Tuple[int, int, int, int]]],
+                   source: Mapping[Any, Any]) -> None:
+    """把同一台设备另一块网卡的分钟并进来。
+
+    分钟仍是集合（同一分钟只算一次），字节和窗口数按列相加。任何一侧没有证据，
+    合并结果就按「未知」处理 —— 拿「没测到」去参与判断，列表页和详情页就会变成
+    两个口径，这正是这个函数所在路径以前出过的错。
+    """
+    for minute, values in (source or {}).items():
+        slot = int(minute)
+        evidence = tuple(values) if values and any(values) else None
+        if slot not in target:
+            target[slot] = evidence
+        elif target[slot] is None or evidence is None:
+            target[slot] = None
+        else:
+            target[slot] = tuple(a + b for a, b in zip(target[slot], evidence))
 
 
 def build_guard_overview(
@@ -1859,14 +2029,13 @@ def build_guard_overview(
     for device in rows:
         device_macs = [mac for mac in _split_macs(device.get("macs")) if mac]
         # 同一台设备的两块网卡在同一分钟只算一次：分钟是集合，不是求和。
-        raw_device: Set[int] = set()
+        raw_device: Dict[int, Optional[Tuple[int, int, int, int]]] = {}
         for mac in device_macs:
-            raw_device.update(int(value) for value in minutes_by_mac.get(mac) or [])
-        raw_apps: Dict[str, Set[int]] = {}
+            _merge_minutes(raw_device, minutes_by_mac.get(mac) or {})
+        raw_apps: Dict[str, Dict[int, Optional[Tuple[int, int, int, int]]]] = {}
         for mac in device_macs:
             for app, minutes in (apps_by_mac.get(mac) or {}).items():
-                raw_apps.setdefault(str(app), set()).update(
-                    int(value) for value in minutes)
+                _merge_minutes(raw_apps.setdefault(str(app), {}), minutes or {})
         # 和详情页同一个函数：列表页的「凌晨还在上网」不能和点进去的夜间时长是
         # 两个数。
         usage = _qualifying_usage(raw_device, raw_apps)
