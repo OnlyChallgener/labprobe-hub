@@ -882,7 +882,7 @@ pub fn apply_sample(store: &mut MinuteStore, input: &SampleInput) -> MinuteRepor
     let mut app_window: BTreeMap<(String, String), (u64, u64, bool)> = BTreeMap::new();
     let mut live_keys: BTreeSet<FlowKey> = BTreeSet::new();
     for row in &input.flow_rows {
-        if !input.child_macs.is_empty() && !input.child_macs.contains(&row.mac) {
+        if !input.child_macs.contains(&row.mac) {
             continue;
         }
         // 0-0-0-0 是引擎的“不知道”，它只进设备总时长，不进应用列表。
@@ -947,7 +947,7 @@ pub fn apply_sample(store: &mut MinuteStore, input: &SampleInput) -> MinuteRepor
 
     // -- 固件设备计数：MAC 的全部 IP 求并集 -------------------------------
     for (mac, ips) in &input.mac_ips {
-        if !input.child_macs.is_empty() && !input.child_macs.contains(mac) {
+        if !input.child_macs.contains(mac) {
             continue;
         }
         let mut window_up = 0u64;
@@ -1052,11 +1052,11 @@ pub fn read_mac_ips() -> BTreeMap<String, BTreeSet<String>> {
         .unwrap_or_default()
 }
 
-/// 固件儿童设备列表。空列表时不过滤，避免中继比策略先启动时什么都记不到。
-pub fn read_child_macs() -> BTreeSet<String> {
-    let Some(text) = read_text(SNIFFER_INFO) else {
-        return BTreeSet::new();
-    };
+/// 上一次读到的受守护 MAC 列表。
+static LAST_CHILD_MACS: OnceLock<Mutex<BTreeSet<String>>> = OnceLock::new();
+
+/// 解析 `/proc/net/sniffer_info`：每行 `<mac> <flag> ...`，flag 为 1 才是被守护设备。
+pub fn parse_child_macs(text: &str) -> BTreeSet<String> {
     text.lines()
         .filter_map(|line| {
             let fields: Vec<&str> = line.split_whitespace().collect();
@@ -1067,6 +1067,27 @@ pub fn read_child_macs() -> BTreeSet<String> {
             (mac.len() == 17 && mac.contains(':')).then_some(mac)
         })
         .collect()
+}
+
+/// 固件儿童设备列表。
+///
+/// 读到空列表时**沿用上一次的非空结果**。原来这里是反的：空列表等于"不过滤"，
+/// 于是 `/proc/net/sniffer_info` 偶发读空、或策略还没写进固件，中继会悄悄把记录
+/// 范围从"被守护设备"放大到"全屋设备"—— 实测 Hub 的分钟表里就躺着 NAS 和电热水器。
+/// 没有守护设备就没有该记的对象，记空比记全网对。
+pub fn read_child_macs() -> BTreeSet<String> {
+    let current = read_text(SNIFFER_INFO)
+        .map(|text| parse_child_macs(&text))
+        .unwrap_or_default();
+    let lock = LAST_CHILD_MACS.get_or_init(|| Mutex::new(BTreeSet::new()));
+    let mut last = lock.lock().unwrap_or_else(|poisoned| poisoned.into_inner());
+    if !current.is_empty() {
+        if *last != current {
+            *last = current.clone();
+        }
+        return current;
+    }
+    last.clone()
 }
 
 /// 把日期往前/往后挪若干天，用于保留窗口裁剪（不依赖时区库）。
@@ -1503,6 +1524,43 @@ mod tests {
                 tx_bytes: 100_000,
                 rx_bytes: 100_000
             })
+        );
+    }
+
+    #[test]
+    fn an_empty_guarded_list_records_nothing() {
+        // 反过来的那句话就是原来那个 bug：空列表 = 不过滤 = 全屋设备逐分钟入账，
+        // NAS 和电热水器的分钟行就是这么进 Hub 的。
+        let mut store = MinuteStore::default();
+        let mut sample = input(
+            T0 + 5,
+            vec![flow("7-1-2-0", 40_000, 90_000, 47218)],
+            counters(1_000_000, 8_000_000),
+        );
+        sample.child_macs = BTreeSet::new();
+        apply_sample(&mut store, &sample);
+        store.advance_to(T0 + 60);
+        assert!(store.device_minutes.is_empty(), "没有守护设备就没有该记的对象");
+        assert!(store.app_minutes.is_empty());
+        assert!(store.traffic.is_empty());
+    }
+
+    #[test]
+    fn child_mac_parsing_keeps_only_flagged_well_formed_macs() {
+        let text = concat!(
+            "da:1f:85:0c:19:fc 1 phone\n",
+            "6C:1F:F7:76:71:04 1 nas\n",
+            "28:7e:80:ed:12:21 0 not-guarded\n",
+            "garbage-line\n",
+            "short 1\n",
+        );
+        let parsed = parse_child_macs(text);
+        assert_eq!(
+            parsed,
+            BTreeSet::from([
+                "da:1f:85:0c:19:fc".to_string(),
+                "6c:1f:f7:76:71:04".to_string(),
+            ])
         );
     }
 
