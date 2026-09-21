@@ -832,7 +832,7 @@ where
 {
     let mut out = Vec::new();
     let mut run: Option<(u64, u64, usize)> = None;
-    for minute in minutes.iter() {
+    for minute in minutes {
         match run {
             Some((start, previous, count)) if *minute == previous + 60 => {
                 run = Some((start, *minute, count + 1));
