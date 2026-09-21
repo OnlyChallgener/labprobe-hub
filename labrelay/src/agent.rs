@@ -1529,6 +1529,46 @@ async fn sync_child_guard(client: &Client, config: &AgentConfig, state: &mut Age
     Ok(())
 }
 
+/// 特征库出站同步的尝试间隔。文件指纹没变时这一轮连 HTTP 都不发，所以 5 分钟
+/// 一次足够，又能让「一键增强」之后的新库很快被 Hub 看到。
+const RDPI_SYNC_INTERVAL_SECS: u64 = 300;
+static RDPI_LAST_ATTEMPT_AT: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+
+/// 把路由器上的 RDPI 库推给 Hub，替代 Hub 反向 SSH 进来读。
+///
+/// 读文件要 fork 不了但也可能读到半截，丢进 `spawn_blocking`；只有 Hub 收下了才
+/// 记指纹，失败下一轮自己重推。
+async fn sync_rdpi(client: &Client, config: &AgentConfig) -> Result<()> {
+    let now = now_epoch();
+    let last = RDPI_LAST_ATTEMPT_AT.load(std::sync::atomic::Ordering::Relaxed);
+    if last != 0 && now.saturating_sub(last) < RDPI_SYNC_INTERVAL_SECS {
+        return Ok(());
+    }
+    RDPI_LAST_ATTEMPT_AT.store(now, std::sync::atomic::Ordering::Relaxed);
+
+    let snapshot = tokio::task::spawn_blocking(move || crate::rdpi::changed_snapshot(now))
+        .await
+        .map_err(|error| anyhow::anyhow!("rdpi read task panicked: {error}"))?;
+    let snapshot = match snapshot {
+        Some(value) => value,
+        // 文件没变，什么都不用发。
+        None => return Ok(()),
+    };
+    let apps = snapshot.get("apps").cloned().unwrap_or_else(|| Value::Array(Vec::new()));
+    let mark = snapshot.get("fingerprint").and_then(Value::as_u64).unwrap_or(0);
+    let count = apps.as_array().map(Vec::len).unwrap_or(0);
+    let body = serde_json::json!({
+        "router": config.router_name,
+        "apps": apps,
+        "readAtEpoch": snapshot.get("readAtEpoch").cloned().unwrap_or(Value::from(now)),
+        "fingerprint": mark,
+    });
+    post_json(client, config, "/api/router/rdpi/ingest", &body).await?;
+    crate::rdpi::note_pushed(mark);
+    log_line(config, "INFO", &format!("rdpi db pushed: {count} apps"));
+    Ok(())
+}
+
 /// Keep the natural-minute buckets warm and hand the deltas to the Hub.
 ///
 /// Sampling is a background duty on its own 5s cadence — it does not care
@@ -2077,6 +2117,10 @@ pub async fn run(args: &[String], once: bool) -> Result<()> {
                 let text = redact(&format!("child guard command: {:#}", error), &config.hook_token);
                 log_limited(&config, &mut state, "WARN", "child-guard-command", &text);
                 errors.push(text);
+            }
+            if let Err(error) = sync_rdpi(&client, &config).await {
+                let text = redact(&format!("rdpi sync: {:#}", error), &config.hook_token);
+                log_limited(&config, &mut state, "WARN", "rdpi-sync", &text);
             }
             last_status_at = now;
         }

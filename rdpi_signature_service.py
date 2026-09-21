@@ -352,32 +352,39 @@ def validate_signature_object(obj: Any) -> Dict[str, Any]:
     }
 
 
+def summarize_rdpi_db(db: Dict[str, Any]) -> Dict[str, Any]:
+    """从一份 RDPI 库算出卡片要的那几个数。
+
+    单独拆出来是因为这份库现在有两个来源：路由器 agent 出站推进来的副本，和（兜底）
+    Hub 自己 SSH 去读。判断「哪些算自定义」只能有一份，否则两条路会慢慢给出不一样
+    的数字。
+    """
+    apps = db.get("apps")
+    apps = apps if isinstance(apps, list) else []
+    total_count = len(apps)
+    # Custom apps: index starts with '9' or has 'custom': True
+    custom_apps = [
+        a for a in apps
+        if str(a.get("index", "")).startswith("9")
+        or a.get("custom") is True
+        or any(a.get("index") == idx and a.get("name") == patch["name"]
+               for idx, patch in CURATED_SIGNATURE_EXTENSIONS.items())
+    ]
+    return {
+        "ok": True,
+        "totalCount": total_count,
+        "officialCount": max(0, total_count - len(custom_apps)),
+        "customCount": len(custom_apps),
+        "customSignatures": custom_apps,
+        "template": STANDARD_RDPI_TEMPLATE,
+    }
+
+
 def get_rdpi_signatures_summary() -> Dict[str, Any]:
     """Returns official count, custom count, custom rules list, and template."""
     client = _get_ssh_client()
     try:
-        db = load_router_rdpi_db(client)
-        apps = db.get("apps", [])
-        total_count = len(apps)
-
-        # Custom apps: index starts with '9' or has 'custom': True
-        custom_apps = [
-            a for a in apps
-            if str(a.get("index", "")).startswith("9")
-            or a.get("custom") is True
-            or any(a.get("index") == idx and a.get("name") == patch["name"]
-                   for idx, patch in CURATED_SIGNATURE_EXTENSIONS.items())
-        ]
-        official_count = total_count - len(custom_apps)
-
-        return {
-            "ok": True,
-            "totalCount": total_count,
-            "officialCount": max(0, official_count),
-            "customCount": len(custom_apps),
-            "customSignatures": custom_apps,
-            "template": STANDARD_RDPI_TEMPLATE,
-        }
+        return summarize_rdpi_db(load_router_rdpi_db(client))
     finally:
         client.close()
 

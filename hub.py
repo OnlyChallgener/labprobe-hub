@@ -3769,13 +3769,63 @@ def api_router_child_guard_ack():
     return jsonify({"ok": True, "acknowledged": count})
 
 
+#: 路由器 agent 出站推进来的 RDPI 库副本。
+RDPI_ROUTER_DB_FILE = DATA_DIR / "rdpi_router_db.json"
+#: agent 每 5 分钟推一次；副本超过这个时长就当作没有，退回原来的 SSH 读法。
+RDPI_SNAPSHOT_MAX_AGE_SECONDS = 900
+
+
+@app.route("/api/router/rdpi/ingest", methods=["POST"])
+def api_router_rdpi_ingest():
+    """路由器 agent 把本机 `/usr/share/ndpi/db.default.json` 推上来。
+
+    以前是 Hub 用 paramiko **反向 SSH 进路由器**去 `cat` 这个文件，host 和端口还是
+    写死的默认值（`rdpi_signature_service.py:25-26`）。路由器一重拨，公网 IP 和 SSH
+    端口全变，特征库当场读不到 —— 2026-09-20 就是这样断的。agent 本来就跑在路由器上、
+    走的是它自己发起的出站隧道，不需要谁进来连它。
+    """
+    if not check_hook_token():
+        return jsonify({"ok": False, "error": "unauthorized"}), 401
+    body = request.get_json(silent=True) or {}
+    apps = body.get("apps")
+    if not isinstance(apps, list) or not apps:
+        return jsonify({"ok": False, "error": "apps must be a non-empty list"}), 400
+    save_json(RDPI_ROUTER_DB_FILE, {
+        "apps": apps,
+        "router": str(body.get("router") or ""),
+        "fingerprint": to_int(body.get("fingerprint"), 0),
+        "readAtEpoch": to_int(body.get("readAtEpoch"), 0),
+        "receivedAt": int(time.time()),
+    })
+    return jsonify({"ok": True, "stored": len(apps)}), 202
+
+
+def _rdpi_router_snapshot() -> Optional[Dict[str, Any]]:
+    """agent 推上来的那份副本；过期或没有就回 None。"""
+    record = load_json(RDPI_ROUTER_DB_FILE, None)
+    if not isinstance(record, dict) or not isinstance(record.get("apps"), list):
+        return None
+    received = to_int(record.get("receivedAt"), 0)
+    if not received or time.time() - received > RDPI_SNAPSHOT_MAX_AGE_SECONDS:
+        return None
+    return record
+
+
 @app.route("/api/router/rdpi/signatures", methods=["GET"])
 def api_router_rdpi_signatures_get():
     if not check_app_token():
         return jsonify({"ok": False, "error": "unauthorized"}), 401
     try:
-        from rdpi_signature_service import get_rdpi_signatures_summary
+        from rdpi_signature_service import get_rdpi_signatures_summary, summarize_rdpi_db
+        snapshot = _rdpi_router_snapshot()
+        if snapshot is not None:
+            summary = summarize_rdpi_db({"apps": snapshot["apps"]})
+            summary["source"] = "agent"
+            summary["readAtEpoch"] = to_int(snapshot.get("readAtEpoch"), 0)
+            return jsonify(summary)
+        # 还没有 agent 副本（中继版本太旧，或刚重启还没轮到推）：先别把卡片打死。
         summary = get_rdpi_signatures_summary()
+        summary["source"] = "ssh"
         return jsonify(summary)
     except Exception as e:
         return jsonify({"ok": False, "error": str(e)}), 500

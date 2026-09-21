@@ -22,6 +22,7 @@ mod agent;
 mod child_guard;
 mod ddns_address;
 mod minute_stats;
+mod rdpi;
 mod tcp_session_test;
 mod usage_stats;
 mod wireguard;
