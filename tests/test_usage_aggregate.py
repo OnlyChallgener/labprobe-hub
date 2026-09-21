@@ -482,7 +482,8 @@ class TestMinuteReport:
     def test_a_night_run_without_any_uplink_is_not_usage(self, store):
         """整段没有一次像样的上行 = 设备在收东西，不是有人在用。"""
         minutes = run_from(bj_minute(DAY, 2, 0), NIGHT_MIN_RUN_MINUTES)
-        heartbeat = [(200, 4_000_000, 1, 0) for _ in minutes]
+        # windows=3 让分钟窗口门槛放行，这样拦下它的只能是「整段没有上行」。
+        heartbeat = [(200, 4_000_000, 3, 0) for _ in minutes]
         store.insert_app_minutes([with_evidence(
             app_minutes_row(MAC_A, DAY, "微信", minutes), heartbeat)])
         report = store.report([MAC_A], DAY)
@@ -490,9 +491,13 @@ class TestMinuteReport:
         assert report["lateNightMinutes"] == 0, "4GB 下行、每次 200B 上行，是推送不是熬夜"
 
     def test_a_night_run_that_sent_anything_counts(self, store):
-        """同一段，只要有一分钟真的上行过，就是人在用。"""
+        """同一段，只要有一分钟真的上行过，就是人在用。
+
+        填充分钟给 windows=3：这条测的是「段内要有上行」，不能被分钟窗口门槛
+        （`APP_MINUTE_MIN_WINDOWS`）顺手拦掉，两件事得各测各的。
+        """
         minutes = run_from(bj_minute(DAY, 2, 0), NIGHT_MIN_RUN_MINUTES)
-        evidence = [(200, 50_000, 1, 0)] * (len(minutes) - 1) + [(30_000, 50_000, 6, 1)]
+        evidence = [(200, 50_000, 3, 0)] * (len(minutes) - 1) + [(30_000, 50_000, 6, 1)]
         store.insert_app_minutes([with_evidence(
             app_minutes_row(MAC_A, DAY, "微信", minutes), evidence)])
         app = store.report([MAC_A], DAY)["apps"][0]
@@ -551,6 +556,39 @@ class TestMinuteReport:
                 "SELECT minute_epoch, up_bytes, windows FROM usage_device_minute"
                 " ORDER BY minute_epoch").fetchall()
         assert [tuple(r) for r in stored] == [(minutes[0], 5_000, 9), (minutes[1], 0, 0)]
+
+    def test_periodic_app_heartbeats_do_not_become_usage(self, store):
+        """微信后台每 2-3 分钟一次 finder 心跳：936B/579B/1 窗口，不该攒成「看了 11 分钟视频号」。
+
+        实测数据形状（2026-09-21 iQOO Neo3 21:18-21:42）。间隔 2 分钟正好落在白天合并
+        容差里，所以段长过滤拦不住，必须在分钟这一级按窗口数拦。
+        """
+        base = bj_minute(DAY, 21, 18)
+        beats = [base, base + 180, base + 360, base + 540, base + 720]
+        store.insert_app_minutes([with_evidence(
+            app_minutes_row(MAC_A, DAY, "微信视频号", beats),
+            [(936, 579, 1, 1)] * len(beats))])
+        report = store.report([MAC_A], DAY)
+        assert report["apps"] == [], "全是 1 个窗口的固定包，一分钟都不该算"
+        assert report["onlineMinutes"] == 0
+
+    def test_the_same_minutes_with_real_payload_still_count(self, store):
+        base = bj_minute(DAY, 21, 18)
+        beats = [base, base + 180, base + 360, base + 540, base + 720]
+        store.insert_app_minutes([with_evidence(
+            app_minutes_row(MAC_A, DAY, "微信视频号", beats),
+            [(224_118, 141_661, 7, 7)] * len(beats))])
+        app = store.report([MAC_A], DAY)["apps"][0]
+        assert app["minutes"] == len(beats)
+
+    def test_instant_apps_are_exempt_from_the_window_floor(self, store):
+        """扫码支付一下就锁屏：一个窗口也要算，这是用户定的「即时应用放宽」。"""
+        minute = bj_minute(DAY, 22, 5)
+        store.insert_app_minutes([with_evidence(
+            app_minutes_row(MAC_A, DAY, "支付宝", [minute]), [(1_584, 5_172, 1, 1)])])
+        report = store.report([MAC_A], DAY)
+        assert report["apps"][0]["minutes"] == 1
+        assert report["onlineMinutes"] == 1
 
     def test_baidu_app_is_reported_under_its_chinese_name(self, store):
         """中继按 `_` 截断后剩下 `baiduAPP`，家长端要看到的是「百度」。"""

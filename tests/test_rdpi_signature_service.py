@@ -222,6 +222,11 @@ def test_new_entries_only_use_hosts_the_engine_can_actually_match():
         patch = service.CURATED_SIGNATURE_EXTENSIONS[index]
         for host in patch["hosts"]:
             assert not host.startswith((".", "*")) and "*" not in host, host
+    # 米家补的域名同样不许带前导点，也不许顺手兜下整个 mi.com。
+    mijia = service.CURATED_SIGNATURE_EXTENSIONS["9-219-1-0"]["hosts"]
+    assert all(not h.startswith((".", "*")) and "*" not in h for h in mijia), mijia
+    assert "mi.com" not in mijia, "裸 mi.com 会把小米商城/运动/视频全吸进米家"
+    assert "api.io.mi.com" in mijia and "io.mi.com" not in mijia, "顶点不解析，收子域就够"
     # 裸 360.cn 会把奇虎全线（浏览器/安全卫士/云盘）卷进儿童手表，明确不收。
     assert "360.cn" not in service.CURATED_SIGNATURE_EXTENSIONS["9-221-1-0"]["hosts"]
     assert "360.cn" not in service.CURATED_SIGNATURE_EXTENSIONS["9-222-1-0"]["hosts"]

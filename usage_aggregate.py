@@ -1571,6 +1571,22 @@ def _run_has_uplink(run: Sequence[int],
                for minute in minutes)
 
 
+#: 应用占一分钟的最低证据。一个 window = 一个带 ≥256B payload 的 5 秒采样窗口，
+#: 所以 2 个就是「这一分钟里至少两处真的在传东西」。
+#: 实测（2026-09-21 iQOO Neo3 21:18-21:42）微信后台的 finder 心跳每 2-3 分钟发一次
+#: `936B 上 / 579B 下 / 1 窗口 / 1 流`，正好落在白天 2 分钟合并容差里连成段，于是
+#: 「没人看的微信视频号」和「真在看的抖音」同时在计时。段长过滤挡不住这种规律心跳，
+#: 只能在分钟这一级拦。
+APP_MINUTE_MIN_WINDOWS = int(os.environ.get("USAGE_APP_MINUTE_MIN_WINDOWS", "2"))
+
+
+def _app_minute_counts(evidence: Optional[Tuple[int, int, int, int]]) -> bool:
+    """这一分钟是不是该应用真的在用。None = 中继没测过（v3 行）-> 按旧口径放行。"""
+    if evidence is None:
+        return True
+    return evidence[2] >= APP_MINUTE_MIN_WINDOWS
+
+
 def _qualifying_usage(
     device_minutes: Any,
     app_minutes: Mapping[str, Any],
@@ -1603,11 +1619,12 @@ def _qualifying_usage(
     apps: Dict[str, Dict[str, Any]] = {}
     for app, values in app_minutes.items():
         evidence = _evidence_map(values)
-        unique = set(evidence)
-        night = {m for m in unique if _beijing_hour(m) < LATE_NIGHT_END_HOUR}
         instant = _is_instant_use(app)
-        # 证据门槛只能筛「夜间段要不要算」，绝不能把筛掉的分钟挪回白天：
-        # 白天的集合是从下面 unique - night 来的，所以 night 本身保持原样。
+        # 即时应用（支付/搜索）一次点击就占一分钟，不能拿窗口数卡它；其余应用先在
+        # 分钟这一级把心跳剔掉。剔掉的分钟白天黑夜都不算，所以过滤要放在昼夜拆分
+        # 之前 —— 放在之后会把夜里的分钟挪进白天集合，那是另一个 bug 的形状。
+        unique = {m for m in evidence if instant or _app_minute_counts(evidence.get(m))}
+        night = {m for m in unique if _beijing_hour(m) < LATE_NIGHT_END_HOUR}
         candidates = ({m for m in night if _instant_minute_counts(evidence.get(m))}
                       if instant else night)
         night_runs = _kept_runs(candidates, gap_minutes=NIGHT_MERGE_GAP_MINUTES,
