@@ -477,13 +477,21 @@ impl MinuteStore {
         self.seen_flows.retain(|_, seen| seen.epoch >= floor);
     }
 
+    /// 只推「已经结束」的分钟。
+    ///
+    /// 分钟在活跃的那一刻就当场入账，所以本分钟的证据还在往上长；水位又是
+    /// 「推过的最大分钟」，一旦把半分钟的证据推上去，这一分钟就再也不会重发，
+    /// Hub 拿到的上下行永远停在半分钟那份。等它结束再推，每条分钟到的时候就是
+    /// 终值。代价是最新一分钟最多晚 60 秒可见，而 `activeNow` 本来就同时看上一
+    /// 分钟（Hub 侧注释同此），家长端不会因此觉得卡住。
     fn unsent_device_minutes(&self) -> BTreeMap<(String, String), Vec<(u64, MinuteEvidence)>> {
+        let floor = minute_start(self.last_sample);
         let mut out = BTreeMap::new();
         for (key, minutes) in &self.device_minutes {
             let watermark = self.pushed_device.get(key).copied().unwrap_or(0);
             let fresh: Vec<(u64, MinuteEvidence)> = minutes
                 .iter()
-                .filter(|(minute, _)| **minute > watermark)
+                .filter(|(minute, _)| **minute > watermark && **minute < floor)
                 .map(|(minute, evidence)| (*minute, evidence.clone()))
                 .collect();
             if !fresh.is_empty() {
@@ -494,12 +502,13 @@ impl MinuteStore {
     }
 
     fn unsent_app_minutes(&self) -> BTreeMap<(String, String, String), Vec<(u64, MinuteEvidence)>> {
+        let floor = minute_start(self.last_sample);
         let mut out = BTreeMap::new();
         for (key, minutes) in &self.app_minutes {
             let watermark = self.pushed_app.get(key).copied().unwrap_or(0);
             let fresh: Vec<(u64, MinuteEvidence)> = minutes
                 .iter()
-                .filter(|(minute, _)| **minute > watermark)
+                .filter(|(minute, _)| **minute > watermark && **minute < floor)
                 .map(|(minute, evidence)| (*minute, evidence.clone()))
                 .collect();
             if !fresh.is_empty() {
@@ -632,7 +641,7 @@ impl MinuteStore {
             .map(|((mac, _, app), minutes)| {
                 json!({
                     "mac": mac, "app": app, "minutes": minutes.len(),
-                    "ranges": ranges_from_minutes(minutes),
+                    "ranges": ranges_from_minutes(minutes.keys()),
                 })
             })
             .collect();
@@ -817,7 +826,10 @@ fn max_minute(row: &Value) -> u64 {
 
 /// 连续分钟合成真实时间段：`end` 是最后一个活跃分钟 +60，即 08:15/08:16/08:17
 /// 显示成 08:15–08:18、3 分钟。断开的分钟必然落成两段，不会用首末时间冒充连续。
-pub fn ranges_from_minutes(minutes: &BTreeSet<u64>) -> Vec<Value> {
+pub fn ranges_from_minutes<'a, I>(minutes: I) -> Vec<Value>
+where
+    I: IntoIterator<Item = &'a u64>,
+{
     let mut out = Vec::new();
     let mut run: Option<(u64, u64, usize)> = None;
     for minute in minutes.iter() {
@@ -1348,7 +1360,7 @@ mod tests {
             .get(&(MAC.to_string(), "2026-09-20".to_string(), "微信".to_string()))
             .cloned()
             .unwrap_or_default();
-        assert_eq!(minutes.iter().copied().collect::<Vec<_>>(), vec![minute_start(T0)]);
+        assert_eq!(minutes.keys().copied().collect::<Vec<_>>(), vec![minute_start(T0)]);
         // 5 秒和 55 秒一样，只有一分钟。
         assert_eq!(
             store
@@ -1574,6 +1586,9 @@ mod tests {
     #[test]
     fn payload_only_carries_minutes_after_the_watermark() {
         let mut store = MinuteStore::default();
+        // 分钟要「已经结束」才推：last_sample 落在 T0+180 这一分钟里，所以
+        // T0 / T0+60 / T0+120 都是终值，本分钟 T0+180 还得等。
+        store.last_sample = T0 + 180;
         store.device_minutes.insert(
             (MAC.to_string(), "2026-09-20".to_string()),
             credited(&[(T0, 100, 900), (T0 + 60, 200, 800)]),
@@ -1595,6 +1610,21 @@ mod tests {
         // 只重发新增的那一分钟，不整天重传。
         assert_eq!(body["deviceMinutes"][0]["minutes"].as_array().unwrap().len(), 1);
         assert_eq!(body["deviceMinutes"][0]["minutes"][0], json!(T0 + 120));
+    }
+
+    #[test]
+    fn the_running_minute_is_never_pushed() {
+        // 半分钟的证据一旦推上去就再也补不回来（水位只往前走），上下行会永远停在
+        // 那一刻。这一条守住「等分钟结束再推」。
+        let mut store = MinuteStore::default();
+        store.last_sample = T0 + 30;
+        store.device_minutes.insert(
+            (MAC.to_string(), "2026-09-20".to_string()),
+            credited(&[(T0, 100, 100)]),
+        );
+        assert!(!store.has_unsent(), "本分钟还没结束，不该带着半截证据出门");
+        store.last_sample = T0 + 61;
+        assert!(store.has_unsent(), "跨过分钟边界后这一分钟就是终值了");
     }
 
     #[test]
