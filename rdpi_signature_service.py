@@ -416,23 +416,35 @@ CURATED_SIGNATURE_EXTENSIONS: Dict[str, Dict[str, Any]] = {
     },
     # UU远程（网易远程桌面）。触发原因不是「缺一个应用」而是抓包抓出来的误判：
     # 电脑没装支付宝也没开浏览器，一条 429MB 的 UDP 流却被记成 支付宝 18-4-1-0。
-    # 三个主机都实测可解析（uuyc.163.com→59.111.44.89、gameviewer.com→42.186.215.27、
-    # mofang.163.com→60.188.233.209）。只写裸域：这台引擎按域名后缀匹配，
-    # 参考稿里的前导点 `.uuyc.163.com` 和通配一样是不生效的。
-    # 参考稿的第二条规则是 protocol=tcp 同时带 hosts+payloads —— 全库 1100 条规则里
-    # 这种形状出现 0 次，引擎不接受的形态不能猜，所以不收，只留主机匹配。
-    # 官方表达 HTTP 方法用的是 http-posts / http-gets 专用键（全库 2 / 182 条），而
-    # 没有任何一条规则的 payload 里出现过 "POST "，混写的后果按最可能的解释是主机条件
-    # 被忽略、只剩包内容 —— 那会把全屋明文 POST 都认成 UU远程。
+    # 只写裸域：这台引擎按域名后缀匹配，前导点 `.uuyc.163.com` 和 `*.` 一样不生效
+    # （全库 1204 条主机只有 1 条前导点、7 条通配，那 7 条还是我们早期推的）。
+    # 用户稿里第二条 `protocol: tcp` 同时带 hosts+payloads 不收：851 条规则里这种形状
+    # 0 次，官方表达 HTTP 方法用的是 http-posts(2)/http-gets(182) 专用键，混写最可能的
+    # 结果是主机条件被忽略、只剩包内容 —— 会把全屋明文 POST 都认成 UU远程。
+    # UU远程（网易远程桌面）。触发原因不是「缺一个应用」而是抓包抓出来的误判：
+    # 电脑没装支付宝也没开浏览器，一条 429MB 的 UDP 流却被记成 支付宝 18-4-1-0。
     #
-    # 但只有主机规则等于认不到：2026-09-21 实测，反复建联断联的 25 秒里这台电脑经路由
-    # 器的 DNS 查询 0 包（客户端拿缓存/内置 IP 直连），60 秒 TLS 里也没有 SNI，3987 行
-    # 抓包按可读字符扫没有任何主机名 —— 载荷全加密。隧道流因此一条都落不到 UU远程。
-    # 于是加下面这条端口规则去探引擎吃不吃 port_limit：形状照库里唯一的先例
-    # 4-1-3-2 英雄联盟PC_Gaming（port_limit + payload_length，payloads 留空），端口取
-    # 实测的中继端口 2481/2482/2581（那一刻全屋只有这台电脑在用），包长 42 是抓包里
-    # 出现最多的长度之一。覆盖率是已知短板：同一时刻这台电脑 19 条 UDP 流里只有 6 条
-    # 落在这三个端口，其余走高位 P2P 端口（还见过 2480），所以这条最多标到三分之一。
+    # 2026-09-21 深夜，用户给了一份 52 秒的退出重登 + 跨设备切换抓包（26116 包），
+    # 里面第一次出现了真名字，域名全部改成实测拿到的：
+    #   DNS 明文查询 4 条：sig-3303-d.nrd.nie.163.com、api-ipv4.nrd.nie.163.com、
+    #     sentry.netease.com、online-logger.webapp.163.com
+    #   TLS SNI 13 条，UU 相关的：sigma-*.proxima.nie.netease.com x49、
+    #     api.nrd.nie.163.com x16、relay-mg-3303-d.nrd.nie.163.com x11、
+    #     sig-3303-d.nrd.nie.163.com x4、fcount-api.webapp.163.com x3、
+    #     nrd-file.fp.ps.netease.com、uuyc.webapp.163.com
+    # `nrd` 就是 NetEase Remote Desktop，控制面、信令、中继全在 nrd.nie.163.com 底下，
+    # 裸域后缀匹配一条就能盖住 api./sig-./relay-mg./api-ipv4. 这些子域。
+    # 故意不收：sentry.netease.com 和 *.webapp.163.com 的日志域名是网易全线共用的
+    # 上报口，收进来等于把别的网易应用也算成 UU远程（就是当初 阿里CDN 那个错）。
+    # 另外更正一次：之前我说这台电脑「明文 DNS 结构性不可见」是说过头了 —— 重登那
+    # 一下确实有明文 53（走 223.5.5.5），只是单纯连接/断开的那 25 秒里一次都不查。
+    #
+    # 端口规则是探引擎吃不吃 port_limit 的第二次尝试，形状照库里唯一先例
+    # 4-1-3-2 英雄联盟PC_Gaming（port_limit + 两级 payload_length，payloads 留空）。
+    # 上一版按 42 字节写，实测一次都没命中，原因是 42 是猜的：抓包里 PC 发往
+    # 2480/2481/2482 的首包一律 28 字节，回来的首包一律 72 字节。
+    # 3378（网易 ACD，39 个对端、首包固定 8 字节）不收：那是网易游戏/加速器共用的
+    # 探测口，认成 UU远程就是又一次「用别人的口说自己的话」。
     "9-220-1-0": {
         "name": "UU远程",
         "category": "工具/远程",
@@ -440,14 +452,18 @@ CURATED_SIGNATURE_EXTENSIONS: Dict[str, Dict[str, Any]] = {
             "uuyc.163.com",
             "gameviewer.com",
             "mofang.163.com",
+            "nrd.nie.163.com",
+            "proxima.nie.netease.com",
+            "uuyc.webapp.163.com",
+            "nrd-file.fp.ps.netease.com",
         ],
         "extra_rules": [
             {
                 "protocol": "udp",
                 "hosts": [],
                 "payloads": [],
-                "port_limit": [{"min": 2481, "max": 2482}, {"min": 2581, "max": 2581}],
-                "payload_length": [{"stage": 0, "length": 42}],
+                "port_limit": [{"min": 2480, "max": 2482}],
+                "payload_length": [{"stage": 0, "length": 28}, {"stage": 1, "length": 72}],
             },
         ],
     },

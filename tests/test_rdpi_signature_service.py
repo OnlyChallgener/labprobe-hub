@@ -276,8 +276,8 @@ def test_port_rule_lands_on_its_entry_and_is_idempotent():
     port_rule = uu["rules"][-1]
     assert port_rule["protocol"] == "udp"
     assert port_rule["payloads"] == []
-    assert {"min": 2481, "max": 2482} in port_rule["port_limit"]
-    assert port_rule["payload_length"] == [{"stage": 0, "length": 42}]
+    assert {"min": 2480, "max": 2482} in port_rule["port_limit"]
+    assert port_rule["payload_length"] == [{"stage": 0, "length": 28}, {"stage": 1, "length": 72}]
     # 端口规则的匹配子只有 payload_length 能过校验器的「至少一个匹配子」，
     # 所以这条一旦哪天被摘掉 payload_length，整库就写不进路由器了。
     for app in patched["apps"]:
@@ -359,13 +359,23 @@ def test_drop_protocols_refuses_to_strip_the_last_matcher():
 
 
 def test_uu_remote_signature_matches_how_the_engine_actually_reads_hosts():
-    """UU远程条目：主机必须是裸域 —— 这台引擎按后缀匹配，前导点和通配都不生效。"""
+    """UU远程条目：主机必须是裸域，而且只能是抓包里真的出现过的那个产品自己的域名。"""
     patch = service.CURATED_SIGNATURE_EXTENSIONS["9-220-1-0"]
     assert patch["name"] == "UU远程"
     for host in patch["hosts"]:
         assert not host.startswith((".", "*")), host
         assert "*" not in host, host
-    assert set(patch["hosts"]) == {"uuyc.163.com", "gameviewer.com", "mofang.163.com"}
+    # nrd = NetEase Remote Desktop：控制面 api./信令 sig-./中继 relay-mg. 全在它下面，
+    # 裸域后缀匹配一条就盖住这些子域（52 秒抓包实测出的名字）。
+    assert "nrd.nie.163.com" in patch["hosts"]
+    assert "proxima.nie.netease.com" in patch["hosts"]
+    assert "uuyc.webapp.163.com" in patch["hosts"]
+    # 网易全线共用的上报口不能占：那是把别人算成 UU远程，重演 阿里CDN 的错。
+    for shared in ("sentry.netease.com", "webapp.163.com", "nie.163.com", "163.com", "netease.com"):
+        assert shared not in patch["hosts"], shared
+    # 3378 是网易 ACD 的探测口（39 个对端、首包固定 8 字节），UU加速器/网易游戏都用它。
+    assert all(range_["max"] < 3378 or range_["min"] > 3378
+               for rule in patch["extra_rules"] for range_ in rule["port_limit"])
 
 
 def test_bundle_against_the_real_official_db_moves_alibaba_infra_off_dingtalk():
