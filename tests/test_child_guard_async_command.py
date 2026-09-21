@@ -4,8 +4,11 @@
 （正文还是反代自己的 HTML），所以超时必须变成「还在处理」而不是错误。
 """
 
+import re
+from pathlib import Path
+
 import hub
-from child_guard_service import ChildGuardCommandStore
+from child_guard_service import ChildGuardCommandStore, _ACTIONS
 
 
 def _prepare(monkeypatch, tmp_path):
@@ -52,3 +55,19 @@ def test_command_status_rejects_malformed_and_unknown_ids(monkeypatch, tmp_path)
     client = _prepare(monkeypatch, tmp_path)
     assert client.get("/api/router/child-guard/command/nope").status_code == 400
     assert client.get(f"/api/router/child-guard/command/{'a' * 24}").status_code == 404
+
+
+def test_every_enqueued_action_is_whitelisted():
+    """路由器支持一个新动作，不等于 Hub 允许入队它。
+
+    2026-09-21 实测：``set_all_plans_enabled`` 已经写进中继的 dispatch，Hub 路由
+    却在 ``enqueue`` 就被 ``unsupported child guard action`` 抛出去，接口直接 500，
+    App 点「全设备上网计划」必然失败回弹。动作白名单和路由调用点分处两个文件，
+    没有测试就一定会再次漂移。
+    """
+    source = Path(hub.__file__).read_text(encoding="utf-8")
+    enqueued = set(re.findall(r'_child_guard_execute\(\s*"([a-z_]+)"', source))
+    enqueued |= set(re.findall(r'CHILD_GUARD_COMMANDS\.enqueue\([A-Za-z_]+,\s*"([a-z_]+)"', source))
+    assert enqueued, "hub.py 里一个 _child_guard_execute 调用都没扫到，扫描式断言本身失效了"
+    missing = sorted(enqueued - _ACTIONS)
+    assert not missing, f"hub.py 入队了 _ACTIONS 之外的动作，接口会 500：{missing}"

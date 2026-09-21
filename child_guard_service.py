@@ -37,6 +37,8 @@ _ACTIONS = {
     "update_plan",
     "delete_plan",
     "set_plan_enabled",
+    "set_all_plans_enabled",
+    "set_device_pass",
     "add_device",
     "remove_device",
     "pause_device",
