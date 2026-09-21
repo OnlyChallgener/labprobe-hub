@@ -282,6 +282,10 @@ def merge_signature_into_db(db: Dict[str, Any], payload: Any) -> Tuple[Dict[str,
         apps.append(db_signature)
         action = "added"
 
+    budget = entry_budget_error(apps)
+    if budget:
+        raise ValueError(budget)
+
     db["apps"] = apps
     return db, {"action": action, "index": idx, "name": name, "totalCount": len(apps)}
 
@@ -374,6 +378,17 @@ CURATED_SIGNATURE_EXTENSIONS: Dict[str, Dict[str, Any]] = {
             "jd.com",
             "360buyimg.com",
             "jd.hk",
+        ],
+    },
+    # 云闪付：路由器上还有一条重复的 18-4-3-0（正主就是这条 18-156-1-0），下面按名字
+    # 守卫把它删掉之前，先把它独占的 unionpay 一族域名并到正主身上，否则删一条就少一片
+    # 覆盖。通配写法（`*.unionpay.com`）在这个引擎里永远不命中，只写裸域名。
+    "18-156-1-0": {
+        "name": "云闪付",
+        "category": "支付",
+        "hosts": [
+            "unionpay.com",
+            "chinaunionpay.com",
         ],
     },
     # 阿里CDN：官方库把阿里系基础设施散在 钉钉_aliyuncs / 钉钉_alibaba / 钉钉_taobao
@@ -783,16 +798,17 @@ CURATED_SIGNATURE_EXTENSIONS: Dict[str, Dict[str, Any]] = {
 CURATED_SIGNATURE_REMOVALS: Dict[str, Any] = {
     # 钉钉_alipay 的三个主机全是支付宝的，而它排在数组第 300 位，真正的支付宝
     # 兜底条目 18-4-1-14 在第 433 位 —— 「支付宝被记成钉钉」就是这么来的。
-    # 官方库把阿里系的 CDN 和埋点域名整片绑给了钉钉：`钉钉_alicdn` 占了 8 个 alicdn
-    # 主机，`钉钉_mmstat` 占了 4 个 mmstat 埋点主机，淘宝/天猫/闲鱼的图片和埋点流量
-    # 因此全被记成钉钉。
+    # 官方库把阿里系的埋点/支付域名绑给了钉钉的派生条目：`钉钉_mmstat` 占 4 个 mmstat
+    # 埋点主机（淘宝/天猫/闲鱼/饿了么的埋点流量因此记成钉钉），`钉钉_alipay` 占 3 个
+    # alipay 主机（那是支付宝自己的域名，正主排在库尾所以一条拿不到）。
     #
-    # 但**绝不整条删除**：2026-09-22 实测，一次删掉 6 条官方条目之后全网一条域名规则
-    # 都不命中，把这 6 条原样放回（追加在库尾也一样）识别立刻恢复 —— 引擎按数组位置
-    # 建 appid 表，删条目会让整表错位。所以这里只摘到「还剩一个主机」为止：条目活着、
-    # 位置不动，它抢走的域名大部分回到该去的地方。
-    "8-4-1-11": ["gw.alipayobjects.com", "loggw-extiny.alipay.com"],
-    "8-4-1-10": ["log.mmstat.com", "s-gm.mmstat.com", "wgo.mmstat.com"],
+    # 这两条按名字守卫整条删 —— 2026-09-22 实测修正：删官方条目**不是**整库识别停摆的
+    # 原因，真正的原因是条目总数超过引擎上限（见 :data:`ENGINE_APP_ENTRY_LIMIT`），而
+    # 删条目恰恰是腾出名额的手段。名字对不上就不动手：线上库的 编号↔名字 已经和固件库
+    # 漂移过（8-4-1-6 在路由器上叫 阿里CDN，固件库里那条叫 钉钉_alicdn），只按编号动手
+    # 是这一批问题的根源。
+    "8-4-1-11": {"delete_if_named": "钉钉_alipay"},
+    "8-4-1-10": {"delete_if_named": "钉钉_mmstat"},
     # 飞书_other 收的是字节跳动公共基础设施域名，同时服务抖音/今日头条/西瓜；
     # api.feelgood.cn 才是飞书自己的（feelgood 是 Lark 的内部代号），保留。
     "8-5-1-4": [
@@ -811,15 +827,16 @@ CURATED_SIGNATURE_REMOVALS: Dict[str, Any] = {
     ],
     # 微软的 CDN 域名出现在腾讯会议条目里，明显是抄错的。
     "8-1-1-4": ["vo.msecnd.net"],
+    # 这条唯一的主机是微软登录域名 login.live.com，摘掉就没有任何匹配子了，整条删。
+    "8-1-1-5": {"delete_if_named": "腾讯会议_join_meeting"},
     # 安全教育平台_null_relation 四个主机全是个推/gepush 推送 SDK —— 任何用个推的
-    # App 都会被记成安全教育平台。留一个 `gi.gepush.com` 让条目继续有效。
-    "8-81-1-15": ["gtc.getui.net", "hzgt2.getui.com", "sdk-open-phone.getui.com"],
-    # 以下三条**不再动手**，理由都是「只能整条删才有效」，而删条目会打死整库识别：
-    #   8-1-1-5 腾讯会议_join_meeting —— 唯一主机是微软登录域名 login.live.com；
-    #   18-4-3-0 云闪付 —— 早先下发留下的重复条目（正主在 18-156-1-0），主机是
-    #     unionpay 一族，重名但不抢别人域名，留着只是列表里多一条；
-    #   8-4-1-6 阿里CDN —— 官方本来就有的 CDN 兜底条目，和我们后建的 9-217-1-0 同名。
-    #     官方条目才是该用的那个号：以后要加阿里系域名，加到 8-4-1-6 上，别再克隆。
+    # App 都会被记成安全教育平台，而这条本身跟安全教育平台没有一个是自己的域名。
+    "8-81-1-15": {"delete_if_named": "安全教育平台_null_relation"},
+    # 线上路由器这条是早先下发留下的重复 云闪付（正主在 18-156-1-0）。它的 unionpay
+    # 一族域名先并进正主再删，否则整条删掉会把 unionpay.com 的覆盖一起丢掉。
+    "18-4-3-0": {"delete_if_named": "云闪付"},
+    # 8-4-1-6 在路由器上已经是我们早先改名的 阿里CDN（固件库里那条叫 钉钉_alicdn），
+    # 官方条目才是该用的那个号：以后要加阿里系域名，加到 8-4-1-6 上，别再克隆。
     # 阿里CDN 早期版本整片兜过裸 `alicdn.com`，实测公共 DNS 114.114.114.114 会被它
     # 卷进来记成阿里CDN。合并是只追加的，改特征表里的名单删不掉已经落到路由器上的
     # 那一行，必须在这里显式摘掉，再由下面的白名单换成精确子域。
@@ -840,35 +857,55 @@ _MATCHER_FIELDS = ("hosts", "payloads", "payload_length", "http-gets",
                    "http-posts", "user-agents")
 
 
+#: BE72 引擎的条目表上限（2026-09-22 在同一台路由器上实测）：488 条时域名规则全部
+#: 正常，490 条起整库一条域名都不命中，只剩协议级 appid（DNS 流还在，标记是 11-6-0-0）。
+#: 主机数、被删的是哪几条、文件是紧凑还是缩进格式都试过了 —— 死的只有**条数**：
+#: 498 条 / 1155 主机照样全灭，486 条 / 1242 主机 7/7 全中。
+ENGINE_APP_ENTRY_LIMIT = 488
+
+
+def apply_slot_retirements(apps: List[Dict[str, Any]]) -> Tuple[List[Dict[str, Any]], List[str]]:
+    """回收永远不会命中的空壳条目，给真正能识别的新应用腾名额。
+
+    固件库自带 14 条一个匹配子都没有的壳（魔兽世界 / 永劫无间 / 鸣潮 / 蔚蓝档案 /
+    蛋仔派对 / PUBG 那类 —— 官方把特征留在了别的文件里），它们在引擎里命中不了任何一条流，
+    却和真正有用的条目一样占 :data:`ENGINE_APP_ENTRY_LIMIT` 的名额。只回收「所有规则
+    都没有匹配子」的条目，有匹配子的一律不动。
+    """
+    kept: List[Dict[str, Any]] = []
+    retired: List[str] = []
+    for app in apps:
+        if any(_has_matcher(rule) for rule in (app.get("rules") or [])):
+            kept.append(app)
+        else:
+            retired.append(f"{app.get('name')} ({app.get('index')} 没有任何匹配子)")
+    return kept, retired
+
+
+def entry_budget_error(apps: List[Dict[str, Any]]) -> Optional[str]:
+    """整库条数超过引擎上限时给出拒绝理由，没超过返回 None。
+
+    没有这道闸，一次「多加几个应用」的下发就会把全网识别打死，而且现场看起来像是
+    特征写错了 —— 宁可在这里拒绝，也不能让路由器带着超限库跑。
+    """
+    over = len(apps) - ENGINE_APP_ENTRY_LIMIT
+    if over <= 0:
+        return None
+    return (f"合并后整库 {len(apps)} 条，超过引擎上限 {ENGINE_APP_ENTRY_LIMIT} 条："
+            f"路由器会停止匹配所有域名规则。需要再减少 {over} 条。")
+
+
 def _has_matcher(rule: Dict[str, Any]) -> bool:
     return any(isinstance(rule.get(field), list) and rule[field] for field in _MATCHER_FIELDS)
 
 
-def _strip_all_hosts(app: Dict[str, Any]) -> int:
-    """清空一条条目的主机清单（就地，不删条目），返回摘掉的主机数。
-
-    只剩一个匹配子都不剩的情况交给调用方判断 —— 条目必须留着：实测（2026-09-22 BE72）
-    **删掉官方条目会让引擎的 appid 表整体错位，此后所有域名规则全部失效**，表现是全网
-    一条都识别不到，而把被删的 6 条原样放回，识别立刻恢复（NAS 查 openapi.alipan.com，
-    它的 443 流当场打上 7-4-1-0 阿里云盘）。
-    """
-    gone = 0
-    for rule in app.get("rules") or []:
-        hosts = rule.get("hosts")
-        if isinstance(hosts, list) and hosts:
-            gone += len(hosts)
-            rule["hosts"] = []
-    return gone
-
-
 def apply_removals(apps: List[Dict[str, Any]]) -> tuple:
-    """按 :data:`CURATED_SIGNATURE_REMOVALS` 摘主机 / 摘协议规则，返回三项统计。
+    """按 :data:`CURATED_SIGNATURE_REMOVALS` 摘主机 / 摘协议规则 / 整条删除，返回三项统计。
 
-    只按 index 精确匹配，不按 name —— 官方库的 name 有重名和 ``_weak_relation``
-    后缀变体。摘完一个匹配子都不剩的条目会被跳过而不是清空，否则整库过不了
-    ``validate_signature_object``，路由器那边还会回滚。
-
-    这里**没有任何一条路径会把条目从数组里删掉**，见 :func:`_strip_all_hosts`。
+    三种动作都按 index 定位条目，但**整条删除必须再过名字这道闸**：线上库的
+    编号↔名字 已经和固件库漂移过（8-4-1-6 在路由器上叫 阿里CDN，固件库里那条叫
+    钉钉_alicdn），只按编号动手会把官方自己的 CDN 兜底条目当成钉钉删掉。
+    删除是就地从数组里摘掉，因此它也是在给 :data:`ENGINE_APP_ENTRY_LIMIT` 腾名额。
     """
     removed_hosts = 0
     removed_apps: List[str] = []
@@ -879,6 +916,16 @@ def apply_removals(apps: List[Dict[str, Any]]) -> tuple:
             continue
         name = str(app.get("name") or idx)
         if isinstance(spec, dict):
+            expected = str(spec.get("delete_if_named") or "")
+            if expected:
+                if name != expected:
+                    # 编号在线上库里被谁占着，只有路由器自己知道；名字对不上就不动手。
+                    skipped.append(f"{name} ({idx} 不是 {expected}，保留)")
+                    continue
+                apps.remove(app)
+                removed_hosts += sum(len(r.get("hosts") or []) for r in app.get("rules") or [])
+                removed_apps.append(f"{name} ({idx} 整条删除，条目不占名额了)")
+                continue
             drop_protocols = {str(p).strip().lower() for p in spec.get("drop_protocols") or []}
             if drop_protocols:
                 # 摘整条协议规则（不是摘主机）：支付宝那条误判就是 payload 规则造成的，
@@ -896,25 +943,7 @@ def apply_removals(apps: List[Dict[str, Any]]) -> tuple:
                 removed_apps.append(f"{name} ({idx} 摘掉 {len(rules) - len(kept)} 条 "
                                     f"{'/'.join(sorted(drop_protocols))} 规则)")
                 continue
-            expected = str(spec.get("delete_if_named") or "")
-            if name != expected:
-                # 编号在线上库里被谁占着，只有路由器自己知道；名字对不上就不动手。
-                skipped.append(f"{name} ({idx} 不是 {expected}，保留)")
-                continue
-        if not isinstance(spec, dict) and spec != "*":
-            drop = set(spec)
-        else:
-            # "*" 与 delete_if_named 的旧语义是「整条删除」—— 那正是把整库识别打死的原因。
-            # 现在改成就地摘主机、条目留在原位：它抢走的域名不再算它的，但数组位置不动。
-            rules = app.get("rules") or []
-            survivors = [r for r in rules if not r.get("hosts") and _has_matcher(r)]
-            if not survivors:
-                skipped.append(f"{name} ({idx} 就地清空会一个匹配子都不剩，保留)")
-                continue
-            gone = _strip_all_hosts(app)
-            removed_hosts += gone
-            removed_apps.append(f"{name} ({idx} 就地摘掉 {gone} 个主机，条目保留)")
-            continue
+        drop = set(spec)
         rules = app.get("rules") or []
         host_rule = next((r for r in rules if r.get("hosts")), None)
         if host_rule is None:
@@ -993,10 +1022,11 @@ def _append_extra_rules(rules: List[Dict[str, Any]], patch: Dict[str, Any]) -> i
 def apply_curated_extensions(db: Dict[str, Any]) -> Tuple[Optional[Dict[str, Any]], Dict[str, Any]]:
     """把策划好的高频域名并进官方条目，返回 (新库, 给界面的字段)；没有新东西就 (None, 说明)。
 
-    官方条目一律不删，只往它的 host 规则里补域名。新增的条目排在最后，让官方那些
-    更具体的规则继续优先命中。
+    先回收没有任何匹配子的空壳腾出名额，再摘后补；新增的条目排在最后，让官方那些
+    更具体的规则继续优先命中。结果受 :data:`ENGINE_APP_ENTRY_LIMIT` 约束 —— 超了就
+    拒绝下发，因为那会让路由器整库停止域名识别。
     """
-    apps = list(db.get("apps") or [])
+    apps, retired_apps = apply_slot_retirements(list(db.get("apps") or []))
 
     # 先摘再补：删掉的条目不该在下一轮按 name 撞上别的补丁。
     hosts_removed, removed_apps, removal_skipped = apply_removals(apps)
@@ -1070,11 +1100,19 @@ def apply_curated_extensions(db: Dict[str, Any]) -> Tuple[Optional[Dict[str, Any
         "totalRulesAdded": extra_rules_added,
         "removedApps": removed_apps,
         "removalSkipped": removal_skipped,
+        "retiredApps": retired_apps,
         "enhancedApps": enhanced_apps,
         "totalApps": len(apps),
+        "entryLimit": ENGINE_APP_ENTRY_LIMIT,
     }
-    if not total_hosts_added and not hosts_removed and not removed_apps and not extra_rules_added:
-        # 一个域名都没变化，就别让路由器白热重载一次。
+    budget = entry_budget_error(apps)
+    if budget:
+        # 宁可拒发，也不能让路由器带着超限库跑：现场只会看到「全是 0 分钟」，
+        # 而看起来像是特征写错了，排查代价是一整晚。
+        return None, {**stats, "ok": False, "errorCode": "entry_budget_exceeded", "error": budget}
+    if (not total_hosts_added and not hosts_removed and not removed_apps
+            and not extra_rules_added and not retired_apps):
+        # 一个域名、一条条目都没变化，就别让路由器白热重载一次。
         return None, {**stats, "ok": True, "message": "高频特征包已是最新状态"}
     db["apps"] = apps
     return db, stats

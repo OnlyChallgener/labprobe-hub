@@ -322,32 +322,79 @@ def test_removal_strips_only_the_named_hosts():
     assert apps[0]["rules"][0]["hosts"] == ["api.feelgood.cn"]
 
 
-def test_removal_never_deletes_an_entry():
-    """条目一律留在原位 —— 删官方条目会把整库域名识别打死（2026-09-22 实测）。
+def test_delete_if_named_only_deletes_when_the_name_matches():
+    """整条删除必须过名字这道闸：线上库的 编号↔名字 已经和固件库漂移过。
 
-    当时删了 6 条官方条目，之后全网一条域名规则都不命中；把这 6 条原样放回，NAS 查
-    openapi.alipan.com 的 443 流当场重新打上 7-4-1-0 阿里云盘。所以这里改成：只摘到
-    「还剩一个主机」为止，数组长度和编号顺序都不许变。
+    8-4-1-6 在固件库里叫 钉钉_alicdn，在路由器上已经被早先下发改名成 阿里CDN —— 只按
+    编号动手就会把官方自己的 CDN 兜底条目当成钉钉删掉。
     """
     apps = [_app("8-4-1-11", "钉钉_alipay", ["mdap.alipay.com", "gw.alipayobjects.com"]),
+            _app("8-4-1-6", "阿里CDN", ["alicdn.com"]),
             _app("7-1-1-0", "别的", ["x.com"])]
-    before = [a["index"] for a in apps]
     removed, gone, skipped = service.apply_removals(apps)
-    assert [a["index"] for a in apps] == before, "条目被删掉了"
-    assert removed == 1
-    assert apps[0]["rules"][0]["hosts"] == ["mdap.alipay.com"]
-    assert not any("整条删除" in x for x in gone)
+    assert "8-4-1-11" not in [a["index"] for a in apps], "该删的没删，白占一个名额"
+    assert "8-4-1-6" in [a["index"] for a in apps]
+    assert removed == 2
+    assert any("整条删除" in x for x in gone)
 
 
-def test_the_shipped_removal_table_keeps_every_official_entry():
-    """配置表里不能再有「整条删除」这类值（"*" / delete_if_named 都算）。"""
+def test_a_name_guard_mismatch_is_reported_and_the_entry_kept():
+    apps = [_app("18-4-3-0", "阿里CDN", ["alicdn.com"])]
+    removed, gone, skipped = service.apply_removals(apps)
+    assert (removed, gone) == (0, [])
+    assert skipped and "18-4-3-0" in skipped[0]
+    assert len(apps) == 1, "名字对不上也必须留着"
+
+
+def test_the_shipped_removal_table_only_uses_the_three_supported_forms():
     for idx, spec in service.CURATED_SIGNATURE_REMOVALS.items():
         if isinstance(spec, dict):
-            assert "delete_if_named" not in spec, idx
-            assert spec.get("drop_protocols"), idx
+            assert set(spec) <= {"delete_if_named", "drop_protocols"}, idx
+            assert spec.get("delete_if_named") or spec.get("drop_protocols"), idx
         else:
-            assert spec != "*", idx
-            assert isinstance(spec, list) and spec, idx
+            # 裸 "*" 会不加判断地清空条目，只允许点名摘主机。
+            assert isinstance(spec, list) and spec and all(isinstance(h, str) for h in spec), idx
+
+
+# -- 条目名额 ------------------------------------------------------------------
+
+
+def test_slot_retirement_drops_only_entries_that_can_never_match():
+    """只回收一个匹配子都没有的空壳；有任何匹配子的条目一律不动。"""
+    apps = [{"index": "4-2-12-0", "name": "魔兽世界", "rules": []},
+            {"index": "4-6-4-0", "name": "PUBG", "rules": [{"protocol": "host", "hosts": []}]},
+            _app("4-1-1-0", "王者荣耀", ["pvp.qq.com"])]
+    kept, retired = service.apply_slot_retirements(apps)
+    assert [a["index"] for a in kept] == ["4-1-1-0"]
+    assert len(retired) == 2 and any("魔兽世界" in r for r in retired)
+
+
+def test_the_engine_refuses_a_db_over_the_entry_limit():
+    """超上限的整库会把全网域名识别打死，必须在 Hub 就拒掉，别让路由器带着它跑。"""
+    official_db = Path(
+        r"D:\Github\LabProbeApp\test\_analysis\extract\rootfs\usr\share\ndpi\db.default.json"
+    )
+    if not official_db.exists():
+        pytest.skip("local official rootfs fixture is unavailable")
+    db = json.loads(official_db.read_text(encoding="utf-8"))
+    # 填充条目放在官方不会碰的段里，保证「超过上限」是这条测试自己造成的。
+    db["apps"] += [_app(f"20-{slot}-1-0", f"填充{slot}", ["x.com"])
+                   for slot in range(service.ENGINE_APP_ENTRY_LIMIT)]
+    merged, extra = service.apply_curated_extensions(db)
+    assert merged is None
+    assert extra["errorCode"] == "entry_budget_exceeded"
+    assert extra["totalApps"] > service.ENGINE_APP_ENTRY_LIMIT
+    assert "停止匹配所有域名规则" in extra["error"]
+
+
+def test_single_signature_merge_is_refused_when_it_would_cross_the_limit():
+    apps = [_app(f"20-{slot}-1-0", f"填充{slot}", ["x.com"])
+            for slot in range(service.ENGINE_APP_ENTRY_LIMIT)]
+    payload = {"index": "9-990-1-0", "name": "多出来的一条",
+               "rules": [{"protocol": "host", "hosts": ["extra.example.com"]}]}
+    with pytest.raises(ValueError, match="上限"):
+        service.merge_signature_into_db({"apps": apps}, payload)
+
 
 
 def test_removal_never_leaves_an_entry_with_no_matcher():
@@ -438,14 +485,18 @@ def test_bundle_against_the_real_official_db_moves_alibaba_infra_off_dingtalk():
 
     assert merged is not None
     by_index = {app["index"]: app for app in merged["apps"]}
-    # 官方条目一条都不能少：删条目会让引擎的 appid 表错位，整库域名识别随之停摆。
-    assert len(merged["apps"]) >= len(db["apps"])
-    for kept in ("8-4-1-6", "8-4-1-10", "8-4-1-11", "8-1-1-5"):
-        assert kept in by_index, f"{kept} 被删掉了"
-    # 钉钉不再成片占着阿里的埋点/支付宝域名，但条目本身留着（各剩一个主机）。
-    for idx in ("8-4-1-10", "8-4-1-11"):
-        hosts = [h for r in by_index[idx]["rules"] for h in (r.get("hosts") or [])]
-        assert len(hosts) == 1, (idx, hosts)
+    # 整库必须留在引擎的条目上限以内：实测 488 条正常、490 条起全网零识别。
+    assert extra["totalApps"] == len(merged["apps"])
+    assert len(merged["apps"]) <= service.ENGINE_APP_ENTRY_LIMIT
+    # 空壳条目（官方发下来就没有匹配子）换成名额，抢域名的派生条目整条删掉；
+    # 官方自己的 阿里CDN 兜底条目（8-4-1-6）必须留着 —— 路由器上它已经被早先的
+    # 下发改名成 阿里CDN，删它等于把阿里 CDN 流量变成无主。
+    for kept in ("8-4-1-6", "4-1-1-0"):
+        assert kept in by_index, f"{kept} 不该动手"
+    for gone in ("8-4-1-10", "8-4-1-11", "8-1-1-5", "8-81-1-15", "4-2-12-0"):
+        assert gone not in by_index, f"{gone} 还占着一个名额"
+    # 钉钉不再成片占着阿里的埋点/支付宝域名。
+    assert extra["totalHostsRemoved"] > 0
     # 飞书不再收字节跳动的公共域名，但自己的 feelgood 还在。
     feishu = by_index["8-5-1-4"]["rules"][0]["hosts"]
     assert "i.snssdk.com" not in feishu and "api.feelgood.cn" in feishu
