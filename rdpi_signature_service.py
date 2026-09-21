@@ -783,16 +783,16 @@ CURATED_SIGNATURE_EXTENSIONS: Dict[str, Dict[str, Any]] = {
 CURATED_SIGNATURE_REMOVALS: Dict[str, Any] = {
     # 钉钉_alipay 的三个主机全是支付宝的，而它排在数组第 300 位，真正的支付宝
     # 兜底条目 18-4-1-14 在第 433 位 —— 「支付宝被记成钉钉」就是这么来的。
-    "8-4-1-11": "*",
-    # 官方库把阿里系的 CDN 和埋点域名整片绑给了钉钉：`钉钉_alicdn`（位置 296）
-    # 占了 img/gw/o/at/g/alibaba 等 8 个 alicdn 主机，`钉钉_mmstat`（位置 299）
-    # 占了 4 个 mmstat 埋点主机。淘宝/天猫/闲鱼/饿了么的图片和埋点流量因此全被记
-    # 成钉钉，而排在库尾的 阿里CDN 一条都拿不到 —— 这就是「阿里CDN 从来没识别过」
-    # 的原因。这两条里没有任何钉钉自己的域名，整条删掉。
-    # 注意：「数组位置靠前的规则优先」是 2026-09-21 从 支付宝→钉钉 这个现象推出来
-    # 的假设，还没在固件上实测过；模拟流量验证跑通才算确认。
-    "8-4-1-6": "*",
-    "8-4-1-10": "*",
+    # 官方库把阿里系的 CDN 和埋点域名整片绑给了钉钉：`钉钉_alicdn` 占了 8 个 alicdn
+    # 主机，`钉钉_mmstat` 占了 4 个 mmstat 埋点主机，淘宝/天猫/闲鱼的图片和埋点流量
+    # 因此全被记成钉钉。
+    #
+    # 但**绝不整条删除**：2026-09-22 实测，一次删掉 6 条官方条目之后全网一条域名规则
+    # 都不命中，把这 6 条原样放回（追加在库尾也一样）识别立刻恢复 —— 引擎按数组位置
+    # 建 appid 表，删条目会让整表错位。所以这里只摘到「还剩一个主机」为止：条目活着、
+    # 位置不动，它抢走的域名大部分回到该去的地方。
+    "8-4-1-11": ["gw.alipayobjects.com", "loggw-extiny.alipay.com"],
+    "8-4-1-10": ["log.mmstat.com", "s-gm.mmstat.com", "wgo.mmstat.com"],
     # 飞书_other 收的是字节跳动公共基础设施域名，同时服务抖音/今日头条/西瓜；
     # api.feelgood.cn 才是飞书自己的（feelgood 是 Lark 的内部代号），保留。
     "8-5-1-4": [
@@ -811,15 +811,15 @@ CURATED_SIGNATURE_REMOVALS: Dict[str, Any] = {
     ],
     # 微软的 CDN 域名出现在腾讯会议条目里，明显是抄错的。
     "8-1-1-4": ["vo.msecnd.net"],
-    # 这条唯一的主机是微软登录域名，摘掉就没有任何匹配子了，只能整条删。
-    "8-1-1-5": "*",
     # 安全教育平台_null_relation 四个主机全是个推/gepush 推送 SDK —— 任何用个推的
-    # App 都会被记成安全教育平台。
-    "8-81-1-15": "*",
-    # 线上路由器有一条重复的 云闪付 占在 18-4-3-0（真正的在 18-156-1-0）。它是早先
-    # 下发留下的产物，上一轮又按 index 把 alicdn/mmstat 等 9 个阿里域名并了进来 ——
-    # 支付应用不该兜 CDN 流量。删的时候必须核对名字：只按编号动手是这一批问题的根源。
-    "18-4-3-0": {"delete_if_named": "云闪付"},
+    # App 都会被记成安全教育平台。留一个 `gi.gepush.com` 让条目继续有效。
+    "8-81-1-15": ["gtc.getui.net", "hzgt2.getui.com", "sdk-open-phone.getui.com"],
+    # 以下三条**不再动手**，理由都是「只能整条删才有效」，而删条目会打死整库识别：
+    #   8-1-1-5 腾讯会议_join_meeting —— 唯一主机是微软登录域名 login.live.com；
+    #   18-4-3-0 云闪付 —— 早先下发留下的重复条目（正主在 18-156-1-0），主机是
+    #     unionpay 一族，重名但不抢别人域名，留着只是列表里多一条；
+    #   8-4-1-6 阿里CDN —— 官方本来就有的 CDN 兜底条目，和我们后建的 9-217-1-0 同名。
+    #     官方条目才是该用的那个号：以后要加阿里系域名，加到 8-4-1-6 上，别再克隆。
     # 阿里CDN 早期版本整片兜过裸 `alicdn.com`，实测公共 DNS 114.114.114.114 会被它
     # 卷进来记成阿里CDN。合并是只追加的，改特征表里的名单删不掉已经落到路由器上的
     # 那一行，必须在这里显式摘掉，再由下面的白名单换成精确子域。
@@ -844,12 +844,31 @@ def _has_matcher(rule: Dict[str, Any]) -> bool:
     return any(isinstance(rule.get(field), list) and rule[field] for field in _MATCHER_FIELDS)
 
 
+def _strip_all_hosts(app: Dict[str, Any]) -> int:
+    """清空一条条目的主机清单（就地，不删条目），返回摘掉的主机数。
+
+    只剩一个匹配子都不剩的情况交给调用方判断 —— 条目必须留着：实测（2026-09-22 BE72）
+    **删掉官方条目会让引擎的 appid 表整体错位，此后所有域名规则全部失效**，表现是全网
+    一条都识别不到，而把被删的 6 条原样放回，识别立刻恢复（NAS 查 openapi.alipan.com，
+    它的 443 流当场打上 7-4-1-0 阿里云盘）。
+    """
+    gone = 0
+    for rule in app.get("rules") or []:
+        hosts = rule.get("hosts")
+        if isinstance(hosts, list) and hosts:
+            gone += len(hosts)
+            rule["hosts"] = []
+    return gone
+
+
 def apply_removals(apps: List[Dict[str, Any]]) -> tuple:
-    """按 :data:`CURATED_SIGNATURE_REMOVALS` 摘主机 / 删条目，返回三项统计。
+    """按 :data:`CURATED_SIGNATURE_REMOVALS` 摘主机 / 摘协议规则，返回三项统计。
 
     只按 index 精确匹配，不按 name —— 官方库的 name 有重名和 ``_weak_relation``
     后缀变体。摘完一个匹配子都不剩的条目会被跳过而不是清空，否则整库过不了
     ``validate_signature_object``，路由器那边还会回滚。
+
+    这里**没有任何一条路径会把条目从数组里删掉**，见 :func:`_strip_all_hosts`。
     """
     removed_hosts = 0
     removed_apps: List[str] = []
@@ -882,14 +901,20 @@ def apply_removals(apps: List[Dict[str, Any]]) -> tuple:
                 # 编号在线上库里被谁占着，只有路由器自己知道；名字对不上就不动手。
                 skipped.append(f"{name} ({idx} 不是 {expected}，保留)")
                 continue
-            apps.remove(app)
-            removed_apps.append(f"{name} ({idx} 整条删除)")
+        if not isinstance(spec, dict) and spec != "*":
+            drop = set(spec)
+        else:
+            # "*" 与 delete_if_named 的旧语义是「整条删除」—— 那正是把整库识别打死的原因。
+            # 现在改成就地摘主机、条目留在原位：它抢走的域名不再算它的，但数组位置不动。
+            rules = app.get("rules") or []
+            survivors = [r for r in rules if not r.get("hosts") and _has_matcher(r)]
+            if not survivors:
+                skipped.append(f"{name} ({idx} 就地清空会一个匹配子都不剩，保留)")
+                continue
+            gone = _strip_all_hosts(app)
+            removed_hosts += gone
+            removed_apps.append(f"{name} ({idx} 就地摘掉 {gone} 个主机，条目保留)")
             continue
-        if spec == "*":
-            apps.remove(app)
-            removed_apps.append(f"{name} ({idx} 整条删除)")
-            continue
-        drop = set(spec)
         rules = app.get("rules") or []
         host_rule = next((r for r in rules if r.get("hosts")), None)
         if host_rule is None:

@@ -322,13 +322,32 @@ def test_removal_strips_only_the_named_hosts():
     assert apps[0]["rules"][0]["hosts"] == ["api.feelgood.cn"]
 
 
-def test_removal_can_drop_a_whole_entry():
-    apps = [_app("8-4-1-11", "钉钉_alipay", ["mdap.alipay.com"]),
+def test_removal_never_deletes_an_entry():
+    """条目一律留在原位 —— 删官方条目会把整库域名识别打死（2026-09-22 实测）。
+
+    当时删了 6 条官方条目，之后全网一条域名规则都不命中；把这 6 条原样放回，NAS 查
+    openapi.alipan.com 的 443 流当场重新打上 7-4-1-0 阿里云盘。所以这里改成：只摘到
+    「还剩一个主机」为止，数组长度和编号顺序都不许变。
+    """
+    apps = [_app("8-4-1-11", "钉钉_alipay", ["mdap.alipay.com", "gw.alipayobjects.com"]),
             _app("7-1-1-0", "别的", ["x.com"])]
+    before = [a["index"] for a in apps]
     removed, gone, skipped = service.apply_removals(apps)
-    assert (removed, skipped) == (0, [])
-    assert gone == ["钉钉_alipay (8-4-1-11 整条删除)"]
-    assert [a["index"] for a in apps] == ["7-1-1-0"]
+    assert [a["index"] for a in apps] == before, "条目被删掉了"
+    assert removed == 1
+    assert apps[0]["rules"][0]["hosts"] == ["mdap.alipay.com"]
+    assert not any("整条删除" in x for x in gone)
+
+
+def test_the_shipped_removal_table_keeps_every_official_entry():
+    """配置表里不能再有「整条删除」这类值（"*" / delete_if_named 都算）。"""
+    for idx, spec in service.CURATED_SIGNATURE_REMOVALS.items():
+        if isinstance(spec, dict):
+            assert "delete_if_named" not in spec, idx
+            assert spec.get("drop_protocols"), idx
+        else:
+            assert spec != "*", idx
+            assert isinstance(spec, list) and spec, idx
 
 
 def test_removal_never_leaves_an_entry_with_no_matcher():
@@ -419,9 +438,14 @@ def test_bundle_against_the_real_official_db_moves_alibaba_infra_off_dingtalk():
 
     assert merged is not None
     by_index = {app["index"]: app for app in merged["apps"]}
-    # 钉钉不再占着阿里的 CDN / 埋点 / 支付宝域名。
-    for stolen in ("8-4-1-6", "8-4-1-10", "8-4-1-11"):
-        assert stolen not in by_index, f"{stolen} 还在把阿里的域名算成钉钉"
+    # 官方条目一条都不能少：删条目会让引擎的 appid 表错位，整库域名识别随之停摆。
+    assert len(merged["apps"]) >= len(db["apps"])
+    for kept in ("8-4-1-6", "8-4-1-10", "8-4-1-11", "8-1-1-5"):
+        assert kept in by_index, f"{kept} 被删掉了"
+    # 钉钉不再成片占着阿里的埋点/支付宝域名，但条目本身留着（各剩一个主机）。
+    for idx in ("8-4-1-10", "8-4-1-11"):
+        hosts = [h for r in by_index[idx]["rules"] for h in (r.get("hosts") or [])]
+        assert len(hosts) == 1, (idx, hosts)
     # 飞书不再收字节跳动的公共域名，但自己的 feelgood 还在。
     feishu = by_index["8-5-1-4"]["rules"][0]["hosts"]
     assert "i.snssdk.com" not in feishu and "api.feelgood.cn" in feishu
@@ -506,15 +530,6 @@ def test_a_taken_index_never_absorbs_an_unrelated_patch():
     created = [a for a in merged["apps"] if a["name"] == "阿里CDN"]
     assert created and created[0]["index"] != "9-217-1-0"
     assert created[0]["index"].startswith("9-"), created[0]["index"]
-
-
-def test_deletion_by_index_is_refused_when_the_name_does_not_match():
-    """只按编号删条目同样危险：名字对不上就不许删。"""
-    apps = [{"index": "18-4-3-0", "name": "某个正经应用",
-             "rules": [{"protocol": "host", "hosts": ["x.com"]}]}]
-    removed, gone, skipped = service.apply_removals(apps)
-    assert gone == [] and skipped and "18-4-3-0" in skipped[0]
-    assert len(apps) == 1
 
 
 def test_index_match_still_enhances_a_derived_official_name():
