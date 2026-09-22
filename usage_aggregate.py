@@ -1537,9 +1537,22 @@ def _run_row(run: List[int]) -> Dict[str, Any]:
 
 
 def _kept_runs(minutes: Iterable[int], *, gap_minutes: int,
-               min_run_minutes: int) -> List[List[int]]:
+               min_run_minutes: int, min_density: float = 0.0) -> List[List[int]]:
     return [run for run in _minute_runs(minutes, gap_minutes)
-            if len(run) >= min_run_minutes]
+            if len(run) >= min_run_minutes and _run_density(run) >= min_density]
+
+
+def _run_density(run: Sequence[int]) -> float:
+    """一段里「有分钟的个数」除以「这段占掉的墙钟分钟数」，1.0 = 一分钟都不空。
+
+    Doze 批量唤醒的形状是每 ~5 分钟冒一次头、每次 1-2 分钟，正好落在 4 分钟的夜间
+    合并容差里，会被粘成一段 50 分钟的「会话」—— 段长门槛拦不住这种，只有密度认得。
+    """
+    minutes = list(run)
+    if len(minutes) < 2:
+        return 1.0
+    span = (max(minutes) - min(minutes)) // MINUTE_SECONDS + 1
+    return len(minutes) / span
 
 
 #: 夜间即时应用的证据门槛。一个 window = 一个带 ≥256B payload 的 5 秒采样窗口，
@@ -1578,13 +1591,46 @@ def _run_has_uplink(run: Sequence[int],
 #: 「没人看的微信视频号」和「真在看的抖音」同时在计时。段长过滤挡不住这种规律心跳，
 #: 只能在分钟这一级拦。
 APP_MINUTE_MIN_WINDOWS = int(os.environ.get("USAGE_APP_MINUTE_MIN_WINDOWS", "2"))
+#: 一分钟内下行不足这么多、上行却是它的两倍以上 —— 那是应用在拿本机做 P2P 加速 /
+#: 后台同步（发得比收得多），不是人在看内容。实测（2026-09-22 iQOO Neo3）凌晨
+#: 03:54-04:34 被记成「微信视频号连续 37 分钟」，其中 32 个分钟是 18-222KB 上行配
+#: 1-22KB 下行；同一台手机真在刷抖音的 07:41-07:49 是每分钟下行 6-13MB。
+#: 只卡「上行占优」这一条形状，不卡绝对量：文字聊天是收得多发得少（下行占优），
+#: 每分钟几十 KB 也是真实使用，不能一并抹掉。
+APP_MINUTE_CONTENT_DOWN_BYTES = int(os.environ.get(
+    "USAGE_APP_MINUTE_CONTENT_DOWN_BYTES", str(100 * 1024)))
+APP_MINUTE_UPLINK_DOMINANCE = int(os.environ.get("USAGE_APP_MINUTE_UPLINK_DOMINANCE", "2"))
+#: 夜间段落的最低密度（只卡夜间，理由和 ``NIGHT_MIN_RUN_MINUTES`` 一样：睡着的手机
+#: 才会稀，人在用就密）。实测同一天 Mate60 在 03:49-04:58 那段「小红书 20 分钟」密度
+#: 只有 29%（每 ~6 分钟冒一次头），而真实使用的微信 135 分钟密度 58%（洞都是 1-2 个
+#: 空分钟）—— 0.5 把前者拦下、后者放过。白天的稀疏段不卡：偶尔回一句的聊天就是稀的。
+APP_RUN_MIN_DENSITY = float(os.environ.get("USAGE_APP_RUN_MIN_DENSITY", "0.5"))
+
+
+#: 「即时应用」不查窗口数也不查段长（扫一次码就锁屏，一个窗口就是真实使用），
+#: 但不能连 1-2KB 的推送心跳一起放行。实测（2026-09-22 华为Mate60）百度搜索卡片每
+#: ~10 分钟自己醒一次，每次 1-2 分钟、下行 266-2037B，一天攒出 15 分钟「用了百度」；
+#: 而真付一次款的微信下行 9-15KB、真搜一次的下行 35-213KB。5KB 卡在两者之间。
+INSTANT_MINUTE_MIN_DOWN_BYTES = int(os.environ.get(
+    "USAGE_INSTANT_MINUTE_MIN_DOWN_BYTES", "5000"))
+
+
+def _instant_minute_has_volume(evidence: Optional[Tuple[int, int, int, int]]) -> bool:
+    """即时应用的分钟至少要有一点下行量，否则就是 App 自己的定时心跳。"""
+    if evidence is None:
+        return True
+    return evidence[1] >= INSTANT_MINUTE_MIN_DOWN_BYTES
 
 
 def _app_minute_counts(evidence: Optional[Tuple[int, int, int, int]]) -> bool:
     """这一分钟是不是该应用真的在用。None = 中继没测过（v3 行）-> 按旧口径放行。"""
     if evidence is None:
         return True
-    return evidence[2] >= APP_MINUTE_MIN_WINDOWS
+    up, down, windows, _flows = evidence
+    if windows < APP_MINUTE_MIN_WINDOWS:
+        return False
+    return not (down < APP_MINUTE_CONTENT_DOWN_BYTES
+                and up > down * APP_MINUTE_UPLINK_DOMINANCE)
 
 
 def _qualifying_usage(
@@ -1606,6 +1652,10 @@ def _qualifying_usage(
     ``NIGHT_INSTANT_MIN_WINDOWS`` 且上行过 ``NIGHT_MIN_UP_BYTES``，普通应用要整段
     里出现过上行。没有证据的行（v3 中继、升级前写的历史）一律退回上面那套旧口径。
 
+    分钟这一级还挡掉「上行占优、下行没内容」的那一分钟（应用在拿本机做 P2P 加速 /
+    后台同步）；夜间段这一级还挡掉 Doze 批量唤醒被合并容差粘成的稀段，白天不卡密度
+    —— 偶尔回一句的聊天本来就是稀的。
+
     被过滤掉的分钟彻底丢弃，不另立「后台活动」池。
     """
     device_map = _evidence_map(device_minutes)
@@ -1620,15 +1670,20 @@ def _qualifying_usage(
     for app, values in app_minutes.items():
         evidence = _evidence_map(values)
         instant = _is_instant_use(app)
-        # 即时应用（支付/搜索）一次点击就占一分钟，不能拿窗口数卡它；其余应用先在
-        # 分钟这一级把心跳剔掉。剔掉的分钟白天黑夜都不算，所以过滤要放在昼夜拆分
-        # 之前 —— 放在之后会把夜里的分钟挪进白天集合，那是另一个 bug 的形状。
-        unique = {m for m in evidence if instant or _app_minute_counts(evidence.get(m))}
+        # 即时应用（支付/搜索）一次点击就占一分钟，不能拿窗口数卡它，只卡一条「得有
+        # 一点下行量」；其余应用先在分钟这一级把心跳剔掉。剔掉的分钟白天黑夜都不算，
+        # 所以过滤要放在昼夜拆分之前 —— 放在之后会把夜里的分钟挪进白天集合，那是
+        # 另一个 bug 的形状。
+        if instant:
+            unique = {m for m in evidence if _instant_minute_has_volume(evidence.get(m))}
+        else:
+            unique = {m for m in evidence if _app_minute_counts(evidence.get(m))}
         night = {m for m in unique if _beijing_hour(m) < LATE_NIGHT_END_HOUR}
         candidates = ({m for m in night if _instant_minute_counts(evidence.get(m))}
                       if instant else night)
         night_runs = _kept_runs(candidates, gap_minutes=NIGHT_MERGE_GAP_MINUTES,
-                                min_run_minutes=_min_run_minutes(app, night=True))
+                                min_run_minutes=_min_run_minutes(app, night=True),
+                                min_density=APP_RUN_MIN_DENSITY)
         day_runs = _kept_runs(unique - night, gap_minutes=DAY_MERGE_GAP_MINUTES,
                               min_run_minutes=_min_run_minutes(app, night=False))
         if not instant:

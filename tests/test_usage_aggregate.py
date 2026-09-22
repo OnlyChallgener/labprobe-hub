@@ -581,6 +581,61 @@ class TestMinuteReport:
         app = store.report([MAC_A], DAY)["apps"][0]
         assert app["minutes"] == len(beats)
 
+    def test_p2p_uplink_minutes_are_not_watching_time(self, store):
+        """整段都在传东西，但那一分钟只下来几 KB、上行是下行的五倍 —— 那是应用在拿
+        本机做 P2P 加速，不是人在看内容。实测（2026-09-22 iQOO Neo3）凌晨
+        03:54-04:34 记成「微信视频号连续 37 分钟」，其中 32 个分钟就是这个形状。
+        """
+        minutes = run_from(bj_minute(DAY, 3, 54), 41)
+        evidence = [(30_000, 6_000, 3, 2)] * 41
+        for index in (13, 17, 25, 33):          # 少数几分钟真的下来了内容
+            evidence[index] = (90_000, 2_500_000, 5, 4)
+        store.insert_app_minutes([with_evidence(
+            app_minutes_row(MAC_A, DAY, "微信视频号", minutes), evidence)])
+        assert store.report([MAC_A], DAY)["apps"] == [], \
+            "四个孤立的内容分钟撑不起一段 5 分钟的连续段"
+
+    def test_dozed_batch_wake_pulses_do_not_chain_into_a_session(self, store):
+        """Doze 每 ~6 分钟醒一次、每次两分钟，正好被 4 分钟的夜间合并容差粘成「一段」：
+        段长够了，密度只有 35%，照样不算。实测（2026-09-22 华为Mate60）03:49-04:58
+        那台没人在用的手机，小红书记了 20 分钟、抖音 10 分钟、百度/淘宝各 15 分钟。
+        """
+        base = bj_minute(DAY, 3, 49)
+        minutes = []
+        for offset in range(0, 70, 6):
+            minutes.extend([base + offset * 60, base + (offset + 1) * 60])
+        store.insert_app_minutes([with_evidence(
+            app_minutes_row(MAC_A, DAY, "小红书", minutes),
+            [(14_000, 37_000, 3, 2)] * len(minutes))])
+        assert store.report([MAC_A], DAY)["apps"] == []
+
+    def test_a_dense_night_session_is_still_counted(self, store):
+        """夜里真正刷了 27 分钟，一分钟都不该少 —— 新门槛只能砍形状，不能砍时长。"""
+        minutes = run_from(bj_minute(DAY, 1, 0), 27)
+        store.insert_app_minutes([with_evidence(
+            app_minutes_row(MAC_A, DAY, "抖音", minutes),
+            [(180_000, 8_000_000, 9, 3)] * len(minutes))])
+        assert store.report([MAC_A], DAY)["apps"][0]["minutes"] == 27
+
+    def test_light_downlink_chat_minutes_still_count(self, store):
+        """每分钟只收几十 KB 的文字聊天是真实使用：下行占优，就不该被 P2P 那条剔掉。"""
+        minutes = run_from(bj_minute(DAY, 20, 0), 12)
+        store.insert_app_minutes([with_evidence(
+            app_minutes_row(MAC_A, DAY, "微信", minutes),
+            [(9_000, 34_000, 2, 1)] * len(minutes))])
+        assert store.report([MAC_A], DAY)["apps"][0]["minutes"] == 12
+
+    def test_a_sparse_but_real_night_session_survives_the_density_gate(self, store):
+        """夜里边看边放下，段里有一半是空分钟（实测真实微信段的密度是 58%）—— 密度
+        门槛必须放得下这种段，不能把真实使用一并抹掉。
+        """
+        base = bj_minute(DAY, 2, 0)
+        minutes = [base + offset * 180 + step for offset in range(30) for step in (0, 60)]
+        store.insert_app_minutes([with_evidence(
+            app_minutes_row(MAC_A, DAY, "哔哩哔哩", minutes),
+            [(40_000, 3_200_000, 6, 2)] * len(minutes))])
+        assert store.report([MAC_A], DAY)["apps"][0]["minutes"] == len(minutes)
+
     def test_instant_apps_are_exempt_from_the_window_floor(self, store):
         """扫码支付一下就锁屏：一个窗口也要算，这是用户定的「即时应用放宽」。"""
         minute = bj_minute(DAY, 22, 5)
@@ -589,6 +644,21 @@ class TestMinuteReport:
         report = store.report([MAC_A], DAY)
         assert report["apps"][0]["minutes"] == 1
         assert report["onlineMinutes"] == 1
+
+    def test_instant_apps_still_need_some_downlink(self, store):
+        """免检不等于全放：百度搜索卡片每 ~10 分钟自己醒一次，每次下行 1KB 不到，
+        实测（2026-09-22 华为Mate60）一天这样攒出 15 分钟「用了百度」。
+        """
+        base = bj_minute(DAY, 7, 0)
+        pings = [base + offset * 600 for offset in range(9)]
+        store.insert_app_minutes([with_evidence(
+            app_minutes_row(MAC_A, DAY, "百度", pings),
+            [(489, 873, 1, 1)] * len(pings))])
+        assert store.report([MAC_A], DAY)["apps"] == []
+        paid = bj_minute(DAY, 9, 30)
+        store.insert_app_minutes([with_evidence(
+            app_minutes_row(MAC_A, DAY, "微信支付", [paid]), [(15_521, 10_478, 2, 1)])])
+        assert store.report([MAC_A], DAY)["apps"][0]["minutes"] == 1, "真付一次款还是要算"
 
     def test_baidu_app_is_reported_under_its_chinese_name(self, store):
         """中继按 `_` 截断后剩下 `baiduAPP`，家长端要看到的是「百度」。"""
