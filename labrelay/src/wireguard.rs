@@ -146,7 +146,7 @@ pub struct WireGuardApplyResult {
     pub control_backend: String,
 }
 
-fn default_interface_name() -> String { "labwg0".into() }
+pub fn default_interface_name() -> String { "labwg0".into() }
 fn default_server_address() -> String { "10.77.0.1/24".into() }
 fn default_listen_port() -> u16 { 51820 }
 fn default_true() -> bool { true }
@@ -705,6 +705,7 @@ pub fn apply_server(config: &WireGuardServerDesired) -> Result<WireGuardApplyRes
     let _ = ensure_openwrt_wg_zone(config.listen_port);
     let ip = find_tool("ip").ok_or_else(|| anyhow::anyhow!("ip tool is required to create the WireGuard interface"))?;
     ensure_interface(&ip, &config.interface_name)?;
+    ensure_wg_zone_iface_bound(&config.interface_name);
     let keypair = load_or_create_keypair(&private_key_path())?;
     let interface: InterfaceName = config.interface_name.parse()
         .map_err(|_| anyhow::anyhow!("invalid WireGuard interface name"))?;
@@ -786,7 +787,7 @@ pub fn delete_server(interface_name: &str) -> Result<()> {
 /// Find a tool on PATH, preferring the plain name and falling back to a couple
 /// of conventional absolute locations used on OpenWrt.
 fn find_tool(name: &str) -> Option<String> {
-    let candidates = [name, &format!("/usr/bin/{name}"), &format!("/sbin/{name}")];
+    let candidates = [name, &format!("/usr/bin/{name}"), &format!("/sbin/{name}"), &format!("/usr/sbin/{name}")];
     for candidate in candidates.iter() {
         let probe = match name {
             "wg" => Command::new(candidate).arg("--version").output(),
@@ -993,6 +994,25 @@ pub fn ensure_openwrt_wg_zone(listen_port: u16) -> Result<()> {
         }
     }
     Ok(())
+}
+
+/// fw3 resolves a zone's `network` option through netifd, but `labwg0` is created over
+/// kernel netlink, so `zone_wg_iface` stays empty and every `--match-set zone_wg_iface`
+/// rule — including the `wg -> lan` forwarding the zone already declares — silently never
+/// matches. Traffic then falls through to the firmware's final `reject`, which the client
+/// sees as a connection refused rather than a timeout. Bind the live device into the set
+/// the firmware itself consults; `ipset add` is idempotent, so this is safe to re-run.
+pub fn ensure_wg_zone_iface_bound(interface_name: &str) {
+    let Some(ipset) = find_tool("ipset") else {
+        return;
+    };
+    let set = "zone_wg_iface".to_string();
+    // No such set means the zone is not in the running ruleset at all; creating it is
+    // ensure_openwrt_wg_zone's job, and adding an entry here would only fail.
+    if run_capture(&ipset, &["list", set.as_str()]).is_err() {
+        return;
+    }
+    let _ = run_capture(&ipset, &["add", set.as_str(), &format!("0.0.0.0/0,{interface_name}")]);
 }
 
 

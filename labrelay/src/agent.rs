@@ -1245,6 +1245,9 @@ async fn collect_dashboard_payload(
         || now.saturating_sub(state.last_wireguard_at)
             >= config.wireguard_interval_seconds.clamp(15, 600);
     if wireguard_due {
+        // A firewall reload rebuilds the zone ipsets from netifd and drops labwg0 again,
+        // so the binding has to be re-asserted on the same low-frequency cadence.
+        crate::wireguard::ensure_wg_zone_iface_bound(&crate::wireguard::default_interface_name());
         let detected = crate::wireguard::detect_wireguard();
         state.wireguard_status = serde_json::to_value(detected).ok();
         state.last_wireguard_at = now;
