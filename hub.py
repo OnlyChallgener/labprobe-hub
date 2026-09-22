@@ -2,6 +2,7 @@ import os
 import copy
 import json
 import socket
+import struct
 import subprocess
 import ipaddress
 import re
@@ -35,7 +36,7 @@ from child_guard_service import (
 )
 
 BEIJING_TZ = ZoneInfo("Asia/Shanghai")
-APP_VERSION = "0.13.27"
+APP_VERSION = "0.13.28"
 PORT = int(os.environ.get("PORT", "58443"))
 BASE_DIR = Path(os.environ.get("LABPROBE_BASE_DIR", ".")).resolve()
 CONFIG_DIR = Path(os.environ.get("CONFIG_DIR", str(BASE_DIR / "config"))).resolve()
@@ -551,17 +552,29 @@ def advertise_url() -> str:
     return env_compat("HUB_ADVERTISE_URL", default=f"http://127.0.0.1:{PORT}").rstrip("/")
 
 
+def parse_default_gateway_ipv4(route_text: str) -> str:
+    """从 /proc/net/route 的文本里取默认网关。
+
+    拆成纯函数是因为 Windows 上根本没有这个文件 —— 直接读文件的版本在非 Linux 上
+    永远走 except 分支，`struct` 忘了 import 也能把测试跑绿（这次就是这么翻车的）。
+    第二列是目的网络，00000000 即默认路由；第三列是网关的小端十六进制。
+    """
+    for line in route_text.splitlines()[1:]:
+        fields = line.split()
+        if len(fields) > 2 and fields[1] == "00000000":
+            try:
+                return socket.inet_ntoa(struct.pack("<I", int(fields[2], 16)))
+            except (ValueError, struct.error):
+                return ""
+    return ""
+
+
 def _default_gateway_ipv4() -> str:
-    # /proc/net/route 第二列是目的网络，00000000 就是默认路由；网关是第三列的小端十六进制。
     try:
         with open("/proc/net/route", "r", encoding="utf-8") as handle:
-            for line in handle.read().splitlines()[1:]:
-                fields = line.split()
-                if len(fields) > 2 and fields[1] == "00000000":
-                    return socket.inet_ntoa(struct.pack("<I", int(fields[2], 16)))
-    except (OSError, ValueError):
-        pass
-    return ""
+            return parse_default_gateway_ipv4(handle.read())
+    except OSError:
+        return ""
 
 
 def hub_lan_ipv4() -> str:

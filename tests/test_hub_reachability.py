@@ -34,6 +34,20 @@ def test_loopback_advertise_url_is_not_offered_as_a_device_address(monkeypatch):
     assert "127.0.0.1" not in report["lan"]
 
 
+def test_default_gateway_parses_real_route_table_text():
+    """纯函数版解析器：Windows 上没有 /proc/net/route，读文件那段永远走 except，
+    当初 `struct` 忘了 import 也能把测试跑绿 —— 真机才炸。这条在任何平台都执行到。"""
+    route = (
+        "Iface\tDestination\tGateway \tFlags\tRefCnt\tUse\tMetric\tMask\tMTU\tWindow\tIRTT\n"
+        "eth0\t00000000\t0105A8C0\t0003\t0\t0\t0\t00000000\t0\t0\t0\n"
+        "eth0\t0005A8C0\t00000000\t0001\t0\t0\t0\t00FFFFFF\t0\t0\t0\n"
+    )
+    assert hub.parse_default_gateway_ipv4(route) == "192.168.5.1"
+    # 没有默认路由时返回空，而不是拿第一条凑数。
+    assert hub.parse_default_gateway_ipv4(route.splitlines()[0] + "\neth0\t0005A8C0\t00000000\t0001\n") == ""
+    assert hub.parse_default_gateway_ipv4("") == ""
+
+
 def test_lan_probe_picks_the_interface_that_routes_to_the_gateway(monkeypatch):
     # 不依赖真实网卡：把默认网关指向一个必然走本机回环地址族的对端，验证它确实是用
     # getsockname 选路，而不是枚举网卡拿第一个。
