@@ -1,5 +1,6 @@
 """Tests for RDPI signature service: validation, template, and schema checks."""
 
+import copy
 import json
 from pathlib import Path
 
@@ -548,7 +549,7 @@ def test_the_requested_apps_all_arrive_in_the_bundle():
     names = {app["name"] for app in merged["apps"]}
     for wanted in ("淘宝", "阿里CDN", "饿了么", "番茄免费小说", "西瓜视频", "醒图",
                    "海尔智家", "美的美居", "TP-LINK物联", "三角洲行动",
-                   "山姆会员商店", "小爱同学", "企业微信", "百度", "菜鸟", "米家"):
+                   "山姆会员商店", "小爱同学", "企业微信", "百度", "菜鸟", "米家", "美团"):
         assert wanted in names, wanted
     # 有独立条目的阿里系不能被 阿里CDN 兜走；没有的才进兜底桶。
     cdn_hosts = set(next(a for a in merged["apps"] if a["name"] == "阿里CDN")["rules"][0]["hosts"])
@@ -560,6 +561,75 @@ def test_the_requested_apps_all_arrive_in_the_bundle():
     wecom = next(a for a in merged["apps"] if a["name"] == "企业微信")
     assert wecom["index"] == "8-1-3-0"
     assert "work.weixin.qq.com" in wecom["rules"][0]["hosts"]
+
+
+def test_meituan_arrives_as_exactly_one_new_entry():
+    """官方库里根本没有美团，补进来只能新建一条，且只收它自己独占的两个域。"""
+    assert service.CURATED_SIGNATURE_EXTENSIONS["9-231-1-0"]["name"] == "美团"
+    assert service.CURATED_SIGNATURE_EXTENSIONS["9-231-1-0"]["hosts"] == [
+        "meituan.com", "sankuai.com"]
+    merged, _extra = service.apply_curated_extensions({"apps": [
+        {"index": "7-1-2-0", "name": "微信",
+         "rules": [{"protocol": "host", "hosts": ["short.weixin.qq.com"], "payloads": []}]},
+    ]})
+    created = [a for a in merged["apps"] if a["name"] == "美团"]
+    assert len(created) == 1, "美团被建了多条，分钟会被拆开"
+    assert created[0]["index"].startswith("9-"), created[0]["index"]
+    assert created[0]["rules"][0]["payloads"] == [], "缺 payloads 会让引擎停掉后面所有域名规则"
+    assert created[0] is merged["apps"][-1], "新条目要排在最后，让官方更具体的规则先命中"
+
+
+def test_weixin_pcdn_hosts_merge_into_the_official_entry_not_a_new_one():
+    """微信 PCDN 的三个实测主机并进官方 7-1-2-0：一个名额都不占，也不另建重名应用。
+
+    裸 `tencent-cloud.net` 是腾讯云对外卖的产品域，裸绑会把租户应用全记成微信，
+    所以这里钉死只收精确主机名。
+    """
+    hosts = service.CURATED_SIGNATURE_EXTENSIONS["7-1-2-0"]["hosts"]
+    assert "tencent-cloud.net" not in hosts and "teg.tencent-cloud.net" not in hosts
+    assert all(h.endswith(".teg.tencent-cloud.net") for h in hosts), hosts
+    official = {"index": "7-1-2-0", "name": "微信", "rules": [
+        {"protocol": "host", "hosts": ["short.weixin.qq.com", "long.weixin.qq.com",
+                                       "res.servicewechat.com"], "payloads": []},
+        {"protocol": "udp", "port_limit": ["53"], "payloads": []},
+    ]}
+    merged, _extra = service.apply_curated_extensions({"apps": [copy.deepcopy(official)]})
+    weixin = [a for a in merged["apps"] if a["name"] == "微信"]
+    assert len(weixin) == 1, "又建了一条微信"
+    assert weixin[0]["index"] == "7-1-2-0"
+    assert set(hosts) <= set(weixin[0]["rules"][0]["hosts"])
+    assert "short.weixin.qq.com" in weixin[0]["rules"][0]["hosts"], "官方原有域名被覆盖"
+    assert len(weixin[0]["rules"]) == 2, "并域名不该动那条端口规则"
+
+
+def test_an_official_entry_we_only_extended_is_not_counted_as_custom():
+    """往官方微信条目里补域名，条目还是官方的；只有我们新建的才算自定义。
+
+    回归的是「自定义特征」徽章把官方 微信/百度/企业微信/拼多多/京东/WPS 全算成我们的
+    那一次：补丁编号撞上官方条目编号就算自定义，补一条微信就多标一条官方应用。
+    """
+    summary = service.summarize_rdpi_db({"apps": [
+        {"index": "7-1-2-0", "name": "微信", "rules": [{"protocol": "host", "hosts": ["a"]}
+                                                       ]},
+        {"index": "7-3-2-0", "name": "百度", "rules": []},
+        {"index": "9-231-1-0", "name": "美团", "rules": []},
+    ]})
+    assert summary["customCount"] == 1
+    assert [a["name"] for a in summary["customSignatures"]] == ["美团"]
+    assert summary["officialCount"] == 2
+
+
+def test_the_official_merge_list_matches_the_firmware_library():
+    """并进官方条目的名单必须和官方固件库逐条对得上，漏一条就多标一个官方应用。"""
+    official_db = Path(
+        r"D:\Github\LabProbeApp\test\_analysis\extract\rootfs\usr\share\ndpi\db.default.json"
+    )
+    if not official_db.exists():
+        pytest.skip("local official rootfs fixture is unavailable")
+    official = {str(a.get("index")) for a in
+                json.loads(official_db.read_text(encoding="utf-8"))["apps"]}
+    in_official = {idx for idx in service.CURATED_SIGNATURE_EXTENSIONS if idx in official}
+    assert in_official == set(service.CURATED_OFFICIAL_MERGE_INDEXES)
 
 
 def test_same_app_family_only_accepts_the_app_itself_and_its_derivatives():

@@ -249,6 +249,7 @@ def summarize_rdpi_db(db: Dict[str, Any]) -> Dict[str, Any]:
         if str(a.get("index", "")).startswith("9")
         or a.get("custom") is True
         or any(a.get("index") == idx and a.get("name") == patch["name"]
+               and idx not in CURATED_OFFICIAL_MERGE_INDEXES
                for idx, patch in CURATED_SIGNATURE_EXTENSIONS.items())
     ]
     return {
@@ -788,7 +789,48 @@ CURATED_SIGNATURE_EXTENSIONS: Dict[str, Dict[str, Any]] = {
             "micoce.com.cn",
         ],
     },
+    # 美团：官方库里连条目都没有（按名字、按 meituan/dianping/sankuai 主机、按固件
+    # 原始库和 OAF 应用树四处交叉查过，全为 0），所以它永远只会是 0-0-0-0。
+    "9-231-1-0": {
+        "name": "美团",
+        "category": "生活/外卖",
+        "hosts": [
+            "meituan.com",
+            "sankuai.com",
+        ],
+    },
+    # 微信的 P2P 加速调度域：10 分钟采样里 `apd-pcdnwx*` 被查了 31 次（login 8 /
+    # stat 18 / nat 5），是采样期最高频的无规则域名，却整条落在 0-0-0-0。这里只写
+    # 实测到的三个精确主机名，不写 `tencent-cloud.net` 裸后缀 —— 那是腾讯云对外
+    # 卖的产品域，裸绑会把租户应用全记成微信，和上面百度那条同一个道理。
+    "7-1-2-0": {
+        "name": "微信",
+        "category": "社交通讯",
+        "hosts": [
+            "apd-pcdnwxlogin.teg.tencent-cloud.net",
+            "apd-pcdnwxnat.teg.tencent-cloud.net",
+            "apd-pcdnwxstat.teg.tencent-cloud.net",
+        ],
+    },
 }
+
+
+#: 这些补丁的编号在**官方固件库里本来就存在** —— 我们只是往官方条目里补域名，条目本身
+#: 仍然是官方的，不能算进「自定义特征」的数目里。剩下那些补丁（9-2xx / 18-4-2-0）才是
+#: 我们新建的应用。这份名单由测试拿官方固件库逐条核对，多一条少一条都会红。
+CURATED_OFFICIAL_MERGE_INDEXES = frozenset({
+    "7-1-2-0",      # 微信
+    "7-1-2-12",     # 微信_other
+    "7-3-2-0",      # 百度
+    "8-1-3-0",      # 企业微信
+    "8-118-1-0",    # WPS Office
+    "10-1-2-0",     # 微信视频号
+    "10-5-1-0",     # 抖音（官方叫「抖音系列」）
+    "10-146-1-0",   # 快手（官方叫「快手系列」）
+    "18-156-1-0",   # 云闪付
+    "18-158-1-0",   # 拼多多
+    "18-159-1-0",   # 京东
+})
 
 
 #: 官方库里抢别家域名的条目 —— 只往官方条目里**补**域名修不好误识别，必须能把错的
