@@ -32,19 +32,36 @@ _RULE_FIELDS = frozenset({
 })
 _PAYLOAD_FIELDS = frozenset({"payload", "pos", "length", "stage", "note", "t_pos", "t_length"})
 
+#: App 里「下载模板」拿到的就是这一份，所以它必须是一个**照抄就能用**的形状：
+#: 三条实测出来的硬规矩都写在 comment 里，并且模板自身能通过校验。
+#:   1. host 规则必须带 ``payloads: []`` —— 缺了它，引擎在这条之后停止解析域名规则，
+#:      整库域名识别一起停摆（2026-09 实测过的那次事故就是这个形状）。
+#:   2. 域名只写裸域。引擎按裸域后缀匹配，``.example.com`` 和 ``*.example.com``
+#:      都永远不会命中（官方库 1093 个主机里一个带点的都没有）。
+#:   3. 一条规则只放一种匹配子。库里 1100 条规则没有一条是 ``protocol: tcp`` 又同时
+#:      带 hosts 和 payloads 的；要按域名走就单独一条 host 规则。
 STANDARD_RDPI_TEMPLATE: Dict[str, Any] = {
     "$schema": "labprobe-rdpi-v1",
-    "comment": "锐捷/Reyee RDPI 自定义应用特征包标准格式，适用于儿童上网与流量审计",
+    "comment": (
+        "锐捷/Reyee RDPI 自定义应用特征包标准格式，适用于儿童上网与流量审计。"
+        "三条硬规矩：① host 规则必须带 payloads:[]，缺了引擎会停掉后面所有域名规则；"
+        "② 域名只写裸域，.example.com 和 *.example.com 永远不会命中；"
+        "③ 一条规则只放一种匹配子，别把 hosts 和 payloads 写进同一条 tcp 规则。"
+        "index 用 9-开头且线上没被占用的编号；撞上一个编号不同名的已有条目会被拒绝导入。"
+        "本地格式检查与模板不保证路由器加载或识别，导入后请真机验证一次命中。"
+    ),
     "app": {
-        "index": "999-1-1-0",
-        "name": "自定义应用/新游戏",
+        "index": "9-999-1-0",
+        "name": "自定义应用示例（请替换）",
         "rules": [
             {
                 "protocol": "host",
                 "hosts": [
                     "customgame.com",
                     "login.customgame.cn"
-                ]
+                ],
+                # 这个空数组不是装饰：删掉它，整库的域名规则都会跟着失效。
+                "payloads": []
             },
             {
                 "protocol": "tcp",
@@ -57,15 +74,12 @@ STANDARD_RDPI_TEMPLATE: Dict[str, Any] = {
                 ]
             },
             {
+                # 端口规则的形状照库里唯一先例 4-1-3-2 英雄联盟PC_Gaming：
+                # port_limit 是 [{min,max}] 列表，不是 {"udp": ["2481"]} 这种字典。
                 "protocol": "udp",
-                "hosts": [],
-                "payloads": [
-                    {
-                        "pos": 0,
-                        "length": 2,
-                        "payload": "ff ff"
-                    }
-                ]
+                "port_limit": [{"min": 2480, "max": 2482}],
+                "payloads": [],
+                "payload_length": [{"stage": 0, "length": 28}]
             }
         ]
     }
@@ -127,6 +141,13 @@ def validate_signature_object(obj: Any) -> Dict[str, Any]:
         if "hosts" in r:
             if not isinstance(r["hosts"], list) or any(not isinstance(h, str) or not h.strip() for h in r["hosts"]):
                 raise ValueError("RDPI hosts must be a list of non-empty strings")
+            # 引擎按裸域后缀匹配，`.example.com` 和 `*.example.com` 都永远不会命中。
+            # 与其收下这条永不生效的规则（作者会以为已经覆盖了），不如当场拒绝。
+            inert = [h for h in r["hosts"] if "*" in h or h.strip().startswith(".") or h.strip().endswith(".")]
+            if inert:
+                raise ValueError(
+                    "RDPI hosts must be bare domains without '*' or leading/trailing dots; "
+                    f"inert form rejected: {sorted(inert)}")
             rule_entry["hosts"] = [h.strip() for h in r["hosts"]]
 
         if "payloads" in r and not isinstance(r["payloads"], list):
@@ -273,6 +294,15 @@ def merge_signature_into_db(db: Dict[str, Any], payload: Any) -> Tuple[Dict[str,
     idx = signature["index"]
     name = signature["name"]
     existing = next((a for a in apps if a.get("index") == idx or a.get("name") == name), None)
+
+    # 合并是**整条覆盖** rules 的，所以必须确认撞上的就是同一个应用：编号相同但名字
+    # 不同，等于把别家条目（可能是官方条目）连规则一起换掉；名字相同但编号不同，会把
+    # 条目挪到别的编号上，还可能撞上第三条。两种都拒绝，让作者改对再导入。
+    if existing is not None and (existing.get("index") != idx or existing.get("name") != name):
+        raise ValueError(
+            f"导入被拒绝：库里已有 {existing.get('index')} {existing.get('name')}，"
+            f"与要写入的 {idx} {name} 编号/名字不一致。改名字就单独建一条新编号，"
+            f"要更新已有条目就让两者与库里完全对齐。")
 
     db_signature = {key: copy.deepcopy(value) for key, value in signature.items() if key != "custom"}
     if existing is not None:
@@ -434,6 +464,10 @@ CURATED_SIGNATURE_EXTENSIONS: Dict[str, Dict[str, Any]] = {
             "api.io.mi.com",
             "iot.mi.com",
             "access.b.iot.mi.com",
+            # 米家特征文档里的第四个：device.io.mi.com 解析到 124.251.58.94，和已在库的
+            # iot.mi.com（124.251.58.134）同段，同一运营方。文档建议的裸 io.mi.com 仍然
+            # 不写 —— 那会把小爱音箱和小米系统服务全吸进米家。
+            "device.io.mi.com",
             "mijia.ai",
         ],
     },

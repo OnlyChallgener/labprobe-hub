@@ -13,16 +13,27 @@ import rdpi_signature_service as service
 
 
 def test_standard_template_validates_successfully():
+    """App 里「下载模板」拿到的就是这份，所以它自己必须是能直接导入的正确形状。"""
     result = validate_signature_object(STANDARD_RDPI_TEMPLATE)
-    assert result["index"] == "999-1-1-0"
-    assert result["name"] == "自定义应用/新游戏"
+    assert result["index"] == "9-999-1-0"
+    assert result["name"] == "自定义应用示例（请替换）"
     assert result["custom"] is True
     assert len(result["rules"]) == 3
     assert result["rules"][0]["protocol"] == "host"
     # 模板里只给裸域名：`*.x.com` 在引擎侧永远不会命中，作为示例会把人带偏。
     assert "customgame.com" in result["rules"][0]["hosts"]
+    # 最关键的一条：host 规则必须自带 payloads 键。模板少这个键，照抄的人就会把整库
+    # 域名识别写停 —— 2026-09 那次事故就是这个形状。
+    assert result["rules"][0]["payloads"] == [], "模板里的 host 规则没带 payloads，照抄会停摆"
     assert result["rules"][1]["protocol"] == "tcp"
+    assert "hosts" not in result["rules"][1], "模板不该示范 hosts+payloads 混在一条"
     assert result["rules"][1]["payloads"][0]["payload"] == "47 41 4d 45"
+    assert result["rules"][2]["port_limit"] == [{"min": 2480, "max": 2482}], \
+        "port_limit 必须是 [{min,max}]，不是 {'udp': ['2481']} 那种字典"
+    # 模板的 comment 要真的把三条规矩写进去，不然下载的人还是照猜。
+    comment = STANDARD_RDPI_TEMPLATE["comment"]
+    for hint in ("payloads", "裸域", "编号"):
+        assert hint in comment, hint
 
 
 def test_validation_rejects_invalid_index():
@@ -163,8 +174,10 @@ def test_supplied_official_883_rules_round_trip_except_14_empty_placeholders():
         except ValueError:
             rejected.append(signature)
     assert len(rules) == 883
-    assert len(accepted) == 869
-    assert len(rejected) == 14
+    # 868 收 / 15 拒。多拒的那一条是厂商自己库里的 `.worldofwarships.` —— 前导点是
+    # 永不命中的写法，校验现在当场拒绝，比让它静默失效好。
+    assert len(accepted) == 868
+    assert len(rejected) == 15
 
 
 def _signature(index="999-1-1-0", name="自定义", host="b.com"):
@@ -193,6 +206,43 @@ def test_merge_updates_in_place_and_keeps_fields_the_payload_omits():
 def test_merge_rejects_an_invalid_signature_before_any_write():
     with pytest.raises(ValueError, match="Invalid RDPI index format"):
         service.merge_signature_into_db({"apps": []}, _signature(index="nope"))
+
+
+def test_validation_rejects_an_inert_host_form_instead_of_storing_it():
+    """`.example.com` / `*.example.com` 永远不会命中，收下只会让作者以为已经覆盖了。
+
+    触发场景是真实的：外部生成的特征包（UU远程那份文档）就是按 `.uuyc.163.com`
+    写的，照单全收等于往库里塞死规则。
+    """
+    for bad in (".uuyc.163.com", "*.uuyc.163.com", "uuyc.163.com."):
+        with pytest.raises(ValueError, match="bare domains"):
+            validate_signature_object({"index": "9-999-1-0", "name": "示例",
+                                       "rules": [{"protocol": "host", "hosts": [bad]}]})
+    # 裸域照常收。
+    ok = validate_signature_object({"index": "9-999-1-0", "name": "示例",
+                                    "rules": [{"protocol": "host", "hosts": ["uuyc.163.com"]}]})
+    assert ok["rules"][0]["hosts"] == ["uuyc.163.com"]
+
+
+def test_merge_refuses_to_clobber_another_apps_entry():
+    """合并是整条覆盖 rules 的：编号撞上别的应用时必须拒绝，不能把人家换掉。
+
+    模板让人自己填 index，填成官方编号（比如 10-5-1-0 抖音系列）就会连规则一起覆盖，
+    而且界面上一句错误都不给。
+    """
+    official = {"index": "10-5-1-0", "name": "抖音系列",
+                "rules": [{"protocol": "host", "hosts": ["iesdouyin.com"], "payloads": []}]}
+    with pytest.raises(ValueError, match="导入被拒绝"):
+        service.merge_signature_into_db(
+            {"apps": [dict(official)]},
+            _signature(index="10-5-1-0", name="我的应用"))
+    assert official["rules"][0]["hosts"] == ["iesdouyin.com"], "官方条目的规则被动了"
+
+    # 同名不同编号也一样拒绝：那会把条目挪走，还可能撞上第三条。
+    with pytest.raises(ValueError, match="导入被拒绝"):
+        service.merge_signature_into_db(
+            {"apps": [_signature(index="9-999-1-0", name="自定义")]},
+            _signature(index="9-999-1-9", name="自定义"))
 
 
 def test_remove_drops_by_index_or_name_and_reports_a_miss():
@@ -228,6 +278,7 @@ def test_new_entries_only_use_hosts_the_engine_can_actually_match():
     assert all(not h.startswith((".", "*")) and "*" not in h for h in mijia), mijia
     assert "mi.com" not in mijia, "裸 mi.com 会把小米商城/运动/视频全吸进米家"
     assert "api.io.mi.com" in mijia and "io.mi.com" not in mijia, "顶点不解析，收子域就够"
+    assert "device.io.mi.com" in mijia, "米家设备通道（与 iot.mi.com 同段）漏收"
     # 裸 360.cn 会把奇虎全线（浏览器/安全卫士/云盘）卷进儿童手表，明确不收。
     assert "360.cn" not in service.CURATED_SIGNATURE_EXTENSIONS["9-221-1-0"]["hosts"]
     assert "360.cn" not in service.CURATED_SIGNATURE_EXTENSIONS["9-222-1-0"]["hosts"]
