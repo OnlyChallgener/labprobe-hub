@@ -35,7 +35,7 @@ from child_guard_service import (
 )
 
 BEIJING_TZ = ZoneInfo("Asia/Shanghai")
-APP_VERSION = "0.13.26"
+APP_VERSION = "0.13.27"
 PORT = int(os.environ.get("PORT", "58443"))
 BASE_DIR = Path(os.environ.get("LABPROBE_BASE_DIR", ".")).resolve()
 CONFIG_DIR = Path(os.environ.get("CONFIG_DIR", str(BASE_DIR / "config"))).resolve()
@@ -549,6 +549,62 @@ def host_mac() -> str:
 
 def advertise_url() -> str:
     return env_compat("HUB_ADVERTISE_URL", default=f"http://127.0.0.1:{PORT}").rstrip("/")
+
+
+def _default_gateway_ipv4() -> str:
+    # /proc/net/route 第二列是目的网络，00000000 就是默认路由；网关是第三列的小端十六进制。
+    try:
+        with open("/proc/net/route", "r", encoding="utf-8") as handle:
+            for line in handle.read().splitlines()[1:]:
+                fields = line.split()
+                if len(fields) > 2 and fields[1] == "00000000":
+                    return socket.inet_ntoa(struct.pack("<I", int(fields[2], 16)))
+    except (OSError, ValueError):
+        pass
+    return ""
+
+
+def hub_lan_ipv4() -> str:
+    """Hub 自己所在的局域网 IPv4。
+
+    容器跑在 host 网络里，所以朝默认路由开一个**不发包**的 UDP socket，内核选中的出口
+    地址就是宿主机内网地址（实测 192.168.5.46）。不用配置、不用猜网段，也不用枚举网卡
+    —— 多网卡/多 VLAN 时内核给的就是"能出默认路由的那一个"，正是设备该连的那个。
+    """
+    for peer in (_default_gateway_ipv4(), "8.8.8.8"):
+        if not peer:
+            continue
+        try:
+            probe = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
+            try:
+                probe.settimeout(0.2)
+                probe.connect((peer, 53))
+                local = str(probe.getsockname()[0])
+            finally:
+                probe.close()
+        except OSError:
+            continue
+        if local and not local.startswith("127."):
+            return local
+    return ""
+
+
+def hub_reachability() -> Dict[str, Any]:
+    """告诉 App「家里该用哪个地址连 Hub」。
+
+    只报局域网直连地址：公网那条要等 Hub 有证书才有意义（App 侧
+    ``HubTransportSecurity`` 明确拒绝公网 http），所以现在故意不报，也不猜。
+    """
+    advertised = advertise_url()
+    lan_ip = hub_lan_ipv4()
+    lan = ""
+    source = ""
+    if advertised and "://127." not in advertised and "://localhost" not in advertised:
+        lan, source = advertised, "advertise"
+    elif lan_ip:
+        lan, source = f"http://{lan_ip}:{PORT}", "detected"
+    return {"ok": True, "lan": lan, "lanSource": source, "lanIp": lan_ip,
+            "port": PORT, "detectedAt": int(time.time())}
 
 
 _QUERY_TOKEN_WARNED: set = set()
@@ -4369,6 +4425,17 @@ def api_sync_changes():
                 canonical_status = status_document()
             change["payload"] = canonical_status
     return jsonify({"ok": True, **result, "time": now_str()})
+
+
+@app.route("/api/hub/reachability", methods=["GET"])
+def api_hub_reachability():
+    """App 每次连上 Hub 后拉一次：家里该用哪个地址连回来。值变了才落盘。"""
+    if not check_app_token():
+        return jsonify({"ok": False, "error": "unauthorized"}), 401
+    try:
+        return jsonify(hub_reachability())
+    except Exception as error:
+        return jsonify({"ok": False, "error": str(error)}), 500
 
 
 @app.route("/health", methods=["GET"])
