@@ -549,7 +549,8 @@ def test_the_requested_apps_all_arrive_in_the_bundle():
     names = {app["name"] for app in merged["apps"]}
     for wanted in ("淘宝", "阿里CDN", "饿了么", "番茄免费小说", "西瓜视频", "醒图",
                    "海尔智家", "美的美居", "TP-LINK物联", "三角洲行动",
-                   "山姆会员商店", "小爱同学", "企业微信", "百度", "菜鸟", "米家", "美团"):
+                   "山姆会员商店", "小爱同学", "企业微信", "百度", "菜鸟", "米家", "美团",
+                   "绿联云", "飞牛私有云"):
         assert wanted in names, wanted
     # 有独立条目的阿里系不能被 阿里CDN 兜走；没有的才进兜底桶。
     cdn_hosts = set(next(a for a in merged["apps"] if a["name"] == "阿里CDN")["rules"][0]["hosts"])
@@ -576,7 +577,12 @@ def test_meituan_arrives_as_exactly_one_new_entry():
     assert len(created) == 1, "美团被建了多条，分钟会被拆开"
     assert created[0]["index"].startswith("9-"), created[0]["index"]
     assert created[0]["rules"][0]["payloads"] == [], "缺 payloads 会让引擎停掉后面所有域名规则"
-    assert created[0] is merged["apps"][-1], "新条目要排在最后，让官方更具体的规则先命中"
+    # 新建的条目一律排在官方条目后面，让官方更具体的规则先命中；不要求它是最后一条，
+    # 后面还会再加新应用。
+    names = [a["name"] for a in merged["apps"]]
+    assert names[0] == "微信", "官方条目被挪到新建条目后面了"
+    for new_app in ("美团", "绿联云", "飞牛私有云"):
+        assert names.index(new_app) > 0, f"{new_app} 没有排在官方条目之后"
 
 
 def test_weixin_pcdn_hosts_merge_into_the_official_entry_not_a_new_one():
@@ -600,6 +606,27 @@ def test_weixin_pcdn_hosts_merge_into_the_official_entry_not_a_new_one():
     assert set(hosts) <= set(weixin[0]["rules"][0]["hosts"])
     assert "short.weixin.qq.com" in weixin[0]["rules"][0]["hosts"], "官方原有域名被覆盖"
     assert len(weixin[0]["rules"]) == 2, "并域名不该动那条端口规则"
+
+
+def test_pcap_derived_rules_stay_on_their_own_domains():
+    """12 份按应用命名的 pcap 筛出来的规则，一个共享域都不许捎带。
+
+    钉住四条实测结论，免得以后有人「顺手补全」把误判放回来：
+    - 裸 360.cn 会把奇虎全线卷进儿童设备；裸 baidu.com 会让 百度 抢走贴吧/网盘。
+    - lulian.cn 实测标题是「UGREEN绿联-品质新体验,数码选绿联」，那是消费电子官网，
+      不是 NAS 业务（文档写的是 lilian.cn，实测那是「里链云」，两个都不能收）。
+    - 红果的 sealaly.net 只有 2 次证据、厂商自己的特征清单里也没有它，明确不补。
+    """
+    cur = service.CURATED_SIGNATURE_EXTENSIONS
+    assert "360.cn" not in cur["9-222-1-0"]["hosts"]
+    assert "live.360.cn" in cur["9-222-1-0"]["hosts"]
+    assert "baidu.com" not in cur["7-3-2-0"]["hosts"]
+    assert "hpd.baidu.com" in cur["7-3-2-0"]["hosts"]
+    shared = {"lulian.cn", "ugreen.com", "lilian.cn", "sealaly.net"}
+    assert not shared & set(cur["9-232-1-0"]["hosts"]), "绿联云把官网/无关域收了进来"
+    assert cur["9-233-1-0"]["hosts"] == ["5ddd.com", "fnos.net", "fnnas.com"]
+    all_hosts = {h for patch in cur.values() for h in patch["hosts"]}
+    assert "sealaly.net" not in all_hosts
 
 
 def test_an_official_entry_we_only_extended_is_not_counted_as_custom():

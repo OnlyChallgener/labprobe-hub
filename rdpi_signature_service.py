@@ -523,6 +523,11 @@ CURATED_SIGNATURE_EXTENSIONS: Dict[str, Dict[str, Any]] = {
         "hosts": [
             "home.360.cn",
             "life.360.cn",
+            # 摄像头实时流走 live.360.cn（speed./g-iot./qos. 三个子域在 3-23 的
+            # 「360智慧生活」采集里占 23 次握手，是那份包 96% 的缺规则证据）。
+            # 裸 360.cn 仍然不收：那会把奇虎全线卷进儿童设备。
+            "live.360.cn",
+            "p.s.360.cn",
         ],
     },
     # 亲宝宝：2020 年品牌启用了新域名 qinbaobao.com，老域名 qbaobei.com 仍在服务
@@ -661,6 +666,15 @@ CURATED_SIGNATURE_EXTENSIONS: Dict[str, Dict[str, Any]] = {
         "hosts": [
             "www.baidu.com",
             "news.baidu.com",
+            # 2025-10-27「百度搜索WEB」采集里实测到、库里却没有的百度自有服务：
+            # hpd 是 HTTPDNS（8 次握手 11KB，占那份包缺规则证据 62%），passport 是
+            # 账号，sp1/hector 是搜索与内容接口。只补精确主机名，不写裸 baidu.com ——
+            # 库里 baidu.com 下已有 27 个主机分属 百度/百度贴吧/百度网盘/baiduAPP，
+            # 裸域放进族主条目会让它抢在派生条目之前命中（9-21 实测）。
+            "hpd.baidu.com",
+            "passport.baidu.com",
+            "sp1.baidu.com",
+            "hector.baidu.com",
         ],
     },
     "9-207-1-0": {
@@ -810,6 +824,38 @@ CURATED_SIGNATURE_EXTENSIONS: Dict[str, Dict[str, Any]] = {
             "apd-pcdnwxlogin.teg.tencent-cloud.net",
             "apd-pcdnwxnat.teg.tencent-cloud.net",
             "apd-pcdnwxstat.teg.tencent-cloud.net",
+        ],
+    },
+    # 绿联云（UGREEN NAS 私有云 App）：官方库里根本没有。域名来自 2025-10-30
+    # 「绿联云.pcap」实测 + 厂商特征文档，两个都当场验过归属：
+    #   ug.link   —— choubao.cn17.ug.link 110 次握手 37KB，占那份包缺规则证据 95%；
+    #               choubao 正是这台 NAS 的主机名，归属没有疑问。
+    #   ugnas.com —— 官网标题「绿联NAS私有云官网…绿联云」，且 www.ug.link 与
+    #               api.ugnas.com 解析到同一个 119.23.87.190，同一运营方。
+    # 特意不收 lulian.cn / ugreen.com：实测标题是「UGREEN绿联-品质新体验,数码选绿联」，
+    # 那是消费电子官网，绑进来会把「看鼠标键盘」记成在用 NAS App。
+    "9-232-1-0": {
+        "name": "绿联云",
+        "category": "工具",
+        "hosts": [
+            "ug.link",
+            "ugnas.com",
+        ],
+    },
+    # 飞牛 fnOS（私有云 App）：官方库里也没有。
+    #   5ddd.com —— FN Connect 中继域，victor1664.5ddd.com 在 2025-11-12 的采集里
+    #               322 次握手 92KB，占那份包缺规则证据 94%，是全部 12 份里最强的一条。
+    #   fnos.net —— 统一网关域，官网标题「FN Connect 远程访问 - 飞牛 fnOS」，且与
+    #               5ddd.com 同 IP（47.101.149.170）。
+    #   fnnas.com —— 文档没提，但实测到 5 个子域共 13 次握手（event/static/static2/cnf/
+    #               help-static），是它自己的另一组服务域。
+    "9-233-1-0": {
+        "name": "飞牛私有云",
+        "category": "工具",
+        "hosts": [
+            "5ddd.com",
+            "fnos.net",
+            "fnnas.com",
         ],
     },
 }
