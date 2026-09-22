@@ -52,7 +52,7 @@ from router_core.service.router_service import RouterService
 from router_core.service.blueprint import create_router_blueprint_v1
 
 PREVIOUS_HUB_VERSION = "0.13.1"
-HUB_VERSION = "0.13.22"
+HUB_VERSION = "0.13.23"
 hub.APP_VERSION = HUB_VERSION
 install_ipv6_neighbor_archive_patch(hub)
 

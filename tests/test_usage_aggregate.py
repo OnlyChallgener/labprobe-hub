@@ -636,6 +636,41 @@ class TestMinuteReport:
             [(40_000, 3_200_000, 6, 2)] * len(minutes))])
         assert store.report([MAC_A], DAY)["apps"][0]["minutes"] == len(minutes)
 
+    def test_a_single_minute_of_real_content_counts_even_when_isolated(self, store):
+        """白天单分钟下来 2.79MB 就是真在用，落单也算一段。
+
+        实测（2026-09-22 华为Mate60）12:38-12:40 连续三分钟 + 12:46 孤立一分钟
+        2.79MB —— 旧口径只报 3 分钟，把 12:46 那次真的刷小红书抹掉了。
+        """
+        base = bj_minute(DAY, 12, 38)
+        minutes = [base, base + 60, base + 120, base + 480]
+        store.insert_app_minutes([with_evidence(
+            app_minutes_row(MAC_A, DAY, "小红书", minutes),
+            [(151_508, 3_714_028, 3, 3), (188_642, 2_478_886, 10, 0),
+             (75_254, 396_152, 7, 0), (163_104, 2_785_610, 3, 3)])])
+        app = store.report([MAC_A], DAY)["apps"][0]
+        assert app["minutes"] == 4, "落单的那一分钟内容比前三分钟都大，不能丢"
+        assert [run["minutes"] for run in app["sessionRanges"]] == [3, 1]
+
+    def test_isolated_small_minutes_still_need_a_run(self, store):
+        """反向守：单分钟几十 KB 的碎片仍然要凑够连续段，别把 P1 变成新的漏口。"""
+        base = bj_minute(DAY, 12, 38)
+        minutes = [base, base + 480, base + 960]
+        store.insert_app_minutes([with_evidence(
+            app_minutes_row(MAC_A, DAY, "小红书", minutes),
+            [(151_508, 470_000, 3, 3)] * 3)])
+        assert store.report([MAC_A], DAY)["apps"] == []
+
+    def test_the_heavy_minute_exemption_does_not_reopen_the_night(self, store):
+        """夜里 2.9MB 的孤立分钟是预拉流（03:54-04:34 微信视频号那段就是这么来的），
+        白天的放宽不能漏到夜间。"""
+        base = bj_minute(DAY, 3, 54)
+        minutes = [base, base + 600, base + 1500]
+        store.insert_app_minutes([with_evidence(
+            app_minutes_row(MAC_A, DAY, "微信视频号", minutes),
+            [(86_384, 2_871_950, 5, 4), (90_559, 622_495, 4, 4), (130_837, 2_279_954, 5, 5)])])
+        assert store.report([MAC_A], DAY)["apps"] == []
+
     def test_instant_apps_are_exempt_from_the_window_floor(self, store):
         """扫码支付一下就锁屏：一个窗口也要算，这是用户定的「即时应用放宽」。"""
         minute = bj_minute(DAY, 22, 5)

@@ -1600,6 +1600,13 @@ APP_MINUTE_MIN_WINDOWS = int(os.environ.get("USAGE_APP_MINUTE_MIN_WINDOWS", "2")
 APP_MINUTE_CONTENT_DOWN_BYTES = int(os.environ.get(
     "USAGE_APP_MINUTE_CONTENT_DOWN_BYTES", str(100 * 1024)))
 APP_MINUTE_UPLINK_DOMINANCE = int(os.environ.get("USAGE_APP_MINUTE_UPLINK_DOMINANCE", "2"))
+#: 一分钟内下行到这么多，就是内容真的下来了，不可能是心跳：实测（2026-09-22
+#: 华为Mate60）12:46 那一分钟小红书下来 2.79MB，前后都没有归属，被「白天连续 3 分钟」
+#: 整段抹掉，界面就成了「只用了 3 分钟」。这种分钟单独成段，不再要求连续。
+#: 只放宽白天 —— 夜里 03:54-04:34 那段「微信视频号」预拉流也是 2.2-2.9MB/分钟，
+#: 但那是手机在口袋里预加载，夜间照旧要成段。
+APP_MINUTE_HEAVY_DOWN_BYTES = int(os.environ.get(
+    "USAGE_APP_MINUTE_HEAVY_DOWN_BYTES", str(1000 * 1000)))
 #: 夜间段落的最低密度（只卡夜间，理由和 ``NIGHT_MIN_RUN_MINUTES`` 一样：睡着的手机
 #: 才会稀，人在用就密）。实测同一天 Mate60 在 03:49-04:58 那段「小红书 20 分钟」密度
 #: 只有 29%（每 ~6 分钟冒一次头），而真实使用的微信 135 分钟密度 58%（洞都是 1-2 个
@@ -1654,7 +1661,8 @@ def _qualifying_usage(
 
     分钟这一级还挡掉「上行占优、下行没内容」的那一分钟（应用在拿本机做 P2P 加速 /
     后台同步）；夜间段这一级还挡掉 Doze 批量唤醒被合并容差粘成的稀段，白天不卡密度
-    —— 偶尔回一句的聊天本来就是稀的。
+    —— 偶尔回一句的聊天本来就是稀的。反过来，白天单分钟下行够大的（真下来了内容）
+    落单也算一段，不被「连续 3 分钟」抹掉。
 
     被过滤掉的分钟彻底丢弃，不另立「后台活动」池。
     """
@@ -1684,8 +1692,17 @@ def _qualifying_usage(
         night_runs = _kept_runs(candidates, gap_minutes=NIGHT_MERGE_GAP_MINUTES,
                                 min_run_minutes=_min_run_minutes(app, night=True),
                                 min_density=APP_RUN_MIN_DENSITY)
-        day_runs = _kept_runs(unique - night, gap_minutes=DAY_MERGE_GAP_MINUTES,
+        day = unique - night
+        day_runs = _kept_runs(day, gap_minutes=DAY_MERGE_GAP_MINUTES,
                               min_run_minutes=_min_run_minutes(app, night=False))
+        # 单分钟下行够大的，落单也算一段（见 APP_MINUTE_HEAVY_DOWN_BYTES）。连续的
+        # 落单分钟合成一段，免得「共 4 次」里出现四行 1 分钟。
+        if not instant:
+            covered = {m for run in day_runs for m in run}
+            heavy = {m for m in day
+                     if (evidence.get(m) or (0, 0, 0, 0))[1] >= APP_MINUTE_HEAVY_DOWN_BYTES}
+            day_runs.extend(_minute_runs(sorted(heavy - covered), DAY_MERGE_GAP_MINUTES))
+            day_runs.sort(key=lambda run: run[0])
         if not instant:
             night_runs = [run for run in night_runs if _run_has_uplink(run, evidence)]
         counted.update(m for run in night_runs for m in run)
