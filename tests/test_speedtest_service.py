@@ -249,6 +249,19 @@ def test_start_route_reports_router_rejection_as_409():
     assert response.get_json()["error"] == "router_rejected"
 
 
+def test_a_second_start_while_testing_is_not_reported_as_a_failure():
+    """重复点「开始测速」时固件会拒第二次（error_code != 0）。路由器本来就在测，
+    界面不该弹「未能启动测速」—— 实测 2026-09-22 09:14:15 同一秒 202 + 409。"""
+    client, driver = build_client({"get_proc_stat": {"get_proc_stat": "1"},
+                                   "start_test": {"error_code": "1"}})
+    response = client.post("/api/router/speedtest/start", json={"intf": ["wan"]})
+    assert response.status_code == 202
+    body = response.get_json()
+    assert body["ok"] is True and body["data"]["alreadyRunning"] is True
+    assert [call["data"] for call in driver.calls] == [{"type": "get_proc_stat"}], \
+        "路由器已经在测，就不该再发 start_test"
+
+
 def test_start_route_rejects_bad_intf_without_touching_router():
     client, driver = build_client({})
     response = client.post("/api/router/speedtest/start", json={"intf": ["eth0"]})

@@ -415,6 +415,20 @@ def install_speedtest_service(hub: Any, logger: Optional[Callable[..., Any]] = N
             nodes = {name: [DEFAULT_NODE] for name in interfaces}
         data: Dict[str, Any] = {"type": "start_test", "intf": interfaces, "set_nodes": nodes}
         driver = _resolve_driver(hub)
+        # 已经在测速时再发一次 start_test，固件回的是 error_code != 0 —— 那不是故障，
+        # 是重复点击（界面一次按下会连着发两个 POST，实测 09:14:15 同一秒 202 + 409）。
+        # 先把路由器自己的进程状态问一遍，正在跑就直接报「已在进行中」，别让它变成一条
+        # 红色「未能启动测速」。
+        if normalize_state(_call(driver, {"type": "get_proc_stat"}, READ_TIMEOUT))["running"]:
+            return jsonify({
+                "ok": True,
+                "data": {
+                    "intf": interfaces,
+                    "nodes": nodes,
+                    "alreadyRunning": True,
+                    "startedAt": int(time.time()),
+                },
+            }), 202
         payload = _call(driver, data, START_TIMEOUT)
         error_code = _text(payload.get("error_code"), 8) or "0"
         if error_code not in {"0", "-0"}:
