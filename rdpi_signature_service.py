@@ -562,6 +562,19 @@ CURATED_SIGNATURE_EXTENSIONS: Dict[str, Dict[str, Any]] = {
             # 裸 360.cn 仍然不收：那会把奇虎全线卷进儿童设备。
             "live.360.cn",
             "p.s.360.cn",
+            # 2026-09-23 两轮实测（用户 39s 包 + 睿易 br-lan 上 175s 定向抓包，客户端
+            # 192.168.0.77）：设备云 API 与云存储回看全在 iot.360.cn 这一层 —— 
+            # ad.iot 24 / ac-api.iot 10 / fastconn-api.iot 3 / cn-iot-deviceapi.iot 2，
+            # 外加 {bj2,sh2,gz2}-hs-7days.<region>.xstore.qihu.com.iot.360.cn 11 次
+            # （后缀匹配，一个裸域吃掉全部 7 个 FQDN、60 次握手）。jia.360.cn 是
+            # 「360智能摄像机」自己的域：q5.jia 15 / ota5.jia 3。
+            "iot.360.cn",
+            "jia.360.cn",
+            # 故意不收：passport.360.cn（奇虎统一登录）、dp.push.dc.360.cn（全线推送，
+            # 儿童卫士也用）、*.ssl.qhimg.com 与 so.com（全公司 CDN/搜索）、
+            # *.zztfly.com（实测是 MobTech 一键登录/短信 SDK，policy.zztfly.com 挂着
+            # 「秒验SDK」「SMSSDK」隐私政策）、sg.tgalileo.com（RDAP 只查到注册商
+            # MarkMonitor，持有人未证实）。收这些就是当年 alicdn.com 那个错。
         ],
     },
     # 亲宝宝：2020 年品牌启用了新域名 qinbaobao.com，老域名 qbaobei.com 仍在服务
