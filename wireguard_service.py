@@ -435,6 +435,11 @@ class WireGuardService:
 
         peers = []
         peer_ids, peer_keys = set(), set()
+        old_peers = {
+            _text(row.get("id")): dict(row)
+            for row in (old.get("peers") or [])
+            if isinstance(row, dict)
+        }
         for raw in payload.get("peers", old.get("peers", [])) or []:
             if not isinstance(raw, dict):
                 raise ValueError("Peer 配置无效")
@@ -457,12 +462,20 @@ class WireGuardService:
                 raise ValueError("Peer Keepalive 必须在 0–600 秒")
             peer_ids.add(peer_id)
             peer_keys.add(key)
+            # A peer keeps the creation stamp it already had; a brand-new one gets
+            # "now". A legacy row with no stamp stays empty rather than claiming a
+            # creation time it never recorded — peers() backfills those from the
+            # command log, which is the only real record that predates this field.
+            created = _text(raw.get("createdAt")) or _text((old_peers.get(peer_id) or {}).get("createdAt"))
+            if not created and peer_id not in old_peers:
+                created = _now_text()
             peers.append({
                 "id": peer_id,
                 "name": _text(raw.get("name"))[:64] or peer_id,
                 "publicKey": key,
                 "allowedIps": allowed,
                 "persistentKeepaliveSeconds": keepalive,
+                "createdAt": created,
             })
         if len(peers) > 64:
             raise ValueError("MVP 最多支持 64 个 Peer")
@@ -684,21 +697,58 @@ class WireGuardService:
             for row in (server.get("endpointProfiles") or [])
             if isinstance(row, dict)
         }
+        history: Optional[Dict[str, str]] = None
         out = []
         for row in server.get("peers") or []:
             if not isinstance(row, dict):
                 continue
+            peer_id = _text(row.get("id"))
+            created = _text(row.get("createdAt"))
+            if not created:
+                # Read the command log at most once per call: it is a file read,
+                # and several peers usually need the same lookup.
+                if history is None:
+                    history = self._peer_first_seen()
+                created = history.get(peer_id, "")
             out.append(
                 {
-                    "id": _text(row.get("id")),
+                    "id": peer_id,
                     "name": _text(row.get("name")),
                     "publicKey": _text(row.get("publicKey")),
                     "allowedIps": [str(value) for value in (row.get("allowedIps") or [])],
                     "keepaliveSeconds": _int(row.get("persistentKeepaliveSeconds"), 25),
-                    "referenced": _text(row.get("id")) in referenced,
+                    "referenced": peer_id in referenced,
+                    "createdAt": created,
                 }
             )
         return out
+
+    def _peer_first_seen(self) -> Dict[str, str]:
+        """When each peer id first rode an ``apply`` command.
+
+        This is the only creation record that predates the per-peer ``createdAt``
+        field, so peers created before it existed can still show a real date
+        instead of the moment the field was added.
+        """
+        first: Dict[str, str] = {}
+        for row in self.commands():
+            if _text(row.get("action")) != "apply":
+                continue
+            stamp = _text(row.get("createdAt"))
+            payload = row.get("payload")
+            if not stamp or not isinstance(payload, dict):
+                continue
+            # ``queue()`` stores the whole request payload, and ``put()`` nests the
+            # server document under "server".
+            desired = payload.get("server")
+            if not isinstance(desired, dict):
+                desired = payload
+            for peer in desired.get("peers") or []:
+                if isinstance(peer, dict):
+                    peer_id = _text(peer.get("id"))
+                    if peer_id and peer_id not in first:
+                        first[peer_id] = stamp
+        return first
 
     def remove_peer(self, peer_id: str, expected_revision: Optional[int]) -> Dict[str, Any]:
         """Drop one router peer through the normal apply path (Agent re-applies the set)."""

@@ -744,3 +744,36 @@ def test_peers_flag_orphans_and_removal_rides_the_apply_path(tmp_path):
         service.remove_peer("orphan", service.document()["revision"])
     with pytest.raises(RuntimeError, match="revision conflict"):
         service.remove_peer("stun-fallback", 0)
+
+
+def test_peer_creation_time_survives_edits_and_backfills_from_history(tmp_path):
+    service = WireGuardService(_hub(tmp_path))
+    payload = _server()
+    payload["peers"] = [{
+        "id": "stun-fallback",
+        "name": "Phone",
+        "publicKey": PUBLIC_KEY,
+        "allowedIps": ["10.77.0.2/32"],
+    }]
+    service.put(payload, 0)
+
+    created = {row["id"]: row["createdAt"] for row in service.peers()}
+    assert created["stun-fallback"]
+
+    # Re-applying the same peer with a change must not reset when it was created.
+    document = service.document()
+    document["server"]["peers"][0]["allowedIps"] = ["10.77.0.9/32"]
+    service.put(document["server"], document["revision"])
+    assert {row["id"]: row["createdAt"] for row in service.peers()} == created
+
+    # A row written before the field existed reports the first apply that carried
+    # it, and never the moment the field was added.
+    document = service.document()
+    document["server"]["peers"][0].pop("createdAt")
+    service.hub.save_json(service.document_path, document)
+    assert {row["id"]: row["createdAt"] for row in service.peers()} == created
+
+    # No creation record at all stays empty rather than inventing one.
+    service.hub.save_json(service.commands_path, {"commands": []})
+    assert service.peers()[0]["createdAt"] == ""
+
