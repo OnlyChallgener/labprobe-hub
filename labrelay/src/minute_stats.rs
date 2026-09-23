@@ -1076,9 +1076,13 @@ pub fn parse_child_macs(text: &str) -> BTreeSet<String> {
 /// 范围从"被守护设备"放大到"全屋设备"—— 实测 Hub 的分钟表里就躺着 NAS 和电热水器。
 /// 没有守护设备就没有该记的对象，记空比记全网对。
 pub fn read_child_macs() -> BTreeSet<String> {
-    let current = read_text(SNIFFER_INFO)
+    let mut current = read_text(SNIFFER_INFO)
         .map(|text| parse_child_macs(&text))
         .unwrap_or_default();
+    // 守护配置里的 MAC 也算在册：总开关关掉只该停限制，不该停上网报告。固件名单会在
+    // reload 时清空，而中继一重启就把下面那份内存里的"上次结果"抹掉 —— 0.2.68 换机
+    // 后分钟桶冻结几小时就是这么来的。UCI 配置是重启后还在的权威成员表。
+    current.extend(crate::child_guard::configured_child_macs());
     let lock = LAST_CHILD_MACS.get_or_init(|| Mutex::new(BTreeSet::new()));
     let mut last = lock.lock().unwrap_or_else(|poisoned| poisoned.into_inner());
     if !current.is_empty() {

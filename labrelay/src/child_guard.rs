@@ -2068,6 +2068,29 @@ fn list_lan_devices() -> Result<Value> {
     Ok(json!({"ok": true, "devices": devices}))
 }
 
+/// MACs named by the guard configuration, whether or not enforcement is on right now.
+///
+/// Usage attribution reads this instead of the firmware's live list: switching the master
+/// guard switch off must stop restrictions, not silently stop the 上网报告. The firmware
+/// list empties on a reload, and a relay restart wipes the in-memory "last known" copy,
+/// which is how a routine upgrade froze every minute bucket for hours.
+pub fn configured_child_macs() -> BTreeSet<String> {
+    let Ok(snapshot) = load_snapshot() else {
+        return BTreeSet::new();
+    };
+    snapshot
+        .sections_of("user")
+        .flat_map(|user| user.lists.get("mac").cloned().unwrap_or_default())
+        .filter_map(normalize_configured_mac)
+        .collect()
+}
+
+/// Only a well-formed MAC may join the tracked set — a bad value must never widen it.
+fn normalize_configured_mac(raw: String) -> Option<String> {
+    let mac = raw.trim().to_ascii_lowercase().replace('-', ":");
+    (mac.len() == 17 && mac.contains(':')).then_some(mac)
+}
+
 pub fn execute(action: &str, payload: &Value) -> Value {
     let result: Result<Value> = (|| match action {
         "get_capabilities" => Ok(capabilities()),
@@ -2408,5 +2431,28 @@ config user 'router_uid'
         );
         // ipset 不存在时输出没有 Members 段，等于「没在用 IPv6 降级」，不是错误。
         assert!(parse_ipset_members("ipset v6: No such set").is_empty());
+    }
+
+    #[test]
+    fn configured_mac_normalizes_case_dashes_and_padding() {
+        assert_eq!(
+            normalize_configured_mac(" 6C-1F-F7-76-71-04 ".to_string()).as_deref(),
+            Some("6c:1f:f7:76:71:04")
+        );
+        assert_eq!(
+            normalize_configured_mac("DA:1F:85:0C:19:FC".to_string()).as_deref(),
+            Some("da:1f:85:0c:19:fc")
+        );
+    }
+
+    #[test]
+    fn configured_mac_rejects_junk_instead_of_widening_the_set() {
+        for raw in ["", "all", "6c:1f:f7", "not a mac at all", "00:00:00:00:00"] {
+            assert_eq!(
+                normalize_configured_mac(raw.to_string()),
+                None,
+                "{raw:?} must not enter the tracked set"
+            );
+        }
     }
 }
