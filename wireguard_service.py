@@ -671,6 +671,53 @@ class WireGuardService:
                 logger.warning("WireGuard firewall sync failed (non-fatal): %s", error)
             return saved
 
+    def peers(self) -> List[Dict[str, Any]]:
+        """Router-side peers plus whether an endpoint profile still references each one.
+
+        A peer without a profile is an orphan: the App card that owned it was deleted,
+        but the shared router config kept the tunnel. The App lists these so they can be
+        cleaned up deliberately instead of squatting on a tunnel address forever.
+        """
+        server = self.document().get("server") or {}
+        referenced = {
+            _text(row.get("id"))
+            for row in (server.get("endpointProfiles") or [])
+            if isinstance(row, dict)
+        }
+        out = []
+        for row in server.get("peers") or []:
+            if not isinstance(row, dict):
+                continue
+            out.append(
+                {
+                    "id": _text(row.get("id")),
+                    "name": _text(row.get("name")),
+                    "publicKey": _text(row.get("publicKey")),
+                    "allowedIps": [str(value) for value in (row.get("allowedIps") or [])],
+                    "keepaliveSeconds": _int(row.get("persistentKeepaliveSeconds"), 25),
+                    "referenced": _text(row.get("id")) in referenced,
+                }
+            )
+        return out
+
+    def remove_peer(self, peer_id: str, expected_revision: Optional[int]) -> Dict[str, Any]:
+        """Drop one router peer through the normal apply path (Agent re-applies the set)."""
+        with self.lock:
+            document = self.document()
+            if expected_revision is not None and expected_revision != document["revision"]:
+                raise RuntimeError("revision conflict")
+            old_server = document.get("server") or {}
+            remaining = [
+                row
+                for row in (old_server.get("peers") or [])
+                if isinstance(row, dict) and _text(row.get("id")) != _text(peer_id)
+            ]
+            if len(remaining) == len(old_server.get("peers") or []):
+                raise ValueError("peer 不存在")
+            payload = dict(old_server)
+            payload["peers"] = remaining
+            return self.put(payload, expected_revision)
+
     def delete(self, expected_revision: Optional[int]) -> Dict[str, Any]:
         with self.lock:
             document = self.document()
@@ -768,6 +815,33 @@ def create_wireguard_blueprint(hub: Any, service: WireGuardService) -> Blueprint
                 return jsonify({"ok": True, **document, "lanForwarding": service.lan_forward_status(document.get("server"))})
         except RuntimeError as error:
             return jsonify({"ok": False, "error": str(error), "currentRevision": service.document()["revision"]}), 409
+        except Exception as error:
+            return jsonify({"ok": False, "error": str(error)}), 400
+
+    @bp.get("/wireguard/peers")
+    def peers():
+        if not hub.check_app_token():
+            return jsonify({"ok": False, "error": "unauthorized"}), 401
+        with service.lock:
+            document = service.document()
+            return jsonify({"ok": True, "revision": document["revision"], "peers": service.peers()})
+
+    @bp.delete("/wireguard/peers/<peer_id>")
+    def remove_peer(peer_id):
+        if not hub.check_app_token():
+            return jsonify({"ok": False, "error": "unauthorized"}), 401
+        expected = request.args.get("expectedRevision")
+        expected_revision = _int(expected) if expected is not None else None
+        try:
+            document = service.remove_peer(peer_id, expected_revision)
+            return jsonify({"ok": True, **document})
+        except RuntimeError as error:
+            return (
+                jsonify(
+                    {"ok": False, "error": str(error), "currentRevision": service.document()["revision"]}
+                ),
+                409,
+            )
         except Exception as error:
             return jsonify({"ok": False, "error": str(error)}), 400
 

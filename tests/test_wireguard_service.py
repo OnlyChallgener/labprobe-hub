@@ -708,3 +708,39 @@ def test_prune_orphan_stun_profile_when_stun_rule_missing(tmp_path):
 
 
 
+
+
+def test_peers_flag_orphans_and_removal_rides_the_apply_path(tmp_path):
+    service = WireGuardService(_hub(tmp_path))
+    payload = _server()
+    payload["peers"] = [
+        {
+            "id": "stun-fallback",
+            "name": "Phone",
+            "publicKey": PUBLIC_KEY,
+            "allowedIps": ["10.77.0.2/32"],
+        },
+        {
+            "id": "orphan",
+            "name": "Old phone",
+            "publicKey": base64.b64encode(bytes(range(10, 42))).decode(),
+            "allowedIps": ["10.77.0.3/32"],
+        },
+    ]
+    service.put(payload, 0)
+
+    listed = {row["id"]: row for row in service.peers()}
+    assert listed["stun-fallback"]["referenced"] is True
+    assert listed["orphan"]["referenced"] is False
+    assert listed["orphan"]["allowedIps"] == ["10.77.0.3/32"]
+
+    service.remove_peer("orphan", service.document()["revision"])
+    assert {row["id"] for row in service.peers()} == {"stun-fallback"}
+    command = service.commands()[-1]
+    assert command["action"] == "apply"
+    assert [row["id"] for row in command["payload"]["server"]["peers"]] == ["stun-fallback"]
+
+    with pytest.raises(ValueError, match="peer 不存在"):
+        service.remove_peer("orphan", service.document()["revision"])
+    with pytest.raises(RuntimeError, match="revision conflict"):
+        service.remove_peer("stun-fallback", 0)
