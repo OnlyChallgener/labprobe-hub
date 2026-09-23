@@ -269,7 +269,10 @@ fn ubus_call(object: &str, method: &str, body: &str) -> bool {
 /// Every call is idempotent, so this is safe to re-run and it self-heals after a
 /// firmware reload wipes the runtime state.
 pub fn prepare_sniffer() -> bool {
-    let macs = child_macs();
+    // 识别名单必须和统计名单同源。只读固件运行时名单的话，儿童上网总开关一关，
+    // 这里就"没东西可声明"，固件不再给任何流打 appid —— 实测 121 条流里 95 条
+    // 0-0-0-0，设备时长照记、应用时长全空，看起来像统计坏了。
+    let macs = crate::minute_stats::read_child_macs();
     if macs.is_empty() {
         return false;
     }
