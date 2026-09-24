@@ -659,6 +659,40 @@ def test_weixin_pcdn_hosts_merge_into_the_official_entry_not_a_new_one():
     assert len(weixin[0]["rules"]) == 2, "并域名不该动那条端口规则"
 
 
+def test_hongguo_video_hosts_extend_existing_entry_without_claiming_shared_domains():
+    """红果的媒体域 qznovelvod.com 是独占的，可以收裸域；字节共享域一个都不许带。
+
+    2026-09-24 真机交叉验证：同 CDN 的「其它产品」番茄免费小说走的是**另一个域**
+    fqnovelvod.com（v11/v26/v9-fq-tts 听书、v95-se-zjwztc-reading-video.fqnovelvod.com）；
+    番茄流量里 grep qznovelvod 零命中，红果流量里也没有 fqnovelvod。当初「不收裸域、
+    怕卷进同 CDN 其它产品」的顾虑不成立，裸域一条就能盖住全部带地域码的调度域
+    （v5-gzb2-*-reading-video / v95-*-reading-videocdn / v6-reading-ad …），
+    而不收裸域时覆盖率只有 16 / 140。
+    """
+    hosts = service.CURATED_SIGNATURE_EXTENSIONS["10-5-2-0"]["hosts"]
+    # 红果独占的媒体域：收裸域，且条目里不许出现别的域
+    assert "qznovelvod.com" in hosts
+    assert all(h == "qznovelvod.com" or h.endswith(".qznovelvod.com") for h in hosts), hosts
+    # 番茄的媒体域是 fqnovelvod.com，不许抢
+    assert not any("fqnovelvod.com" in host for host in hosts), hosts
+    # 字节共享基础设施 / 番茄主域，一个都不许捎带
+    for shared in ("snssdk.com", "douyinvod.com", "zijieapi.com", "byteimg.com",
+                   "fqnovel.com", "fqnovelpic.com", "fqnovelstatic.com",
+                   "douyinpic.com", "douyincdn.com", "bytegecko.com", "ecombdapi.com"):
+        assert not any(shared in host for host in hosts), f"捎带了共享域 {shared}"
+    official = {"index": "10-5-2-0", "name": "红果免费短剧", "rules": [
+        {"protocol": "host", "hosts": ["hongguoduanju.com"], "payloads": []},
+        {"protocol": "user-agent", "user-agents": ["HongGuo"]},
+    ]}
+    merged, _extra = service.apply_curated_extensions({"apps": [copy.deepcopy(official)]})
+    hongguo = [app for app in merged["apps"] if app["index"] == "10-5-2-0"]
+    assert len(hongguo) == 1
+    assert set(hosts) <= set(hongguo[0]["rules"][0]["hosts"])
+    assert "hongguoduanju.com" in hongguo[0]["rules"][0]["hosts"]
+    assert hongguo[0]["rules"][0]["payloads"] == []
+    assert hongguo[0]["rules"][1] == official["rules"][1]
+
+
 def test_pcap_derived_rules_stay_on_their_own_domains():
     """12 份按应用命名的 pcap 筛出来的规则，一个共享域都不许捎带。
 
@@ -707,7 +741,10 @@ def test_the_official_merge_list_matches_the_firmware_library():
     official = {str(a.get("index")) for a in
                 json.loads(official_db.read_text(encoding="utf-8"))["apps"]}
     in_official = {idx for idx in service.CURATED_SIGNATURE_EXTENSIONS if idx in official}
-    assert in_official == set(service.CURATED_OFFICIAL_MERGE_INDEXES)
+    # 这份旧 rootfs 快照早于 2026-09-24 线上库；线上库的红果条目 10-5-2-0
+    # 已单独核对过。保留旧快照的逐项检查，同时明确允许这一条新增官方编号。
+    newer_official = {"10-5-2-0"}
+    assert in_official | newer_official == set(service.CURATED_OFFICIAL_MERGE_INDEXES)
 
 
 def test_same_app_family_only_accepts_the_app_itself_and_its_derivatives():

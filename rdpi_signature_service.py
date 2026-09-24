@@ -401,6 +401,18 @@ CURATED_SIGNATURE_EXTENSIONS: Dict[str, Dict[str, Any]] = {
             "pinduoduo.net",
         ],
     },
+    # 京东：主域 jd.com / 360buyimg.com 两个裸域就把 App 流量盖满了（2026-09-24 真机抓包
+    # 核对：mars.jd.com ×471、storage.jd.com ×9、ex.m.jd.com ×6、api.m.jd.com ×5、
+    # img30/img20/img14…/m11/m15/storage11/storage23.360buyimg.com、sso/sh/sgm-w/dns/ccc-x/
+    # cactus/uranus/gias/jcap/blackhole/anti-sdk-report/h5speed/sdkfp/pro.m.jd.com 全部命中）。
+    #
+    # 漏的是**视频/图片域 300hu.com**（真机 vod ×7、discover ×3、jvod ×2，共 12 次），
+    # 它不在 jd.com 下面，所以原来一条都盖不住。归属证据三条：
+    #   1. 京东联盟开放 API 文档里商品视频的 playUrl 就是 https://vod.300hu.com/... ，
+    #      主图地址是 300hu.com/4c1f7a6atransbjngwcloud1oss/...jpg；
+    #   2. 京东国际商品详情页的视频 URL 形如 jvod.300hu.com/vod/product/<sku>/...mp4；
+    #   3. Netify 把 jvod.300hu.com.gslb.qianxun.com 标为 Jingdong，走 Wangsu(网宿) CDN。
+    # 裸域一条盖住 vod / jvod / discover / img / m 全部子域。
     "18-159-1-0": {
         "name": "京东",
         "category": "综合电商",
@@ -409,6 +421,7 @@ CURATED_SIGNATURE_EXTENSIONS: Dict[str, Dict[str, Any]] = {
             "jd.com",
             "360buyimg.com",
             "jd.hk",
+            "300hu.com",
         ],
     },
     # 云闪付：路由器上还有一条重复的 18-4-3-0（正主就是这条 18-156-1-0），下面按名字
@@ -468,9 +481,20 @@ CURATED_SIGNATURE_EXTENSIONS: Dict[str, Dict[str, Any]] = {
             # iot.mi.com（124.251.58.134）同段，同一运营方。文档建议的裸 io.mi.com 仍然
             # 不写 —— 那会把小爱音箱和小米系统服务全吸进米家。
             "device.io.mi.com",
-            "mijia.ai",
+            # 2026-09-24 真机（192.168.0.156 开米家 App 控设备）：流量大头全在
+            # **mijia.tech** 上 —— app.processor.smartcamera.api.mijia.tech ×23、
+            # app.business.smartcamera.api.mijia.tech ×4、api.mijia.tech ×4、
+            # core.api.mijia.tech ×3，原来这 7 个域一个都没盖住。
+            # 归属铁证：api.mijia.tech 解析 110.43.87.16 / 202.69.4.15 / 220.181.106.173，
+            # 与在库的 api.io.mi.com 完全相同；第三方「Xiaomi Home Android app」域名清单
+            # 也列着 api / core.api / stream.api / sts.api .mijia.tech。
+            # 裸域一条盖住全部变体，包括带业务前缀的 smartcamera 那些。
+            "mijia.tech",
         ],
     },
+    # mijia.ai 已摘除（2026-09-24）：实测 https://mijia.ai 返回的是
+    # 「mijia.ai for sale | Spaceship.com」—— 一个待售域名（AWS 44.232.173.249），
+    # 不是小米在用的域，真机抓包零命中。留着就是「名字像米家就收」的典型误收。
     # UU远程（网易远程桌面）。触发原因不是「缺一个应用」而是抓包抓出来的误判：
     # 电脑没装支付宝也没开浏览器，一条 429MB 的 UDP 流却被记成 支付宝 18-4-1-0。
     # 只写裸域：这台引擎按域名后缀匹配，前导点 `.uuyc.163.com` 和 `*.` 一样不生效
@@ -544,11 +568,26 @@ CURATED_SIGNATURE_EXTENSIONS: Dict[str, Dict[str, Any]] = {
     # 绑给谁都会把 360浏览器 / 安全卫士 / 云盘 一起卷进来，和当初裸 `alicdn.com`
     # 记成云闪付是同一类错。共享平台域（api/open/app/cloud.360.cn）因此宁可落
     # 未识别，也不猜给某一家 —— 代价是儿童手表走平台域的那部分不计入它自己。
+    # 2026-09-24 真机（192.168.0.156 开 360 儿童卫士 App）翻出来的：
+    # kids.360.cn ×146，而 **m.baby.360.cn 还有 ×135**（v7.baby 另有 2 次）—— 一半的流量
+    # 原来压根没盖住。baby.360.cn 是 360 儿童卫士的**官网 / App 下载 / 固件升级域**：
+    # 新浪、中新网多条报道写着「官方购买链接 baby.360.cn」「固件升级工具从 baby.360.cn
+    # 下载」「在地址栏输入 baby.360.cn 或者 360儿童卫士」。
+    # IP 也对得上：baby.360.cn 解析 101.198.3.97 / 106.63.24.79，与 kids.360.cn 完全相同。
+    #
+    # kidswatch-sg.com 是海外服务域（真机 api.kidswatch-sg.com ×1），名字就是「儿童手表」。
+    #
+    # ⚠️ 已知冲突（别硬掰）：儿童卫士用的 iotbear.live.360.cn / cloudcontrol.live.360.cn
+    # 落在 live.360.cn 下，而 live.360.cn 已归 9-222 360智慧生活 → 这部分会显示成智慧生活。
+    # ⚠️ 高德地图 amap.com 命中 147 次（定位用的第三方地图 SDK）—— 收了会把所有用高德的
+    # 应用都记成儿童卫士，绝不能收。声网 agora.io（音视频 SDK）同理。
     "9-221-1-0": {
         "name": "360儿童卫士",
         "category": "智能家居",
         "hosts": [
             "kids.360.cn",
+            "baby.360.cn",
+            "kidswatch-sg.com",
         ],
     },
     "9-222-1-0": {
@@ -577,14 +616,23 @@ CURATED_SIGNATURE_EXTENSIONS: Dict[str, Dict[str, Any]] = {
             # MarkMonitor，持有人未证实）。收这些就是当年 alicdn.com 那个错。
         ],
     },
-    # 亲宝宝：2020 年品牌启用了新域名 qinbaobao.com，老域名 qbaobei.com 仍在服务
-    # （app.qbaobei.com 实测解析到 122.10.42.170），两个都是它自己的，都收。
+    # 亲宝宝：App 真正的业务域是 **qbb6.com**，不是官网域（2026-09-24 真机抓包定案）。
+    # 现场：挂在 192.168.0.3 那台 TL-XDR3010 后面的手机正在用亲宝宝，110 秒里
+    # qthumb0-sh.qbb6.com 命中 113 次，qfile6-sh / qfile1-sh / qfile0-sh /
+    # apilog / api / apievt .qbb6.com 合计 130+ 次；而 qinbaobao.com 一条都没出现。
+    # 归属证据：www.qbb6.com 返回的官网页面与 www.qinbaobao.com 逐字相同 ——
+    # 同一备案主体「杭州点望科技有限公司」、同一 IP 121.40.177.227、
+    # 同一邮箱 support@qinbaobao.com。裸域后缀匹配，一个 qbb6.com 就覆盖全部子域。
+    #
+    # qbaobei.com 已摘除：它现在是「亲亲宝贝 - 专业的育儿网站」（解析 122.10.42.170），
+    # 是另一个育儿内容站，不是亲宝宝 App。真机抓包里亲宝宝的流量一条 qbaobei.com
+    # 都没有 —— 留着就是把别人站点的流量记到亲宝宝名下（当年 alicdn.com 那个错）。
     "9-223-1-0": {
         "name": "亲宝宝",
         "category": "社交",
         "hosts": [
             "qinbaobao.com",
-            "qbaobei.com",
+            "qbb6.com",
         ],
     },
     # 阿里CDN 是**阿里系的兜底桶**（2026-09-21 定的规则）：淘宝 / 支付宝 / 钉钉 /
@@ -647,11 +695,22 @@ CURATED_SIGNATURE_EXTENSIONS: Dict[str, Dict[str, Any]] = {
             "doubao.com",
         ],
     },
+    # DeepSeek：裸域 deepseek.com 盖住 App 的会话与静态资源（真机：chat.deepseek.com、
+    # static.deepseek.com、hif-leim / hif-dliq.deepseek.com 全部命中）。
+    #
+    # 另收 deepseeksvc.com（2026-09-24 真机抓到 files.deepseeksvc.com）：
+    # 它解析到 116.205.40.113 / 116.205.40.114，与官方 chat.deepseek.com **完全相同**，
+    # 是它自己的文件/附件服务域，不在 deepseek.com 下面，不补就漏。
+    #
+    # ⚠️ 只认这两条硬证据，**不按"名字像"收域** —— 奇安信统计过 DeepSeek 有 2650+ 仿冒
+    # 域名，官方声明只认 deepseek.com / deepseek.cn。名字像 DeepSeek 的域一律不收。
+    # deepseek.cn 虽在官方声明里，但 DNS 无 A 记录、真机零流量，暂不收。
     "9-202-1-0": {
         "name": "DeepSeek",
         "category": "AI/聊天",
         "hosts": [
             "deepseek.com",
+            "deepseeksvc.com",
         ],
     },
     "9-203-1-0": {
@@ -761,6 +820,37 @@ CURATED_SIGNATURE_EXTENSIONS: Dict[str, Dict[str, Any]] = {
             "novelfmstatic.com",
         ],
     },
+    # 2026-09-24 在 192.168.0.77 播放红果短剧时定向抓包：下面两个 TLS 主机
+    # 共承载 13.7 MB 视频流。当时只补完整主机名、不收 qznovelvod.com 裸域，
+    # 是怕把同 CDN 的其它产品一起卷进来 —— 这个顾虑现在已经查清。
+    #
+    # 2026-09-24 全流程抓包（192.168.0.156：刷视频 / 切页 / 退出重进 / 检测新版本）：
+    # 视频流命中 140+ 次，全在 qznovelvod.com 上，但分散在十几个**带地域码的调度域**上
+    # （v5-gzb2-gddgtc-reading-video ×25、n98-v-readingvideo ×24、v95-hzyy-thr-daily-reading-videocdn
+    # ×24、v5-gzb2-bjtc-reading-video ×22、v18-reading-videocdn302 ×16、v6-daily-reading-videocdn
+    # ×13、v6-reading-ad ×11 …）。两个精确主机名只盖住 16 / 140，而地域码是 CDN 动态
+    # 生成的，穷举不完。
+    #
+    # 同 CDN 的「其它产品」是谁？是**番茄免费小说**，但它走的是**另一个域**
+    # fqnovelvod.com（v11 / v26 / v9-fq-tts 听书、v95-se-zjwztc-reading-video.fqnovelvod.com）。
+    # 两轮抓包交叉验证：番茄的流量里 grep qznovelvod 零命中，红果的流量里也没有 fqnovelvod。
+    # ⇒ qznovelvod.com 是红果独占，收裸域安全，当初的顾虑不成立。裸域一条盖住全部地域变体。
+    #
+    # ⚠️ 仍然共用的（域名层面无解，不要硬掰）：红果的 API / 日志 / 图片走
+    # fqnovel.com / fqnovelpic.com / fqnovelstatic.com（api5-normal-lf、api5-normal-sinfonlinea/b、
+    # mon11-misc-lf、log5-applog-lf、frontier100-toutiao-hl、lf3-reading …，本次 40+ 次），
+    # 这些已归 9-208 番茄免费小说，所以红果这部分流量会显示成「番茄免费小说」。
+    # 字节全线共享基础设施（snssdk / zijieapi / byteimg / douyinpic / douyincdn / bytegecko /
+    # ecombdapi）一律不收。
+    "10-5-2-0": {
+        "name": "红果免费短剧",
+        "category": "短视频/直播",
+        "hosts": [
+            "v18-reading-videocdn302.qznovelvod.com",
+            "v91-reading-videocdnon.qznovelvod.com",
+            "qznovelvod.com",
+        ],
+    },
     "9-209-1-0": {
         "name": "西瓜视频",
         "category": "短视频/直播",
@@ -829,12 +919,29 @@ CURATED_SIGNATURE_EXTENSIONS: Dict[str, Dict[str, Any]] = {
             "puffer.500638030-11-1.gcloudsvcs.com",
         ],
     },
+    # 山姆：App 的业务域是 **walmartmobile.cn**，不是官网域（2026-09-24 真机抓包定案）。
+    # 现场：192.168.0.156 开着山姆会员商店，90 秒里 api-sams.walmartmobile.cn 命中 19 次、
+    # aloha.walmartmobile.cn 与 tongdun-fingerprint.walmartmobile.cn 各 1 次，
+    # 而 samsclub.cn / samsclub.com.cn 一条都没出现。
+    # 归属证据：api-sams.walmartmobile.cn 解析 121.14.22.78，与 www.samsclub.cn 同 IP。
+    # 裸域后缀匹配，一个 walmartmobile.cn 就覆盖 api-sams / aloha / tongdun-fingerprint 全部子域。
+    #
+    # 三个腾讯云 COS 素材桶也收（真机命中 7 / 2 / 1 次），桶名都带 sam、且是同一个
+    # APPID 1302115363，就是山姆自己的桶。照阿里CDN 先例只收**精确主机名**：
+    # 裸 file.myqcloud.com 是 COS 共享域，收了会把所有 COS 桶的流量都记成山姆。
+    #
+    # samsclub.cn 保留且真有命中（真机里 v.samsclub.cn 出现 1 次）；samsclub.com.cn
+    # 是官网主域（161.165.193.39），一起留着给网页 / H5 场景。
     "9-215-1-0": {
         "name": "山姆会员商店",
         "category": "综合电商",
         "hosts": [
             "samsclub.cn",
             "samsclub.com.cn",
+            "walmartmobile.cn",
+            "0sam-material-online-1302115363.file.myqcloud.com",
+            "6gz-cos-sam-yewu-online-01-1302115363.file.myqcloud.com",
+            "1sam-web-admin-online-1302115363.file.myqcloud.com",
         ],
     },
     # 小爱同学没有可用的独占域名：它跑在小米共用云上（mi.com / io.mi.com /
@@ -881,12 +988,19 @@ CURATED_SIGNATURE_EXTENSIONS: Dict[str, Dict[str, Any]] = {
     #               api.ugnas.com 解析到同一个 119.23.87.190，同一运营方。
     # 特意不收 lulian.cn / ugreen.com：实测标题是「UGREEN绿联-品质新体验,数码选绿联」，
     # 那是消费电子官网，绑进来会把「看鼠标键盘」记成在用 NAS App。
+    # 2026-09-24 真机（192.168.0.156 开绿联云 App）核对：api.ugnas.com ×3、
+    # qt-api.ugnas.com ×4 全被 ugnas.com 裸域盖住；ug.link 这轮没出现（那份包里它是主力，
+    # 取决于这台 NAS 用哪种方式连）。
+    # 补一个日志桶 ugreen-log.oss-cn-shenzhen.aliyuncs.com（真机 1 次）：桶名带 ugreen，
+    # 照山姆 COS 桶、阿里CDN 的先例只收**精确主机名** —— 裸 oss-cn-shenzhen.aliyuncs.com
+    # 是阿里云 OSS 共享域，收了会把所有人的 OSS 桶都记成绿联云。
     "9-232-1-0": {
         "name": "绿联云",
         "category": "工具",
         "hosts": [
             "ug.link",
             "ugnas.com",
+            "ugreen-log.oss-cn-shenzhen.aliyuncs.com",
         ],
     },
     # 飞牛 fnOS（私有云 App）：官方库里也没有。
@@ -919,6 +1033,7 @@ CURATED_OFFICIAL_MERGE_INDEXES = frozenset({
     "8-118-1-0",    # WPS Office
     "10-1-2-0",     # 微信视频号
     "10-5-1-0",     # 抖音（官方叫「抖音系列」）
+    "10-5-2-0",     # 红果免费短剧
     "10-146-1-0",   # 快手（官方叫「快手系列」）
     "18-156-1-0",   # 云闪付
     "18-158-1-0",   # 拼多多
