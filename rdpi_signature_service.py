@@ -1098,6 +1098,19 @@ CURATED_SIGNATURE_REMOVALS: Dict[str, Any] = {
     # 一个包就给整条流定性，1% 的命中率足够。
     # 支付宝真正的识别来自 3 个 alipay 主机 + user-agent，摘掉 UDP 不影响它认自己。
     "18-4-1-0": {"drop_protocols": ["udp"]},
+    # 下面两条是**我们自己**早先下发时带进去的错域名，2026-09-24 真机抓包核对后判错：
+    # 只把名字从 :data:`CURATED_SIGNATURE_EXTENSIONS` 里删掉是不够的 —— 合并只追加，
+    # 已经落到路由器上的那一行不会被改回去，必须在这里显式摘。
+    #
+    # 亲宝宝：qbaobei.com 现在是「亲亲宝贝 - 专业的育儿网站」（122.10.42.170，另一个
+    # 育儿内容站），真机抓包 110 秒里亲宝宝一条 qbaobei.com 都没有。留着就是把别人
+    # 站点的流量记到亲宝宝名下（当年 alicdn.com 那个错的翻版）。正主域 qinbaobao.com
+    # + 新加的 qbb6.com 保留。
+    "9-223-1-0": ["qbaobei.com"],
+    # 米家：mijia.ai 实测返回「mijia.ai for sale | Spaceship.com」，一个停在 AWS
+    # 44.232.173.249 的待售域名，跟小米没关系，真机零命中。正主域 api.io.mi.com 一族
+    # + 新加的 mijia.tech 保留。
+    "9-219-1-0": ["mijia.ai"],
 }
 
 
