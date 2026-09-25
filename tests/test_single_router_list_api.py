@@ -12,16 +12,19 @@ import hub
 
 
 def _seed(monkeypatch, *, dashboard, devices, archive=None):
-    """把两条数据源直接接上：dashboard 是内存缓存，devices 走 load_json。
+    """把两条数据源直接接上：dashboard 是内存缓存，设备/归档走 load_json。
 
     不写真实 DATA_DIR —— 这里要验证的是行构造逻辑，不是 SQLite 存储层。
+    archive=None 表示「归档读不出来」，和 archive={} （归档真的是空的）是两回事。
     """
     cache = dict(dashboard)
     cache.setdefault("router", "客厅锐捷")
     monkeypatch.setattr(hub, "ROUTER_DASHBOARD_CACHE", cache)
-    monkeypatch.setattr(hub, "load_json", lambda path, default: dict(devices or {}) if path == hub.DEVICES_FILE else default)
+    docs = {hub.DEVICES_FILE: dict(devices or {})}
     if archive is not None:
-        monkeypatch.setattr(hub, "load_device_archive", lambda: dict(archive))
+        docs[hub.DEVICE_ARCHIVE_FILE] = dict(archive)
+    monkeypatch.setattr(hub, "load_json", lambda path, default: docs[path] if path in docs else default)
+    monkeypatch.setattr(hub, "load_device_archive", lambda: dict(archive or {}))
     monkeypatch.setenv("APP_TOKEN", "app-token-for-test")
     monkeypatch.delenv("APP_TOKEN_PREVIOUS", raising=False)
     monkeypatch.delenv("HOOK_TOKEN", raising=False)
@@ -118,6 +121,24 @@ def test_explicit_total_still_wins_over_the_archive_fallback(monkeypatch):
         archive={"aa:bb:cc:dd:ee:ff": {"mac": "aa:bb:cc:dd:ee:ff"}},
     )
     assert _row(hub.app.test_client())["deviceCount"] == 42
+
+
+def test_unreadable_archive_omits_the_total_instead_of_shrinking_it_to_online(monkeypatch):
+    """load_json 读失败时返回它的 default，所以归档「读不出来」和「真的是空的」长得一样。
+
+    生产上真翻过一次：25 台报成 10 台（正好等于在线数），数字看着完全合理，
+    没人会怀疑。所以读不出来时必须整个不报，而不是退化成在线数。
+    """
+    online = [{"mac": f"aa:bb:cc:00:00:{i:02d}"} for i in range(10)]
+    _seed(
+        monkeypatch,
+        dashboard={"receivedEpoch": time.time()},
+        devices={"source": "router_rpc", "online": online, "onlineDeviceCount": 10},
+        archive=None,
+    )
+    row = _row(hub.app.test_client())
+    assert "deviceCount" not in row
+    assert row["onlineDeviceCount"] == 10
 
 
 def test_no_device_document_at_all_still_omits_the_count(monkeypatch):

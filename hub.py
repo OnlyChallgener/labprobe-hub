@@ -5673,10 +5673,16 @@ def _single_router_row() -> Dict[str, Any]:
     if total < 0 and isinstance(devices.get("online"), list):
         # 锐捷推送（source=ruijie_push）才写 total；走 eWeb RPC 的设备源从来不写，
         # 于是「总设备数」永远是空。这时用 App 设备列表本身就是的那个口径：
-        # 在线 + 归档里最后已知的离线设备。它和列表里数出来的台数一致，不是新造数。
-        # 没有 online 键 = 压根没有设备文档，那就继续报「不知道」而不是 0。
-        online_rows = devices["online"]
-        total = len(online_rows) + len(archived_offline_devices(online_rows))
+        # 在线 + 归档里最后已知的离线设备，和用户在列表里数出来的台数一致。
+        # 没有 online 键 = 压根没有设备文档，那就继续不出现这个字段。
+        #
+        # 归档必须显式用 None 兜底再判空：load_json 读失败时返回的就是它的 default，
+        # 而 load_device_archive() 的 default 是 {} —— 一次 DATA_LOCK 超时会被读成
+        # 「归档里 0 台离线」，总数就从 25 悄悄掉成在线数。宁可不报。
+        archive = load_json(DEVICE_ARCHIVE_FILE, None)
+        if isinstance(archive, dict):
+            online_rows = devices["online"]
+            total = len(online_rows) + len(archived_offline_devices(online_rows, archive))
     online_count = to_int(devices.get("onlineDeviceCount"), -1)
     if online_count < 0 and isinstance(dashboard.get("telemetry"), dict):
         online_count = to_int(dashboard["telemetry"].get("onlineDeviceCount"), -1)
