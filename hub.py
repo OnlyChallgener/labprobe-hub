@@ -5641,6 +5641,57 @@ def api_devices():
     })
 
 
+SINGLE_ROUTER_ID = "default"
+
+
+def _single_router_row() -> Dict[str, Any]:
+    """One workspace row for a Hub that serves exactly one router.
+
+    There is no ``site`` here: a single-router Hub has nowhere to declare it, and
+    an empty string beats an invented label because the App drops blanks.
+    """
+    dashboard = _router_dashboard_public()
+    devices = load_json(DEVICES_FILE, {})
+    if not isinstance(devices, dict):
+        devices = {}
+    details = dashboard.get("details") if isinstance(dashboard.get("details"), dict) else {}
+    ap = details.get("ap") if isinstance(details.get("ap"), dict) else {}
+    identity = details.get("identity") if isinstance(details.get("identity"), dict) else {}
+    online = bool(dashboard.get("online"))
+    row: Dict[str, Any] = {
+        "routerId": SINGLE_ROUTER_ID,
+        "name": primary_router_name() or clean_saved_value(dashboard.get("router")) or "默认路由器",
+        "site": "",
+        "model": clean_saved_value(ap.get("model") or identity.get("model")),
+        "platform": "reyee",
+        "online": online,
+        "agentOnline": online,
+        "basePath": "",
+        "updatedAt": devices.get("updatedAt") or dashboard.get("receivedAt") or "",
+    }
+    total = to_int(devices.get("total"), -1)
+    online_count = to_int(devices.get("onlineDeviceCount"), -1)
+    if online_count < 0 and isinstance(dashboard.get("telemetry"), dict):
+        online_count = to_int(dashboard["telemetry"].get("onlineDeviceCount"), -1)
+    if total >= 0:
+        row["deviceCount"] = total
+    if online_count >= 0:
+        row["onlineDeviceCount"] = online_count
+    return row
+
+
+@app.route("/api/routers", methods=["GET"])
+def api_routers():
+    if not check_app_token():
+        return jsonify({"ok": False, "error": "未授权"}), 401
+    return jsonify({
+        "ok": True,
+        "defaultRouterId": SINGLE_ROUTER_ID,
+        "multiRouter": False,
+        "routers": [_single_router_row()],
+    })
+
+
 @app.route("/api/ipv6-neighbors", methods=["GET"])
 def api_ipv6_neighbors():
     if not check_read_token():
