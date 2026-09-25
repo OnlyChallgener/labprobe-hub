@@ -11,7 +11,7 @@ import time
 import hub
 
 
-def _seed(monkeypatch, *, dashboard, devices):
+def _seed(monkeypatch, *, dashboard, devices, archive=None):
     """把两条数据源直接接上：dashboard 是内存缓存，devices 走 load_json。
 
     不写真实 DATA_DIR —— 这里要验证的是行构造逻辑，不是 SQLite 存储层。
@@ -20,11 +20,17 @@ def _seed(monkeypatch, *, dashboard, devices):
     cache.setdefault("router", "客厅锐捷")
     monkeypatch.setattr(hub, "ROUTER_DASHBOARD_CACHE", cache)
     monkeypatch.setattr(hub, "load_json", lambda path, default: dict(devices or {}) if path == hub.DEVICES_FILE else default)
+    if archive is not None:
+        monkeypatch.setattr(hub, "load_device_archive", lambda: dict(archive))
     monkeypatch.setenv("APP_TOKEN", "app-token-for-test")
     monkeypatch.delenv("APP_TOKEN_PREVIOUS", raising=False)
     monkeypatch.delenv("HOOK_TOKEN", raising=False)
     monkeypatch.delenv("HOOK_TOKEN_PREVIOUS", raising=False)
     monkeypatch.setattr(hub, "primary_router_name", lambda: "客厅锐捷")
+
+
+def _row(client):
+    return client.get("/api/routers", headers={"Authorization": "Bearer app-token-for-test"}).get_json()["routers"][0]
 
 
 def test_router_list_reports_agent_online_and_both_device_counts(monkeypatch):
@@ -80,6 +86,46 @@ def test_router_list_falls_back_to_telemetry_online_count(monkeypatch):
     row = client.get("/api/routers", headers={"Authorization": "Bearer app-token-for-test"}).get_json()["routers"][0]
     assert row["deviceCount"] == 30
     assert row["onlineDeviceCount"] == 11
+
+
+def test_total_falls_back_to_online_plus_archive_when_the_source_has_no_total(monkeypatch):
+    """eWeb RPC 设备源不写 total，「总设备数」得用 App 列表本身的那口径补上。
+
+    这台路由生产上就是 source=router_rpc + 没有 total，所以不补这一条的话
+    deviceCount 字段永远不出现，App 那一行只剩在线数。
+    """
+    online = [{"mac": f"aa:bb:cc:00:00:{i:02d}"} for i in range(10)]
+    archive = {d["mac"]: dict(d) for d in online}
+    for i in range(5):
+        mac = f"aa:bb:cc:11:11:{i:02d}"
+        archive[mac] = {"mac": mac, "offlineAt": f"2026-09-2{i} 10:00:00"}
+    _seed(
+        monkeypatch,
+        dashboard={"receivedEpoch": time.time()},
+        devices={"source": "router_rpc", "updatedAt": "2026-09-25 19:50:25", "online": online, "onlineDeviceCount": 10},
+        archive=archive,
+    )
+    row = _row(hub.app.test_client())
+    assert row["deviceCount"] == 15
+    assert row["onlineDeviceCount"] == 10
+
+
+def test_explicit_total_still_wins_over_the_archive_fallback(monkeypatch):
+    _seed(
+        monkeypatch,
+        dashboard={"receivedEpoch": time.time()},
+        devices={"source": "ruijie_push", "total": 42, "online": [{"mac": "aa:bb:cc:dd:ee:ff"}], "onlineDeviceCount": 1},
+        archive={"aa:bb:cc:dd:ee:ff": {"mac": "aa:bb:cc:dd:ee:ff"}},
+    )
+    assert _row(hub.app.test_client())["deviceCount"] == 42
+
+
+def test_no_device_document_at_all_still_omits_the_count(monkeypatch):
+    # 空 dict 不能算成「0 台」：那会被读成这台路由一个设备都没有。
+    _seed(monkeypatch, dashboard={"receivedEpoch": time.time()}, devices={}, archive={})
+    row = _row(hub.app.test_client())
+    assert "deviceCount" not in row
+    assert "onlineDeviceCount" not in row
 
 
 def test_router_list_rejects_anonymous_and_hook_tokens(monkeypatch):
