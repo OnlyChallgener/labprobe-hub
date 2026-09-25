@@ -113,12 +113,32 @@ def test_total_falls_back_to_online_plus_archive_when_the_source_has_no_total(mo
     assert row["onlineDeviceCount"] == 10
 
 
-def test_explicit_total_still_wins_over_the_archive_fallback(monkeypatch):
+def test_a_stored_total_that_understates_known_devices_never_wins(monkeypatch):
+    """设备文档有两个写入者轮流覆盖，其中一个把 total 写成在线数。
+
+    生产实测：labrelay_durable_snapshot 写 total=10，router_rpc 干脆不写 total，
+    接口就在 25 / 10 之间抖。所以能算就用算的，存储值只在算不出时兜底。
+    """
+    online = [{"mac": f"aa:bb:cc:00:00:{i:02d}"} for i in range(10)]
+    archive = {d["mac"]: dict(d) for d in online}
+    for i in range(5):
+        mac = f"aa:bb:cc:11:11:{i:02d}"
+        archive[mac] = {"mac": mac, "offlineAt": f"2026-09-2{i} 10:00:00"}
+    _seed(
+        monkeypatch,
+        dashboard={"receivedEpoch": time.time()},
+        devices={"source": "labrelay_durable_snapshot", "total": 10, "online": online, "onlineDeviceCount": 10},
+        archive=archive,
+    )
+    assert _row(hub.app.test_client())["deviceCount"] == 15
+
+
+def test_stored_total_is_the_fallback_when_the_archive_cannot_be_read(monkeypatch):
     _seed(
         monkeypatch,
         dashboard={"receivedEpoch": time.time()},
         devices={"source": "ruijie_push", "total": 42, "online": [{"mac": "aa:bb:cc:dd:ee:ff"}], "onlineDeviceCount": 1},
-        archive={"aa:bb:cc:dd:ee:ff": {"mac": "aa:bb:cc:dd:ee:ff"}},
+        archive=None,
     )
     assert _row(hub.app.test_client())["deviceCount"] == 42
 

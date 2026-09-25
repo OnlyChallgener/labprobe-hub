@@ -5670,15 +5670,17 @@ def _single_router_row() -> Dict[str, Any]:
         "updatedAt": devices.get("updatedAt") or dashboard.get("receivedAt") or "",
     }
     total = to_int(devices.get("total"), -1)
-    if total < 0 and isinstance(devices.get("online"), list):
-        # 锐捷推送（source=ruijie_push）才写 total；走 eWeb RPC 的设备源从来不写，
-        # 于是「总设备数」永远是空。这时用 App 设备列表本身就是的那个口径：
-        # 在线 + 归档里最后已知的离线设备，和用户在列表里数出来的台数一致。
-        # 没有 online 键 = 压根没有设备文档，那就继续不出现这个字段。
+    if isinstance(devices.get("online"), list):
+        # 总设备数用「在线 + 归档里最后已知的离线设备」自己算，和用户在设备列表里
+        # 数出来的台数是同一个口径；存储里的 total 只在算不出来时兜底。
+        #
+        # 为什么不信 total：这台路由的设备文档有两个写入者几秒一轮互相覆盖，
+        # 其中 labrelay_durable_snapshot 写的是 total=在线数（10），另一个干脆不写。
+        # 实测接口就在 25 和 10 之间抖 —— 那个 10 看着完全合理，没人会怀疑。
         #
         # 归档必须显式用 None 兜底再判空：load_json 读失败时返回的就是它的 default，
         # 而 load_device_archive() 的 default 是 {} —— 一次 DATA_LOCK 超时会被读成
-        # 「归档里 0 台离线」，总数就从 25 悄悄掉成在线数。宁可不报。
+        # 「归档里 0 台离线」，总数就从 25 悄悄掉成在线数。算不出干脆弱掉不报。
         archive = load_json(DEVICE_ARCHIVE_FILE, None)
         if isinstance(archive, dict):
             online_rows = devices["online"]
