@@ -81,7 +81,9 @@ PORTMAP_MUTATION_LOCK = threading.RLock()
 DATA_LOCK_REQUEST_TIMEOUT_SECONDS = 3.0
 DATA_LOCK_BYPASS_PREFIXES = (
     "/api/ai/chat",
+    "/api/ai/notifications",
     "/api/ai/notifications/stream",
+    "/api/agent/update/status",
     "/api/stun",
     "/api/router/stun",
     "/api/wireguard",
@@ -398,7 +400,8 @@ def request_uses_data_lock(path: str) -> bool:
     """Return whether a request needs the legacy request-wide data lock."""
     normalized = str(path or "")
     if (
-        normalized.startswith("/api/router/dashboard")
+        normalized == "/health"
+        or normalized.startswith("/api/router/dashboard")
         or normalized.startswith("/api/router/realtime")
         or normalized.startswith("/api/devices/realtime")
         or normalized == "/api/realtime"

@@ -26,6 +26,9 @@ def _request_lock_is_acquired(path: str, method: str = "GET") -> bool:
     ("path", "method"),
     [
         ("/api/ai/notifications/stream", "GET"),
+        ("/api/ai/notifications", "GET"),
+        ("/api/agent/update/status", "GET"),
+        ("/health", "GET"),
         ("/api/ai/chat", "POST"),
         ("/api/stun", "GET"),
         ("/api/stun/rule-1", "PUT"),
