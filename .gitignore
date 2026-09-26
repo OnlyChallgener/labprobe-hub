@@ -210,6 +210,11 @@ tempCodeRunnerFile.py
 /backups/
 /logs/
 
+# Optional multi-router local secrets and isolated worker data
+/multi-router.env
+/multi-router.yaml
+/multi-data/
+
 # Local relay build/scratch artifacts (large binaries, never shipped)
 /build_artifacts/
 

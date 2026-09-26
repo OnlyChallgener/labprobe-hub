@@ -1,0 +1,28 @@
+version: 1
+gateway:
+  listenPort: 58443
+  registryPort: 58444
+  publicBaseUrl: http://192.168.5.46:58443
+  storageRoot: /app/multi
+  defaultRouterId: home-reyee
+routers:
+  - routerId: home-reyee
+    name: 家庭锐捷
+    site: 家
+    model: Reyee
+    platform: reyee
+    ewebTransport: direct
+    ewebUrl: http://192.168.5.1
+    workerPort: 58501
+    appTokenEnv: HOME_APP_TOKEN
+    hookTokenEnv: HOME_HOOK_TOKEN
+  - routerId: office-reyee
+    name: 办公室锐捷
+    site: 办公室
+    model: Reyee
+    platform: reyee
+    ewebTransport: direct
+    ewebUrl: http://192.168.6.1
+    workerPort: 58502
+    appTokenEnv: OFFICE_APP_TOKEN
+    hookTokenEnv: OFFICE_HOOK_TOKEN

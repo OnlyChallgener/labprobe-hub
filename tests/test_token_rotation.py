@@ -47,3 +47,16 @@ def test_failed_attempts_trigger_and_expire_throttle(hub_app):
     hub_module._AUTH_BLOCKED.clear()
     with app.test_request_context("/", headers={"Authorization": "Bearer current-app-token"}):
         assert hub_module.check_app_token() is True
+
+
+def test_strict_worker_tokens_do_not_cross_authenticate(hub_app, monkeypatch):
+    monkeypatch.setenv("STRICT_TOKEN_SEPARATION", "1")
+    app = hub_app.app
+    with app.test_request_context("/", headers={"Authorization": "Bearer current-hook-token"}):
+        assert hub_module.check_app_token() is False
+    with app.test_request_context("/", headers={"X-LabProbe-Token": "current-app-token"}):
+        assert hub_module.check_hook_token() is False
+    with app.test_request_context("/", headers={"Authorization": "Bearer current-app-token"}):
+        assert hub_module.check_app_token() is True
+    with app.test_request_context("/", headers={"X-LabProbe-Token": "current-hook-token"}):
+        assert hub_module.check_hook_token() is True

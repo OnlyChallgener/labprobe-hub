@@ -64,3 +64,89 @@ def test_router_core_frame_is_fanned_out_to_registered_app_socket():
     finally:
         websocket._unregister(client)
         service.stop()
+
+
+def test_device_wire_frames_drop_repeated_history_but_keep_app_fields():
+    runtime = {
+        "type": "devices",
+        "data": {
+            "sampleEpochMs": 123,
+            "sampleAgeMs": 1,
+            "onlineDeviceCount": 1,
+            "delta": False,
+            "devices": [{
+                "mac": "aa:bb:cc:dd:ee:ff",
+                "uploadBps": 10,
+                "downloadBps": 20,
+                "connectionCount": 3,
+                "ipv6Records": [{"address": "2001:db8::1"}] * 100,
+            }],
+        },
+    }
+    raw = json.dumps(runtime, separators=(",", ":"))
+    compact = json.loads(HubRealtimeWebSocketService._wire_frame(raw))
+    assert compact["data"]["devices"] == [{
+        "mac": "aa:bb:cc:dd:ee:ff",
+        "uploadBps": 10,
+        "downloadBps": 20,
+        "connectionCount": 3,
+    }]
+    assert len(json.dumps(compact)) < len(raw) // 4
+
+    snapshot = {
+        "type": "devices_snapshot",
+        "data": {
+            "fullSnapshot": True,
+            "accepted": True,
+            "sampleEpochMs": 123,
+            "devices": [{
+                "mac": "aa:bb:cc:dd:ee:ff",
+                "name": "phone",
+                "ipv6List": ["2001:db8::1"],
+                "ipv6Records": [{"address": "2001:db8::1"}] * 100,
+                "raw": {"vendorMetadata": "x" * 1000},
+            }],
+        },
+    }
+    compact = json.loads(HubRealtimeWebSocketService._wire_frame(json.dumps(snapshot, separators=(",", ":"))))
+    assert compact["data"]["devices"] == [{
+        "mac": "aa:bb:cc:dd:ee:ff",
+        "name": "phone",
+        "ipv6List": ["2001:db8::1"],
+    }]
+    assert "ipv6Records" in snapshot["data"]["devices"][0]
+
+
+def test_repeated_device_snapshots_send_small_runtime_frames_between_full_updates():
+    _engine, service, websocket = _fixture()
+    client = websocket._register()
+    try:
+        def frame(epoch):
+            return json.dumps({
+                "type": "devices_snapshot",
+                "data": {
+                    "accepted": True,
+                    "fullSnapshot": True,
+                    "sampleEpochMs": epoch,
+                    "onlineDeviceCount": 1,
+                    "devices": [{
+                        "mac": "aa:bb:cc:dd:ee:ff",
+                        "name": "phone",
+                        "uploadBps": epoch,
+                        "ipv6Records": [{"address": "2001:db8::1"}] * 100,
+                    }],
+                },
+            }, separators=(",", ":"))
+
+        websocket._fan_out(frame(100))
+        first = [json.loads(client.frames.get_nowait()) for _ in range(2)]
+        assert [item["type"] for item in first] == ["devices", "devices_snapshot"]
+        websocket._fan_out(frame(200))
+        second = json.loads(client.frames.get_nowait())
+        assert second["type"] == "devices"
+        assert second["data"]["sampleEpochMs"] == 200
+        assert second["data"]["devices"][0]["uploadBps"] == 200
+        assert client.frames.empty()
+    finally:
+        websocket._unregister(client)
+        service.stop()

@@ -22,6 +22,7 @@ from flask_sock import Sock
 
 CLIENT_QUEUE_SIZE = 8
 KEEPALIVE_SECONDS = 3.0
+DEVICE_SNAPSHOT_WIRE_INTERVAL_SECONDS = 15.0
 PROTOCOL_NAME = "labprobe-realtime-v3"
 
 
@@ -41,6 +42,7 @@ class HubRealtimeWebSocketService:
         self.logger = hub.LOGGER
         self._clients_lock = threading.RLock()
         self._clients: Dict[str, _RealtimeClient] = {}
+        self._last_device_snapshot_wire_at = 0.0
         self._sock = Sock()
         self._sock.route("/api/realtime/ws")(self._connect)
         self._sock.init_app(hub.app)
@@ -75,10 +77,71 @@ class HubRealtimeWebSocketService:
         except queue.Full:
             return
 
+    @staticmethod
+    def _wire_frame(frame: str) -> str:
+        """Keep frequent device frames small without changing Hub's full cache."""
+        if '"devices' not in frame:
+            return frame
+        try:
+            message = json.loads(frame)
+        except (TypeError, ValueError):
+            return frame
+        kind = message.get("type")
+        payload = message.get("data")
+        if kind not in {"devices", "devices_snapshot"} or not isinstance(payload, dict):
+            return frame
+        rows = payload.get("devices")
+        if not isinstance(rows, list):
+            return frame
+        if kind == "devices":
+            fields = ("mac", "uploadBps", "downloadBps", "connectionCount")
+            compact = {
+                key: payload[key]
+                for key in ("ok", "sampleEpochMs", "sampleAgeMs", "onlineDeviceCount", "delta", "stale", "source")
+                if key in payload
+            }
+            compact["devices"] = [
+                {key: row[key] for key in fields if key in row}
+                for row in rows if isinstance(row, dict)
+            ]
+            message["data"] = compact
+        else:
+            compact = dict(payload)
+            compact["devices"] = [
+                {key: value for key, value in row.items() if key not in {"raw", "ipv6Records"}}
+                for row in rows if isinstance(row, dict)
+            ]
+            message["data"] = compact
+        return json.dumps(message, ensure_ascii=False, separators=(",", ":"))
+
     def _fan_out(self, frame: str) -> None:
         """Queue one Router Core frame for every connected App socket."""
         if not isinstance(frame, str) or not frame:
             return
+        if '"devices_snapshot"' in frame:
+            try:
+                message = json.loads(frame)
+            except ValueError:
+                message = None
+            if isinstance(message, dict) and message.get("type") == "devices_snapshot":
+                payload = message.get("data")
+                if isinstance(payload, dict):
+                    runtime = self._wire_frame(self._frame("devices", payload))
+                    snapshot = self._wire_frame(frame)
+                    with self._clients_lock:
+                        clients = tuple(self._clients.values())
+                        now = time.monotonic()
+                        send_snapshot = bool(clients) and (
+                            now - self._last_device_snapshot_wire_at >= DEVICE_SNAPSHOT_WIRE_INTERVAL_SECONDS
+                        )
+                        if send_snapshot:
+                            self._last_device_snapshot_wire_at = now
+                    for client in clients:
+                        self._enqueue(client, runtime)
+                        if send_snapshot:
+                            self._enqueue(client, snapshot)
+                    return
+        frame = self._wire_frame(frame)
         with self._clients_lock:
             clients = tuple(self._clients.values())
         for client in clients:
@@ -146,7 +209,9 @@ class HubRealtimeWebSocketService:
             self._send(ws, client, self._frame("router", router))
         devices = self.realtime_service.devices_payload()
         if int(devices.get("sampleEpochMs") or 0) > 0:
-            self._send(ws, client, self._frame("devices", devices))
+            self._send(ws, client, self._wire_frame(self._frame("devices", devices)))
+            if devices.get("fullSnapshot") and devices.get("accepted"):
+                self._send(ws, client, self._wire_frame(self._frame("devices_snapshot", devices)))
 
         # Persistent configuration snapshots are Hub-owned state. Replaying them
         # makes a cold APP render settings immediately without opening each page.

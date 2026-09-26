@@ -104,3 +104,17 @@ def test_production_router_ipv6_and_firewall_unconfigured_contract(test_client):
     if res.status_code in (502, 503):
         body = res.get_json()
         assert body["ok"] is False
+
+
+def test_multi_router_worker_locks_eweb_target(monkeypatch):
+    class SavedRouter:
+        def load(self):
+            return {"managed": True, "address": "http://192.168.5.1", "password": "secret"}
+
+    monkeypatch.setattr(hub_entry, "router_config_store", SavedRouter())
+    monkeypatch.setenv("MULTI_ROUTER_LOCK_EWEB", "1")
+    monkeypatch.setenv("ROUTER_EWEB_URL", "http://192.168.6.1")
+    assert hub_entry._resolve_router_settings()["host"] == "http://192.168.6.1"
+    assert hub_entry._save_router_config({"address": "http://192.168.5.1"}) == {
+        "ok": False, "error": "router_address_managed_by_gateway"
+    }

@@ -64,7 +64,8 @@ def _resolve_router_settings():
     legacy = router_config_store.load()
     managed = bool(legacy.get("managed", False))
     host = (
-        (legacy.get("address") if managed else None)
+        (os.environ.get("ROUTER_EWEB_URL") if os.environ.get("MULTI_ROUTER_LOCK_EWEB") == "1" else None)
+        or (legacy.get("address") if managed else None)
         or hub.cfg_get("router.host")
         or hub.cfg_get("router.address")
         or hub.cfg_get("router.ip")
@@ -163,7 +164,11 @@ def _public_router_config() -> dict:
 
 def _save_router_config(body: dict) -> dict:
     current = router_config_store.load()
-    address = str(body.get("address") or current.get("address") or "").strip()
+    locked = os.environ.get("ROUTER_EWEB_URL", "").strip() if os.environ.get("MULTI_ROUTER_LOCK_EWEB") == "1" else ""
+    requested = str(body.get("address") or locked or current.get("address") or "").strip()
+    if locked and requested.rstrip("/").lower() != locked.rstrip("/").lower():
+        return {"ok": False, "error": "router_address_managed_by_gateway"}
+    address = locked or requested
     username = str(body.get("username") or current.get("username") or "admin").strip() or "admin"
     name = str(body.get("name") if "name" in body else current.get("name") or "").strip()
     password = body.get("password") if "password" in body and str(body.get("password") or "") else None

@@ -175,7 +175,8 @@ class EncryptedRouterConfigStore:
                     saved = {}
             managed = bool(saved.get("managed", False))
             address = _clean_url(
-                (saved.get("address") if managed else os.environ.get("ROUTER_EWEB_URL"))
+                (os.environ.get("ROUTER_EWEB_URL") if os.environ.get("MULTI_ROUTER_LOCK_EWEB") == "1" else None)
+                or (saved.get("address") if managed else os.environ.get("ROUTER_EWEB_URL"))
                 or saved.get("address")
                 or os.environ.get("ROUTER_EWEB_URL")
                 or DEFAULT_ROUTER_URL

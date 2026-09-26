@@ -1,0 +1,24 @@
+# Optional multi-router deployment. Do not run beside labprobe-hub on the same
+# host/port. Keep the existing MQTT broker running at 127.0.0.1:1883.
+services:
+  labprobe-multi-router:
+    image: labprobe-hub:multi-router-local
+    build:
+      context: .
+      dockerfile: Dockerfile
+    container_name: labprobe-multi-router
+    network_mode: host
+    restart: unless-stopped
+    env_file:
+      - ${MULTI_ROUTER_ENV_FILE:-./multi-router.env}
+    environment:
+      PORT: ${MULTI_ROUTER_GATEWAY_PORT:-58443}
+      TZ: ${TZ:-Asia/Shanghai}
+      MQTT_INTERNAL_HOST: 127.0.0.1
+      MQTT_INTERNAL_PORT: 1883
+      UPDATE_REPOSITORY_DIR: /app/update-repository
+    volumes:
+      - ${MULTI_ROUTER_CONFIG:-./multi-router.yaml}:/app/multi-router.yaml:ro
+      - ${MULTI_ROUTER_DATA_DIR:-./multi-data}:/app/multi
+      - ${UPDATE_REPOSITORY_HOST_DIR:-./update-repository}:/app/update-repository:ro
+    command: ["python", "/app/multi_router_gateway.py", "--config", "/app/multi-router.yaml"]

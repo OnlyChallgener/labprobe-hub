@@ -702,7 +702,9 @@ def get_app_tokens() -> List[str]:
     ``APP_TOKEN_PREVIOUS`` keeps rotation zero-downtime: set it to the old
     token, restart, update every client, then remove it and restart again.
     """
-    tokens = [get_app_token(), get_hook_token()]
+    tokens = [get_app_token()]
+    if os.environ.get("STRICT_TOKEN_SEPARATION") != "1":
+        tokens.append(get_hook_token())
     previous = str(os.environ.get("APP_TOKEN_PREVIOUS", "") or "").strip()
     if previous:
         tokens.append(previous)
@@ -710,7 +712,9 @@ def get_app_tokens() -> List[str]:
 
 
 def get_hook_tokens() -> List[str]:
-    tokens = [get_hook_token(), get_app_token()]
+    tokens = [get_hook_token()]
+    if os.environ.get("STRICT_TOKEN_SEPARATION") != "1":
+        tokens.append(get_app_token())
     previous = str(os.environ.get("HOOK_TOKEN_PREVIOUS", "") or "").strip()
     if previous:
         tokens.append(previous)
@@ -6075,7 +6079,8 @@ def command_line() -> int:
             print(f"test-hub failed: {exc}", file=sys.stderr)
             return 1
 
-    LOGGER.info("Hub v%s starting architecture=%s listen=0.0.0.0:%s", APP_VERSION, platform.machine(), PORT)
+    bind_host = os.environ.get("HUB_BIND_HOST", "0.0.0.0")
+    LOGGER.info("Hub v%s starting architecture=%s listen=%s:%s", APP_VERSION, platform.machine(), bind_host, PORT)
     LOGGER.info("paths config=%s data=%s backups=%s logs=%s", CONFIG_PATH, DATA_DIR, BACKUPS_DIR, LOGS_DIR)
     LOGGER.info("database schema=%s status=%s revision=%s", STORE.status()["schemaVersion"], MIGRATION_RESULT.get("status"), STORE.status()["revision"])
     LOGGER.info("mqtt enabled=%s connected=%s public=%s", MQTT_PUBLISHER.enabled, MQTT_PUBLISHER.connected, bool(MQTT_PUBLIC_URL))
@@ -6086,7 +6091,7 @@ def command_line() -> int:
         LOGGER.error("configuration: %s", error)
     # Flask 3 enables threaded serving by default. Keep it explicit because
     # notification SSE and slow router diagnostics require concurrent requests.
-    app.run(host="0.0.0.0", port=PORT, threaded=True)
+    app.run(host=bind_host, port=PORT, threaded=True)
     return 0
 
 
