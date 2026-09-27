@@ -185,6 +185,99 @@ def test_relay_push_is_acknowledged_without_becoming_a_data_source():
     assert hub.realtime_publisher.devices == []
 
 
+def test_agent_telemetry_push_becomes_a_router_frame_when_eweb_is_absent():
+    hub, _service = _fixture()
+    engine = RouterRealtimeEngine()
+    frames = []
+    engine.subscribe(lambda raw: frames.append(json.loads(raw)))
+    service = RouterLiteRealtimeService(hub, router_realtime=engine)
+    service.set_wss_demand("app-core", True)
+    epoch_ms = int(time.time() * 1000)
+
+    response = service.accept_push({
+        "router": "BE50",
+        "source": "relay_local_dev_sta",
+        "agentVersion": "0.2.70",
+        "sampleEpochMs": epoch_ms,
+        "telemetry": {
+            "cpuPercent": 6.02,
+            "memoryPercent": 37.85,
+            "storagePercent": None,
+            "uptimeSeconds": 1302851,
+            "temperatureC": 72.0,
+            "onlineDeviceCount": 7,
+            "connections": {"ipv4": 128, "ipv6": 2, "ipv4Half": 20, "cps": 3},
+            "wan": {"downloadBps": 1074743, "uploadBps": 12000, "totalDownloadBytes": 999},
+        },
+        "devices": [],
+    })
+
+    assert response["ok"] is True
+    # 终端那一路照旧只应答不落缓存，这条只开路由器实时。
+    assert response["acceptedRouter"] is False
+    assert response["acceptedDevices"] is False
+    assert service.devices_payload()["devices"] == []
+
+    data = frames[-1]["data"]
+    assert frames[-1]["type"] == "router"
+    assert data["source"] == "agent_dashboard_push"
+    assert data["sampleEpochMs"] == epoch_ms
+    assert data["downloadBps"] == 1074743
+    assert data["ipv4Connections"] == 128
+    assert data["onlineDeviceCount"] == 7
+    assert "storagePercent" not in data
+
+    payload = service.router_payload()
+    assert payload["connected"] is True
+    assert payload["stale"] is False
+    assert payload["cpuPercent"] == 6.02
+    assert hub.realtime_publisher.router == []
+
+
+def test_agent_telemetry_push_yields_to_a_fresh_eweb_sample():
+    hub, _service = _fixture()
+    engine = RouterRealtimeEngine()
+    frames = []
+    engine.subscribe(lambda raw: frames.append(json.loads(raw)))
+    service = RouterLiteRealtimeService(hub, router_realtime=engine)
+    service.set_wss_demand("app-core", True)
+    now_ms = int(time.time() * 1000)
+    engine.accept_router_fast({"uploadBps": 1, "downloadBps": 2}, now_ms)
+
+    service.accept_push({
+        "sampleEpochMs": now_ms + 10,
+        "telemetry": {"cpuPercent": 99.0, "wan": {"downloadBps": 9}},
+    })
+
+    assert frames[-1]["data"]["source"] == "router_eweb_ws_fast"
+    assert service.router_payload()["downloadBps"] == 2
+    # 让路就是整帧不要，不是把 agent 的数混进 eWeb 帧里。
+    assert "cpuPercent" not in service.router_payload()
+
+
+def test_agent_telemetry_push_takes_over_once_eweb_goes_quiet():
+    hub, _service = _fixture()
+    engine = RouterRealtimeEngine()
+    frames = []
+    engine.subscribe(lambda raw: frames.append(json.loads(raw)))
+    service = RouterLiteRealtimeService(hub, router_realtime=engine)
+    service.set_wss_demand("app-core", True)
+    now_ms = int(time.time() * 1000)
+    quiet_ms = now_ms - int(engine.AGENT_TELEMETRY_TAKEOVER_SECONDS * 1000) - 1000
+    engine.accept_router_fast({"uploadBps": 1, "downloadBps": 2}, quiet_ms)
+
+    service.accept_push({
+        "sampleEpochMs": now_ms,
+        "telemetry": {"cpuPercent": 12.5, "wan": {"downloadBps": 9}},
+    })
+
+    payload = service.router_payload()
+    assert frames[-1]["data"]["source"] == "agent_dashboard_push"
+    assert payload["downloadBps"] == 9
+    assert payload["cpuPercent"] == 12.5
+    assert payload["stale"] is False
+
+
 def test_router_core_owns_router_and_device_samples_independently():
     _hub, _service = _fixture()
     engine = RouterRealtimeEngine()

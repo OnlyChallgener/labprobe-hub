@@ -233,6 +233,16 @@ class RouterLiteRealtimeService:
     def accept_push(self, payload: Any) -> Dict[str, Any]:
         if not isinstance(payload, dict):
             raise ValueError("invalid realtime payload")
+        # EG 线（BE50）连不上 eWeb WS，agent 推送是唯一的实时源；这里以前只重置 demand
+        # 标志、把数据丢掉，App 就永远停在「等待首帧」。
+        engine = self.router_realtime
+        telemetry = payload.get("telemetry")
+        if engine is not None and isinstance(telemetry, dict) \
+                and hasattr(engine, "accept_agent_telemetry"):
+            try:
+                engine.accept_agent_telemetry(telemetry, _integer(payload.get("sampleEpochMs"), 0))
+            except Exception as exc:  # noqa: BLE001 - 实时通道不能拖垮 demand 应答
+                self.logger.warning("agent realtime push rejected: %s", exc)
         with self._demand:
             demand = self._demand_payload_locked()
         demand["acceptedRouter"] = False
