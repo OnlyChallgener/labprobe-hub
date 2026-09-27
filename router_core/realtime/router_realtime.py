@@ -398,10 +398,8 @@ class RouterRealtimeEngine:
             "ok": True,
             "state": "checking",
             "connected": False,
-            "cpuPercent": 0.0,
-            "memoryPercent": 0.0,
-            "uploadBps": 0,
-            "downloadBps": 0,
+            # 没有真帧时不给 cpuPercent/memoryPercent/速率键：0.0 会被 App 渲染成「0%」，
+            # 把「没测到」伪装成「测到 0」。缺键时 App 侧按 -- 显示。
             "wanIp": "",
             "message": "正在准备数据",
             "sampleEpochMs": 0,
