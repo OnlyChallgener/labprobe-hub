@@ -96,8 +96,7 @@ jobs:
           BINARY="$RUNNER_TEMP/labrelay-cross-target/armv7-unknown-linux-musleabi/release/labrelay"
           test -x "$BINARY"
           OUTPUT="$(qemu-arm-static "$BINARY" version)"
-          printf '%s
-' "$OUTPUT"
+          printf '%s\n' "$OUTPUT"
           test "$OUTPUT" = "labrelay $VERSION"
 
       - name: Assemble complete installer repository
