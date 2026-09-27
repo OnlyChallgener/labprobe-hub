@@ -16,13 +16,13 @@ routers:
     workerPort: 58501
     appTokenEnv: HOME_APP_TOKEN
     hookTokenEnv: HOME_HOOK_TOKEN
-  - routerId: office-reyee
-    name: 办公室锐捷
-    site: 办公室
-    model: Reyee
+  - routerId: be50
+    name: BE50
+    site: 节点小宝组网
+    model: BE50
     platform: reyee
     ewebTransport: direct
-    ewebUrl: http://192.168.6.1
+    ewebUrl: http://100.66.1.1
     workerPort: 58502
-    appTokenEnv: OFFICE_APP_TOKEN
-    hookTokenEnv: OFFICE_HOOK_TOKEN
+    appTokenEnv: BE50_APP_TOKEN
+    hookTokenEnv: BE50_HOOK_TOKEN

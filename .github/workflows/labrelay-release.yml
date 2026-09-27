@@ -5,6 +5,8 @@ on:
   push:
     branches:
       - fix/relay-nofile-upgrade-0.2.33-v2
+      - fix_hub_sync_ui
+      - main
 
 concurrency:
   group: publish-labrelay-${{ github.ref }}
@@ -70,21 +72,29 @@ jobs:
           sudo apt-get update
           sudo apt-get install -y qemu-user-static
 
-      - name: Build static ARM64 router binary
+      - name: Build static router binaries
         env:
           CARGO_TARGET_DIR: ${{ runner.temp }}/labrelay-cross-target
-        run: cross build --manifest-path labrelay/Cargo.toml --release --target aarch64-unknown-linux-musl
+        run: |
+          cross build --manifest-path labrelay/Cargo.toml --release --target aarch64-unknown-linux-musl
+          cross build --manifest-path labrelay/Cargo.toml --release --target armv7-unknown-linux-musleabi
 
       - name: Verify binary self-reported version
         env:
           VERSION: ${{ steps.version.outputs.version }}
         run: |
           set -euo pipefail
-          BINARY="$RUNNER_TEMP/labrelay-cross-target/aarch64-unknown-linux-musl/release/labrelay"
-          test -x "$BINARY"
-          OUTPUT="$(qemu-aarch64-static "$BINARY" version)"
-          printf '%s\n' "$OUTPUT"
-          test "$OUTPUT" = "labrelay $VERSION"
+          BINARY_ARM64="$RUNNER_TEMP/labrelay-cross-target/aarch64-unknown-linux-musl/release/labrelay"
+          test -x "$BINARY_ARM64"
+          OUTPUT_ARM64="$(qemu-aarch64-static "$BINARY_ARM64" version)"
+          printf 'ARM64: %s\n' "$OUTPUT_ARM64"
+          test "$OUTPUT_ARM64" = "labrelay $VERSION"
+
+          BINARY_ARMV7="$RUNNER_TEMP/labrelay-cross-target/armv7-unknown-linux-musleabi/release/labrelay"
+          test -x "$BINARY_ARMV7"
+          OUTPUT_ARMV7="$(qemu-arm-static "$BINARY_ARMV7" version)"
+          printf 'ARMv7: %s\n' "$OUTPUT_ARMV7"
+          test "$OUTPUT_ARMV7" = "labrelay $VERSION"
 
       - name: Assemble complete installer repository
         env:
@@ -93,15 +103,20 @@ jobs:
         run: |
           set -euo pipefail
           OUT="$RUNNER_TEMP/agent"
-          BINARY="$RUNNER_TEMP/labrelay-cross-target/aarch64-unknown-linux-musl/release/labrelay"
-          test -x "$BINARY"
+          BINARY_ARM64="$RUNNER_TEMP/labrelay-cross-target/aarch64-unknown-linux-musl/release/labrelay"
+          BINARY_ARMV7="$RUNNER_TEMP/labrelay-cross-target/armv7-unknown-linux-musleabi/release/labrelay"
+          test -x "$BINARY_ARM64"
+          test -x "$BINARY_ARMV7"
           mkdir -p "$OUT"
-          cp "$BINARY" "$OUT/labrelay-linux-arm64"
+          cp "$BINARY_ARM64" "$OUT/labrelay-linux-arm64"
+          cp "$BINARY_ARMV7" "$OUT/labrelay-linux-armv7"
           cp scripts/labprobe-install.sh "$OUT/install.sh"
           cp scripts/labprobe-install.sh "$OUT/labprobe-install.sh"
-          chmod 755 "$OUT/labrelay-linux-arm64" "$OUT/install.sh" "$OUT/labprobe-install.sh"
-          file "$OUT/labrelay-linux-arm64" > "$RUNNER_TEMP/labrelay-file.txt"
-          grep -Eqi 'aarch64|ARM aarch64|ARM64' "$RUNNER_TEMP/labrelay-file.txt"
+          chmod 755 "$OUT/labrelay-linux-arm64" "$OUT/labrelay-linux-armv7" "$OUT/install.sh" "$OUT/labprobe-install.sh"
+          file "$OUT/labrelay-linux-arm64" > "$RUNNER_TEMP/labrelay-file-arm64.txt"
+          grep -Eqi 'aarch64|ARM aarch64|ARM64' "$RUNNER_TEMP/labrelay-file-arm64.txt"
+          file "$OUT/labrelay-linux-armv7" > "$RUNNER_TEMP/labrelay-file-armv7.txt"
+          grep -Eqi 'arm|ARM' "$RUNNER_TEMP/labrelay-file-armv7.txt"
           sh -n "$OUT/install.sh"
           grep -q "ulimit -n 131072" "$OUT/install.sh"
           grep -q 'procd_set_param limits nofile="131072 131072"' "$OUT/install.sh"
@@ -129,14 +144,17 @@ jobs:
           manifest = {
               'schemaVersion': 1,
               'versionName': version,
-              'changelog': 'Fix BE72 Relay nofile inheritance, add guarded TCP peak extreme mode with automatic source-port restoration, and allow router-self TCP STUN listener/keepalive to share the configured middle port.',
+              'changelog': f'Multi-arch LabRelay v{version} for Ruijie BE72 (ARM64) and BE50 (ARMv7), supporting Child Guard, flow telemetry, and reverse tunnels.',
               'installUrl': f'{release_root}/install.sh',
               'checksumsUrl': f'{release_root}/checksums.txt',
               'installer': metadata('install.sh'),
-              'binaries': {'arm64': metadata('labrelay-linux-arm64')},
+              'binaries': {
+                  'arm64': metadata('labrelay-linux-arm64'),
+                  'armv7': metadata('labrelay-linux-armv7'),
+              },
           }
           (out / 'latest.json').write_text(json.dumps(manifest, ensure_ascii=False, indent=2) + '\n', encoding='utf-8')
-          names = ['labrelay-linux-arm64', 'install.sh', 'labprobe-install.sh', 'latest.json']
+          names = ['labrelay-linux-arm64', 'labrelay-linux-armv7', 'install.sh', 'labprobe-install.sh', 'latest.json']
           lines = []
           for name in names:
               data = (out / name).read_bytes()
@@ -144,15 +162,15 @@ jobs:
           (out / 'checksums.txt').write_text('\n'.join(lines) + '\n', encoding='utf-8')
           PY
           (cd "$OUT" && sha256sum -c checksums.txt)
-          tar -C "$RUNNER_TEMP" -czf "$RUNNER_TEMP/labrelay-router-arm64-v$VERSION.tar.gz" agent
+          tar -C "$RUNNER_TEMP" -czf "$RUNNER_TEMP/labrelay-router-multiarch-v$VERSION.tar.gz" agent
 
       - name: Upload complete router bundle artifact
         uses: actions/upload-artifact@v4
         with:
-          name: labrelay-router-arm64-v${{ steps.version.outputs.version }}
+          name: labrelay-router-multiarch-v${{ steps.version.outputs.version }}
           path: |
             ${{ runner.temp }}/agent/**
-            ${{ runner.temp }}/labrelay-router-arm64-v${{ steps.version.outputs.version }}.tar.gz
+            ${{ runner.temp }}/labrelay-router-multiarch-v${{ steps.version.outputs.version }}.tar.gz
           if-no-files-found: error
 
       - name: Publish or update GitHub release assets
@@ -165,24 +183,24 @@ jobs:
           prerelease: false
           generate_release_notes: false
           body: |
-            LabRelay OpenWrt/BE72 router bundle.
+            LabRelay OpenWrt / Ruijie Multi-Arch Router Bundle.
 
-            0.2.41 fixes:
-            - Relay daemon raises and verifies `RLIMIT_NOFILE=131072` instead of silently running with BE72 `1024/4096` limits;
-            - the unified `/etc/init.d/labprobe` installer is now the canonical update installer;
-            - TCP peak test supports guarded extreme mode with temporary `ip_local_port_range=1024 65535` and automatic restoration on completion/stop/error or next daemon startup;
-            - router-self TCP STUN allows its listener and outbound STUN keepalive to share the configured middle port via `SO_REUSEPORT`;
-            - existing CPU, memory, Conntrack, FD and source-port protection remains active.
+            Features:
+            - Multi-arch support: ARM64 (BE72) and ARMv7 SoftFP (BE50);
+            - Full Child Internet Guard (5-second flow sampling, app identification, minute-bucket reporting, IPv6 automatic downgrade protection);
+            - High performance reverse proxy and TCP STUN;
+            - OpenWrt procd unified service integration.
 
             First install:
-            `sh install.sh HUB_URL HOOK_TOKEN BE72Pro`
+            `sh install.sh HUB_URL HOOK_TOKEN ROUTER_NAME`
 
             Existing installation upgrade:
             `sh install.sh upgrade`
           files: |
             ${{ runner.temp }}/agent/labrelay-linux-arm64
+            ${{ runner.temp }}/agent/labrelay-linux-armv7
             ${{ runner.temp }}/agent/install.sh
             ${{ runner.temp }}/agent/labprobe-install.sh
             ${{ runner.temp }}/agent/latest.json
             ${{ runner.temp }}/agent/checksums.txt
-            ${{ runner.temp }}/labrelay-router-arm64-v${{ steps.version.outputs.version }}.tar.gz
+            ${{ runner.temp }}/labrelay-router-multiarch-v${{ steps.version.outputs.version }}.tar.gz

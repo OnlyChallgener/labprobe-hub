@@ -2676,11 +2676,12 @@ def _normalized_agent_manifest(root: Any, source_url: str) -> Dict[str, Any]:
     version = clean_saved_value(manifest.get("versionName") or manifest.get("version"))
     binaries = manifest.get("binaries")
     arm64 = binaries.get("arm64") if isinstance(binaries, dict) else None
-    if not version or not isinstance(arm64, dict):
+    armv7 = binaries.get("armv7") if isinstance(binaries, dict) else None
+    if not version or (not isinstance(arm64, dict) and not isinstance(armv7, dict)):
         raise ValueError("agent latest.json is invalid")
 
     installer_url = clean_saved_value(manifest.get("installUrl")) or AGENT_INSTALLER_URL
-    binary_url = clean_saved_value(arm64.get("url"))
+    binary_url = clean_saved_value((arm64 or armv7 or {}).get("url"))
     repository_root = UPDATE_REPOSITORY_ROOT
     release_asset_url = binary_url or installer_url
     if "/releases/download/" in release_asset_url and "/" in release_asset_url:
@@ -5695,6 +5696,8 @@ def _single_router_row() -> Dict[str, Any]:
     online_count = to_int(devices.get("onlineDeviceCount"), -1)
     if online_count < 0 and isinstance(dashboard.get("telemetry"), dict):
         online_count = to_int(dashboard["telemetry"].get("onlineDeviceCount"), -1)
+    if online_count < 0 and isinstance(devices.get("online"), list):
+        online_count = len(devices["online"])
     if total >= 0:
         row["deviceCount"] = total
     if online_count >= 0:

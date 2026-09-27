@@ -55,6 +55,7 @@ esac
 
 case "$(uname -m 2>/dev/null || true)" in
   aarch64|arm64|armv8*) ARCH=arm64 ;;
+  armv7*|arm) ARCH=armv7 ;;
   x86_64|amd64) ARCH=amd64 ;;
   *) fail "unsupported architecture: $(uname -m 2>/dev/null || echo unknown)" ;;
 esac
@@ -189,6 +190,9 @@ else
     if [ "$ARCH" = arm64 ]; then
       primary="$(json_value '@.binaries.arm64.url' url "$MANIFEST")"
       fallback="$(json_value '@.binaries.arm64.fallbackUrl' fallbackUrl "$MANIFEST")"
+    elif [ "$ARCH" = armv7 ]; then
+      primary="$(json_value '@.binaries.armv7.url' url "$MANIFEST")"
+      fallback="$(json_value '@.binaries.armv7.fallbackUrl' fallbackUrl "$MANIFEST")"
     else
       primary="$(json_value '@.binaries.amd64.url' url "$MANIFEST")"
       fallback="$(json_value '@.binaries.amd64.fallbackUrl' fallbackUrl "$MANIFEST")"
@@ -203,6 +207,8 @@ else
   if [ "$downloaded" = 0 ]; then
     if [ "$ARCH" = arm64 ]; then
       names='labrelay-linux-arm64 labrelay-aarch64-musl labrelay-linux-aarch64'
+    elif [ "$ARCH" = armv7 ]; then
+      names='labrelay-linux-armv7 labrelay-armv7-musl labrelay-linux-armv7l'
     else
       names='labrelay-linux-amd64 labrelay-x86_64-musl labrelay-linux-x86_64'
     fi

@@ -64,7 +64,8 @@ need_root() { [ "$(id -u 2>/dev/null)" = "0" ] || fail "请使用 root 运行"; 
 detect_arch() {
   case "$(uname -m 2>/dev/null)" in
     aarch64|arm64) ARCH="arm64" ;;
-    *) fail "Rust Agent 仅支持已适配锐捷路由器的 ARM64 架构：$(uname -m 2>/dev/null)" ;;
+    armv7*|armv8l|arm) ARCH="armv7" ;;
+    *) fail "Rust Agent 仅支持已适配锐捷路由器的 ARM64 / ARMv7 架构：$(uname -m 2>/dev/null)" ;;
   esac
 }
 
@@ -329,7 +330,7 @@ mkdir -p "$INSTALL_DIR/backups" /tmp/labprobe
 INSTALL_STAGE="备份现有 Agent"
 backup_old
 prune_backups
-INSTALL_STAGE="下载并校验 ARM64 Agent"
+INSTALL_STAGE="下载并校验 $ARCH Agent"
 download_binary
 [ -x "$INIT_SCRIPT" ] && "$INIT_SCRIPT" stop >/dev/null 2>&1 || true
 INSTALL_STAGE="替换 Agent 程序"

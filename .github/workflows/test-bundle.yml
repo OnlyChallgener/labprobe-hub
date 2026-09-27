@@ -95,21 +95,29 @@ jobs:
           sudo apt-get update
           sudo apt-get install -y qemu-user-static
 
-      - name: Build static ARM64 router binary
+      - name: Build static router binaries
         env:
           CARGO_TARGET_DIR: ${{ runner.temp }}/labrelay-cross-target
-        run: cross build --manifest-path labrelay/Cargo.toml --release --target aarch64-unknown-linux-musl
+        run: |
+          cross build --manifest-path labrelay/Cargo.toml --release --target aarch64-unknown-linux-musl
+          cross build --manifest-path labrelay/Cargo.toml --release --target armv7-unknown-linux-musleabi
 
       - name: Verify binary self-reported version
         env:
           VERSION: ${{ steps.version.outputs.version }}
         run: |
           set -euo pipefail
-          BINARY="$RUNNER_TEMP/labrelay-cross-target/aarch64-unknown-linux-musl/release/labrelay"
-          test -x "$BINARY"
-          OUTPUT="$(qemu-aarch64-static "$BINARY" version)"
-          printf '%s\n' "$OUTPUT"
-          test "$OUTPUT" = "labrelay $VERSION"
+          BINARY_ARM64="$RUNNER_TEMP/labrelay-cross-target/aarch64-unknown-linux-musl/release/labrelay"
+          test -x "$BINARY_ARM64"
+          OUTPUT_ARM64="$(qemu-aarch64-static "$BINARY_ARM64" version)"
+          printf 'ARM64: %s\n' "$OUTPUT_ARM64"
+          test "$OUTPUT_ARM64" = "labrelay $VERSION"
+
+          BINARY_ARMV7="$RUNNER_TEMP/labrelay-cross-target/armv7-unknown-linux-musleabi/release/labrelay"
+          test -x "$BINARY_ARMV7"
+          OUTPUT_ARMV7="$(qemu-arm-static "$BINARY_ARMV7" version)"
+          printf 'ARMv7: %s\n' "$OUTPUT_ARMV7"
+          test "$OUTPUT_ARMV7" = "labrelay $VERSION"
 
       - name: Assemble test agent bundle
         env:
@@ -118,14 +126,17 @@ jobs:
         run: |
           set -euo pipefail
           OUT="$RUNNER_TEMP/agent"
-          BINARY="$RUNNER_TEMP/labrelay-cross-target/aarch64-unknown-linux-musl/release/labrelay"
-          test -x "$BINARY"
+          BINARY_ARM64="$RUNNER_TEMP/labrelay-cross-target/aarch64-unknown-linux-musl/release/labrelay"
+          BINARY_ARMV7="$RUNNER_TEMP/labrelay-cross-target/armv7-unknown-linux-musleabi/release/labrelay"
+          test -x "$BINARY_ARM64"
+          test -x "$BINARY_ARMV7"
           mkdir -p "$OUT"
-          cp "$BINARY" "$OUT/labrelay-linux-arm64"
+          cp "$BINARY_ARM64" "$OUT/labrelay-linux-arm64"
+          cp "$BINARY_ARMV7" "$OUT/labrelay-linux-armv7"
           # Use the unified installer so test upgrades cannot leave legacy
           # labrelay/labrelay_agent services running beside /etc/init.d/labprobe.
           cp scripts/labprobe-install.sh "$OUT/install.sh"
-          chmod 755 "$OUT/labrelay-linux-arm64" "$OUT/install.sh"
+          chmod 755 "$OUT/labrelay-linux-arm64" "$OUT/labrelay-linux-armv7" "$OUT/install.sh"
           python3 - <<'PY'
           import hashlib
           import json
@@ -154,10 +165,13 @@ jobs:
               'installUrl': f'{release_root}/install.sh',
               'checksumsUrl': f'{release_root}/checksums.txt',
               'installer': metadata('install.sh'),
-              'binaries': {'arm64': metadata('labrelay-linux-arm64')},
+              'binaries': {
+                  'arm64': metadata('labrelay-linux-arm64'),
+                  'armv7': metadata('labrelay-linux-armv7'),
+              },
           }
           (out / 'latest.json').write_text(json.dumps(manifest, ensure_ascii=False, indent=2) + '\n', encoding='utf-8')
-          names = ['labrelay-linux-arm64', 'install.sh', 'latest.json']
+          names = ['labrelay-linux-arm64', 'labrelay-linux-armv7', 'install.sh', 'latest.json']
           lines = []
           for name in names:
               data = (out / name).read_bytes()
@@ -165,12 +179,12 @@ jobs:
           (out / 'checksums.txt').write_text('\n'.join(lines) + '\n', encoding='utf-8')
           PY
           (cd "$OUT" && sha256sum -c checksums.txt)
-          tar -C "$RUNNER_TEMP" -czf "$RUNNER_TEMP/labrelay-test-arm64-v$VERSION.tar.gz" agent
+          tar -C "$RUNNER_TEMP" -czf "$RUNNER_TEMP/labrelay-test-multiarch-v$VERSION.tar.gz" agent
 
       - name: Upload router bundle artifact
         uses: actions/upload-artifact@v4
         with:
-          name: labrelay-test-arm64-v${{ steps.version.outputs.version }}
+          name: labrelay-test-multiarch-v${{ steps.version.outputs.version }}
           path: |
             ${{ runner.temp }}/agent/**
             ${{ runner.temp }}/labrelay-test-arm64-v${{ steps.version.outputs.version }}.tar.gz
