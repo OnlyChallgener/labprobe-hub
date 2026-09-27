@@ -4268,6 +4268,8 @@ def api_router_dashboard_push():
             resolved_operator = _operator_for_dashboard_ip(hub_exit_ipv4)
     else:
         _schedule_dashboard_operator_probe()
+    agent_telemetry: Optional[Dict[str, Any]] = None
+    agent_telemetry_epoch_ms = 0
     with ROUTER_DASHBOARD_LOCK:
         ROUTER_DASHBOARD_CACHE["router"] = router_name
         ROUTER_DASHBOARD_CACHE["receivedAt"] = now_str()
@@ -4277,6 +4279,8 @@ def api_router_dashboard_push():
             ROUTER_DASHBOARD_CACHE["telemetry"] = telemetry
             ROUTER_DASHBOARD_CACHE["telemetryAt"] = now_str()
             ROUTER_DASHBOARD_CACHE["telemetryEpoch"] = _dashboard_epoch(payload.get("telemetryEpoch")) or now_epoch
+            agent_telemetry = telemetry
+            agent_telemetry_epoch_ms = int(ROUTER_DASHBOARD_CACHE["telemetryEpoch"] * 1000)
         details = payload.get("details")
         if isinstance(details, dict):
             existing_details = ROUTER_DASHBOARD_CACHE.get("details") if isinstance(ROUTER_DASHBOARD_CACHE.get("details"), dict) else {}
@@ -4313,6 +4317,16 @@ def api_router_dashboard_push():
         credentials_refresh_nonce = ROUTER_CREDENTIALS_REFRESH_NONCE
     _persist_router_dashboard_if_due()
     MQTT_PUBLISHER.publish_dashboard(public)
+    if agent_telemetry is not None:
+        # EG 线（BE50 那类）的 eWeb WS 采样接口和 BE72 不是一套，hub 连不上去，
+        # App 就永远停在「等待首帧」。agent 的 dashboard 推送是它唯一的实时源。
+        # 引擎自己会在 eWeb 采样还新鲜时让路，所以这里无条件调用即可。
+        engine = globals().get("ROUTER_REALTIME")
+        if engine is not None and hasattr(engine, "accept_agent_telemetry"):
+            try:
+                engine.accept_agent_telemetry(agent_telemetry, agent_telemetry_epoch_ms)
+            except Exception as exc:
+                LOGGER.warning("agent telemetry realtime feed failed: %s", exc)
     return jsonify({
         "ok": True,
         "time": now_str(),

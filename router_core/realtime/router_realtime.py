@@ -248,6 +248,67 @@ class RouterRealtimeEngine:
         """Normalize one Reyee ``fast`` sample and publish the App router contract."""
         self._accept_router_sample(sample, sample_epoch_ms, "router_eweb_ws_fast")
 
+    # Agent 的 dashboard 推送是 EG 线（BE50 那类）唯一的实时源：那台机器的 eWeb 端口表
+    # 和 WS 采样接口跟 BE72 不是一套，hub 连上去只会永远 ``等待路由器本地实时采样``。
+    # 但 BE72 上 eWeb 更快也更全，不能被 2 秒一次的 agent 推送盖过去，所以只在 eWeb
+    # 超过这个秒数没出样时才让 agent 顶上。
+    AGENT_TELEMETRY_TAKEOVER_SECONDS = 20
+
+    @staticmethod
+    def flatten_agent_telemetry(telemetry: Dict[str, Any]) -> Dict[str, Any]:
+        """把 agent 的嵌套 telemetry 摊平成 App 实时契约的字段名。
+
+        值为 None 的字段直接丢掉：``storagePercent: null`` 是「没读到」，
+        摊成 0.0 就会在 App 上显示成 0%，那是把未知伪装成测到过的数。
+        """
+        connections = telemetry.get("connections") if isinstance(telemetry.get("connections"), dict) else {}
+        wan = telemetry.get("wan") if isinstance(telemetry.get("wan"), dict) else {}
+        sample: Dict[str, Any] = {}
+        flat = (
+            ("cpuPercent", telemetry, "cpuPercent"),
+            ("memoryPercent", telemetry, "memoryPercent"),
+            ("temperatureC", telemetry, "temperatureC"),
+            ("temperature2gC", telemetry, "temperature2gC"),
+            ("temperature5gC", telemetry, "temperature5gC"),
+            ("storagePercent", telemetry, "storagePercent"),
+            ("uptimeSeconds", telemetry, "uptimeSeconds"),
+            ("onlineDeviceCount", telemetry, "onlineDeviceCount"),
+            ("ipv4Connections", connections, "ipv4"),
+            ("ipv6Connections", connections, "ipv6"),
+            ("ipv4HalfConnections", connections, "ipv4Half"),
+            ("ipv6HalfConnections", connections, "ipv6Half"),
+            ("cps", connections, "cps"),
+            ("downloadBps", wan, "downloadBps"),
+            ("uploadBps", wan, "uploadBps"),
+            ("totalDownloadBytes", wan, "totalDownloadBytes"),
+            ("totalUploadBytes", wan, "totalUploadBytes"),
+        )
+        for target, source, key in flat:
+            value = source.get(key) if key in source else None
+            if value is not None:
+                sample[target] = value
+        return sample
+
+    def accept_agent_telemetry(self, telemetry: Any, sample_epoch_ms: int = 0) -> None:
+        """Feed the App realtime contract from an agent dashboard push.
+
+        Skipped while the eWeb WebSocket path is still producing samples, so this
+        never downgrades a Reyee box that already has the faster source.
+        """
+        if not isinstance(telemetry, dict):
+            return
+        with self._lock:
+            data = dict((self._latest_router_frame or {}).get("data") or {})
+        source = str(data.get("source") or "")
+        epoch_ms = _integer(data.get("sampleEpochMs"), 0)
+        if source.startswith("router_eweb_ws") and epoch_ms and \
+                int(time.time() * 1000) - epoch_ms < int(self.AGENT_TELEMETRY_TAKEOVER_SECONDS * 1000):
+            return
+        sample = self.flatten_agent_telemetry(telemetry)
+        if not sample:
+            return
+        self._accept_router_sample(sample, sample_epoch_ms, "agent_dashboard_push")
+
     def accept_router_slow(self, sample: Any, sample_epoch_ms: int = 0) -> None:
         """Merge slow eWeb fields such as storage without delaying APP refresh."""
         if isinstance(sample, dict):
