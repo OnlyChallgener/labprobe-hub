@@ -73,6 +73,11 @@ struct AgentState {
     last_dashboard_network_at: u64,
     last_storage_check_at: u64,
     storage_percent: Option<f64>,
+    local_cpu_busy: u64,
+    local_cpu_total: u64,
+    local_wan_rx: u64,
+    local_wan_tx: u64,
+    local_rate_at: u64,
     last_dashboard_refresh_nonce: u64,
     last_credentials_refresh_nonce: u64,
     last_wireguard_at: u64,
@@ -797,6 +802,159 @@ fn storage_percent_from_df() -> Result<f64> {
         .ok_or_else(|| anyhow!("df returned no writable overlay usage"))
 }
 
+/// EG 线固件（BE50 那类）没有 eWeb 的 ws_sysinfo 采样命令，实时数只能读 procfs/sysfs。
+/// 解析函数都吃 &str 以便单测；读不到一律 None，Hub 侧按「没测到」处理而不是 0。
+fn parse_local_cpu_percent(raw: &str, prev_busy: u64, prev_total: u64) -> Option<(f64, u64, u64)> {
+    let line = raw.lines().next()?;
+    let mut fields = line.split_whitespace();
+    if fields.next()? != "cpu" {
+        return None;
+    }
+    let cells: Vec<u64> = fields.map(|cell| cell.parse::<u64>().unwrap_or(0)).collect();
+    if cells.len() < 4 {
+        return None;
+    }
+    let total: u64 = cells.iter().sum();
+    let idle = cells[3] + cells.get(4).copied().unwrap_or(0);
+    let busy = total.saturating_sub(idle);
+    let d_total = total.saturating_sub(prev_total);
+    let percent = if prev_total == 0 || d_total == 0 {
+        0.0
+    } else {
+        (busy.saturating_sub(prev_busy)) as f64 / d_total as f64 * 100.0
+    };
+    Some((percent, busy, total))
+}
+
+fn parse_local_memory_percent(raw: &str) -> Option<f64> {
+    let mut total = None;
+    let mut available = None;
+    for line in raw.lines() {
+        if let Some(rest) = line.strip_prefix("MemTotal:") {
+            total = rest.split_whitespace().next().and_then(|value| value.parse::<f64>().ok());
+        } else if let Some(rest) = line.strip_prefix("MemAvailable:") {
+            available = rest.split_whitespace().next().and_then(|value| value.parse::<f64>().ok());
+        }
+    }
+    let total = total.filter(|value| *value > 0.0)?;
+    let available = available?;
+    Some(((total - available) / total * 100.0).clamp(0.0, 100.0))
+}
+
+fn parse_local_uptime_seconds(raw: &str) -> Option<u64> {
+    let secs: f64 = raw.split_whitespace().next()?.parse().ok()?;
+    Some(secs as u64)
+}
+
+fn parse_local_temperature_c(raw: &str) -> Option<f64> {
+    let milli: f64 = raw.trim().parse().ok()?;
+    Some(milli / 1000.0)
+}
+
+/// /proc/net/dev 里挑第一个有流量的 WAN 候选口；NodeBabyLink 这类隧道口不在候选里。
+fn parse_wan_counters(raw: &str) -> Option<(&'static str, u64, u64)> {
+    for candidate in ["br-wan", "pppoe-wan", "eth5", "eth0"] {
+        for line in raw.lines() {
+            let Some((name, rest)) = line.split_once(':') else { continue };
+            if name.trim() != candidate {
+                continue;
+            }
+            let cells: Vec<&str> = rest.split_whitespace().collect();
+            if cells.len() < 9 {
+                continue;
+            }
+            let rx = cells[0].parse::<u64>().unwrap_or(0);
+            let tx = cells[8].parse::<u64>().unwrap_or(0);
+            if rx + tx > 0 {
+                return Some((candidate, rx, tx));
+            }
+        }
+    }
+    None
+}
+
+/// sniffer_flow_full 一行一条流；源/目的任一是 v6 字面量就记 v6。
+fn parse_local_connection_counts(raw: &str) -> (u64, u64) {
+    let (mut ipv4, mut ipv6) = (0u64, 0u64);
+    for line in raw.lines() {
+        let cells: Vec<&str> = line.split_whitespace().collect();
+        if cells.len() < 3 {
+            continue;
+        }
+        if cells[1].contains(':') || cells[2].contains(':') {
+            ipv6 += 1;
+        } else {
+            ipv4 += 1;
+        }
+    }
+    (ipv4, ipv6)
+}
+
+fn local_telemetry_payload(config: &AgentConfig, state: &mut AgentState) -> Value {
+    let now = now_epoch();
+    let cpu = fs::read_to_string("/proc/stat")
+        .ok()
+        .and_then(|raw| parse_local_cpu_percent(&raw, state.local_cpu_busy, state.local_cpu_total))
+        .map(|(percent, busy, total)| {
+            state.local_cpu_busy = busy;
+            state.local_cpu_total = total;
+            percent
+        });
+    let memory = fs::read_to_string("/proc/meminfo")
+        .ok()
+        .and_then(|raw| parse_local_memory_percent(&raw));
+    let uptime = fs::read_to_string("/proc/uptime")
+        .ok()
+        .and_then(|raw| parse_local_uptime_seconds(&raw));
+    let temperature = fs::read_to_string("/sys/class/thermal/thermal_zone0/temp")
+        .ok()
+        .and_then(|raw| parse_local_temperature_c(&raw));
+    let wan = fs::read_to_string("/proc/net/dev")
+        .ok()
+        .and_then(|raw| parse_wan_counters(&raw))
+        .map(|(_, rx, tx)| {
+            let dt = now.saturating_sub(state.local_rate_at);
+            let rates = if state.local_rate_at == 0 || dt == 0 {
+                (0u64, 0u64)
+            } else {
+                (
+                    rx.saturating_sub(state.local_wan_rx) / dt,
+                    tx.saturating_sub(state.local_wan_tx) / dt,
+                )
+            };
+            state.local_wan_rx = rx;
+            state.local_wan_tx = tx;
+            state.local_rate_at = now;
+            json!({
+                "downloadBps": rates.0,
+                "uploadBps": rates.1,
+                "totalDownloadBytes": rx,
+                "totalUploadBytes": tx,
+            })
+        });
+    let connections = fs::read_to_string("/proc/net/sniffer_flow_full")
+        .ok()
+        .map(|raw| {
+            let (ipv4, ipv6) = parse_local_connection_counts(&raw);
+            json!({ "ipv4": ipv4, "ipv6": ipv6 })
+        });
+    json!({
+        "router": config.router_name,
+        "telemetryAt": now,
+        "telemetryEpoch": now,
+        "telemetry": {
+            "cpuPercent": cpu,
+            "memoryPercent": memory,
+            "storagePercent": state.storage_percent,
+            "temperatureC": temperature,
+            "uptimeSeconds": uptime,
+            "onlineDeviceCount": state.devices.len(),
+            "connections": connections,
+            "wan": wan,
+        }
+    })
+}
+
 fn telemetry_from_fast(fast: &Value, online_devices: usize, cached_storage_percent: Option<f64>) -> Value {
     let wan_primary = object_path(fast, &["wan_stat", "wan"]).unwrap_or(&Value::Null);
     let wan = object_path(fast, &["wan_stat", "wans"])
@@ -1190,7 +1348,21 @@ async fn collect_dashboard_payload(
         }
     }
 
-    let fast = command_json("dev_sta", &["get", "-m", "ws_sysinfo", r#"{"get":"fast"}"#])?;
+    let fast = match command_json("dev_sta", &["get", "-m", "ws_sysinfo", r#"{"get":"fast"}"#]) {
+        Ok(value) => value,
+        Err(error) => {
+            // EG 线没有 ws_sysinfo：不兜底的话整个 dashboard push 直接 Err，
+            // Hub 的 /api/router/realtime 就永远「等待首帧」。改走本地 procfs，节奏不变。
+            log_limited(
+                config,
+                state,
+                "WARN",
+                "router-fast-local",
+                &format!("eWeb fast unavailable, using local procfs telemetry: {:#}", error),
+            );
+            return Ok(local_telemetry_payload(config, state));
+        }
+    };
     state.last_dashboard_fast_at = now;
     let mut payload = json!({
         "router": config.router_name,
@@ -2294,4 +2466,48 @@ pub fn print_status(args: &[String]) -> Result<()> {
         )?
     );
     Ok(())
+}
+
+#[cfg(test)]
+mod local_telemetry_tests {
+    use super::*;
+
+    const STAT_A: &str = "cpu  12631344 0 10923736 237436470 293 0 660503 0 0 0\ncpu0 6515314 0 4512333 119261354 129 0 537043 0 0 0\n";
+    const STAT_B: &str = "cpu  12631844 0 10923736 237436970 293 0 660503 0 0 0\ncpu0 6515314 0 4512333 119261354 129 0 537043 0 0 0\n";
+    const MEMINFO: &str = "MemTotal:         452696 kB\nMemFree:          105352 kB\nMemAvailable:     149624 kB\nBuffers:            9652 kB\n";
+    const DEV: &str = "Inter-|   Receive                                                |  Transmit\n face |bytes    packets errs drop fifo frame compressed multicast|bytes    packets errs drop fifo colls carrier compressed\n  eth5: 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0\nNodeBabyLink: 44103024  312486    0    0    0     0          0         0 65631867  376238    0    0    0     0       0          0\nbr-wan: 1321998294 5187532 0 261112 0 0 0 0 2109392551 7658534 0 0 0 0 0 0\n";
+    const FLOWS: &str = "b8:88:80:14:ef:9b 192.168.110.118 110.43.39.214 22079 32100 UDP 0 0-0-0-0 71 180 5 376 5 208 1\nb8:88:80:14:ef:9b 192.168.110.118 42.157.165.215 29135 32100 UDP 0 0-0-0-0 131 180 5 376 5 208 1\naa:bb:cc:dd:ee:ff 2001:db8::1 2001:db8::2 1 2 UDP 0 0 1 1 1 1 1 1 1\n";
+
+    #[test]
+    fn cpu_percent_uses_delta_between_samples() {
+        let first = parse_local_cpu_percent(STAT_A, 0, 0).expect("first sample");
+        assert_eq!(first.0, 0.0);
+        let second = parse_local_cpu_percent(STAT_B, first.1, first.2).expect("second sample");
+        assert!((second.0 - 50.0).abs() < 0.01, "delta busy 500 / delta total 1000 = 50%");
+    }
+
+    #[test]
+    fn memory_percent_uses_available_not_free() {
+        let percent = parse_local_memory_percent(MEMINFO).expect("meminfo");
+        assert!((percent - 66.95).abs() < 0.05);
+    }
+
+    #[test]
+    fn uptime_and_temperature_parse_real_shapes() {
+        assert_eq!(parse_local_uptime_seconds("1308261.73 2374364.70\n"), Some(1308261));
+        assert!((parse_local_temperature_c("71800\n").expect("temp") - 71.8).abs() < 0.001);
+    }
+
+    #[test]
+    fn wan_counters_skip_dead_and_tunnel_interfaces() {
+        let (iface, rx, tx) = parse_wan_counters(DEV).expect("br-wan");
+        assert_eq!(iface, "br-wan");
+        assert_eq!(rx, 1321998294);
+        assert_eq!(tx, 2109392551);
+    }
+
+    #[test]
+    fn connection_counts_split_v4_and_v6_flows() {
+        assert_eq!(parse_local_connection_counts(FLOWS), (2, 1));
+    }
 }

@@ -75,6 +75,11 @@ jobs:
           CARGO_TARGET_DIR: ${{ runner.temp }}/labrelay-cross-target
         run: cross build --manifest-path labrelay/Cargo.toml --release --target aarch64-unknown-linux-musl
 
+      - name: Build static ARMv7 router binary (soft-float musl for EG line like BE50)
+        env:
+          CARGO_TARGET_DIR: ${{ runner.temp }}/labrelay-cross-target
+        run: cross build --manifest-path labrelay/Cargo.toml --release --target armv7-unknown-linux-musleabi
+
       - name: Verify binary self-reported version
         env:
           VERSION: ${{ steps.version.outputs.version }}
@@ -84,6 +89,18 @@ jobs:
           test -x "$BINARY"
           OUTPUT="$(qemu-aarch64-static "$BINARY" version)"
           printf '%s\n' "$OUTPUT"
+          test "$OUTPUT" = "labrelay $VERSION"
+
+      - name: Verify ARMv7 binary self-reported version
+        env:
+          VERSION: ${{ steps.version.outputs.version }}
+        run: |
+          set -euo pipefail
+          BINARY="$RUNNER_TEMP/labrelay-cross-target/armv7-unknown-linux-musleabi/release/labrelay"
+          test -x "$BINARY"
+          OUTPUT="$(qemu-arm-static "$BINARY" version)"
+          printf '%s
+' "$OUTPUT"
           test "$OUTPUT" = "labrelay $VERSION"
 
       - name: Assemble complete installer repository
@@ -102,6 +119,10 @@ jobs:
           chmod 755 "$OUT/labrelay-linux-arm64" "$OUT/install.sh" "$OUT/labprobe-install.sh"
           file "$OUT/labrelay-linux-arm64" > "$RUNNER_TEMP/labrelay-file.txt"
           grep -Eqi 'aarch64|ARM aarch64|ARM64' "$RUNNER_TEMP/labrelay-file.txt"
+          cp "$RUNNER_TEMP/labrelay-cross-target/armv7-unknown-linux-musleabi/release/labrelay" "$OUT/labrelay-linux-armv7"
+          chmod 755 "$OUT/labrelay-linux-armv7"
+          file "$OUT/labrelay-linux-armv7" > "$RUNNER_TEMP/labrelay-file-armv7.txt"
+          grep -Eqi 'ARM, EABI5|32-bit .*ARM' "$RUNNER_TEMP/labrelay-file-armv7.txt"
           sh -n "$OUT/install.sh"
           grep -q "ulimit -n 131072" "$OUT/install.sh"
           grep -q 'procd_set_param limits nofile="131072 131072"' "$OUT/install.sh"
@@ -133,10 +154,10 @@ jobs:
               'installUrl': f'{release_root}/install.sh',
               'checksumsUrl': f'{release_root}/checksums.txt',
               'installer': metadata('install.sh'),
-              'binaries': {'arm64': metadata('labrelay-linux-arm64')},
+              'binaries': {'arm64': metadata('labrelay-linux-arm64'), 'armv7': metadata('labrelay-linux-armv7')},
           }
           (out / 'latest.json').write_text(json.dumps(manifest, ensure_ascii=False, indent=2) + '\n', encoding='utf-8')
-          names = ['labrelay-linux-arm64', 'install.sh', 'labprobe-install.sh', 'latest.json']
+          names = ['labrelay-linux-arm64', 'labrelay-linux-armv7', 'install.sh', 'labprobe-install.sh', 'latest.json']
           lines = []
           for name in names:
               data = (out / name).read_bytes()
@@ -145,6 +166,7 @@ jobs:
           PY
           (cd "$OUT" && sha256sum -c checksums.txt)
           tar -C "$RUNNER_TEMP" -czf "$RUNNER_TEMP/labrelay-router-arm64-v$VERSION.tar.gz" agent
+          tar -C "$RUNNER_TEMP" -czf "$RUNNER_TEMP/labrelay-router-multiarch-v$VERSION.tar.gz" agent
 
       - name: Upload complete router bundle artifact
         uses: actions/upload-artifact@v4
@@ -153,6 +175,7 @@ jobs:
           path: |
             ${{ runner.temp }}/agent/**
             ${{ runner.temp }}/labrelay-router-arm64-v${{ steps.version.outputs.version }}.tar.gz
+            ${{ runner.temp }}/labrelay-router-multiarch-v${{ steps.version.outputs.version }}.tar.gz
           if-no-files-found: error
 
       - name: Publish or update GitHub release assets
@@ -185,4 +208,6 @@ jobs:
             ${{ runner.temp }}/agent/labprobe-install.sh
             ${{ runner.temp }}/agent/latest.json
             ${{ runner.temp }}/agent/checksums.txt
+            ${{ runner.temp }}/agent/labrelay-linux-armv7
             ${{ runner.temp }}/labrelay-router-arm64-v${{ steps.version.outputs.version }}.tar.gz
+            ${{ runner.temp }}/labrelay-router-multiarch-v${{ steps.version.outputs.version }}.tar.gz

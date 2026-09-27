@@ -64,7 +64,8 @@ need_root() { [ "$(id -u 2>/dev/null)" = "0" ] || fail "请使用 root 运行"; 
 detect_arch() {
   case "$(uname -m 2>/dev/null)" in
     aarch64|arm64) ARCH="arm64" ;;
-    *) fail "Rust Agent 仅支持已适配锐捷路由器的 ARM64 架构：$(uname -m 2>/dev/null)" ;;
+    armv7|armv7l) ARCH="armv7" ;;
+    *) fail "Rust Agent 仅支持已适配锐捷路由器的 ARM64/ARMv7 架构：$(uname -m 2>/dev/null)" ;;
   esac
 }
 
