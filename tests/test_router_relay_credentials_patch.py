@@ -328,3 +328,63 @@ def test_agent_long_poll_wakes_immediately_on_credential_refresh(monkeypatch):
     assert result["elapsed"] < 1.0
     assert result["payload"]["credentialsRefreshNonce"] == 101
     assert result["payload"]["credentialsCompletedNonce"] == 100
+
+
+def test_relay_dashboard_ack_feeds_realtime_engine_from_agent_telemetry():
+    """EG 线唯一实时源是 agent 本地遥测：ack 照旧忽略 dashboard 缓存，但要喂实时引擎。"""
+    from router_core.realtime.router_realtime import RouterRealtimeEngine
+
+    app = Flask(__name__)
+    engine = RouterRealtimeEngine()
+    hub = _dashboard_ack_hub()
+    hub.ROUTER_REALTIME = engine
+    hub.LOGGER = SimpleNamespace(warning=lambda *a: None, info=lambda *a: None)
+    telemetry = {
+        "cpuPercent": 33.9, "memoryPercent": 66.9, "storagePercent": 23.0,
+        "temperatureC": 70.7, "uptimeSeconds": 1311376, "onlineDeviceCount": 7,
+        "connections": {"ipv4": 21, "ipv6": 0},
+        "wan": {"downloadBps": 180000, "uploadBps": 40000,
+                "totalDownloadBytes": 1362914035, "totalUploadBytes": 2183262653},
+    }
+    with app.test_request_context(
+        "/api/router/dashboard/push",
+        method="POST",
+        json={"telemetry": telemetry, "telemetryEpoch": int(time.time())},
+    ):
+        response = _relay_dashboard_ack(SimpleNamespace(hub=hub))
+        payload = response.get_json()
+
+    # 缓存语义不变：仍然 ignored / router_rpc。
+    assert payload["ignored"] is True
+    assert payload["source"] == "router_rpc"
+    # 但实时引擎收到了这一帧。
+    frame = engine.router_payload()
+    assert frame["connected"] is True
+    assert frame["source"] == "agent_dashboard_push"
+    assert frame["cpuPercent"] == 33.9
+    assert frame["temperatureC"] == 70.7
+    assert frame["ipv4Connections"] == 21
+    assert frame["downloadBps"] == 180000
+
+
+def test_relay_dashboard_ack_engine_feed_yields_to_fresh_eweb_sample():
+    """BE72 有新鲜 eWeb 采样时，agent 这条必须让路，不能降级。"""
+    from router_core.realtime.router_realtime import RouterRealtimeEngine
+
+    app = Flask(__name__)
+    engine = RouterRealtimeEngine()
+    engine.accept_router_fast({"cpuPercent": 5.0, "downloadBps": 999}, int(time.time() * 1000))
+    hub = _dashboard_ack_hub()
+    hub.ROUTER_REALTIME = engine
+    hub.LOGGER = SimpleNamespace(warning=lambda *a: None, info=lambda *a: None)
+    with app.test_request_context(
+        "/api/router/dashboard/push",
+        method="POST",
+        json={"telemetry": {"cpuPercent": 88.0, "wan": {"downloadBps": 1}},
+              "telemetryEpoch": int(time.time())},
+    ):
+        _relay_dashboard_ack(SimpleNamespace(hub=hub))
+
+    frame = engine.router_payload()
+    assert frame["source"] == "router_eweb_ws_fast"
+    assert frame["downloadBps"] == 999

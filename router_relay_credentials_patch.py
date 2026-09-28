@@ -211,6 +211,19 @@ def _relay_dashboard_ack(self: Any):
                 self.hub.ROUTER_DASHBOARD_CACHE["wireguard"] = dict(wireguard)
             if hasattr(self.hub, "_persist_router_dashboard_if_due"):
                 self.hub._persist_router_dashboard_if_due(force=False)
+        # EG 线（BE50 那类）固件的 eWeb RPC 只回零值，agent 的本地 procfs 遥测是
+        # App 实时契约的唯一真源。dashboard 缓存仍以 Hub RPC 为准（上面照旧忽略），
+        # 但把这份 telemetry 单独喂给实时引擎；引擎自带 eWeb 新鲜让路守卫，
+        # 所以 BE72 这类有 eWeb 采样的机器不会被这条降级。
+        telemetry = payload.get("telemetry")
+        if isinstance(telemetry, dict):
+            engine = getattr(self.hub, "ROUTER_REALTIME", None)
+            if engine is not None and hasattr(engine, "accept_agent_telemetry"):
+                epoch = _safe_int(payload.get("telemetryEpoch"), 0) or int(time.time())
+                try:
+                    engine.accept_agent_telemetry(telemetry, epoch * 1000)
+                except Exception as exc:
+                    self.hub.LOGGER.warning("agent dashboard telemetry feed failed: %s", exc)
 
     dashboard_nonce = 0
     if hasattr(self.hub, "ROUTER_DASHBOARD_LOCK"):
