@@ -382,6 +382,12 @@ class SQLiteStore:
         return changes
 
     def _changes_for_document(self, key: str, old: Any, new: Any) -> List[Tuple[str, str, str, Any]]:
+        if key == "device_archive.json" and isinstance(old, dict) and isinstance(new, dict):
+            # Clients keep offline cards independently of events. Event deletes
+            # cannot remove those cards, and sample-by-sample archive revisions
+            # would be too large. Membership removal alone invalidates snapshots.
+            if old.keys() - new.keys():
+                return [("system", "snapshot_reset", key, None)]
         if key in NON_REVISION_DOCUMENTS:
             return []
         if key == "devices.json":
@@ -434,7 +440,12 @@ class SQLiteStore:
             info = {"oldestRevision": int(row["oldest"]), "revision": int(row["current"]), "sequence": int(row["current"])}
             oldest = info["oldestRevision"]
             current = info["revision"]
-            full_required = since < 0 or (oldest > 0 and since < oldest - 1) or since > current
+            reset = conn.execute(
+                "SELECT 1 FROM revisions WHERE entity='system' "
+                "AND operation='snapshot_reset' AND revision>? LIMIT 1",
+                (since,),
+            ).fetchone()
+            full_required = bool(reset) or since < 0 or (oldest > 0 and since < oldest - 1) or since > current
             if full_required:
                 return {**info, "fromRevision": since, "fullRequired": True, "hasMore": False, "changes": []}
             rows = conn.execute(

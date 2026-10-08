@@ -36,6 +36,7 @@ COPY router /app/router
 COPY assistant /app/assistant
 COPY router_core /app/router_core
 COPY scripts/repair_storage.py /app/scripts/repair_storage.py
+COPY tools/repair_device_history.py /app/tools/repair_device_history.py
 COPY scripts/docker_preflight.py /app/scripts/docker_preflight.py
 
 # Compile every module that ended up in the image instead of a hand-written
