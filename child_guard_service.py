@@ -290,6 +290,31 @@ class RouterCommandStore:
         }
         with self.changed:
             rows = self._load()
+            command["sequence"] = max(time.time_ns() // 1000, max((int(r.get("sequence") or 0) for r in rows), default=0) + 1)
+            # A phone retry after a lost HTTP reply must follow the original
+            # add, rather than filling the relay queue with duplicate writes.
+            if action == "add_device":
+                wanted = sorted(str(mac).strip().lower() for mac in command["payload"].get("macs", []))
+                for previous in reversed(rows):
+                    if (previous.get("action") == action
+                            and previous.get("status") in {"pending", "delivered"}
+                            and previous.get("router") == command["router"]
+                            and previous.get("payload", {}).get("officialUid") == command["payload"].get("officialUid")
+                            and command["createdEpoch"] - int(previous.get("createdEpoch") or 0) <= 600
+                            and sorted(str(mac).strip().lower() for mac in previous.get("payload", {}).get("macs", [])) == wanted):
+                        return dict(previous)
+            # Coalesce identical reads already waiting on this router. A read
+            # queued before a write cannot satisfy a refresh requested after it.
+            if action.startswith("get_") or action == "list_devices":
+                for previous in reversed(rows):
+                    if previous.get("router") != command["router"]:
+                        continue
+                    if not (str(previous.get("action", "")).startswith("get_") or previous.get("action") == "list_devices"):
+                        break
+                    if (previous.get("action") == action and previous.get("payload") == command["payload"]
+                            and previous.get("status") in {"pending", "delivered"}
+                            and command["createdEpoch"] - int(previous.get("createdEpoch") or 0) <= 20):
+                        return dict(previous)
             rows.append(command)
             self._save(rows)
             self.changed.notify_all()
@@ -303,7 +328,13 @@ class RouterCommandStore:
         with self.lock:
             rows = self._load()
             changed = False
-            for command in rows:
+            # Writes retain FIFO order. Let fresh manual changes pass queued
+            # reads, but age reads into the same lane so they cannot starve.
+            ordered = sorted(rows, key=lambda item: (
+                1 if (str(item.get("action", "")).startswith("get_") or item.get("action") == "list_devices")
+                    and now - int(item.get("createdEpoch") or now) < 15 else 0,
+                int(item.get("sequence") or int(item.get("createdEpoch") or 0) * 1000000)))
+            for command in ordered:
                 cmd_alias = router_alias(command.get("router"))
                 if cmd_alias != canonical_alias and cmd_alias not in ("default", "router", "primary", "") and canonical_alias not in ("default", "router", "primary", ""):
                     continue
@@ -375,6 +406,9 @@ class RouterCommandStore:
                     continue
                 result = acknowledgement.get("result")
                 result = result if isinstance(result, dict) else {}
+                if command.get("action") in {"get_users", "add_device", "remove_device"}:
+                    result = {**result, "membershipVersion": int(command.get("sequence") or
+                        int(command.get("createdEpoch") or 0) * 1000000)}
                 ok = bool(acknowledgement.get("ok")) and bool(result.get("ok", True))
                 command.update({
                     "status": "done" if ok else "failed",

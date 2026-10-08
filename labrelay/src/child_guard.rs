@@ -1762,7 +1762,7 @@ fn verify_device_pause(section: &str, endtime: u64) -> Result<()> {
 
 /// Guard membership management: the App's "select devices to guard" page maps
 /// to creating/removing child_guard user sections (the official app does the
-/// same through its cloud, which the router pulls every 15 minutes).
+/// same through its cloud; cloud membership is delivered separately from stats).
 fn generate_uid() -> String {
     use std::io::Read;
     let mut bytes = [0u8; 16];
@@ -1892,6 +1892,41 @@ fn verify_user_presence(uid: &str, should_exist: bool, macs: &[String]) -> Resul
     }
 }
 
+fn membership_uid(snapshot: &Snapshot, requested: &str, macs: &[String]) -> Result<Option<String>> {
+    let matching = |user: &UciSection| user.lists.get("mac").map(|values|
+        values.iter().any(|mac| macs.contains(&normalize_mac(mac)))).unwrap_or(false);
+    if let Some(user) = snapshot.user(requested) {
+        if !macs.is_empty() && !matching(user) { bail!("守护设备标识已变化，请刷新名单后重试"); }
+        return Ok(Some(user.name.clone()));
+    }
+    if macs.is_empty() { return Ok(None); }
+    let matches: Vec<_> = snapshot.sections_of("user").filter(|user| matching(user)).collect();
+    if matches.len() > 1 { bail!("设备对应多个守护编号，请刷新名单后重试"); }
+    Ok(matches.first().map(|user| user.name.clone()))
+}
+
+fn membership_add_uid(snapshot: &Snapshot, macs: &[String], official: Option<&str>) -> Result<Option<String>> {
+    let matches: Vec<_> = snapshot.sections_of("user").filter(|user| {
+        user.lists.get("mac").map(|list| list.iter().any(|mac| macs.contains(&normalize_mac(mac)))).unwrap_or(false)
+    }).collect();
+    if let Some(uid) = official {
+        if uid.len() != 32 || !uid.bytes().all(|b| b.is_ascii_hexdigit()) {
+            bail!("invalid official guard uid");
+        }
+        if let Some(section) = snapshot.named(uid) {
+            if section.kind != "user" || !macs.iter().all(|mac| section.lists.get("mac")
+                .map(|list| list.iter().any(|m| normalize_mac(m) == *mac)).unwrap_or(false)) {
+                bail!("official uid belongs to another device");
+            }
+        }
+        if matches.iter().any(|user| !user.name.eq_ignore_ascii_case(uid)) {
+            bail!("legacy guard uid must be reconciled before official add");
+        }
+        return Ok(snapshot.user(uid).map(|user| user.name.clone()));
+    }
+    Ok(matches.first().map(|user| user.name.clone()))
+}
+
 fn mutate_membership(action: &str, payload: &Value) -> Result<Value> {
     match action {
         "add_device" => {
@@ -1904,16 +1939,9 @@ fn mutate_membership(action: &str, payload: &Value) -> Result<Value> {
                 bail!("at least one valid mac is required");
             }
             let snapshot = load_snapshot()?;
-            // Idempotent: if any requested mac is already guarded, report it.
-            if let Some(user) = snapshot.sections_of("user").find(|user| {
-                user.lists
-                    .get("mac")
-                    .map(|list| {
-                        list.iter()
-                            .any(|mac| macs.contains(&normalize_mac(mac)))
-                    })
-                    .unwrap_or(false)
-            }) {
+            let official_uid = payload.get("officialUid").and_then(Value::as_str).map(str::to_uppercase);
+            if let Some(existing_uid) = membership_add_uid(&snapshot, &macs, official_uid.as_deref())? {
+                let user = snapshot.user(&existing_uid).ok_or_else(|| anyhow!("missing guard user"))?;
                 let uid = user.name.clone();
                 let existing_macs = user.lists.get("mac").cloned().unwrap_or_default();
                 // A previous add may have landed in UCI but lost the runtime mac
@@ -1927,7 +1955,7 @@ fn mutate_membership(action: &str, payload: &Value) -> Result<Value> {
                     "created": false,
                 }));
             }
-            let mut uid = generate_uid();
+            let mut uid = official_uid.unwrap_or_else(generate_uid);
             while snapshot.named(&uid).is_some() {
                 uid = generate_uid();
             }
@@ -1961,19 +1989,16 @@ fn mutate_membership(action: &str, payload: &Value) -> Result<Value> {
             Ok(json!({"ok": true, "uid": uid, "macs": macs, "created": true}))
         }
         "remove_device" => {
-            let uid = payload
-                .get("uid")
-                .and_then(Value::as_str)
+            let requested_uid = payload.get("uid").and_then(Value::as_str)
                 .ok_or_else(|| anyhow!("missing uid"))?;
+            let macs: Vec<_> = json_strings(payload.get("macs")).iter().map(|mac| normalize_mac(mac)).collect();
             let snapshot = load_snapshot()?;
-            if snapshot.user(uid).is_none() {
-                // 设备本来就不在了（比如在官方星耀家里被移出守护）。要的状态已经成立，
-                // 报「device not found」只会让界面弹一句英文原文、列表里那行永远删不掉。
-                return Ok(json!({
-                    "ok": true, "uid": uid, "alreadyAbsent": true,
-                    "removedPlans": 0, "rollback": "not_needed",
-                }));
-            }
+            let resolved = membership_uid(&snapshot, requested_uid, &macs)?;
+            let Some(resolved_uid) = resolved else {
+                return Ok(json!({"ok": true, "uid": requested_uid, "alreadyAbsent": true,
+                    "removedPlans": 0, "rollback": "not_needed"}));
+            };
+            let uid = resolved_uid.as_str();
             let plans = policies_for(&snapshot, uid);
             let removed_plans = plans.len();
             let plan_names = plans
@@ -1994,7 +2019,7 @@ fn mutate_membership(action: &str, payload: &Value) -> Result<Value> {
             }
             trigger_reload();
             verify_user_presence(uid, false, &[])?;
-            Ok(json!({"ok": true, "uid": uid, "removedPlans": removed_plans}))
+            Ok(json!({"ok": true, "uid": uid, "removedUids": [requested_uid, uid], "removedPlans": removed_plans}))
         }
         _ => bail!("unsupported membership action"),
     }
@@ -2211,6 +2236,29 @@ config timerange 'child_tr_abc1234'
  list time 'tue-08:00-09:00'
  option pid 'abc1234_wechat'
 "#;
+
+    #[test]
+    fn removal_resolves_changed_uid_by_mac_but_not_by_device_name() {
+        let snapshot = parse_uci_export("config user 'new'\n list mac 'aa:bb:cc:dd:ee:01'\n option name 'Mate60'\nconfig user 'other'\n list mac 'aa:bb:cc:dd:ee:02'\n option name 'Mate60'\n");
+        assert_eq!(membership_uid(&snapshot, "old", &["aa:bb:cc:dd:ee:01".into()]).unwrap(), Some("new".into()));
+        assert_eq!(membership_uid(&snapshot, "old", &[]).unwrap(), None);
+        assert!(membership_uid(&snapshot, "other", &["aa:bb:cc:dd:ee:01".into()]).is_err());
+        assert!(membership_uid(&snapshot, "old", &["aa:bb:cc:dd:ee:01".into(), "aa:bb:cc:dd:ee:02".into()]).is_err());
+    }
+
+    #[test]
+    fn official_add_requires_the_cloud_uid_and_rejects_legacy_or_foreign_identity() {
+        let uid = "ABCDEF0123456789ABCDEF0123456789";
+        let macs = vec!["aa:bb:cc:dd:ee:01".into()];
+        assert_eq!(membership_add_uid(&Snapshot::default(), &macs, Some(uid)).unwrap(), None);
+        let canonical = parse_uci_export(&format!("config user '{uid}'\n list mac 'aa:bb:cc:dd:ee:01'\n"));
+        assert_eq!(membership_add_uid(&canonical, &macs, Some(uid)).unwrap(), Some(uid.into()));
+        let legacy = parse_uci_export("config user 'old'\n list mac 'aa:bb:cc:dd:ee:01'\n");
+        assert!(membership_add_uid(&legacy, &macs, Some(uid)).is_err());
+        let foreign = parse_uci_export(&format!("config user '{uid}'\n list mac 'aa:bb:cc:dd:ee:02'\n"));
+        assert!(membership_add_uid(&foreign, &macs, Some(uid)).is_err());
+        assert!(membership_add_uid(&canonical, &macs, Some("bad")).is_err());
+    }
 
     #[test]
     fn parses_child_guard_export() {

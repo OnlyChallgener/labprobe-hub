@@ -54,7 +54,7 @@ jobs:
       - name: Verify release versions
         run: |
           set -e
-          grep -q 'HUB_VERSION = "0.13.32"' hub_entry.py
+          grep -q 'HUB_VERSION = "0.14.1"' hub_entry.py
           grep -q 'create_router_blueprint_v1' hub_entry.py
           grep -q 'create_ai_blueprint' hub_entry.py
           grep -q 'install_hub0934_fixes(hub)' hub_entry.py
@@ -71,9 +71,9 @@ jobs:
           # Guards against the removed OpenClaw / WeChat bridge reappearing in
           # shipped Hub code or docs.  Test fixtures are excluded on purpose:
           # the child-guard allowlist mirrors the router's own RDPI app ids, and
-          # "wechat" is the identifier the firmware reports for 微信.  Naming it
-          # in a fixture is not the bridge coming back.
-          ! git grep -qi -E 'wechat|clawbot|openclaw' -- '*.py' '*.md' '*.env*' 'Dockerfile' ':(exclude)tests/**'
+          # "wechat" is the identifier the firmware reports for 微信. The
+          # standalone RDPI traffic simulator uses the same identifier.
+          ! git grep -qi -E 'wechat|clawbot|openclaw' -- '*.py' '*.md' '*.env*' 'Dockerfile' ':(exclude)tests/**' ':(exclude)scripts/simulate_rdpi_traffic.py'
           # LabRelay's version is whatever Cargo.toml declares, and Cargo.lock
           # must agree with it. Do NOT hardcode the number here: a stale literal
           # turns every version bump into a red build across all branches (the
@@ -118,6 +118,6 @@ jobs:
         # check that proves the image is self-contained.  It is deliberately run
         # against the built image, not the working tree.
         run: |
-          docker build --pull=false -t labprobe-hub:v0.13.32 .
-          docker run --rm --entrypoint python labprobe-hub:v0.13.32 -c \
-            'import hub_entry, child_guard_service, assistant, router_core, hub0934_fixes, hub0935_sync_fix, labrelay_sync_patch; print("Hub 0.13.32 imports OK")'
+          docker build --pull=false -t labprobe-hub:v0.14.1 .
+          docker run --rm --entrypoint python labprobe-hub:v0.14.1 -c \
+            'import hub_entry, child_guard_service, assistant, router_core, hub0934_fixes, hub0935_sync_fix, labrelay_sync_patch; print("Hub 0.14.1 imports OK")'

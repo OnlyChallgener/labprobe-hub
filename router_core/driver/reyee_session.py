@@ -30,6 +30,7 @@ from router_core.errors import (
     RouterUnreachableError,
 )
 from router_core.session.interface import RouterSessionProtocol
+from router_capabilities import is_be50_firmware
 
 _KEY_PATTERNS = (
     re.compile(r'GibberishAES\.enc\(passwordEl\.value,\s*["\']([A-Fa-f0-9]+)["\']\)', re.I),
@@ -316,15 +317,26 @@ class ReyeeSessionManager(RouterSessionProtocol):
         encrypted_pwd = gibberish_aes_encrypt(self.password, encryption_key)
         timestamp = str(round(time.time()))
 
-        payload = {
-            "method": "login",
-            "params": {
+        if is_be50_firmware():
+            # Official BE50 eWeb uses the same single-password screen but sends
+            # `pwd` and `username`, rather than BE72's `password` envelope.
+            params = {
+                "username": self.username,
+                "time": timestamp,
+                "encry": True,
+                "pwd": encrypted_pwd,
+            }
+        else:
+            params = {
                 "password": encrypted_pwd,
                 "time": timestamp,
                 "encry": True,
                 "limit": False,
                 "setInit": False,
-            },
+            }
+        payload = {
+            "method": "login",
+            "params": params,
         }
         wire = self._wire_json(payload)
 

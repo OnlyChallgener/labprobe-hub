@@ -12,9 +12,9 @@ RELAY_CONFIG="$INSTALL_DIR/relay.json"
 INIT_SCRIPT="/etc/init.d/labprobe"
 TMP_BIN="/tmp/labrelay.new"
 TMP_SUM="/tmp/labrelay.new.sha256"
-UPDATE_ROOT="${LABPROBE_UPDATE_ROOT:-https://lab.net86.dynv6.net:27772}"
+UPDATE_ROOT="${LABPROBE_UPDATE_ROOT:-https://github.com/OnlyChallgener/labprobe-hub/releases/latest/download}"
 case "${LABPROBE_AGENT_BASE:-$UPDATE_ROOT}" in
-  */releases/download/*) AGENT_BASE="${LABPROBE_AGENT_BASE:-${UPDATE_ROOT%/}}" ;;
+  */releases/download/*|*/releases/latest/download) AGENT_BASE="${LABPROBE_AGENT_BASE:-${UPDATE_ROOT%/}}" ;;
   *) AGENT_BASE="${LABPROBE_AGENT_BASE:-${UPDATE_ROOT%/}/agent}" ;;
 esac
 NONINTERACTIVE="${LABPROBE_NONINTERACTIVE:-0}"
@@ -330,7 +330,7 @@ mkdir -p "$INSTALL_DIR/backups" /tmp/labprobe
 INSTALL_STAGE="备份现有 Agent"
 backup_old
 prune_backups
-INSTALL_STAGE="下载并校验 ARM64 Agent"
+INSTALL_STAGE="下载并校验 $ARCH Agent"
 download_binary
 [ -x "$INIT_SCRIPT" ] && "$INIT_SCRIPT" stop >/dev/null 2>&1 || true
 INSTALL_STAGE="替换 Agent 程序"

@@ -295,6 +295,10 @@ def _device_counts(router: dict) -> dict:
         value = payload.get(source)
         if target not in result and isinstance(value, int) and not isinstance(value, bool) and value >= 0:
             result[target] = value
+    if "onlineDeviceCount" not in result and isinstance(payload.get("online"), list):
+        result["onlineDeviceCount"] = len(payload["online"])
+    if "deviceCount" not in result and "onlineDeviceCount" in result:
+        result["deviceCount"] = result["onlineDeviceCount"]
     return result
 
 

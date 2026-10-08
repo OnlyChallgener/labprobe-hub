@@ -132,13 +132,12 @@ jobs:
           version = os.environ['VERSION']
           tag = os.environ['TAG']
           release_root = f'https://github.com/OnlyChallgener/labprobe-hub/releases/download/{tag}'
-          public_root = 'https://lab.net86.dynv6.net:27772/agent'
 
           def metadata(name: str):
               data = (out / name).read_bytes()
               return {
                   'url': f'{release_root}/{name}',
-                  'fallbackUrl': f'{public_root}/{name}',
+                  'fallbackUrl': f'{release_root}/{name}',
                   'sha256': hashlib.sha256(data).hexdigest(),
                   'sizeBytes': len(data),
               }
@@ -146,7 +145,7 @@ jobs:
           manifest = {
               'schemaVersion': 1,
               'versionName': version,
-              'changelog': 'Fix BE72 Relay nofile inheritance, add guarded TCP peak extreme mode with automatic source-port restoration, and allow router-self TCP STUN listener/keepalive to share the configured middle port.',
+                'changelog': 'BE72 and BE50 relay telemetry, child guard synchronization, router realtime recovery and installer update.',
               'installUrl': f'{release_root}/install.sh',
               'checksumsUrl': f'{release_root}/checksums.txt',
               'installer': metadata('install.sh'),
@@ -184,17 +183,16 @@ jobs:
           prerelease: false
           generate_release_notes: false
           body: |
-            LabRelay OpenWrt/BE72 router bundle.
+            LabRelay router bundle for BE72 (ARM64) and BE50 (ARMv7).
 
-            0.2.41 fixes:
-            - Relay daemon raises and verifies `RLIMIT_NOFILE=131072` instead of silently running with BE72 `1024/4096` limits;
-            - the unified `/etc/init.d/labprobe` installer is now the canonical update installer;
-            - TCP peak test supports guarded extreme mode with temporary `ip_local_port_range=1024 65535` and automatic restoration on completion/stop/error or next daemon startup;
-            - router-self TCP STUN allows its listener and outbound STUN keepalive to share the configured middle port via `SO_REUSEPORT`;
-            - existing CPU, memory, Conntrack, FD and source-port protection remains active.
+            0.2.75: relay telemetry, child guard synchronization, router realtime recovery and unified installer. Use the matching binary for each router architecture.
 
             First install:
-            `sh install.sh HUB_URL HOOK_TOKEN BE72Pro`
+            `export HUB_URL=http://YOUR_HUB_IP:58443`
+
+            `sh install.sh`
+
+            Enter your Hub HOOK_TOKEN when prompted. See INSTALL_AND_UPDATE_GUIDE.md in the Hub v0.14.1 release for Docker deployment and APP settings.
 
             Existing installation upgrade:
             `sh install.sh upgrade`

@@ -22,6 +22,7 @@ import requests
 from Crypto.Cipher import AES
 from Crypto.Util.Padding import pad
 from flask import Blueprint, jsonify, request
+from router_capabilities import firmware_features
 
 HUB_ROUTER_API_VERSION = "1.0"
 DEFAULT_ROUTER_URL = "http://192.168.5.1"
@@ -794,19 +795,12 @@ def create_router_blueprint(check_app_token: Callable[[], bool], logger: Any, co
 
     @bp.get("/capabilities")
     def capabilities():
+        configured = bool(client.config.get("password"))
         return jsonify({
             "ok": True,
             "apiVersion": HUB_ROUTER_API_VERSION,
-            "configured": bool(client.config.get("password")),
-            "features": {
-                "dashboard": True,
-                "devices": True,
-                "firewall": True,
-                "nativePortMapping": True,
-                "upnp": True,
-                "ddns": True,
-                "diagnostic": True,
-            },
+            "configured": configured,
+            "features": firmware_features(client.config.get("name", ""), configured),
         })
 
     @bp.get("/dashboard")

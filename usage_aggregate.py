@@ -263,9 +263,11 @@ def _iso_date(value: Any) -> str:
 def _as_count(value: Any) -> int:
     try:
         number = int(value)
-    except (TypeError, ValueError):
+    except (TypeError, ValueError, OverflowError):
         return 0
-    return number if number > 0 else 0
+    # Firmware counters occasionally contain u64::MAX after a reset. SQLite
+    # stores signed int64; an invalid sample must not reject the entire push.
+    return number if 0 < number <= 0x7FFF_FFFF_FFFF_FFFF else 0
 
 
 def _as_hour(value: Any) -> int:
@@ -314,8 +316,10 @@ def _u64_list(value: Any) -> List[int]:
         try:
             if isinstance(item, bool):
                 raise ValueError(item)
-            out.append(max(0, int(float(item))))
-        except (TypeError, ValueError):
+            # Do not round integers through float (int64 max becomes 2**63).
+            number = int(item) if isinstance(item, (int, float)) else int(str(item).strip())
+            out.append(number if 0 <= number <= 0x7FFF_FFFF_FFFF_FFFF else 0)
+        except (TypeError, ValueError, OverflowError):
             out.append(0)
     return out
 
@@ -569,6 +573,11 @@ class UsageAggregateStore:
                         PRIMARY KEY (router, uid)
                     ) WITHOUT ROWID;
 
+                    CREATE TABLE IF NOT EXISTS child_guard_membership_version (
+                        router TEXT PRIMARY KEY,
+                        version INTEGER NOT NULL
+                    ) WITHOUT ROWID;
+
                     CREATE TABLE IF NOT EXISTS child_guard_plan_cache (
                         router       TEXT    NOT NULL,
                         uid          TEXT    NOT NULL,
@@ -755,6 +764,67 @@ class UsageAggregateStore:
                     conn.close()
             stored += 1
         return stored
+
+    def reconcile_guard_membership(self, router: Any, action: str, devices: List[Dict[str, Any]],
+                                   uid: Any, version: int) -> bool:
+        """Apply one ordered directory result; preserve all usage-history tables.
+
+        Empty full snapshots clear the directory. Late pre-mutation snapshots
+        cannot resurrect removals. A duplicate waiter/ack result is a no-op.
+        """
+        key = router_key(router)
+        if action not in {"get_users", "add_device", "remove_device"} or version <= 0:
+            return False
+        if action != "remove_device" and any(not isinstance(d, dict) or not _guard_uid(d.get("uid")) for d in devices):
+            return False
+        with self._lock:
+            conn = self.connect()
+            try:
+                conn.execute("BEGIN IMMEDIATE")
+                previous = conn.execute("SELECT version FROM child_guard_membership_version WHERE router=?", (key,)).fetchone()
+                if previous and int(previous[0]) >= version:
+                    conn.rollback()
+                    return False
+                rows = {str(row["uid"]): dict(row) for row in conn.execute(
+                    "SELECT * FROM child_guard_device WHERE router=?", (key,)).fetchall()}
+                old_rows = dict(rows)
+                if action == "get_users":
+                    rows = {}
+                if action == "remove_device":
+                    for removed_uid in uid if isinstance(uid, list) else [uid]:
+                        rows.pop(_guard_uid(removed_uid), None)
+                else:
+                    for device in devices:
+                        identity = _guard_uid(device.get("uid"))
+                        old = old_rows.get(identity, {})
+                        macs = device.get("macs")
+                        clean_macs = [normalize_mac(mac) for mac in macs if normalize_mac(mac)] if isinstance(macs, list) else _split_macs(str(old.get("macs", "")))
+                        # A changed UID for the same MAC replaces its old directory
+                        # identity; a matching name alone never merges devices.
+                        if action == "add_device":
+                            for old_uid, old_device in list(rows.items()):
+                                if old_uid != identity and set(clean_macs).intersection(_split_macs(old_device.get("macs", ""))):
+                                    rows.pop(old_uid)
+                        rows[identity] = dict(uid=identity,
+                            name=_guard_name(device.get("name")) or _guard_name(device.get("userDefinedName")) or old.get("name", ""),
+                            macs=",".join(clean_macs),
+                            blocked=int(bool(device["blocked"])) if "blocked" in device else int(old.get("blocked", 0)),
+                            blocked_until=_as_count(device.get("blockedUntilEpoch", old.get("blocked_until", 0))),
+                            pass_until=_as_count(device.get("pausedUntilEpoch", old.get("pass_until", 0))),
+                            updated_at=int(time.time()))
+                conn.execute("DELETE FROM child_guard_device WHERE router=?", (key,))
+                for row in rows.values():
+                    conn.execute("INSERT INTO child_guard_device(router,uid,name,macs,blocked,blocked_until,pass_until,updated_at) VALUES(?,?,?,?,?,?,?,?)",
+                        (key, row["uid"], row["name"], row["macs"], row["blocked"], row["blocked_until"], row["pass_until"], row["updated_at"]))
+                conn.execute("DELETE FROM child_guard_plan_cache WHERE router=? AND uid NOT IN (SELECT uid FROM child_guard_device WHERE router=?)", (key,key))
+                conn.execute("INSERT INTO child_guard_membership_version(router,version) VALUES(?,?) ON CONFLICT(router) DO UPDATE SET version=excluded.version", (key,version))
+                conn.commit()
+                return True
+            except Exception:
+                conn.rollback()
+                raise
+            finally:
+                conn.close()
 
     def guard_devices(self, router: Any) -> List[Dict[str, Any]]:
         """这个路由器下 Hub 已知的全部受管控设备；空表 = Hub 还没见过任何设备。"""
@@ -2540,15 +2610,22 @@ def compose_device_report(
     """
     keep = default_keep_days()
     report: Optional[Dict[str, Any]] = None
+    empty_candidate: Optional[Dict[str, Any]] = None
 
     if store is not None:
         try:
             candidate = store.report(macs, date, router)
         except Exception:
             candidate = None
-        if candidate and (candidate.get("hourly") or candidate.get("apps")):
+        if candidate and (candidate.get("hourly") or candidate.get("apps") or candidate.get("hasData")):
             basis = str(candidate.get("basis") or "legacy")
             report = {**candidate, "source": f"hub+{basis}", "keepDays": keep}
+        elif candidate:
+            # A quiet device still has collector freshness and traffic metadata.
+            # Keep it if the optional live fallback also has no activity.
+            empty_candidate = {**candidate, "source": "empty", "keepDays": keep}
+            if not candidate.get("lastSampleAt"):
+                empty_candidate["coverage"] = {"status": "unavailable", "hasRecords": False}
 
     live_report: Optional[Dict[str, Any]] = None
     # The live probe costs an agent round-trip, so only pay it when the hub
@@ -2582,7 +2659,7 @@ def compose_device_report(
             report.setdefault("traffic", _empty_traffic_block())
 
     if report is None:
-        report = {**_empty_report(_iso_date(date), macs, basis="none"),
+        report = empty_candidate or {**_empty_report(_iso_date(date), macs, basis="none"),
                   "source": "empty", "keepDays": keep,
                   "coverage": {"status": "unavailable", "hasRecords": False}}
 

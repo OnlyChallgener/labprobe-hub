@@ -9,7 +9,7 @@ use std::path::{Path, PathBuf};
 use std::process::Command;
 use std::process::Stdio;
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
-use tokio::time::sleep;
+use tokio::time::{sleep, timeout, MissedTickBehavior};
 
 use crate::ctl_request;
 use crate::ddns_address;
@@ -89,6 +89,15 @@ struct AgentState {
     last_ddns_address_at: u64,
     ddns_address: Option<Value>,
 }
+
+#[derive(Clone, Copy)]
+struct FastDashboardMetadata {
+    online_devices: usize,
+    storage_percent: Option<f64>,
+}
+
+const FAST_COMMAND_TIMEOUT: Duration = Duration::from_secs(2);
+const FAST_PUSH_TIMEOUT: Duration = Duration::from_secs(2);
 
 fn now_epoch() -> u64 {
     SystemTime::now()
@@ -611,6 +620,10 @@ fn command_output(program: &str, args: &[&str]) -> Result<String> {
 
 fn command_json(program: &str, args: &[&str]) -> Result<Value> {
     let raw = command_output(program, args)?;
+    parse_command_json(program, &raw)
+}
+
+fn parse_command_json(program: &str, raw: &str) -> Result<Value> {
     if raw.trim().is_empty() {
         bail!("{} returned empty JSON", program);
     }
@@ -625,6 +638,192 @@ fn command_json(program: &str, args: &[&str]) -> Result<Value> {
         return Ok(root.get("data").cloned().unwrap_or(Value::Null));
     }
     Ok(root)
+}
+
+async fn bounded_command_json(program: &str, args: &[String], deadline: Duration) -> Result<Value> {
+    // The fast lane owns this subprocess. A hung vendor command is killed when
+    // its bounded output future is dropped, instead of blocking all agent work.
+    let mut command = tokio::process::Command::new(program);
+    command.args(args);
+    command.kill_on_drop(true);
+    let output = timeout(deadline, command.output())
+        .await
+        .context("router fast command timed out")??;
+    if !output.status.success() {
+        bail!("router fast command failed");
+    }
+    parse_command_json(program, &String::from_utf8_lossy(&output.stdout))
+}
+
+fn numeric_metric(value: Option<&Value>) -> Option<f64> {
+        let value = match value? {
+            Value::Number(value) => value.as_f64(),
+            Value::String(value) => value.trim().trim_end_matches('%').parse().ok(),
+            _ => None,
+        }?;
+        value.is_finite().then_some(value)
+}
+
+fn validate_fast_telemetry(fast: &Value) -> Result<()> {
+    if !fast.is_object() {
+        bail!("router fast payload is not an object");
+    }
+    let cpu = numeric_metric(fast.get("cpu_usage")).or_else(|| numeric_metric(fast.get("cpuutil")));
+    let memory = numeric_metric(fast.get("memutil"));
+    let uptime = numeric_metric(fast.get("runtime"));
+    if !cpu.is_some_and(|value| (0.0..=100.0).contains(&value))
+        || !memory.is_some_and(|value| (0.0..=100.0).contains(&value))
+        || !uptime.is_some_and(|value| value >= 0.0)
+    {
+        bail!("router fast CPU, memory or uptime is missing or invalid");
+    }
+    Ok(())
+}
+
+fn has_numeric_metric(value: &Value, keys: &[&str]) -> bool {
+    keys.iter().any(|key| numeric_metric(value.get(*key)).is_some_and(|value| value >= 0.0))
+}
+
+fn fast_telemetry_with_local_fallback(config: &AgentConfig, state: &mut AgentState, fast: &Value, metadata: FastDashboardMetadata) -> Value {
+    let mut telemetry = telemetry_from_fast(fast, metadata.online_devices, metadata.storage_percent);
+    let wan = object_path(fast, &["wan_stat", "wans"])
+        .or_else(|| object_path(fast, &["wan_stat", "wan"]))
+        .unwrap_or(&Value::Null);
+    let missing_upload = !has_numeric_metric(wan, &["tx_rate_bps", "tx_rate", "up"]);
+    let missing_download = !has_numeric_metric(wan, &["rx_rate_bps", "rx_rate", "down"]);
+    let missing_ipv4 = !has_numeric_metric(wan, &["ipv4_connection_count", "ipv4_session_count", "ipv4_connections", "ipv4_sessions", "v4_connection_count", "v4_session_count", "connection_ipv4", "session_ipv4"]);
+    if missing_upload || missing_download || missing_ipv4 {
+        let local = local_telemetry_payload(config, state);
+        let fallback = &local["telemetry"];
+        if missing_upload {
+            telemetry["wan"]["uploadBps"] = fallback["wan"]["uploadBps"].clone();
+            telemetry["wan"]["totalUploadBytes"] = fallback["wan"]["totalUploadBytes"].clone();
+            telemetry["wan"].as_object_mut().unwrap().remove("uploadRaw");
+        }
+        if missing_download {
+            telemetry["wan"]["downloadBps"] = fallback["wan"]["downloadBps"].clone();
+            telemetry["wan"]["totalDownloadBytes"] = fallback["wan"]["totalDownloadBytes"].clone();
+            telemetry["wan"].as_object_mut().unwrap().remove("downloadRaw");
+        }
+        if missing_ipv4 {
+            telemetry["connections"]["ipv4"] = fallback["connections"]["ipv4"].clone();
+        }
+    }
+    telemetry
+}
+
+async fn collect_fast_dashboard_payload(
+    config: &AgentConfig,
+    state: &mut AgentState,
+    metadata: FastDashboardMetadata,
+    command: &(String, Vec<String>),
+) -> Result<Value> {
+    state.storage_percent = metadata.storage_percent;
+    let fast = bounded_command_json(&command.0, &command.1, FAST_COMMAND_TIMEOUT)
+        .await
+        .and_then(|fast| { validate_fast_telemetry(&fast)?; Ok(fast) });
+    let mut payload = match fast {
+        Ok(fast) => {
+            // Stamp the sample after acquisition, before any HTTP publication.
+            let now = now_epoch();
+            json!({
+                "router": config.router_name,
+                "telemetryAt": now,
+                "telemetryEpoch": now,
+                "telemetry": fast_telemetry_with_local_fallback(config, state, &fast, metadata),
+            })
+        }
+        Err(error) => {
+            log_limited(config, state, "WARN", "router-fast-local", &format!("eWeb fast unavailable, using local procfs telemetry: {:#}", error));
+            local_telemetry_payload(config, state)
+        }
+    };
+    payload["telemetry"]["onlineDeviceCount"] = json!(metadata.online_devices);
+    let router = config.router_name.to_ascii_lowercase();
+    if router.contains("be50") || router.contains("be5100") {
+        if let Some(connections) = payload["telemetry"]["connections"].as_object_mut() {
+            connections.remove("ipv6");
+            connections.remove("ipv6Half");
+        }
+    }
+    Ok(payload)
+}
+
+async fn publish_fast_dashboard(
+    client: &Client,
+    config: &AgentConfig,
+    payload: &Value,
+) -> Result<()> {
+    // A failed publication is replaced by the next newly acquired sample. Do
+    // not retry an old frame through the control plane's 12-second retry loop.
+    let response = client
+        .post(format!("{}/api/router/dashboard/push", config.hub_url.trim_end_matches('/')))
+        .header("X-LabProbe-Token", &config.hook_token)
+        .json(payload)
+        .send()
+        .await?;
+    if !response.status().is_success() {
+        bail!("router fast push HTTP {}", response.status());
+    }
+    Ok(())
+}
+
+async fn fast_dashboard_loop(
+    client: Client,
+    config: AgentConfig,
+    metadata: tokio::sync::watch::Receiver<FastDashboardMetadata>,
+    command: (String, Vec<String>),
+) {
+    let mut state = AgentState::default();
+    let mut ticker = tokio::time::interval(Duration::from_secs(config.dashboard_interval_seconds.clamp(2, 30)));
+    ticker.set_missed_tick_behavior(MissedTickBehavior::Skip);
+    loop {
+        ticker.tick().await;
+        if metadata.has_changed().is_err() {
+            break;
+        }
+        let current = *metadata.borrow();
+        let result = match collect_fast_dashboard_payload(&config, &mut state, current, &command).await {
+            Ok(payload) => publish_fast_dashboard(&client, &config, &payload).await,
+            Err(error) => Err(error),
+        };
+        if let Err(error) = result {
+            let message = redact(&format!("router fast dashboard: {:#}", error), &config.hook_token);
+            log_limited(&config, &mut state, "WARN", "router-dashboard-fast", &message);
+        }
+    }
+}
+
+fn start_fast_dashboard(
+    config: &AgentConfig,
+    metadata: tokio::sync::watch::Receiver<FastDashboardMetadata>,
+) -> Result<std::thread::JoinHandle<()>> {
+    start_fast_dashboard_with_command(config, metadata, (
+        "dev_sta".into(),
+        ["get", "-m", "ws_sysinfo", r#"{"get":"fast"}"#].into_iter().map(str::to_string).collect(),
+    ))
+}
+
+fn start_fast_dashboard_with_command(
+    config: &AgentConfig,
+    metadata: tokio::sync::watch::Receiver<FastDashboardMetadata>,
+    command: (String, Vec<String>),
+) -> Result<std::thread::JoinHandle<()>> {
+    let client = Client::builder()
+        .connect_timeout(Duration::from_secs(1))
+        .timeout(FAST_PUSH_TIMEOUT)
+        .user_agent(concat!("labrelay/", env!("CARGO_PKG_VERSION")))
+        .build()?;
+    let config = config.clone();
+    // Vendor shell commands in the control loop are synchronous. A dedicated
+    // runtime thread keeps them from occupying the fast worker's executor.
+    Ok(std::thread::Builder::new().name("router-fast".into()).spawn(move || {
+        let runtime = tokio::runtime::Builder::new_current_thread().enable_all().build();
+        match runtime {
+            Ok(runtime) => runtime.block_on(fast_dashboard_loop(client, config, metadata, command)),
+            Err(error) => log_line(&config, "ERROR", &format!("router fast runtime: {}", error)),
+        }
+    })?)
 }
 
 fn number(value: Option<&Value>) -> f64 {
@@ -890,6 +1089,10 @@ fn parse_local_connection_counts(raw: &str) -> (u64, u64) {
     (ipv4, ipv6)
 }
 
+fn wan_rate_bps(current_bytes: u64, previous_bytes: u64, elapsed_seconds: u64) -> u64 {
+    current_bytes.saturating_sub(previous_bytes).saturating_mul(8) / elapsed_seconds.max(1)
+}
+
 fn local_telemetry_payload(config: &AgentConfig, state: &mut AgentState) -> Value {
     let now = now_epoch();
     let cpu = fs::read_to_string("/proc/stat")
@@ -918,8 +1121,8 @@ fn local_telemetry_payload(config: &AgentConfig, state: &mut AgentState) -> Valu
                 (0u64, 0u64)
             } else {
                 (
-                    rx.saturating_sub(state.local_wan_rx) / dt,
-                    tx.saturating_sub(state.local_wan_tx) / dt,
+                    wan_rate_bps(rx, state.local_wan_rx, dt),
+                    wan_rate_bps(tx, state.local_wan_tx, dt),
                 )
             };
             state.local_wan_rx = rx;
@@ -936,7 +1139,11 @@ fn local_telemetry_payload(config: &AgentConfig, state: &mut AgentState) -> Valu
         .ok()
         .map(|raw| {
             let (ipv4, ipv6) = parse_local_connection_counts(&raw);
-            json!({ "ipv4": ipv4, "ipv6": ipv6 })
+            if config.router_name.to_ascii_lowercase().contains("be50") {
+                json!({ "ipv4": ipv4 })
+            } else {
+                json!({ "ipv4": ipv4, "ipv6": ipv6 })
+            }
         });
     json!({
         "router": config.router_name,
@@ -1330,6 +1537,7 @@ async fn collect_dashboard_payload(
     state: &mut AgentState,
     force_details: bool,
     refresh_nonce: u64,
+    include_telemetry: bool,
 ) -> Result<Value> {
     let now = now_epoch();
     let storage_due = state.last_storage_check_at == 0
@@ -1348,28 +1556,32 @@ async fn collect_dashboard_payload(
         }
     }
 
-    let fast = match command_json("dev_sta", &["get", "-m", "ws_sysinfo", r#"{"get":"fast"}"#]) {
-        Ok(value) => value,
-        Err(error) => {
-            // EG 线没有 ws_sysinfo：不兜底的话整个 dashboard push 直接 Err，
-            // Hub 的 /api/router/realtime 就永远「等待首帧」。改走本地 procfs，节奏不变。
-            log_limited(
-                config,
-                state,
-                "WARN",
-                "router-fast-local",
-                &format!("eWeb fast unavailable, using local procfs telemetry: {:#}", error),
-            );
-            return Ok(local_telemetry_payload(config, state));
-        }
-    };
+    let mut payload = json!({"router": config.router_name});
+    if include_telemetry {
+        let fast = match command_json("dev_sta", &["get", "-m", "ws_sysinfo", r#"{"get":"fast"}"#]) {
+            Ok(value) => value,
+            Err(error) => {
+                // Firmware without ws_sysinfo uses its local procfs sample.
+                log_limited(
+                    config,
+                    state,
+                    "WARN",
+                    "router-fast-local",
+                    &format!("eWeb fast unavailable, using local procfs telemetry: {:#}", error),
+                );
+                return Ok(local_telemetry_payload(config, state));
+            }
+        };
+        payload = json!({
+            "router": config.router_name,
+            "telemetryAt": now,
+            "telemetryEpoch": now,
+            "telemetry": telemetry_from_fast(&fast, state.devices.len(), state.storage_percent)
+        });
+    }
+    // In daemon mode this timestamp schedules low-frequency dashboard metadata
+    // checks only; actual telemetry belongs to the independent fast lane.
     state.last_dashboard_fast_at = now;
-    let mut payload = json!({
-        "router": config.router_name,
-        "telemetryAt": now,
-        "telemetryEpoch": now,
-        "telemetry": telemetry_from_fast(&fast, state.devices.len(), state.storage_percent)
-    });
 
     let details_due = force_details
         || state.last_dashboard_details_at == 0
@@ -1484,11 +1696,11 @@ async fn sync_router_credentials(
 }
 
 async fn sync_router_dashboard(client: &Client, config: &AgentConfig, state: &mut AgentState, force: bool) -> Result<()> {
-    let payload = collect_dashboard_payload(config, state, force, if force { state.last_dashboard_refresh_nonce } else { 0 }).await?;
+    let payload = collect_dashboard_payload(config, state, force, if force { state.last_dashboard_refresh_nonce } else { 0 }, force).await?;
     let response = post_json(client, config, "/api/router/dashboard/push", &payload).await?;
     let requested = response.get("refreshNonce").and_then(Value::as_u64).unwrap_or(0);
     if requested > state.last_dashboard_refresh_nonce {
-        let full = collect_dashboard_payload(config, state, true, requested).await?;
+        let full = collect_dashboard_payload(config, state, true, requested, force).await?;
         post_json(client, config, "/api/router/dashboard/push", &full).await?;
         state.last_dashboard_refresh_nonce = requested;
     }
@@ -1660,12 +1872,12 @@ fn url_encode(value: &str) -> String {
         .collect()
 }
 
-async fn sync_child_guard(client: &Client, config: &AgentConfig, state: &mut AgentState) -> Result<()> {
+async fn sync_child_guard(client: &Client, config: &AgentConfig) -> Result<()> {
     let router = url_encode(&config.router_name);
     let root = get_json(
         client,
         config,
-        &format!("/api/router/child-guard/commands?router={}&limit=10", router),
+        &format!("/api/router/child-guard/commands?router={}&limit=1", router),
     )
     .await?;
     let commands = root
@@ -1676,31 +1888,21 @@ async fn sync_child_guard(client: &Client, config: &AgentConfig, state: &mut Age
     if commands.is_empty() {
         return Ok(());
     }
-    let mut acknowledgements = Vec::new();
     for command in commands {
         let id = command.get("id").and_then(Value::as_str).unwrap_or("").to_string();
         let action = command.get("action").and_then(Value::as_str).unwrap_or("").to_string();
         let payload = command.get("payload").cloned().unwrap_or_else(|| json!({}));
-        let action_for_worker = action.clone();
         let result = tokio::task::spawn_blocking(move || {
-            crate::child_guard::execute(&action_for_worker, &payload)
+            crate::child_guard::execute(&action, &payload)
         })
         .await
         .unwrap_or_else(|error| json!({"ok": false, "errorCode": "adapter_panic", "error": error.to_string()}));
-        acknowledgements.push(json!({
-            "id": id,
-            "ok": result.get("ok").and_then(Value::as_bool).unwrap_or(false),
-            "result": result,
-        }));
+        // Return each result before taking another command. A slow report must
+        // not hide an already-completed manual change behind a batch response.
+        post_json(client, config, &format!("/api/router/child-guard/ack?router={}", router),
+            &json!({"acks": [{"id": id,
+                "ok": result.get("ok").and_then(Value::as_bool).unwrap_or(false), "result": result}]})).await?;
     }
-    post_json(
-        client,
-        config,
-        &format!("/api/router/child-guard/ack?router={}", router),
-        &json!({"acks": acknowledgements}),
-    )
-    .await?;
-    state.last_command_at = now_epoch();
     Ok(())
 }
 
@@ -2272,6 +2474,11 @@ pub async fn run(args: &[String], once: bool) -> Result<()> {
     let state_path = PathBuf::from(&config.state_path);
     let mut state = load_state(&state_path);
     let client = http_client()?;
+    let (fast_metadata, fast_metadata_rx) = tokio::sync::watch::channel(FastDashboardMetadata {
+        online_devices: state.devices.len(),
+        storage_percent: state.storage_percent,
+    });
+    let _fast_dashboard = if once { None } else { Some(start_fast_dashboard(&config, fast_metadata_rx)?) };
     let mut last_agent_cycle_at = 0u64;
     let mut last_status_at = 0u64;
     log_line(&config, "INFO", "Rust agent started");
@@ -2294,6 +2501,46 @@ pub async fn run(args: &[String], once: bool) -> Result<()> {
                         last_error_log = now;
                     }
                 }
+                sleep(Duration::from_secs(1)).await;
+            }
+        }))
+    };
+    // Child control is sequential within its own lane, independent of slow
+    // inventory, STUN, WireGuard, and RDPI work in the housekeeping cycle.
+    let _child_control = if once { None } else {
+        let child_client = client.clone();
+        let child_config = config.clone();
+        Some(tokio::spawn(async move {
+            let mut last_error_log = 0u64;
+            loop {
+                if let Err(error) = sync_child_guard(&child_client, &child_config).await {
+                    let now = now_epoch();
+                    if now.saturating_sub(last_error_log) >= 30 {
+                        let text = redact(&format!("child guard command: {:#}", error), &child_config.hook_token);
+                        log_line(&child_config, "WARN", &text);
+                        last_error_log = now;
+                    }
+                }
+                sleep(Duration::from_secs(1)).await;
+            }
+        }))
+    };
+    let _child_statistics = if once { None } else {
+        let usage_client = client.clone();
+        let usage_config = config.clone();
+        Some(tokio::spawn(async move {
+            let mut last_error_log = 0u64;
+            loop {
+                if let Err(error) = sync_usage_stats(&usage_client, &usage_config).await {
+                    let now = now_epoch();
+                    if now.saturating_sub(last_error_log) >= 30 {
+                        let text = redact(&format!("usage stats: {:#}", error), &usage_config.hook_token);
+                        log_line(&usage_config, "WARN", &text);
+                        last_error_log = now;
+                    }
+                }
+                // Sampling/push functions retain their 5 s / 30 s watermarks;
+                // only their scheduling is independent of housekeeping now.
                 sleep(Duration::from_secs(1)).await;
             }
         }))
@@ -2337,7 +2584,7 @@ pub async fn run(args: &[String], once: bool) -> Result<()> {
                 log_limited(&config, &mut state, "WARN", "wireguard-status", &text);
                 errors.push(text);
             }
-            if let Err(error) = sync_child_guard(&client, &config, &mut state).await {
+            if let Err(error) = if once { sync_child_guard(&client, &config).await } else { Ok(()) } {
                 let text = redact(&format!("child guard command: {:#}", error), &config.hook_token);
                 log_limited(&config, &mut state, "WARN", "child-guard-command", &text);
                 errors.push(text);
@@ -2376,11 +2623,7 @@ pub async fn run(args: &[String], once: bool) -> Result<()> {
         // re-assert), so it only enters the loop when one of those is due. The
         // minute buckets live in `minute_stats` for the whole process, not here:
         // nothing in this loop may rebuild them.
-        if once
-            || minute_stats::sample_due(now)
-            || minute_stats::push_due(now)
-            || minute_stats::sniffer_due(now)
-        {
+        if once {
             if let Err(error) = sync_usage_stats(&client, &config).await {
                 let text = redact(&format!("usage stats: {:#}", error), &config.hook_token);
                 log_limited(&config, &mut state, "WARN", "usage-stats", &text);
@@ -2396,6 +2639,10 @@ pub async fn run(args: &[String], once: bool) -> Result<()> {
         } else {
             state.last_error = errors.join(" | ");
         }
+        fast_metadata.send_replace(FastDashboardMetadata {
+            online_devices: state.devices.len(),
+            storage_percent: state.storage_percent,
+        });
         save_json(&state_path, &state)?;
         if once {
             return if state.last_error.is_empty() { Ok(()) } else { Err(anyhow!(state.last_error)) };
@@ -2471,6 +2718,133 @@ pub fn print_status(args: &[String]) -> Result<()> {
 #[cfg(test)]
 mod local_telemetry_tests {
     use super::*;
+
+    #[test]
+    fn fast_schema_accepts_real_zero_but_rejects_missing_metrics() {
+        assert!(validate_fast_telemetry(&json!({"cpu_usage":0,"memutil":0,"runtime":0})).is_ok());
+        assert!(validate_fast_telemetry(&json!({"cpuutil":"12.5%","memutil":"68","runtime":"123"})).is_ok());
+        for payload in [Value::Null, json!({}), json!({"cpu_usage":12,"runtime":123}), json!({"cpu_usage":"NaN","memutil":68,"runtime":123})] {
+            assert!(validate_fast_telemetry(&payload).is_err());
+        }
+    }
+
+    #[tokio::test]
+    async fn empty_success_and_empty_object_use_real_procfs_metrics() {
+        let config = AgentConfig { router_name:"BE50".into(), ..AgentConfig::default() };
+        let metadata = FastDashboardMetadata { online_devices:7, storage_percent:Some(27.0) };
+        for body in [r#"{"message":"success","data":null}"#, "{}"] {
+            let mut state = AgentState::default();
+            let command = ("/bin/sh".into(), vec!["-c".into(), format!("printf '%s' '{}'",body)]);
+            let payload = collect_fast_dashboard_payload(&config, &mut state, metadata, &command).await.unwrap();
+            assert!(state.local_cpu_total > 0, "invalid vendor payload must read procfs");
+            assert!(payload["telemetry"]["memoryPercent"].as_f64().unwrap() > 0.0);
+            assert!(payload["telemetry"]["uptimeSeconds"].as_u64().unwrap() > 0);
+            assert_eq!(payload["telemetry"]["onlineDeviceCount"], 7);
+        }
+    }
+
+    #[test]
+    fn partial_vendor_wan_keeps_valid_rates_and_falls_back_per_field() {
+        let config = AgentConfig { router_name:"BE50".into(), ..AgentConfig::default() };
+        let metadata = FastDashboardMetadata { online_devices:7, storage_percent:Some(27.0) };
+        let mut state = AgentState::default();
+        let fast = json!({"cpu_usage":23,"memutil":68,"runtime":1234,"wan_stat":{"wans":{"tx_rate":12}}});
+        let value = fast_telemetry_with_local_fallback(&config, &mut state, &fast, metadata);
+        assert_eq!(value["cpuPercent"], 23.0);
+        assert_eq!(value["wan"]["uploadBps"], 96);
+        assert!(value["wan"].get("downloadRaw").is_none());
+        assert!(state.local_cpu_total > 0, "missing fields must read actual procfs rather than fabricate zero");
+    }
+
+    #[test]
+    fn procfs_wan_byte_counters_follow_the_bits_per_second_contract() {
+        assert_eq!(wan_rate_bps(2000, 1000, 2), 4000);
+        assert_eq!(wan_rate_bps(500, 1000, 2), 0);
+    }
+
+    #[tokio::test]
+    async fn be50_fast_payload_never_advertises_ipv6_connection_counts() {
+        let config = AgentConfig { router_name:"BE50".into(), ..AgentConfig::default() };
+        let metadata = FastDashboardMetadata { online_devices:7, storage_percent:Some(27.0) };
+        let mut state = AgentState::default();
+        let command = ("/bin/sh".into(), vec!["-c".into(), "printf '%s' '{\"cpu_usage\":23,\"memutil\":68,\"runtime\":1234}'".into()]);
+        let payload = collect_fast_dashboard_payload(&config, &mut state, metadata, &command).await.unwrap();
+        assert!(payload["telemetry"]["connections"].get("ipv6").is_none());
+        assert!(payload["telemetry"]["connections"].get("ipv6Half").is_none());
+    }
+
+    #[tokio::test]
+    async fn vendor_fast_command_has_a_deadline() {
+        let started = std::time::Instant::now();
+        let args = vec!["-c".to_string(), "exec sleep 2".to_string()];
+        assert!(bounded_command_json("/bin/sh", &args, Duration::from_millis(50)).await.is_err());
+        assert!(started.elapsed() < Duration::from_millis(500));
+    }
+
+    #[test]
+    fn fast_publication_continues_while_control_thread_is_blocked() {
+        use std::io::{Read, Write};
+        use std::net::TcpListener;
+
+        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        let address = listener.local_addr().unwrap();
+        listener.set_nonblocking(true).unwrap();
+        let server = std::thread::spawn(move || {
+            let deadline = std::time::Instant::now() + Duration::from_secs(8);
+            let mut received = Vec::new();
+            while received.len() < 3 && std::time::Instant::now() < deadline {
+                let (mut stream, _) = match listener.accept() {
+                    Ok(value) => value,
+                    Err(error) if error.kind() == std::io::ErrorKind::WouldBlock => {
+                        std::thread::sleep(Duration::from_millis(10));
+                        continue;
+                    }
+                    Err(error) => panic!("fake Hub accept: {}", error),
+                };
+                stream.set_read_timeout(Some(Duration::from_secs(2))).unwrap();
+                let mut headers = Vec::new();
+                while !headers.ends_with(b"\r\n\r\n") {
+                    let mut byte = [0u8];
+                    stream.read_exact(&mut byte).unwrap();
+                    headers.push(byte[0]);
+                    assert!(headers.len() < 8192);
+                }
+                let headers = String::from_utf8(headers).unwrap();
+                let length: usize = headers.lines().find_map(|line| {
+                    let (key, value) = line.split_once(':')?;
+                    key.eq_ignore_ascii_case("content-length").then(|| value.trim().parse().unwrap())
+                }).unwrap();
+                let mut body = vec![0u8; length];
+                stream.read_exact(&mut body).unwrap();
+                received.push((std::time::Instant::now(), serde_json::from_slice::<Value>(&body).unwrap()));
+                stream.write_all(b"HTTP/1.1 200 OK\r\nContent-Length: 11\r\nConnection: close\r\n\r\n{\"ok\":true}").unwrap();
+            }
+            received
+        });
+        let config = AgentConfig { hub_url: format!("http://{}", address), router_name: "BE50".into(), ..AgentConfig::default() };
+        let (metadata, receiver) = tokio::sync::watch::channel(FastDashboardMetadata { online_devices: 7, storage_percent: Some(27.0) });
+        let command = ("/bin/sh".into(), vec!["-c".into(), "printf '%s' '{\"cpu_usage\":23,\"memutil\":68,\"runtime\":1234}'".into()]);
+        let worker = start_fast_dashboard_with_command(&config, receiver, command).unwrap();
+        // This is the actual blocking behavior of vendor commands in the main
+        // control task; no async yield is available to rescue that executor.
+        std::thread::sleep(Duration::from_secs(5));
+        drop(metadata);
+        worker.join().unwrap();
+        let received = server.join().unwrap();
+        assert_eq!(received.len(), 3, "fresh pushes must occur during slow control work");
+        for pair in received.windows(2) {
+            assert!(pair[1].0.duration_since(pair[0].0) < Duration::from_millis(2500));
+            assert!(pair[1].1["telemetryEpoch"].as_u64().unwrap() > pair[0].1["telemetryEpoch"].as_u64().unwrap());
+        }
+        for (_, payload) in received {
+            assert_eq!(payload["router"], "BE50");
+            assert_eq!(payload["telemetry"]["cpuPercent"], 23.0);
+            assert_eq!(payload["telemetry"]["memoryPercent"], 68.0);
+            assert_eq!(payload["telemetry"]["onlineDeviceCount"], 7);
+            assert!(payload.get("details").is_none());
+            assert!(payload.get("ddnsAddress").is_none());
+        }
+    }
 
     const STAT_A: &str = "cpu  12631344 0 10923736 237436470 293 0 660503 0 0 0\ncpu0 6515314 0 4512333 119261354 129 0 537043 0 0 0\n";
     const STAT_B: &str = "cpu  12631844 0 10923736 237436970 293 0 660503 0 0 0\ncpu0 6515314 0 4512333 119261354 129 0 537043 0 0 0\n";

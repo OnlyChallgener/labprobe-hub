@@ -20,6 +20,7 @@ import websocket
 
 import router_compat
 import router_rpc_v010
+from router_capabilities import firmware_features
 
 
 WS_MESSAGE_TYPES = {"static", "slow", "fast", "recent_wan", "daily_wan", "ping"}
@@ -284,12 +285,16 @@ class RouterWebSocketMonitor:
         self._authenticated = threading.Event()
 
     def start(self) -> None:
-        if self._thread is not None:
+        if not self._supports_eweb_wss() or self._thread is not None:
             return
         self._low_thread = threading.Thread(target=self._low_frequency_loop, name="router-eweb-ws-low", daemon=True)
         self._thread = threading.Thread(target=self._loop, name="router-eweb-ws", daemon=True)
         self._low_thread.start()
         self._thread.start()
+
+    def _supports_eweb_wss(self) -> bool:
+        config = _dict(getattr(self.client, "config", {}))
+        return bool(firmware_features(str(config.get("name") or ""), True)["routerEwebWss"])
 
     def stop(self) -> None:
         self._stop.set()
@@ -586,6 +591,9 @@ class RouterWebSocketMonitor:
         last_logged_error = ""
         force_login = False
         while not self._stop.is_set():
+            if not self._supports_eweb_wss():
+                self._set_connected(False)
+                return
             try:
                 if not self._ensure_authenticated(force=force_login):
                     self._stop.wait(1.0)

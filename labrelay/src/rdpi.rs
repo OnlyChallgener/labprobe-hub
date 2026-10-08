@@ -137,6 +137,14 @@ fn write_db(payload: &Value) -> Result<Value> {
     if apps.is_empty() {
         bail!("拒绝写入空特征库");
     }
+    validate_entry_count(apps.len())?;
+    let mut indexes = std::collections::BTreeSet::new();
+    for app in apps {
+        let index = app.get("index").and_then(Value::as_str).unwrap_or("");
+        if index.is_empty() || !indexes.insert(index) {
+            bail!("特征库包含空编号或重复编号，拒绝写入");
+        }
+    }
 
     let current = std::fs::read_to_string(ROUTER_DB_PATH).with_context(|| format!("read {ROUTER_DB_PATH}"))?;
     let current_mark = fingerprint(&current);
@@ -202,9 +210,23 @@ fn write_db(payload: &Value) -> Result<Value> {
     }))
 }
 
+fn validate_entry_count(count: usize) -> Result<()> {
+    if count > 488 {
+        bail!("特征库共 {count} 条，超过安全上限 488 条，拒绝写入");
+    }
+    Ok(())
+}
+
 #[cfg(test)]
 mod tests {
-    use super::{fingerprint, should_push, write_is_stale};
+    use super::{fingerprint, should_push, write_is_stale, validate_entry_count};
+
+    #[test]
+    fn entry_limit_is_enforced_before_any_file_write() {
+        assert!(validate_entry_count(488).is_ok());
+        assert!(validate_entry_count(489).is_err());
+        assert!(validate_entry_count(490).is_err());
+    }
 
     #[test]
     fn an_unchanged_library_still_gets_resent_before_the_hub_drops_it() {

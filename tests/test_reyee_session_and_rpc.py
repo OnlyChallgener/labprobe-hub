@@ -107,6 +107,32 @@ def test_dynamic_key_extraction_and_login():
     assert probe_call.kwargs["headers"]["Cookie"] == "SN123456789=sid_abc_999"
 
 
+def test_be50_uses_the_official_pwd_login_envelope(monkeypatch):
+    monkeypatch.setenv("PRIMARY_ROUTER_NAME", "BE50")
+    mock_http = MagicMock(spec=requests.Session())
+    get_resp = MagicMock(status_code=200)
+    get_resp.text = 'GibberishAES.enc(passwordEl.value, "9c25038175ff503f2d55f4ea7db30e36")'
+    post_resp = MagicMock(status_code=200)
+    post_resp.json.return_value = {
+        "code": 0,
+        "data": {"token": "be50-token", "sid": "be50-sid", "sn": "BE50-SN"},
+    }
+    mock_http.get.return_value = get_resp
+    mock_http.post.return_value = post_resp
+    mock_http.cookies = requests.cookies.RequestsCookieJar()
+
+    manager = ReyeeSessionManager(
+        address="http://100.66.1.1", password="test-password",
+        session_factory=lambda: mock_http,
+    )
+    assert manager.get_session().sid == "be50-sid"
+    auth = json.loads(mock_http.post.call_args_list[0].kwargs["data"])
+    assert auth["method"] == "login"
+    assert set(auth["params"]) == {"username", "pwd", "time", "encry"}
+    assert auth["params"]["username"] == "admin"
+    assert gibberish_aes_decrypt(auth["params"]["pwd"], "9c25038175ff503f2d55f4ea7db30e36") == "test-password"
+
+
 def test_single_flight_concurrent_login():
     """Spawns 30 concurrent threads requesting get_session() simultaneously.
     

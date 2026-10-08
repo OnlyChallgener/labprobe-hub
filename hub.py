@@ -26,6 +26,7 @@ import paho.mqtt.client as mqtt
 from flask import Flask, request, jsonify, g
 from labprobe_storage import SQLiteStore
 from child_guard_schedule import clean_pass_until
+from official_child_guard import OfficialGuardCoordinator, OfficialGuardError
 from child_guard_service import (
     RouterCommandStore,
     ChildGuardValidationError,
@@ -36,7 +37,7 @@ from child_guard_service import (
 )
 
 BEIJING_TZ = ZoneInfo("Asia/Shanghai")
-APP_VERSION = "0.13.32"
+APP_VERSION = "0.14.1"
 PORT = int(os.environ.get("PORT", "58443"))
 BASE_DIR = Path(os.environ.get("LABPROBE_BASE_DIR", ".")).resolve()
 CONFIG_DIR = Path(os.environ.get("CONFIG_DIR", str(BASE_DIR / "config"))).resolve()
@@ -68,6 +69,8 @@ NOTES_DIR = DATA_DIR / "notes"
 NOTES_DIR.mkdir(parents=True, exist_ok=True)
 
 app = Flask(__name__)
+from http_response_compression import install_json_compression
+install_json_compression(app)
 
 DATA_LOCK = threading.RLock()
 ROUTER_DASHBOARD_LOCK = threading.RLock()
@@ -97,9 +100,10 @@ REFRESH_RUNNING = False
 STATUS_REFRESH_TTL_SEC = int(os.environ.get("STATUS_REFRESH_TTL_SEC", "180"))
 STORE = SQLiteStore(DATA_DIR, BACKUPS_DIR, DB_PATH)
 CHILD_GUARD_COMMANDS = RouterCommandStore(DATA_DIR)
-UPDATE_REPOSITORY_ROOT = (os.environ.get("UPDATE_REPOSITORY_ROOT") or "").strip().rstrip("/") or "https://lab.net86.dynv6.net:27772"
-AGENT_MANIFEST_URL = f"{UPDATE_REPOSITORY_ROOT}/agent/latest.json"
-AGENT_INSTALLER_URL = f"{UPDATE_REPOSITORY_ROOT}/agent/install.sh"
+UPDATE_REPOSITORY_ROOT = (os.environ.get("UPDATE_REPOSITORY_ROOT") or "").strip().rstrip("/") or "https://github.com/OnlyChallgener/labprobe-hub/releases/latest/download"
+_AGENT_REPOSITORY_ASSET_PREFIX = "" if "/releases/" in UPDATE_REPOSITORY_ROOT else "/agent"
+AGENT_MANIFEST_URL = f"{UPDATE_REPOSITORY_ROOT}{_AGENT_REPOSITORY_ASSET_PREFIX}/latest.json"
+AGENT_INSTALLER_URL = f"{UPDATE_REPOSITORY_ROOT}{_AGENT_REPOSITORY_ASSET_PREFIX}/install.sh"
 AGENT_GITHUB_MANIFEST_URL = (
     os.environ.get("AGENT_GITHUB_MANIFEST_URL") or
     "https://github.com/OnlyChallgener/labprobe-hub/releases/latest/download/latest.json"
@@ -3206,6 +3210,9 @@ def api_child_guard_command(command_id: str):
     cid = str(command_id or "").strip()
     if not re.fullmatch(r"[0-9a-f]{24}", cid):
         return jsonify({"ok": False, "errorCode": "invalid_request", "error": "unknown command"}), 400
+    official = OFFICIAL_CHILD_GUARD.status(cid)
+    if official is not None:
+        return jsonify(official), 200 if official.get("ok") else 409
     row = CHILD_GUARD_COMMANDS.record(cid)
     if not row:
         return jsonify({"ok": False, "errorCode": "not_found", "error": "command not found"}), 404
@@ -3426,16 +3433,16 @@ def _child_guard_remember_devices(action: str, result: Dict[str, Any],
     key = child_guard_router_alias(router) or "router"
     body = payload if isinstance(payload, dict) else {}
     try:
-        if action == "get_users":
-            devices = result.get("devices")
-            if isinstance(devices, list) and devices:
-                store.remember_guard_devices(key, devices)
-        elif action == "add_device":
-            store.remember_guard_devices(key, [{
+        if action in ("get_users", "add_device", "remove_device"):
+            version = int(result.get("membershipVersion") or 0)
+            devices = result.get("devices") if action == "get_users" else [{
                 "uid": result.get("uid") or body.get("uid"),
                 "macs": result.get("macs") or body.get("macs"),
                 "name": result.get("name") or body.get("deviceName") or body.get("name"),
-            }])
+            }]
+            if isinstance(devices, list):
+                store.reconcile_guard_membership(key, action, devices,
+                    result.get("removedUids") or result.get("uid") or body.get("uid"), version)
         elif action in ("pause_device", "resume_device"):
             until = to_int(result.get("blockedUntilEpoch"), 0) or to_int(body.get("untilEpoch"), 0)
             store.remember_guard_devices(key, [{
@@ -3450,8 +3457,6 @@ def _child_guard_remember_devices(action: str, result: Dict[str, Any],
                 "pausedUntilEpoch": to_int(result.get("passUntilEpoch"),
                                            to_int(body.get("untilEpoch"), 0)),
             }])
-        elif action == "remove_device":
-            store.forget_guard_device(key, str(result.get("uid") or body.get("uid") or ""))
         else:
             _child_guard_remember_plans(store, key, action, result, body)
     except Exception:  # pragma: no cover - 缓存失败不能拖垮业务响应
@@ -3514,9 +3519,66 @@ def _child_guard_on_command_result(command: Dict[str, Any]) -> None:
         str(command.get("action") or ""), result,
         str(command.get("router") or ""), command.get("payload") or {},
     )
+    if command.get("action") == "get_users":
+        try:
+            OFFICIAL_CHILD_GUARD.observe(str(command.get("router") or ""), result.get("devices"))
+        except Exception:
+            LOGGER.warning("official child guard reconciliation could not inspect router list")
 
 
 CHILD_GUARD_COMMANDS.add_result_observer(_child_guard_on_command_result)
+
+
+def _official_child_guard_identity(router: str) -> str:
+    # Each deployed Hub serves one router. Never borrow another router's serial
+    # or use an APP-supplied serial to select an official network.
+    key = child_guard_router_alias(router)
+    if not key or key != child_guard_router_alias(primary_router_name()):
+        return ""
+    with ROUTER_DASHBOARD_LOCK:
+        dashboard = copy.deepcopy(ROUTER_DASHBOARD_CACHE)
+    dashboard_key = child_guard_router_alias(dashboard.get("router"))
+    # eWeb reports its generic hostname "Ruijie" on BE50. It is not a model
+    # identity; the independently verified serial remains the binding boundary.
+    if dashboard_key and dashboard_key not in {key, "ruijie", "router", "primary", "default"}:
+        return ""
+    details = dashboard.get("details") or {}
+    ap = details.get("ap") or {}
+    return str(ap.get("serialNumber") or "").strip()
+
+
+OFFICIAL_CHILD_GUARD = OfficialGuardCoordinator(
+    DATA_DIR, CHILD_GUARD_COMMANDS, _official_child_guard_identity,
+    lambda: notify_agent_commands_changed(),
+)
+OFFICIAL_CHILD_GUARD.start()
+
+
+def _child_guard_official_membership(action: str, payload: Dict[str, Any]):
+    router = clean_saved_value(payload.get("router") or request.args.get("router") or primary_router_name())
+    try:
+        result = OFFICIAL_CHILD_GUARD.submit(router, action, payload)
+    except OfficialGuardError as error:
+        return jsonify({"ok": False, "router": router, "errorCode": error.code,
+                        "error": str(error)}), 400 if error.code == "invalid_request" else 409
+    return jsonify(result), 202 if result.get("pending") else 200
+
+
+@app.route("/api/router/child-guard/official/auth", methods=["GET", "POST"])
+def api_child_guard_official_auth():
+    if not (check_app_token() if request.method == "POST" else check_read_token()):
+        return jsonify({"ok": False, "error": "unauthorized"}), 401
+    body = request.get_json(silent=True) or {} if request.method == "POST" else {}
+    router = clean_saved_value(body.get("router") or request.args.get("router") or primary_router_name())
+    if request.method == "GET":
+        return jsonify(OFFICIAL_CHILD_GUARD.authorization_status(router))
+    account, password = str(body.get("account") or ""), str(body.get("password") or "")
+    if not account or not password or len(account) > 128 or len(password) > 256:
+        return jsonify({"ok": False, "errorCode": "invalid_request", "error": "请填写官方账号和密码"}), 400
+    try:
+        return jsonify(OFFICIAL_CHILD_GUARD.connect(router, account, password))
+    except OfficialGuardError as error:
+        return jsonify({"ok": False, "errorCode": error.code, "error": str(error)}), 409
 
 
 def _child_guard_directory(router: Optional[str] = None) -> List[Dict[str, Any]]:
@@ -3829,8 +3891,10 @@ def api_child_guard_devices_collection():
             macs.append(mac)
     with _CHILD_GUARD_MACS_CACHE_LOCK:
         _CHILD_GUARD_MACS_CACHE.clear()
-    return _child_guard_execute("add_device", {"macs": macs,
+    return _child_guard_official_membership("add_device", {"macs": macs,
                                                "deviceName": body.get("deviceName"),
+                                               "deviceType": body.get("deviceType"),
+                                               "manufacturer": body.get("manufacturer"),
                                                "router": body.get("router")})
 
 
@@ -3845,8 +3909,16 @@ def api_child_guard_device_delete(uid: str):
     body = request.get_json(silent=True) or {}
     with _CHILD_GUARD_MACS_CACHE_LOCK:
         _CHILD_GUARD_MACS_CACHE.pop(normalized_uid, None)
-    return _child_guard_execute("remove_device", {"uid": normalized_uid,
-                                                  "router": body.get("router")})
+    macs = body.get("macs")
+    if macs is not None and (not isinstance(macs, list) or len(macs) > 16 or
+            any(not re.fullmatch(r"[0-9a-fA-F]{2}(:[0-9a-fA-F]{2}){5}", str(mac)) for mac in macs)):
+        return jsonify({"ok": False, "errorCode": "invalid_request", "error": "设备 MAC 格式不正确"}), 400
+    if not macs:
+        store = _usage_aggregate_store()
+        cached = store.guard_device(_child_guard_router_key(_child_guard_router(body)), normalized_uid) if store else None
+        macs = cached.get("macs", []) if cached else []
+    return _child_guard_official_membership("remove_device", {"uid": normalized_uid,
+                                                  "macs": macs, "router": body.get("router")})
 
 
 @app.route("/api/router/child-guard/commands", methods=["GET"])
@@ -3988,6 +4060,12 @@ def _rdpi_apply(mutate: Callable[[Dict[str, Any]], Tuple[Optional[Dict[str, Any]
     merged, extra = mutate(db)
     if merged is None:
         return jsonify(extra)
+    # Every whole-library writer must enforce the same final safety boundary,
+    # including future mutators that do not call the curated merge helper.
+    from rdpi_signature_service import entry_budget_error
+    budget_error = entry_budget_error(merged.get("apps") or [])
+    if budget_error:
+        return jsonify({"ok": False, "errorCode": "entry_budget_exceeded", "error": budget_error}), 400
     text = json.dumps(merged, ensure_ascii=False, indent=2)
     command = RDPI_COMMANDS.enqueue(primary_router_name(), "write_db", {
         "dbText": text,
@@ -5709,6 +5787,8 @@ def _single_router_row() -> Dict[str, Any]:
     online_count = to_int(devices.get("onlineDeviceCount"), -1)
     if online_count < 0 and isinstance(dashboard.get("telemetry"), dict):
         online_count = to_int(dashboard["telemetry"].get("onlineDeviceCount"), -1)
+    if online_count < 0 and isinstance(devices.get("online"), list):
+        online_count = len(devices["online"])
     if total >= 0:
         row["deviceCount"] = total
     if online_count >= 0:

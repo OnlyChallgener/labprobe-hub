@@ -24,6 +24,7 @@ AGENT_ASSET_NAMES = {
     "labprobe-install.sh",
     "checksums.txt",
     "labrelay-linux-arm64",
+    "labrelay-linux-armv7",
     "labrelay-linux-aarch64",
     "labrelay-aarch64-musl",
     "labrelay-linux-amd64",
@@ -79,29 +80,32 @@ def _fallback_manifest(hub: Any) -> Dict[str, Any]:
         except Exception as exc:
             hub.LOGGER.warning("local agent manifest parse failed: %s", exc)
 
-    version = (os.environ.get("LABRELAY_RELEASE_VERSION") or "0.2.28").strip()
+    version = (os.environ.get("LABRELAY_RELEASE_VERSION") or "0.2.75").strip()
     public_root = (os.environ.get("UPDATE_REPOSITORY_ROOT") or "").strip().rstrip("/")
     fallback_root = "https://github.com/OnlyChallgener/labprobe-hub/releases/latest/download"
     if not public_root:
         public_root = fallback_root
+    asset_prefix = "" if "/releases/" in public_root else "/agent"
+    def asset_url(name: str) -> str:
+        return f"{public_root}{asset_prefix}/{name}"
     return {
         "schemaVersion": 1,
         "versionName": version,
         "changelog": "LabRelay OpenWrt installer and update-source stability fixes.",
-        "installUrl": f"{public_root}/agent/install.sh",
-        "checksumsUrl": f"{public_root}/agent/checksums.txt",
+        "installUrl": asset_url("install.sh"),
+        "checksumsUrl": asset_url("checksums.txt"),
         "binaries": {
             "arm64": {
-                "url": f"{public_root}/agent/labrelay-linux-arm64",
+                "url": asset_url("labrelay-linux-arm64"),
                 "fallbackUrl": f"{fallback_root}/labrelay-linux-arm64",
             },
-            "amd64": {
-                "url": f"{public_root}/agent/labrelay-linux-amd64",
-                "fallbackUrl": f"{fallback_root}/labrelay-linux-amd64",
+            "armv7": {
+                "url": asset_url("labrelay-linux-armv7"),
+                "fallbackUrl": f"{fallback_root}/labrelay-linux-armv7",
             },
         },
         "installer": {
-            "url": f"{public_root}/agent/install.sh",
+            "url": asset_url("install.sh"),
             "fallbackUrl": f"{fallback_root}/labprobe-install.sh",
         },
         "source": "hub-local-fallback",

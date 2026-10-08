@@ -12,6 +12,7 @@ Guarantees 100% contract fidelity with docs/contracts/app-hub-contract-v1.json:
 from typing import Any, Callable, Dict, List, Optional
 from router_core.driver.base import RouterDriver
 from router_core.errors import RouterCoreError, from_legacy_error
+from router_capabilities import is_be50_firmware
 
 
 class RouterService:
@@ -81,7 +82,29 @@ class RouterService:
 
     def get_status(self) -> Dict[str, Any]:
         try:
-            return self._driver.get_status()
+            status = self._driver.get_status()
+            if is_be50_firmware() and self._realtime is not None:
+                sample = self._realtime.get_router_calibration_snapshot()
+                age = sample.get("sampleAgeMs")
+                fresh_agent = (
+                    sample.get("source") == "agent_dashboard_push"
+                    and isinstance(age, (int, float))
+                    and 0 <= age <= 10_000
+                    and not sample.get("stale", True)
+                )
+                if fresh_agent:
+                    # BE50 has no usable eWeb WSS. A fresh Relay sample proves
+                    # the router is online even without an eWeb control session.
+                    return {
+                        **status,
+                        "state": "connected",
+                        "connected": True,
+                        "dataAvailable": True,
+                        "source": "agent_dashboard_push",
+                        "message": "BE50 本地采样正常",
+                        "lastSuccessAt": sample.get("sampleEpochMs", 0),
+                    }
+            return status
         except Exception as exc:
             raise from_legacy_error(exc) from exc
 

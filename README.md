@@ -1,4 +1,4 @@
-# LabProbe Hub 0.11.5
+# LabProbe Hub 0.14.1
 
 LabProbe Hub 可部署在任意 Linux AMD64/ARM64 宿主机，包括服务器、小主机、NAS 和软路由。Hub 使用 SQLite 保存数据；已适配锐捷路由器上的 Rust Agent 继续以 `dev_sta/user_list` 为核心数据源。
 
@@ -53,7 +53,7 @@ HUB_ADVERTISE_URL=http://192.168.1.20:58443
 HUB_HOST_IPV4=192.168.1.20
 HUB_HOST_IPV6=
 HUB_HOST_MAC=
-# 可选：留空使用内置 Lucky 更新仓；私有更新仓才填写。
+# 可选：留空使用 GitHub Release；自建更新仓才填写。
 UPDATE_REPOSITORY_ROOT=
 ```
 
@@ -139,7 +139,8 @@ AI 对话、工具确认、每日记录和 Token 统计均由 Hub 提供。APP �
 SSH 登录已适配的锐捷路由器后执行：
 
 ```sh
-wget -O /tmp/labprobe-install.sh https://lab.net86.dynv6.net:27772/agent/install.sh \
+export HUB_URL=http://192.168.1.20:58443  # 改成自己的 Hub 地址
+wget -O /tmp/labprobe-install.sh "$HUB_URL/agent/install.sh" \
 && sh /tmp/labprobe-install.sh
 ```
 
@@ -159,7 +160,7 @@ Hub 通过 `LOG_LEVEL`、`LOG_RETENTION_DAYS` 控制日志级别和保留天数�
 
 ## 更新仓与发版文件
 
-Hub 从统一的 `UPDATE_REPOSITORY_ROOT` 读取 Rust `latest.json`，APP 评分详情页可查询 Agent 当前版本并经 Hub 下发更新指令。锐捷 Rust Agent 仅发布 ARM64 程序；安装脚本会显示下载进度并校验 `checksums.txt`。Hub Docker 镜像仍同时支持 linux/amd64 和 linux/arm64。
+Hub 从统一的 `UPDATE_REPOSITORY_ROOT` 读取 Rust `latest.json`，APP 评分详情页可查询 Agent 当前版本并经 Hub 下发更新指令。目前支持 BE72（已验证 BE72 Pro）与 BE50，分别提供 ARM64 和 ARMv7 Relay；安装脚本会自动选择架构、显示下载进度并校验 `checksums.txt`。Hub Docker 镜像同时支持 linux/amd64 和 linux/arm64，N1 须使用 64 位 Linux。
 
 `scripts/build_update_bundle.py` 会生成同一份可上传到本地、GitHub 和 Lucky 的目录：
 

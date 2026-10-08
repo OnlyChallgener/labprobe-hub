@@ -917,6 +917,18 @@ def install_lab_ddns(hub: Any) -> LabDdnsStore:
             return jsonify({"ok": False, "error": "unauthorized"}), 401
         return jsonify({"ok": True, "providers": provider_specs()})
 
+    @blueprint.get("/<record_id>/credentials")
+    def get_record_credentials(record_id: str):
+        """Explicit authenticated editor read; never included in list snapshots."""
+        if not hub.check_app_token():
+            return jsonify({"ok": False, "error": "unauthorized"}), 401
+        if not any(row.get("id") == record_id for row in store.snapshot().get("records", [])):
+            return jsonify({"ok": False, "error": "not_found"}), 404
+        response = jsonify({"ok": True, "credentials": store.secrets.get(record_id)})
+        response.headers["Cache-Control"] = "no-store"
+        response.headers["Pragma"] = "no-cache"
+        return response
+
     @blueprint.post("")
     def add_ddns():
         if not hub.check_app_token():

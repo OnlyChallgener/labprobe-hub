@@ -177,3 +177,16 @@ def test_router_list_rejects_anonymous_and_hook_tokens(monkeypatch):
     # STRICT_TOKEN_SEPARATION 之外，HOOK_TOKEN 仍可当只读令牌用；这里只要求它不出现在响应里。
     assert "app-token-for-test" not in client.get(
         "/api/routers", headers={"Authorization": "Bearer app-token-for-test"}).get_data(as_text=True)
+
+
+def test_online_device_count_falls_back_to_online_list_len_when_absent(monkeypatch):
+    online = [{"mac": f"aa:bb:cc:00:00:{i:02d}"} for i in range(7)]
+    _seed(
+        monkeypatch,
+        dashboard={"receivedEpoch": time.time()},
+        devices={"source": "custom_sync", "online": online},
+        archive={},
+    )
+    row = _row(hub.app.test_client())
+    assert row["onlineDeviceCount"] == 7
+    assert row["deviceCount"] == 7

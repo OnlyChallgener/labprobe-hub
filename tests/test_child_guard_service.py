@@ -3,6 +3,18 @@ import time
 
 import pytest
 
+
+def test_add_retry_reuses_pending_command_only_for_same_router_and_macs(tmp_path):
+    store = RouterCommandStore(tmp_path)
+    first = store.enqueue("BE50", "add_device", {"macs": ["AA:BB:CC:DD:EE:FF"]})
+    store.take("BE50")
+    retry = store.enqueue("BE50", "add_device", {"macs": ["aa:bb:cc:dd:ee:ff"]})
+    assert retry["id"] == first["id"]
+    other = store.enqueue("BE72", "add_device", {"macs": ["aa:bb:cc:dd:ee:ff"]})
+    assert other["id"] != first["id"]
+    store.acknowledge("BE50", [{"id": first["id"], "ok": True, "result": {"ok": True}}])
+    assert store.enqueue("BE50", "add_device", first["payload"])["id"] != first["id"]
+
 from child_guard_service import (
     RouterCommandStore,
     ChildGuardValidationError,
@@ -89,3 +101,30 @@ def test_wait_wakes_after_agent_ack(tmp_path):
     thread.join()
     assert result.state == "done"
     assert result.result["devices"] == []
+
+
+def test_manual_writes_pass_pending_reads_but_keep_write_order(tmp_path):
+    store = RouterCommandStore(tmp_path)
+    read = store.enqueue("BE72", "get_users", {})
+    add = store.enqueue("BE72", "add_device", {"macs": ["aa:bb:cc:dd:ee:ff"]})
+    remove = store.enqueue("BE72", "remove_device", {"uid": "test"})
+    assert [r["id"] for r in store.take("BE72")] == [add["id"], remove["id"], read["id"]]
+
+
+def test_identical_reads_merge_but_post_write_refresh_is_new(tmp_path):
+    store = RouterCommandStore(tmp_path)
+    first = store.enqueue("BE72", "get_users", {})
+    assert store.enqueue("BE72", "get_users", {})["id"] == first["id"]
+    store.enqueue("BE72", "remove_device", {"uid": "test"})
+    newer = store.enqueue("BE72", "get_users", {})
+    assert newer["id"] != first["id"]
+    assert newer["sequence"] > first["sequence"]
+
+
+def test_membership_result_carries_request_order_and_duplicate_ack_is_noop(tmp_path):
+    store = RouterCommandStore(tmp_path)
+    first = store.enqueue("BE72", "get_users", {})
+    ack = [{"id": first["id"], "ok": True, "result": {"ok": True, "devices": []}}]
+    assert store.acknowledge("BE72", ack) == 1
+    assert store.result(first["id"]).result["membershipVersion"] == first["sequence"]
+    assert store.acknowledge("BE72", ack) == 0

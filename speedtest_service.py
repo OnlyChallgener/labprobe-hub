@@ -355,6 +355,10 @@ def install_speedtest_service(hub: Any, logger: Optional[Callable[..., Any]] = N
     def _authorize():  # pragma: no cover - exercised through the routes
         if not hub.check_app_token():
             return jsonify({"ok": False, "error": "unauthorized"}), 401
+        from router_capabilities import is_be50_firmware
+        if is_be50_firmware() and request.path != "/api/router/speedtest/ports":
+            return jsonify({"ok": False, "error": "unsupported_feature",
+                            "message": "当前路由器固件不支持网络测速"}), 422
         return None
 
     @bp.errorhandler(SpeedTestError)

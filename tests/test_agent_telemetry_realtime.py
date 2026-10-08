@@ -11,7 +11,10 @@ BE72 上 eWeb 那条更快也更全，所以 agent 这条必须让路 —— 下
 import json
 import time
 
+import pytest
+
 from router_core.realtime.router_realtime import RouterRealtimeEngine
+from router_core.service.router_service import RouterService
 
 
 # 2026-09-27 从 58444 那台 hub 的 /api/router/dashboard 里抄下来的真实形状。
@@ -102,3 +105,51 @@ def test_agent_telemetry_ignores_payloads_without_any_contract_field():
     engine.accept_agent_telemetry({"wireguard": {"peers": 2}}, int(time.time() * 1000))
     engine.accept_agent_telemetry(None)
     assert frames == []
+
+
+@pytest.mark.parametrize("age_ms, stale", [(9000, False), (10000, False), (10001, True), (45000, True)])
+def test_be50_agent_freshness_uses_sample_epoch_and_ten_second_window(monkeypatch, age_ms, stale):
+    monkeypatch.setenv("PRIMARY_ROUTER_NAME", "BE50")
+    monkeypatch.delenv("ROUTER_FIRMWARE_FAMILY", raising=False)
+    monkeypatch.setattr("router_core.realtime.router_realtime.time.time", lambda: 1000.0)
+    epoch_ms = 1_000_000 - age_ms
+    engine = RouterRealtimeEngine()
+    engine.accept_agent_telemetry({"cpuPercent": 7.0, "onlineDeviceCount": 7}, epoch_ms)
+
+    sample = engine.get_router_calibration_snapshot()
+
+    assert sample["sampleEpochMs"] == epoch_ms
+    assert sample["sampleAgeMs"] == age_ms
+    assert sample["stale"] is stale
+
+
+@pytest.mark.parametrize("firmware, source", [("BE72", "agent"), ("BE50", "eweb")])
+def test_other_router_sources_keep_three_second_freshness(monkeypatch, firmware, source):
+    monkeypatch.setenv("PRIMARY_ROUTER_NAME", firmware)
+    monkeypatch.delenv("ROUTER_FIRMWARE_FAMILY", raising=False)
+    monkeypatch.setattr("router_core.realtime.router_realtime.time.time", lambda: 1000.0)
+    engine = RouterRealtimeEngine()
+    accept = engine.accept_agent_telemetry if source == "agent" else engine.accept_router_fast
+    accept({"cpuPercent": 7.0}, 997_000)
+    assert engine.get_router_calibration_snapshot()["stale"] is False
+    accept({"cpuPercent": 7.0}, 996_999)
+    assert engine.get_router_calibration_snapshot()["stale"] is True
+
+
+@pytest.mark.parametrize("age_ms, connected", [(9000, True), (10001, False)])
+def test_be50_status_confirms_only_agent_samples_within_freshness_window(monkeypatch, age_ms, connected):
+    monkeypatch.setenv("PRIMARY_ROUTER_NAME", "BE50")
+    monkeypatch.delenv("ROUTER_FIRMWARE_FAMILY", raising=False)
+    monkeypatch.setattr("router_core.realtime.router_realtime.time.time", lambda: 1000.0)
+
+    class Driver:
+        def get_status(self):
+            return {"connected": False, "sessionConnected": False, "dataAvailable": False}
+
+    engine = RouterRealtimeEngine()
+    engine.accept_agent_telemetry({"cpuPercent": 7.0}, 1_000_000 - age_ms)
+    status = RouterService(Driver(), realtime=engine).get_status()
+
+    assert status["connected"] is connected
+    assert status["dataAvailable"] is connected
+    assert status["sessionConnected"] is False

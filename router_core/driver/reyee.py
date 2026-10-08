@@ -13,6 +13,7 @@ from .base import RouterDriver
 from router_core.driver.reyee_rpc import ReyeeRpcClient
 from router_core.driver.reyee_session import ReyeeSessionManager
 from router_core.errors import from_legacy_error
+from router_capabilities import firmware_features
 
 
 class ReyeeEWebDriver(RouterDriver):
@@ -109,7 +110,10 @@ class ReyeeEWebDriver(RouterDriver):
     def get_capabilities(self) -> Dict[str, Any]:
         try:
             if self._legacy_client and hasattr(self._legacy_client, "capabilities"):
-                return self._legacy_client.capabilities()
+                result = self._legacy_client.capabilities()
+                cfg = getattr(self._legacy_client, "config", {}) or {}
+                result["features"] = firmware_features(cfg.get("name", ""), bool(result.get("configured", True)))
+                return result
             if self._legacy_client:
                 cfg = getattr(self._legacy_client, "config", {})
                 configured = bool(cfg.get("address")) if cfg else True
@@ -121,18 +125,8 @@ class ReyeeEWebDriver(RouterDriver):
             else:
                 configured = False
 
-            return {
-                "configured": configured,
-                "features": {
-                    "dashboard": configured,
-                    "devices": configured,
-                    "firewall": configured,
-                    "nativePortMapping": configured,
-                    "upnp": configured,
-                    "ddns": configured,
-                    "diagnostic": configured,
-                },
-            }
+            name = cfg.get("name", "") if self._legacy_client else ""
+            return {"configured": configured, "features": firmware_features(name, configured)}
         except Exception as exc:
             raise from_legacy_error(exc) from exc
 

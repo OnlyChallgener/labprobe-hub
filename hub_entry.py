@@ -52,7 +52,7 @@ from router_core.service.router_service import RouterService
 from router_core.service.blueprint import create_router_blueprint_v1
 
 PREVIOUS_HUB_VERSION = "0.13.1"
-HUB_VERSION = "0.13.32"
+HUB_VERSION = "0.14.1"
 hub.APP_VERSION = HUB_VERSION
 install_ipv6_neighbor_archive_patch(hub)
 
@@ -70,6 +70,7 @@ def _resolve_router_settings():
         or hub.cfg_get("router.address")
         or hub.cfg_get("router.ip")
         or legacy.get("address")
+        or os.environ.get("ROUTER_EWEB_URL")
         or os.environ.get("ROUTER_HOST")
         or os.environ.get("ROUTER_IP")
         or os.environ.get("ROUTER_ADDRESS")
@@ -79,6 +80,7 @@ def _resolve_router_settings():
         (legacy.get("password") if managed else None)
         or hub.cfg_get("router.password")
         or legacy.get("password")
+        or os.environ.get("ROUTER_EWEB_PASSWORD")
         or os.environ.get("ROUTER_PASSWORD")
         or ""
     )
@@ -219,6 +221,10 @@ router_service = RouterService(
     config_saver=_save_router_config,
 )
 hub.ROUTER_SERVICE = router_service
+
+# Compatibility API for the independently packaged Shinya Hub client.
+from shinya_compat import install_shinya_compat
+install_shinya_compat(hub)
 
 # Register Router Core Blueprint v1 as official production API
 hub.app.register_blueprint(

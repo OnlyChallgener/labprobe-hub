@@ -23,8 +23,11 @@ import threading
 import time
 from typing import Any, Callable, Dict, List, Optional, Set
 
+from router_capabilities import is_be50_firmware
+
 
 ROUTER_STALE_MS = 3_000
+BE50_AGENT_STALE_MS = 10_000
 DEVICES_STALE_MS = 4_000
 _ROUTER_INTEGER_FIELDS = {
     "uploadBps",
@@ -392,7 +395,12 @@ class RouterRealtimeEngine:
             age_ms = max(0, now_ms - epoch_ms) if epoch_ms else 0
             latest["serverEpochMs"] = now_ms
             latest["sampleAgeMs"] = age_ms
-            latest["stale"] = not epoch_ms or age_ms > ROUTER_STALE_MS
+            stale_ms = (
+                BE50_AGENT_STALE_MS
+                if is_be50_firmware() and latest.get("source") == "agent_dashboard_push"
+                else ROUTER_STALE_MS
+            )
+            latest["stale"] = not epoch_ms or age_ms > stale_ms
             return latest
         return {
             "ok": True,

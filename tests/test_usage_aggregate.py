@@ -31,6 +31,18 @@ def store(tmp_path):
     return aggregate
 
 
+def test_overflow_counter_does_not_block_valid_minutes(store):
+    minute = int(datetime(2026, 10, 4, 10, tzinfo=timezone.utc).timestamp())
+    rows = [{"date": "2026-10-04", "mac": "aa:bb:cc:dd:ee:ff",
+             "minutes": [minute, minute + 60, minute + 120],
+             "up": [2**64 - 1, 4096, 2**63 - 1],
+             "down": [float("inf"), 8192, 256]}]
+    assert store.insert_device_minutes(rows, router="be50") == 3
+    with store.connect() as conn:
+        values = conn.execute("SELECT up_bytes, down_bytes FROM usage_device_minute ORDER BY minute_epoch").fetchall()
+    assert [tuple(row) for row in values] == [(0, 0), (4096, 8192), (2**63 - 1, 256)]
+
+
 def hourly(mac, day, hour, secs, tx=0, rx=0):
     return {"date": day, "mac": mac, "hour": hour,
             "active_secs": secs, "tx_bytes": tx, "rx_bytes": rx}
@@ -1090,6 +1102,22 @@ class TestComposeDeviceReport:
         assert report["macs"] == ["aa:bb:cc:dd:ee:ff"]
 
 
+class TestQuietReportMetadata:
+    def test_empty_day_retains_collector_freshness_and_traffic(self):
+        class QuietStore:
+            def report(self, macs, date, router):
+                return {"date": date, "macs": list(macs), "basis": "none", "hourly": [], "apps": [],
+                        "generatedAt": 1791154800, "lastSampleAt": 1791154795, "stale": False,
+                        "hasData": False, "traffic": {"txBytes": 100},
+                        "coverage": {"status": "no_record", "hasRecords": False}}
+        report = compose_device_report(QuietStore(), [MAC_A], DAY, router="BE72")
+        assert report["lastSampleAt"] == 1791154795
+        assert report["stale"] is False
+        assert report["hasData"] is False
+        assert report["coverage"]["status"] == "no_record"
+        assert report["traffic"]["txBytes"] == 100
+
+
 class TestRangeSeries:
     """The 最近10天 chart: one call, a stable number of bars, no client date maths."""
 
@@ -1827,3 +1855,42 @@ class TestGuardOverview:
                                         now_epoch=bj_minute(DAY, 13))
         assert payload["devices"][0]["todayMinutes"] == 0
 
+
+
+class TestGuardMembershipReconciliation:
+    def test_complete_snapshot_replaces_uid_and_keeps_same_name_distinct_macs(self, store):
+        store.reconcile_guard_membership(ROUTER, "get_users", [
+            {"uid": "OLD", "macs": [MAC_A], "name": "Mate60"}], None, 10)
+        store.reconcile_guard_membership(ROUTER, "get_users", [
+            {"uid": "NEW", "macs": [MAC_A], "name": "Mate60"},
+            {"uid": "OTHER", "macs": [MAC_B], "name": "Mate60"}], None, 20)
+        assert {d["uid"] for d in store.guard_devices(ROUTER)} == {"NEW", "OTHER"}
+
+    def test_late_full_snapshot_cannot_undo_manual_delete(self, store):
+        device = {"uid": UID, "macs": [MAC_A]}
+        store.reconcile_guard_membership(ROUTER, "get_users", [device], None, 10)
+        store.reconcile_guard_membership(ROUTER, "remove_device", [], UID, 30)
+        assert not store.reconcile_guard_membership(ROUTER, "get_users", [device], None, 20)
+        assert store.guard_devices(ROUTER) == []
+        # A later authoritative change is allowed back; no eternal tombstone.
+        assert store.reconcile_guard_membership(ROUTER, "get_users", [device], None, 40)
+        assert len(store.guard_devices(ROUTER)) == 1
+
+    def test_empty_snapshot_clears_membership_and_plans_but_not_history_or_other_router(self, store):
+        device = {"uid": UID, "macs": [MAC_A]}
+        store.reconcile_guard_membership(ROUTER, "get_users", [device], None, 10)
+        store.reconcile_guard_membership("other", "get_users", [device], None, 10)
+        store.remember_guard_plans(ROUTER, UID, [{"id": "plan"}])
+        store.insert_device_minutes([device_minutes_row(MAC_A, DAY, [bj_minute(DAY, 20)])])
+        before = store.report([MAC_A], DAY)
+        assert store.reconcile_guard_membership(ROUTER, "get_users", [], None, 20)
+        assert store.guard_devices(ROUTER) == []
+        assert store.guard_plan_snapshot(ROUTER, UID) is None
+        assert len(store.guard_devices("other")) == 1
+        after = store.report([MAC_A], DAY)
+        assert {k: v for k, v in after.items() if k != "generatedAt"} == {k: v for k, v in before.items() if k != "generatedAt"}
+
+    def test_malformed_snapshot_cannot_clear_current_members(self, store):
+        store.reconcile_guard_membership(ROUTER, "get_users", [{"uid": UID, "macs": [MAC_A]}], None, 10)
+        assert not store.reconcile_guard_membership(ROUTER, "get_users", [{"name": "invalid"}], None, 20)
+        assert len(store.guard_devices(ROUTER)) == 1

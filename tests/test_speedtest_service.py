@@ -291,3 +291,13 @@ def test_unauthorized_is_rejected():
     hub.check_app_token = staticmethod(lambda: False)
     st.install_speedtest_service(hub)
     assert hub.app.test_client().get("/api/router/speedtest/ports").status_code == 401
+
+
+def test_be50_hides_native_speedtest_and_never_calls_firmware(monkeypatch):
+    monkeypatch.setenv("ROUTER_FIRMWARE_FAMILY", "be50-stock")
+    client, driver = build_client({"port_status": PORT_STATUS})
+    for path in ("servers", "state", "progress", "history"):
+        assert client.get("/api/router/speedtest/" + path).status_code == 422
+    assert client.post("/api/router/speedtest/start", json={}).status_code == 422
+    assert driver.calls == []
+    assert client.get("/api/router/speedtest/ports").status_code == 200
