@@ -1,5 +1,6 @@
 import time
 from types import SimpleNamespace
+from unittest.mock import Mock
 
 import websocket
 
@@ -27,6 +28,20 @@ def test_fast_stall_detection_uses_current_connection_only():
     assert patch._fast_stream_stalled(monitor, now - 1, now) is False
     monitor._last_fast_at = now - patch.FAST_STALL_SECONDS - 0.1
     assert patch._fast_stream_stalled(monitor, now - 10, now) is True
+
+
+def test_patched_recovery_respects_be50_firmware_capability(monkeypatch):
+    monkeypatch.setenv("PRIMARY_ROUTER_NAME", "BE50")
+    monkeypatch.delenv("ROUTER_FIRMWARE_FAMILY", raising=False)
+    patch.install_router_fast_watchdog_patch()
+    monitor = router_ws_patch.RouterWebSocketMonitor(SimpleNamespace(config={}), Mock())
+    authenticate = Mock(side_effect=AssertionError("BE50 must not authenticate the native websocket"))
+    monkeypatch.setattr(monitor, "_ensure_authenticated", authenticate)
+
+    monitor._loop()
+
+    authenticate.assert_not_called()
+    assert monitor._thread is None
 
 
 def test_run_connection_returns_quickly_when_fast_stream_is_silent(monkeypatch):

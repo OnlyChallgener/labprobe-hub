@@ -2,6 +2,8 @@
 
 ## 0.14.1 / LabRelay 0.2.75
 
+- 实时恢复逻辑遵守 BE50 的固件能力判断，避免对不支持的原生 WebSocket 反复认证。
+
 - 汇总 BE72 与 BE50 的 Relay 遥测、儿童上网同步和路由器实时数据修复；增加星耀家 Hub 第一阶段协议适配。
 - Hub Docker 镜像发布 AMD64 和 ARM64；Relay 发布 ARM64 与 ARMv7 两套路由器程序。
 - 安装脚本与更新清单默认使用 GitHub Release。路由器可从 Docker Hub 容器的 `/agent/install.sh` 获取安装器，不再依赖原 NAS 域名。

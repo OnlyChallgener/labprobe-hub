@@ -101,6 +101,9 @@ def _router_ws_loop_fast_recovery(self: Any) -> None:
     last_logged_error = ""
     force_login = False
     while not self._stop.is_set():
+        if not self._supports_eweb_wss():
+            self._set_connected(False)
+            return
         try:
             if not self._ensure_authenticated(force=force_login):
                 self._stop.wait(1.0)
