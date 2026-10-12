@@ -41,8 +41,9 @@ SERVICE_TEMPLATES = {
 # Cloudflare publishes its free STUN endpoint for UDP only. A TCP rule must
 # use a server that explicitly accepts STUN Binding requests over TCP.
 DEFAULT_STUN_UDP_SERVER = "stun.cloudflare.com:3478"
-DEFAULT_STUN_TCP_SERVER = "stunserver2025.stunprotocol.org:3478"
+DEFAULT_STUN_TCP_SERVER = "stun.nextcloud.com:3478"
 LEGACY_TCP_STUN_SERVER = DEFAULT_STUN_UDP_SERVER
+LEGACY_TCP_STUN_SERVERS = {DEFAULT_STUN_UDP_SERVER, "stunserver2025.stunprotocol.org:3478"}
 STUN_MAPPING_FRESH_SECONDS = 90
 
 # Fields that change Relay execution or the router-owned forwarding path.
@@ -196,7 +197,7 @@ class StunService:
                     rule["forwardMode"] = forward_mode
                     rule["updatedAt"] = _now_text()
                     changed = True
-                if protocol == "TCP" and _text(rule.get("stunServer")) == LEGACY_TCP_STUN_SERVER:
+                if protocol == "TCP" and (_text(rule.get("stunServer")) in LEGACY_TCP_STUN_SERVERS or not _text(rule.get("stunServer"))):
                     rule["stunServer"] = _stun_server("TCP")
                     rule["updatedAt"] = _now_text()
                     changed = True
@@ -790,6 +791,32 @@ class StunService:
         document = self._document()
         desired = {rule["id"]: rule for rule in document["rules"]}
         sync_errors = self._command_sync_errors(desired)
+        # Older router-self rules can retain a working firewall entry after
+        # their ownership fingerprint was lost.  An exact read-only match is
+        # enough to report the observed network state, but never grants this
+        # service permission to update or delete that unowned entry.
+        unowned_relay_rules = [
+            rule for rule in document["rules"]
+            if _bool(rule.get("enabled")) and not self._is_native_forward(rule)
+            and not firewall_bindings.get(rule["id"], {}).get("uuid")
+            and firewall_bindings.get(rule["id"], {}).get("state") == "manual_change"
+        ]
+        observed_firewall = {}
+        if unowned_relay_rules:
+            try:
+                snapshot = self.client.firewall(False)
+                rows = snapshot.get("list", []) if isinstance(snapshot, dict) else []
+                for rule in unowned_relay_rules:
+                    expected = self._expected_firewall(rule)
+                    observed_firewall[rule["id"]] = any(
+                        isinstance(row, dict)
+                        and _text(row.get("ruleName")) == expected["ruleName"]
+                        and self._firewall_matches(row, expected)
+                        for row in rows
+                    )
+            except Exception:
+                # A failed router read must not turn an unverified rule green.
+                pass
         result = []
         for rule in document["rules"]:
             item = dict(rule)
@@ -799,6 +826,12 @@ class StunService:
             native_binding = native_bindings.get(rule["id"], {})
             native_state = _text(native_binding.get("state")) or ("ready" if native_binding.get("fingerprint") else "pending")
             firewall_state = "not_required" if self._is_native_forward(rule) else (_text(firewall_bindings.get(rule["id"], {}).get("state")) or ("ready" if firewall_bindings.get(rule["id"], {}).get("uuid") else "pending"))
+            observed_unowned = bool(observed_firewall.get(rule["id"]))
+            if observed_unowned:
+                # `ready` describes the effective firewall configuration so
+                # existing clients do not keep showing an error. Ownership is
+                # reported separately and still withheld from mutations.
+                firewall_state = "ready"
             actual = _text(current.get("state"))
             if not _bool(rule.get("enabled")):
                 actual = "stopped"
@@ -820,6 +853,8 @@ class StunService:
                 actual = "mapping"
                 if not _text(current.get("lastError")):
                     current["lastError"] = "STUN 映射状态已过期，正在重新确认"
+            elif actual == "mapped" and mapping_fresh:
+                current["lastError"] = ""
             current["mappingFresh"] = mapping_fresh
             current["mappingAgeSeconds"] = mapping_age
             target_host = _text(rule.get("targetIpv4"))
@@ -829,8 +864,8 @@ class StunService:
                 "runtime": current,
                 "actualState": actual,
                 "firewallState": firewall_state,
-                "firewallMessage": _text(firewall_bindings.get(rule["id"], {}).get("message")),
-                "firewallOwner": _text(firewall_bindings.get(rule["id"], {}).get("owner")) or ("" if self._is_native_forward(rule) else "labprobe-stun"),
+                "firewallMessage": "防火墙规则内容匹配，但归属记录缺失；不会改动该规则" if observed_unowned else _text(firewall_bindings.get(rule["id"], {}).get("message")),
+                "firewallOwner": "untracked" if observed_unowned else (_text(firewall_bindings.get(rule["id"], {}).get("owner")) or ("" if self._is_native_forward(rule) else "labprobe-stun")),
                 "nativeMappingState": native_state,
                 "nativeMappingMessage": _text(native_binding.get("message")),
                 "syncError": _text(sync_errors.get(rule["id"])),

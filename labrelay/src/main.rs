@@ -33,7 +33,7 @@ const DEFAULT_SOCKET: &str = "/tmp/labrelay.sock";
 const DEFAULT_STATE: &str = "/tmp/labrelay/state.json";
 const DEFAULT_PID: &str = "/tmp/labrelay.pid";
 const DEFAULT_UDP_STUN_SERVER: &str = "stun.cloudflare.com:3478";
-const DEFAULT_TCP_STUN_SERVER: &str = "stunserver2025.stunprotocol.org:3478";
+const DEFAULT_TCP_STUN_SERVER: &str = "stun.nextcloud.com:3478";
 const LEGACY_TCP_STUN_SERVER: &str = DEFAULT_UDP_STUN_SERVER;
 const STUN_TCP_KEEPALIVE_INTERVAL: Duration = Duration::from_secs(10);
 const STUN_MAPPING_FAILURE_GRACE: Duration = Duration::from_secs(90);
@@ -1796,7 +1796,7 @@ fn normalize_rule(rule: &mut Rule) {
             "router_native".to_string()
         };
         if rule.stun_server.is_empty()
-            || (rule.transport_protocol == "TCP" && rule.stun_server == LEGACY_TCP_STUN_SERVER)
+            || (rule.transport_protocol == "TCP" && (rule.stun_server == LEGACY_TCP_STUN_SERVER || rule.stun_server == "stunserver2025.stunprotocol.org:3478"))
         {
             rule.stun_server = default_stun_server(&rule.transport_protocol);
         }

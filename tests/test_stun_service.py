@@ -143,6 +143,34 @@ def test_router_self_create_uses_firewall_and_exposes_owner_without_native_mappi
     assert row["firewallMessage"] == ""
 
 
+def test_unowned_matching_router_self_firewall_reports_mapping_without_adopting_rule(tmp_path):
+    hub = _hub(tmp_path)
+    client = _Client()
+    service = StunService(hub, client)
+    rule = service.clean_rule({"serviceType": "SSH", "targetType": "router_self", "targetPort": 54133})
+    service._save_rules([rule])
+    service._save_firewall_bindings({rule["id"]: {"state": "manual_change", "owner": "labprobe-stun"}})
+    client.rules.append({**service._expected_firewall(rule), "uuid": "unowned-1"})
+    now = int(time.time())
+    hub.save_json(service.status_path, {"status": {"rules": [{
+        "rule": rule,
+        "runtime": {"state": "mapped", "publicEndpoint": "203.0.113.9:12636", "mappingUpdatedAt": now},
+    }]}})
+
+    matched = service.rows()[0]
+    assert matched["actualState"] == "mapped"
+    assert matched["runtime"]["mappingFresh"] is True
+    assert matched["firewallState"] == "ready"
+    assert matched["firewallOwner"] == "untracked"
+    assert service._firewall_bindings()[rule["id"]].get("uuid") is None
+    assert client.rpc_calls == []
+
+    client.rules[0]["destPort"] = "9999"
+    mismatched = service.rows()[0]
+    assert mismatched["actualState"] == "firewall_error"
+    assert mismatched["firewallState"] == "manual_change"
+
+
 def test_legacy_tcp_rule_is_migrated_to_a_tcp_stun_server_and_queued(tmp_path):
     hub = _hub(tmp_path)
     legacy = {
@@ -162,6 +190,26 @@ def test_legacy_tcp_rule_is_migrated_to_a_tcp_stun_server_and_queued(tmp_path):
     assert service._document()["rules"][0]["stunServer"] == DEFAULT_STUN_TCP_SERVER
     assert service._commands()[0]["action"] == "upsert"
     assert service._commands()[0]["payload"]["rule"]["stunServer"] == DEFAULT_STUN_TCP_SERVER
+
+def test_stunserver2025_tcp_rule_is_migrated_to_nextcloud_and_queued(tmp_path):
+    hub = _hub(tmp_path)
+    legacy = {
+        "id": "stun-tcp-2025",
+        "kind": "stun",
+        "name": "HTTPS · 192.168.5.46:443",
+        "enabled": True,
+        "targetIpv4": "192.168.5.46",
+        "targetPort": 443,
+        "transportProtocol": "TCP",
+        "stunServer": "stunserver2025.stunprotocol.org:3478",
+    }
+    hub.save_json(tmp_path / "stun_rules.json", {"revision": 1, "rules": [legacy]})
+
+    service = StunService(hub, _Client())
+
+    assert service._document()["rules"][0]["stunServer"] == "stun.nextcloud.com:3478"
+    assert service._commands()[0]["action"] == "upsert"
+    assert service._commands()[0]["payload"]["rule"]["stunServer"] == "stun.nextcloud.com:3478"
 
 
 def test_router_self_rule_keeps_local_proxy_across_service_restart(tmp_path):
