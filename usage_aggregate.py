@@ -578,6 +578,13 @@ class UsageAggregateStore:
                         version INTEGER NOT NULL
                     ) WITHOUT ROWID;
 
+                    CREATE TABLE IF NOT EXISTS child_guard_master_cache (
+                        router TEXT PRIMARY KEY,
+                        enabled INTEGER NOT NULL,
+                        revision INTEGER NOT NULL DEFAULT 0,
+                        updated_at INTEGER NOT NULL
+                    ) WITHOUT ROWID;
+
                     CREATE TABLE IF NOT EXISTS child_guard_plan_cache (
                         router       TEXT    NOT NULL,
                         uid          TEXT    NOT NULL,
@@ -850,6 +857,30 @@ class UsageAggregateStore:
             }
             for row in rows
         ]
+
+    def remember_guard_master(self, router: Any, enabled: bool, revision: int = 0) -> None:
+        if not isinstance(enabled, bool):
+            return
+        with self._lock:
+            conn = self.connect()
+            try:
+                conn.execute("INSERT INTO child_guard_master_cache(router,enabled,revision,updated_at) VALUES(?,?,?,?)"
+                             " ON CONFLICT(router) DO UPDATE SET enabled=excluded.enabled,revision=excluded.revision,updated_at=excluded.updated_at"
+                             " WHERE excluded.revision >= child_guard_master_cache.revision",
+                             (router_key(router), int(enabled), int(revision), int(time.time())))
+            finally:
+                conn.close()
+
+    def guard_master(self, router: Any) -> Optional[Dict[str, Any]]:
+        with self._lock:
+            conn = self.connect()
+            try:
+                row = conn.execute("SELECT enabled,updated_at,revision FROM child_guard_master_cache WHERE router=?",
+                                   (router_key(router),)).fetchone()
+                return {"masterEnabled": bool(row[0]), "masterSupported": True,
+                        "masterUpdatedAt": row[1], "masterRevision": row[2]} if row is not None else None
+            finally:
+                conn.close()
 
     def remember_guard_plans(self, router: Any, uid: Any,
                              plans: Iterable[Dict[str, Any]]) -> bool:

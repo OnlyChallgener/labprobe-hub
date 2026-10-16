@@ -3232,6 +3232,20 @@ def api_child_guard_command(command_id: str):
                     "rollback": result.get("rollback")}), 409
 
 
+@app.route("/api/router/child-guard/master", methods=["GET", "POST"])
+def api_child_guard_master():
+    if request.method == "GET":
+        if not check_read_token():
+            return jsonify({"ok": False, "error": "unauthorized"}), 401
+        return _child_guard_execute("get_master_state")
+    if not check_app_token():
+        return jsonify({"ok": False, "error": "unauthorized"}), 401
+    body = request.get_json(silent=True) or {}
+    if not isinstance(body.get("enabled"), bool):
+        return jsonify({"ok": False, "error": "enabled must be boolean"}), 400
+    return _child_guard_execute("set_master_enabled", {"enabled": body["enabled"], "router": body.get("router")})
+
+
 @app.route("/api/router/child-guard/capabilities", methods=["GET"])
 def api_child_guard_capabilities():
     if not check_read_token():
@@ -3433,6 +3447,8 @@ def _child_guard_remember_devices(action: str, result: Dict[str, Any],
     key = child_guard_router_alias(router) or "router"
     body = payload if isinstance(payload, dict) else {}
     try:
+        if isinstance(result.get("masterEnabled"), bool) and result.get("masterSupported") is True:
+            store.remember_guard_master(key, result["masterEnabled"], to_int(result.get("masterRevision"), 0))
         if action in ("get_users", "add_device", "remove_device"):
             version = int(result.get("membershipVersion") or 0)
             devices = result.get("devices") if action == "get_users" else [{
@@ -3691,8 +3707,20 @@ def _child_guard_overview_payload(router: Optional[str] = None,
     rows = devices if devices is not None else (
         (store.guard_devices(key) if store is not None else [])
     )
-    return build_guard_overview(store, router=key, devices=rows,
-                                presence=_child_guard_presence_by_mac())
+    overview = build_guard_overview(store, router=key, devices=rows,
+                                    presence=_child_guard_presence_by_mac())
+    master = store.guard_master(key) if store is not None else None
+    if master is not None:
+        overview.update(master)
+        if not master["masterEnabled"]:
+            for device in overview.get("devices") or []:
+                if not device.get("blocked"):
+                    device.update(schedule="unrestricted", currentRange=None, blockedRange=None,
+                                  nextChangeAtEpoch=None, minutesToChange=None)
+    else:
+        overview["masterSupported"] = False
+        _child_guard_refresh_async(key, "get_master_state", {})
+    return overview
 
 
 def _child_guard_devices_enriched(result: Dict[str, Any], router: str) -> Dict[str, Any]:
@@ -3891,11 +3919,15 @@ def api_child_guard_devices_collection():
             macs.append(mac)
     with _CHILD_GUARD_MACS_CACHE_LOCK:
         _CHILD_GUARD_MACS_CACHE.clear()
-    return _child_guard_official_membership("add_device", {"macs": macs,
-                                               "deviceName": body.get("deviceName"),
-                                               "deviceType": body.get("deviceType"),
-                                               "manufacturer": body.get("manufacturer"),
-                                               "router": body.get("router")})
+    operation = {"macs": macs, "deviceName": body.get("deviceName"),
+                 "deviceType": body.get("deviceType"),
+                 "manufacturer": body.get("manufacturer"),
+                 "router": body.get("router")}
+    # LabProbeApp manages the router's native child_guard membership. Official
+    # cloud synchronization is an explicit opt-in for clients that need it.
+    if request.args.get("sync") == "official":
+        return _child_guard_official_membership("add_device", operation)
+    return _child_guard_execute("add_device", operation)
 
 
 @app.route("/api/router/child-guard/devices/<uid>", methods=["DELETE"])
@@ -3917,8 +3949,10 @@ def api_child_guard_device_delete(uid: str):
         store = _usage_aggregate_store()
         cached = store.guard_device(_child_guard_router_key(_child_guard_router(body)), normalized_uid) if store else None
         macs = cached.get("macs", []) if cached else []
-    return _child_guard_official_membership("remove_device", {"uid": normalized_uid,
-                                                  "macs": macs, "router": body.get("router")})
+    operation = {"uid": normalized_uid, "macs": macs, "router": body.get("router")}
+    if request.args.get("sync") == "official":
+        return _child_guard_official_membership("remove_device", operation)
+    return _child_guard_execute("remove_device", operation)
 
 
 @app.route("/api/router/child-guard/commands", methods=["GET"])

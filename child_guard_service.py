@@ -27,6 +27,8 @@ _WEEKDAY_NUMBERS = {"1": "mon", "2": "tue", "3": "wed", "4": "thu", "5": "fri", 
 _MODES = {"internet_window", "app_allowlist", "app_blocklist"}
 CHILD_GUARD_ACTIONS = {
     "get_capabilities",
+    "get_master_state",
+    "set_master_enabled",
     "get_users",
     "get_plans",
     "get_runtime_state",

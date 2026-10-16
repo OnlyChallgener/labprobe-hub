@@ -24,6 +24,7 @@ def _aggregate(tmp_path):
 
 
 def _prepare(monkeypatch, tmp_path, aggregate):
+    aggregate.remember_guard_master(ROUTER, True)
     monkeypatch.setattr(hub, "CHILD_GUARD_COMMANDS", RouterCommandStore(tmp_path))
     monkeypatch.setattr(hub, "CHILD_GUARD_SYNC_WAIT_SECONDS", 0.0)
     monkeypatch.setattr(hub, "notify_agent_commands_changed", lambda *a, **k: None)

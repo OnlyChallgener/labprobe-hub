@@ -1080,8 +1080,25 @@ fn policy_with_enabled(policy: &UciSection, snapshot: &Snapshot, enabled: bool) 
     updated
 }
 
+fn master_revision(snapshot: &Snapshot) -> u64 {
+    snapshot.named("config").and_then(|s| s.options.get("labprobe_master_revision"))
+        .and_then(|value| value.parse().ok()).unwrap_or(0)
+}
+
+fn master_enabled(snapshot: &Snapshot) -> bool {
+    snapshot.named("config").and_then(|s| s.options.get("labprobe_master_enabled"))
+        .map(|value| value != "0").unwrap_or(true)
+}
+
 fn payload_policy(policy: &UciSection, snapshot: &Snapshot) -> UciSection {
     let mut copy = policy.clone();
+    // Preserve desired ranges before replacing effective ranges, including policies
+    // originally created by the firmware rather than LabProbe.
+    let desired = desired_times(policy, snapshot);
+    copy.options.entry("labprobe_time".into())
+        .or_insert_with(|| times_json(&desired).to_string());
+    copy.options.entry("labprobe_enabled".into())
+        .or_insert_with(|| if desired.is_empty() { "0" } else { "1" }.into());
     let times = copy.lists.remove("_times").unwrap_or_else(|| {
         let enabled = copy
             .options
@@ -1100,6 +1117,7 @@ fn payload_policy(policy: &UciSection, snapshot: &Snapshot) -> UciSection {
             })
             .collect()
     });
+    let times = if master_enabled(snapshot) { times } else { Vec::new() };
     let tr_name = copy.options.get("tr").cloned().unwrap_or_default();
     copy.options.insert(
         "_payload_times".into(),
@@ -1281,6 +1299,14 @@ fn write_user(
     policies: &[UciSection],
     fallback: Option<&Value>,
 ) -> Result<()> {
+    write_user_config(snapshot, uid, policies, fallback)?;
+    trigger_reload();
+    Ok(())
+}
+
+fn write_user_config(
+    snapshot: &Snapshot, uid: &str, policies: &[UciSection], fallback: Option<&Value>
+) -> Result<()> {
     let policies = policies
         .iter()
         .map(|policy| payload_policy(policy, snapshot))
@@ -1289,7 +1315,6 @@ fn write_user(
     let body = serde_json::to_string(&json!({"data": data}))?;
     command_output("dev_config", &["add", "-m", CONFIG, &body])?;
     restore_metadata(&policies)?;
-    trigger_reload();
     Ok(())
 }
 
@@ -1510,6 +1535,63 @@ fn runtime_mapping(uid: &str, user_show: &Value, policy_show: &Value) -> Value {
 /// 四台设备各两条规则就是 8 次写、两三轮 reload，路由器连续 busy 一分多钟，期间
 /// Hub 的请求全卡住，界面上就是反复弹「儿童守护请求失败」。`write_user` 本来就是
 /// 整条 user 全量重写，所以一次写完和写 N 次落到的最终状态完全一样。
+// Router-scoped plan pause: never overwrite individual plan-enabled flags,
+// per-device manual blocks, membership or statistics.
+fn set_master_enabled(payload: &Value) -> Result<Value> {
+    let enabled = payload.get("enabled").and_then(Value::as_bool)
+        .ok_or_else(|| anyhow!("missing enabled"))?;
+    let before = load_snapshot()?;
+    let next_revision = master_revision(&before).saturating_add(1);
+    let mut target = before.clone();
+    let config = target.sections.iter_mut().find(|s| s.name == "config")
+        .ok_or_else(|| anyhow!("child_guard config not found"))?;
+    config.options.insert("labprobe_master_enabled".into(), if enabled { "1" } else { "0" }.into());
+    config.options.insert("labprobe_master_revision".into(), next_revision.to_string());
+    let users = before.sections_of("user").map(|u| u.name.clone()).collect::<Vec<_>>();
+    let apply = |snapshot: &Snapshot| -> Result<()> {
+        for uid in &users {
+            write_user_config(snapshot, uid, &policies_for(snapshot, uid), None)?;
+        }
+        let assignment = format!("{}.config.labprobe_master_enabled={}", CONFIG,
+            if master_enabled(snapshot) { "1" } else { "0" });
+        command_output("uci", &["-q", "set", &assignment])?;
+        let revision = format!("{}.config.labprobe_master_revision={}", CONFIG, master_revision(snapshot));
+        command_output("uci", &["-q", "set", &revision])?;
+        command_output("uci", &["-q", "commit", CONFIG])?;
+        Ok(())
+    };
+    transactional_write(&before, || apply(&target), || {
+        let current = load_snapshot()?;
+        if master_enabled(&current) != enabled { bail!("master state verification failed"); }
+        for uid in &users {
+            for original in policies_for(&target, uid) {
+                let actual = current.named(&original.name)
+                    .ok_or_else(|| anyhow!("plan missing after master write"))?;
+                if plan_value(actual, &current) != plan_value(&original, &target) {
+                    // Firmware-origin plans gain metadata but keep their public content.
+                    let mut actual_value = plan_value(actual, &current);
+                    let mut expected_value = plan_value(&original, &target);
+                    actual_value.as_object_mut().unwrap().remove("source");
+                    expected_value.as_object_mut().unwrap().remove("source");
+                    if actual_value != expected_value { bail!("plan changed during master write"); }
+                }
+                let expected = payload_policy(&original, &target);
+                let actual_times = actual.options.get("tr").and_then(|name| current.named(name))
+                    .map(parse_times).unwrap_or_default();
+                let actual_times = times_json(&actual_times);
+                let prepared = user_payload_with_times(&target, uid, &[expected], None)?;
+                if prepared["policies"][0]["tr"] != actual_times {
+                    bail!("effective plan ranges verification failed");
+                }
+            }
+        }
+        Ok(())
+    }, |snapshot| apply(snapshot))?;
+    trigger_reload();
+    Ok(json!({"ok": true, "masterEnabled": enabled, "masterSupported": true,
+        "masterRevision": next_revision, "changed": users.len(), "runtimePending": true}))
+}
+
 fn set_all_plans_enabled(payload: &Value) -> Result<Value> {
     let uid = payload
         .get("uid")
@@ -2090,7 +2172,7 @@ fn list_lan_devices() -> Result<Value> {
         };
         key(a).cmp(&key(b))
     });
-    Ok(json!({"ok": true, "devices": devices}))
+    Ok(json!({"ok": true, "devices": devices, "masterEnabled": master_enabled(&snapshot), "masterRevision": master_revision(&snapshot), "masterSupported": true}))
 }
 
 /// MACs named by the guard configuration, whether or not enforcement is on right now.
@@ -2118,6 +2200,11 @@ fn normalize_configured_mac(raw: String) -> Option<String> {
 
 pub fn execute(action: &str, payload: &Value) -> Value {
     let result: Result<Value> = (|| match action {
+        "get_master_state" => {
+            let snapshot = load_snapshot()?;
+            Ok(json!({"ok": true, "masterEnabled": master_enabled(&snapshot), "masterRevision": master_revision(&snapshot), "masterSupported": true}))
+        }
+        "set_master_enabled" => set_master_enabled(payload),
         "get_capabilities" => Ok(capabilities()),
         "get_users" => {
             let snapshot = load_snapshot()?;
@@ -2236,6 +2323,53 @@ config timerange 'child_tr_abc1234'
  list time 'tue-08:00-09:00'
  option pid 'abc1234_wechat'
 "#;
+
+    #[test]
+    fn global_pause_preserves_plan_flags_ranges_and_manual_blocks() {
+        let mut paused = parse_uci_export(SAMPLE);
+        let uid = "aabbccddeeff";
+        let policy = paused.sections_of("policy").next().unwrap().clone();
+        let original = plan_value(&policy, &paused);
+        paused.sections.iter_mut().find(|s| s.name == "config").unwrap()
+            .options.insert("labprobe_master_enabled".into(), "0".into());
+        let prepared = payload_policy(&policy, &paused);
+        assert_eq!(prepared.options["_payload_times"], "[]");
+        assert_eq!(prepared.options["labprobe_enabled"], "1");
+        assert_eq!(plan_value(&prepared, &paused), original);
+        // Simulate firmware persistence with empty effective timerange.
+        let mut saved = paused.clone();
+        for section in &mut saved.sections {
+            if section.name == policy.name { *section = prepared.clone(); }
+            if section.kind == "timerange" { section.lists.remove("time"); }
+        }
+        let restored_policy = saved.named(&policy.name).unwrap().clone();
+        saved.sections.iter_mut().find(|s| s.name == "config").unwrap()
+            .options.insert("labprobe_master_enabled".into(), "1".into());
+        let restored = payload_policy(&restored_policy, &saved);
+        assert_ne!(restored.options["_payload_times"], "[]");
+        assert_eq!(plan_value(&restored, &saved), original);
+        assert!(user_payload_with_times(&saved, uid, &[restored], None).is_ok());
+    }
+
+    #[test]
+    fn global_resume_does_not_enable_an_individually_disabled_plan() {
+        let snapshot = parse_uci_export(SAMPLE);
+        let original = snapshot.sections_of("policy").next().unwrap();
+        let disabled = policy_with_enabled(original, &snapshot, false);
+        let effective = payload_policy(&disabled, &snapshot);
+        assert_eq!(effective.options["_payload_times"], "[]");
+        assert_eq!(effective.options["labprobe_enabled"], "0");
+        assert!(!desired_times(&effective, &snapshot).is_empty());
+    }
+
+    #[test]
+    fn a_global_state_exists_even_without_any_plans() {
+        let mut snapshot = parse_uci_export("config config 'config'\n option version '1'\n");
+        assert!(master_enabled(&snapshot));
+        snapshot.sections[0].options.insert("labprobe_master_enabled".into(), "0".into());
+        assert!(!master_enabled(&snapshot));
+        assert_eq!(snapshot.sections_of("policy").count(), 0);
+    }
 
     #[test]
     fn removal_resolves_changed_uid_by_mac_but_not_by_device_name() {

@@ -193,15 +193,38 @@ def test_membership_http_uses_durable_official_workflow_and_existing_poll_protoc
     monkeypatch.setattr(hub, "check_app_token", lambda: True)
     monkeypatch.setattr(hub, "check_read_token", lambda: True)
     client = hub.app.test_client()
-    response = client.post("/api/router/child-guard/devices?router=BE72", json={"macs": [MAC], "deviceName": "iPad"})
+    response = client.post("/api/router/child-guard/devices?router=BE72&sync=official", json={"macs": [MAC], "deviceName": "iPad"})
     assert response.status_code == 202 and store.take("BE72") == []
     cid = response.get_json()["commandId"]
     assert client.get(f"/api/router/child-guard/command/{cid}").get_json()["pending"]
     complete(coordinator, store, cid, [])
     done = client.get(f"/api/router/child-guard/command/{cid}").get_json()
     assert done["uid"] == UID and done["officialSync"]["routerConfirmed"]
-    foreign = client.post("/api/router/child-guard/devices?router=BE50", json={"macs": [MAC]})
+    foreign = client.post("/api/router/child-guard/devices?router=BE50&sync=official", json={"macs": [MAC]})
     assert foreign.status_code == 409 and not foreign.get_json()["ok"]
+
+
+def test_app_membership_uses_native_router_without_official_authorization(monkeypatch):
+    import hub
+
+    calls = []
+
+    def native(action, payload):
+        calls.append((action, payload))
+        return hub.jsonify({"ok": True, "uid": UID}), 200
+
+    monkeypatch.setattr(hub, "check_app_token", lambda: True)
+    monkeypatch.setattr(hub, "_child_guard_execute", native)
+    monkeypatch.setattr(hub, "_child_guard_official_membership",
+                        lambda *_: pytest.fail("default App route must not require official cloud"))
+    client = hub.app.test_client()
+    added = client.post("/api/router/child-guard/devices?router=BE72",
+                        json={"macs": [MAC], "deviceName": "iPad"})
+    removed = client.delete(f"/api/router/child-guard/devices/{UID}?router=BE72",
+                            json={"macs": [MAC]})
+    assert added.status_code == removed.status_code == 200
+    assert [action for action, _ in calls] == ["add_device", "remove_device"]
+    assert calls[1][1] == {"uid": UID, "macs": [MAC], "router": None}
 
 
 def test_official_binding_accepts_generic_eweb_hostname_but_rejects_another_router(monkeypatch):
