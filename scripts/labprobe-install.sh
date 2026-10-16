@@ -99,7 +99,19 @@ probe_hub() {
     wget -O /tmp/labprobe-discovery.json -T 2 "$base/.well-known/labprobe" >/dev/null 2>&1 || return 1
   fi
   grep -q '"ok"[[:space:]]*:[[:space:]]*true' /tmp/labprobe-discovery.json || return 1
-  HUB_URL="$base"; return 0
+  HUB_URL="$base"
+  # 网关模式下每台路由器有自己的通道 /r/<routerId>。relay 探测的是一个它已经知道的
+  # 地址，所以不能只靠 advertiseUrl（默认还是回环）——这里用 basePath 自己拼。
+  # 单路由 Hub 的 basePath 是空的，拼上去等于什么都没做。
+  channel="$(sed -n 's/.*"basePath"[[:space:]]*:[[:space:]]*"\([^"]*\)".*/\1/p' /tmp/labprobe-discovery.json | head -n1)"
+  if [ -n "$channel" ] && [ "$channel" != "/" ]; then
+    case "$base" in
+      *"$channel") : ;;
+      *) HUB_URL="$base$channel" ;;
+    esac
+    say "本机通道：$HUB_URL"
+  fi
+  return 0
 }
 
 discover_hub() {

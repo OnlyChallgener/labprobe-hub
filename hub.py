@@ -4540,6 +4540,12 @@ def labprobe_discovery():
         "name": hub_name(),
         "version": APP_VERSION,
         "advertiseUrl": advertise_url(),
+        # The relay discovers the Hub by probing an address it already knows, so it
+        # cannot learn its own channel from advertiseUrl alone (that defaults to
+        # loopback). basePath lets it compose /r/<routerId> itself; it is empty for a
+        # single-router Hub, which is why this changes nothing today.
+        "routerId": workspace_router_id(),
+        "basePath": "/r/%s" % gateway_router_id() if gateway_router_id() else "",
         "capabilities": ["snapshot", "revision", "incremental", "token_auth", "sqlite", "mqtt_revision", "router_dashboard", "router_credentials_ephemeral"],
         "mqtt": mqtt_client_config(include_secret=False),
     })
