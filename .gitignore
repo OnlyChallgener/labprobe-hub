@@ -231,3 +231,7 @@ __marimo__/
 
 # Streamlit
 .streamlit/secrets.toml
+# scratch produced by test runs and the design tool workspace
+/.pytest_tmp/
+/test_tmp_*/
+/.superdesign/
