@@ -152,6 +152,7 @@ def _public_router_config() -> dict:
     status = router_driver.get_status()
     return {
         "ok": True,
+        "routerId": hub.workspace_router_id(),
         "name": str(config.get("name") or hub.primary_router_name() or "").strip(),
         "username": str(config.get("username") or "admin").strip(),
         "address": str(config.get("address") or "").strip(),

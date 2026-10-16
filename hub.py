@@ -5786,7 +5786,23 @@ def api_devices():
     })
 
 
-SINGLE_ROUTER_ID = "default"
+def gateway_router_id() -> str:
+    """The router ID assigned to this process by the multi-router gateway.
+
+    Empty means this is a plain single-router Hub, which is the case today and must
+    keep answering exactly as before.
+    """
+    return (os.environ.get("ROUTER_ID") or "").strip()
+
+
+def workspace_router_id() -> str:
+    """Which router this Hub speaks for.
+
+    Under the gateway the worker binds to loopback and `/api/routers` is answered by
+    the registry, so nothing else tells a client *who it reached*. Without this the
+    App can only compare router names, which is not an identity check.
+    """
+    return gateway_router_id() or "default"
 
 
 def _single_router_row() -> Dict[str, Any]:
@@ -5804,14 +5820,14 @@ def _single_router_row() -> Dict[str, Any]:
     identity = details.get("identity") if isinstance(details.get("identity"), dict) else {}
     online = bool(dashboard.get("online"))
     row: Dict[str, Any] = {
-        "routerId": SINGLE_ROUTER_ID,
+        "routerId": workspace_router_id(),
         "name": primary_router_name() or clean_saved_value(dashboard.get("router")) or "默认路由器",
         "site": "",
         "model": clean_saved_value(ap.get("model") or identity.get("model")),
         "platform": "reyee",
         "online": online,
         "agentOnline": online,
-        "basePath": "",
+        "basePath": "/r/%s" % gateway_router_id() if gateway_router_id() else "",
         "updatedAt": devices.get("updatedAt") or dashboard.get("receivedAt") or "",
     }
     total = to_int(devices.get("total"), -1)
@@ -5848,8 +5864,8 @@ def api_routers():
         return jsonify({"ok": False, "error": "未授权"}), 401
     return jsonify({
         "ok": True,
-        "defaultRouterId": SINGLE_ROUTER_ID,
-        "multiRouter": False,
+        "defaultRouterId": workspace_router_id(),
+        "multiRouter": bool(gateway_router_id()),
         "routers": [_single_router_row()],
     })
 

@@ -29,6 +29,7 @@ def _seed(monkeypatch, *, dashboard, devices, archive=None):
     monkeypatch.delenv("APP_TOKEN_PREVIOUS", raising=False)
     monkeypatch.delenv("HOOK_TOKEN", raising=False)
     monkeypatch.delenv("HOOK_TOKEN_PREVIOUS", raising=False)
+    monkeypatch.delenv("ROUTER_ID", raising=False)
     monkeypatch.setattr(hub, "primary_router_name", lambda: "客厅锐捷")
 
 
@@ -53,9 +54,9 @@ def test_router_list_reports_agent_online_and_both_device_counts(monkeypatch):
     body = response.get_json()
     assert body["ok"] is True
     assert body["multiRouter"] is False
-    assert body["defaultRouterId"] == hub.SINGLE_ROUTER_ID
+    assert body["defaultRouterId"] == "default"
     (row,) = body["routers"]
-    assert row["routerId"] == hub.SINGLE_ROUTER_ID
+    assert row["routerId"] == "default"
     assert row["name"] == "客厅锐捷"
     assert row["model"] == "RG-EAP762"
     assert row["online"] is True
@@ -63,6 +64,36 @@ def test_router_list_reports_agent_online_and_both_device_counts(monkeypatch):
     assert row["onlineDeviceCount"] == 9
     # App 的默认工作区必须落在 Hub 根路径上，不能拼出 /r/default。
     assert row["basePath"] == ""
+
+
+def test_router_list_identifies_the_channel_the_gateway_assigned(monkeypatch):
+    """ROUTER_ID 是网关注入的身份，读不到它就等于「我是那台默认的」。
+
+    网关模式下 /api/routers 由 registry 回答，但同一份响应形状也必须能由 worker
+    自述，否则客户端除了比路由器名字之外没有任何身份判据。
+    """
+    now = time.time()
+    _seed(
+        monkeypatch,
+        dashboard={
+            "receivedEpoch": now,
+            "details": {"ap": {"model": "RG-BE72Pro"}},
+            "telemetry": {"onlineDeviceCount": 3},
+        },
+        devices={"updatedAt": "2026-10-16 07:00:00", "total": 12, "onlineDeviceCount": 4},
+    )
+    monkeypatch.setenv("ROUTER_ID", "be50")
+    client = hub.app.test_client()
+    body = client.get("/api/routers",
+                      headers={"Authorization": "Bearer app-token-for-test"}).get_json()
+    assert body["multiRouter"] is True
+    assert body["defaultRouterId"] == "be50"
+    (row,) = body["routers"]
+    assert row["routerId"] == "be50"
+    # 自述的通道要和 registry 那一行同形，不能让人以为它还在根路径上。
+    assert row["basePath"] == "/r/be50"
+    monkeypatch.delenv("ROUTER_ID")
+    assert hub.workspace_router_id() == "default"
 
 
 def test_router_list_says_offline_without_a_device_cache(monkeypatch):
