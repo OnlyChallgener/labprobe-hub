@@ -1,0 +1,4 @@
+aarch64
+labrelay 0.2.75
+675f38b624db7a68949d8a7ff31f6e4f92cb1ee943e0c15b6b4cba794050f612  /usr/bin/labrelay
+BE72

@@ -1,0 +1,3 @@
+PREFLIGHT_OK identity=BE72 candidate=0.2.76 agent=14910 relay=14909 scope=agent_only
+AGENT_RUNNING pid=828
+SWITCH_COMPLETE binary=0.2.76 relay_unchanged=yes config_unchanged=yes backup=/etc/labprobe/backups/relay-control-0.2.76/20261016-072121-32626

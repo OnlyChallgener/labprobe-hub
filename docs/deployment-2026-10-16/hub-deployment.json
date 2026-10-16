@@ -1,0 +1,11 @@
+{
+  "ok": true,
+  "backup": "/volume1/docker/labprobe-hub/master-backups/20261016-072204",
+  "oldImage": "labprobe-hub:pre-master-20261016-072210",
+  "image": "labprobe-hub:master-20261016-072224",
+  "hashes": {
+    "hub.py": "f68e5673dd583cf65041c0427db8a933a25d6308726391c2ac62ee82b63dbce6",
+    "usage_aggregate.py": "5f2da82baafa5a882b850b86c8c6f58646666c03ceac32dd46a18564031c33bd",
+    "child_guard_service.py": "decdf6960cbc0414bfcf676647c83aa4c8e9e09e379c518a4b5c23e4b62ad3f4"
+  }
+}
