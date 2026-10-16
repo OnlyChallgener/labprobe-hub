@@ -4170,6 +4170,18 @@ def api_router_rdpi_signatures_bundle():
         return jsonify({"ok": False, "error": str(error)}), 500
 
 
+@app.route("/api/router/rdpi/signatures/haokan", methods=["POST"])
+def api_router_rdpi_signatures_haokan():
+    """Install one reviewed HaoKan rule within the BE72 engine's entry cap."""
+    if not check_app_token():
+        return jsonify({"ok": False, "error": "unauthorized"}), 401
+    from rdpi_signature_service import merge_haokan_with_one_empty_slot
+    try:
+        return _rdpi_apply(merge_haokan_with_one_empty_slot)
+    except ValueError as error:
+        return jsonify({"ok": False, "error": str(error)}), 400
+
+
 @app.route("/api/router/child-guard/ip6-audit/sync", methods=["POST"])
 def api_child_guard_ip6_audit_sync():
     """路由器上的 `child_guard_ip6_block` 由中继自己重建，Hub 不再连进路由器。

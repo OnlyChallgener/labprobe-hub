@@ -1019,6 +1019,20 @@ CURATED_SIGNATURE_EXTENSIONS: Dict[str, Dict[str, Any]] = {
             "fnnas.com",
         ],
     },
+    # 好看视频的专属域名及用户提供的百度视频 CDN 域名。
+    # 路由器库只支持 OR 域名匹配；QUIC/TLS 流量行为不在此处伪装成精确签名。
+    # sv.baidu.com / vd3.bdstatic.com 是百度共用服务，仍由原有规则处理。
+    "9-234-1-0": {
+        "name": "好看视频",
+        "category": "短视频/直播",
+        "hosts": [
+            "haokan.baidu.com",
+            "haokan.bdstatic.com",
+            "haokan-video.baidu.com",
+            "bdvideo.baidu.com",
+            "haokanupdate.cdn.bcebos.com",
+        ],
+    },
 }
 
 
@@ -1156,6 +1170,42 @@ def entry_budget_error(apps: List[Dict[str, Any]]) -> Optional[str]:
         return None
     return (f"合并后整库 {len(apps)} 条，超过引擎上限 {ENGINE_APP_ENTRY_LIMIT} 条："
             f"路由器会停止匹配所有域名规则。需要再减少 {over} 条。")
+
+
+def merge_haokan_with_one_empty_slot(db: Dict[str, Any]) -> Tuple[Optional[Dict[str, Any]], Dict[str, Any]]:
+    """Add HaoKan atomically without touching any matching rule in a full library."""
+    patch = CURATED_SIGNATURE_EXTENSIONS["9-234-1-0"]
+    apps = list(db.get("apps") or [])
+    existing = [a for a in apps if a.get("index") == "9-234-1-0" or a.get("name") == "好看视频"]
+    if existing:
+        if len(existing) != 1 or existing[0].get("index") != "9-234-1-0" or existing[0].get("name") != "好看视频":
+            raise ValueError("好看视频编号或名称与现有条目冲突")
+        hosts = {host for rule in existing[0].get("rules", []) for host in rule.get("hosts", [])}
+        if set(patch["hosts"]).issubset(hosts):
+            return None, {"ok": True, "message": "好看视频特征已存在", "totalCount": len(apps)}
+        raise ValueError("现有好看视频规则不完整，需单独核对后更新")
+    if len(apps) > ENGINE_APP_ENTRY_LIMIT:
+        raise ValueError("当前特征库已经超过引擎条数上限")
+
+    candidate = copy.deepcopy(db)
+    retained = list(candidate["apps"])
+    retired = None
+    if len(retained) == ENGINE_APP_ENTRY_LIMIT:
+        # This BE72 firmware slot has no rules at all, while a separate
+        # 4-6-10-2 entry carries the actual HELLDIVERS 2 matcher.  Do not
+        # retire any other slot if this exact shell changes in a later build.
+        shell = next((a for a in retained if a.get("index") == "4-6-10-0"
+                      and a.get("name") == "HELLDIVERS™ 2"), None)
+        if shell is None or shell.get("rules"):
+            raise ValueError("没有经过核对的空规则名额，拒绝写入满额特征库")
+        retained.remove(shell)
+        candidate["apps"] = retained
+        retired = shell["index"]
+    payload = {"index": "9-234-1-0", "name": patch["name"],
+               "rules": [{"protocol": "host", "hosts": list(patch["hosts"]), "payloads": []}]}
+    merged, result = merge_signature_into_db(candidate, payload)
+    result["retiredEmptySlot"] = retired
+    return merged, result
 
 
 def _has_matcher(rule: Dict[str, Any]) -> bool:

@@ -12,6 +12,38 @@ from rdpi_signature_service import (
 import rdpi_signature_service as service
 
 
+def test_haokan_full_library_retires_only_verified_empty_shell():
+    shell = {"index": "4-6-10-0", "name": "HELLDIVERS™ 2", "rules": []}
+    matching = {"index": "4-6-10-2", "name": "HELLDIVERS™ 2_Gaming",
+                "rules": [{"protocol": "host", "hosts": ["game.example"], "payloads": []}]}
+    fillers = [{"index": f"20-{i}-1-0", "name": f"应用{i}",
+                "rules": [{"protocol": "host", "hosts": [f"app{i}.example"], "payloads": []}]}
+               for i in range(service.ENGINE_APP_ENTRY_LIMIT - 2)]
+    db = {"version": "original", "apps": [shell, matching, *fillers]}
+    before = copy.deepcopy(db)
+    result, extra = service.merge_haokan_with_one_empty_slot(db)
+    assert db == before
+    assert result["version"] == "original"
+    assert len(result["apps"]) == service.ENGINE_APP_ENTRY_LIMIT
+    assert matching in result["apps"]
+    assert shell not in result["apps"]
+    assert extra["retiredEmptySlot"] == "4-6-10-0"
+    haokan = result["apps"][-1]
+    assert haokan["index"] == "9-234-1-0"
+    assert haokan["rules"][0]["payloads"] == []
+    assert "bdvideo.baidu.com" in haokan["rules"][0]["hosts"]
+    assert service.merge_haokan_with_one_empty_slot(result)[0] is None
+
+
+def test_haokan_refuses_to_retire_shell_if_it_gains_a_rule():
+    shell = {"index": "4-6-10-0", "name": "HELLDIVERS™ 2",
+             "rules": [{"protocol": "host", "hosts": ["game.example"], "payloads": []}]}
+    fillers = [{"index": f"20-{i}-1-0", "name": f"应用{i}", "rules": []}
+               for i in range(service.ENGINE_APP_ENTRY_LIMIT - 1)]
+    with pytest.raises(ValueError, match="空规则名额"):
+        service.merge_haokan_with_one_empty_slot({"apps": [shell, *fillers]})
+
+
 def test_standard_template_validates_successfully():
     """App 里「下载模板」拿到的就是这份，所以它自己必须是能直接导入的正确形状。"""
     result = validate_signature_object(STANDARD_RDPI_TEMPLATE)
@@ -710,6 +742,13 @@ def test_pcap_derived_rules_stay_on_their_own_domains():
     shared = {"lulian.cn", "ugreen.com", "lilian.cn", "sealaly.net"}
     assert not shared & set(cur["9-232-1-0"]["hosts"]), "绿联云把官网/无关域收了进来"
     assert cur["9-233-1-0"]["hosts"] == ["5ddd.com", "fnos.net", "fnnas.com"]
+    assert cur["9-234-1-0"]["name"] == "好看视频"
+    assert cur["9-234-1-0"]["hosts"] == [
+        "haokan.baidu.com", "haokan.bdstatic.com",
+        "haokan-video.baidu.com", "bdvideo.baidu.com",
+        "haokanupdate.cdn.bcebos.com"]
+    assert not {"baidu.com", "sv.baidu.com", "vd3.bdstatic.com"} & set(
+        cur["9-234-1-0"]["hosts"])
     all_hosts = {h for patch in cur.values() for h in patch["hosts"]}
     assert "sealaly.net" not in all_hosts
 
