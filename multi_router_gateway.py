@@ -31,6 +31,12 @@ ID_PATTERN = re.compile(r"^[a-z][a-z0-9_-]{1,31}$")
 TOPIC_PATTERN = re.compile(r"^[A-Za-z0-9_-]+(?:/[A-Za-z0-9_-]+)*$")
 PLACEHOLDERS = {"", "change-app-token", "change-hook-token", "replace-me", "changeme"}
 
+# The front door renders each worker's APP secret into the nginx configuration.
+# A secret that could carry a quote, a backslash, a variable marker or whitespace
+# would let the value end its own string and add directives, so it is refused
+# before anything is rendered rather than escaped afterwards.
+UNSAFE_SECRET = re.compile(r'["\\`$\r\n\t ]')
+
 
 def _port(value: object, label: str) -> int:
     try:
@@ -129,6 +135,9 @@ def load_gateway_config(path: str | Path, environ: dict[str, str] | None = None)
             raise ValueError(f"{router_id}: set strong APP and HOOK secrets in the environment")
         if app_token in used_secrets or hook_token in used_secrets or app_token == hook_token:
             raise ValueError("every APP and HOOK secret must be unique across workers")
+        for field, value in (("appTokenEnv", app_token), ("hookTokenEnv", hook_token)):
+            if UNSAFE_SECRET.search(value):
+                raise ValueError(f"{router_id}: {field} contains a character that cannot be rendered into nginx")
         used_secrets.update((app_token, hook_token))
         optional_secrets = {}
         for field in ("ewebPasswordEnv", "routerConfigKeyEnv"):
@@ -226,6 +235,23 @@ def render_nginx_config(config: dict, pid_path: Path) -> str:
         "events { worker_connections 1024; }",
         "http {",
         "  map $http_upgrade $connection_upgrade { default upgrade; '' close; }",
+    ]
+    # A relay presents its own HOOK credential and the worker must keep seeing it as
+    # such; a management credential is rewritten into that worker's APP secret. The
+    # gate reports which one opened the channel, and nginx decides per router from it.
+    for router in config["routers"]:
+        slug = "labprobe_" + router["routerId"].replace("-", "_")
+        lines.extend([
+            f"  map ${slug}_kind ${slug}_authorization {{",
+            '    "device" $http_authorization;',
+            f'    default "Bearer {router["appToken"]}";',
+            "  }",
+            f"  map ${slug}_kind ${slug}_token {{",
+            '    "device" $http_x_labprobe_token;',
+            f'    default "{router["appToken"]}";',
+            "  }",
+        ])
+    lines.extend([
         "  access_log /dev/stdout;",
         "  error_log /dev/stderr warn;",
         "  server {",
@@ -244,14 +270,34 @@ def render_nginx_config(config: dict, pid_path: Path) -> str:
         "    proxy_request_buffering off;",
         f"    location = /api/routers {{ proxy_pass http://127.0.0.1:{config['registryPort']}/api/routers; }}",
         f"    location = /api/routers/default {{ proxy_pass http://127.0.0.1:{config['registryPort']}/api/routers/default; }}",
-    ]
+        "    location ^~ /_gateauth/ {",
+        "      internal;",
+        f"      proxy_pass http://127.0.0.1:{config['registryPort']};",
+        "      proxy_pass_request_body off;",
+        '      proxy_set_header Content-Length "";',
+        "      proxy_set_header Authorization $http_authorization;",
+        "      proxy_set_header X-LabProbe-Token $http_x_labprobe_token;",
+        "    }",
+        "    location @denied {",
+        '      default_type application/json;',
+        "      return 401 '{\"ok\": false, \"error\": \"未授权\"}';",
+        "    }",
+    ])
     for router in config["routers"]:
         router_id = router["routerId"]
         port = router["workerPort"]
+        slug = "labprobe_" + router_id.replace("-", "_")
+        # Both header names are replaced because the realtime WebSocket presents both,
+        # and each worker only ever sees its own credential.
         lines.extend([
             f"    location = /r/{router_id} {{ return 308 /r/{router_id}/; }}",
             f"    location ^~ /r/{router_id}/ {{",
+            f"      auth_request /_gateauth/{router_id};",
+            f"      auth_request_set ${slug}_kind $upstream_http_x_labprobe_auth_kind;",
+            "      error_page 401 = @denied;",
             f"      proxy_pass http://127.0.0.1:{port}/;",
+            f"      proxy_set_header Authorization ${slug}_authorization;",
+            f"      proxy_set_header X-LabProbe-Token ${slug}_token;",
             "    }",
         ])
     lines.append("    location ^~ /r/ { return 404; }")
@@ -385,12 +431,30 @@ def make_registry_handler(config: dict, controller: DefaultRouterController | No
     expected = initial["appToken"].encode("utf-8")
 
     class RegistryHandler(BaseHTTPRequestHandler):
-        def authorized(self) -> bool:
+        def credential(self) -> bytes:
             header = self.headers.get("Authorization", "").strip()
             candidate = header[7:].strip() if header.lower().startswith("bearer ") else header
             if not candidate:
                 candidate = self.headers.get("X-LabProbe-Token", "").strip()
-            return hmac.compare_digest(candidate.encode("utf-8"), expected)
+            return candidate.encode("utf-8")
+
+        def authorized(self) -> bool:
+            return hmac.compare_digest(self.credential(), expected)
+
+        def gate_kind(self, router: dict) -> str:
+            """Which credential opened this channel, or empty when none did.
+
+            A management credential is rewritten into that worker's own APP secret by
+            nginx. A device credential is passed through untouched so the worker keeps
+            validating it as HOOK - rewriting it would hand the relay App-level access.
+            """
+            presented = self.credential()
+            if hmac.compare_digest(presented, expected) or hmac.compare_digest(
+                    presented, router["appToken"].encode("utf-8")):
+                return "management"
+            if hmac.compare_digest(presented, router["hookToken"].encode("utf-8")):
+                return "device"
+            return ""
 
         def respond(self, body: dict, status: int = 200) -> None:
             payload = json.dumps(body, ensure_ascii=False).encode("utf-8")
@@ -402,6 +466,22 @@ def make_registry_handler(config: dict, controller: DefaultRouterController | No
             self.wfile.write(payload)
 
         def do_GET(self) -> None:
+            if self.path.startswith("/_gateauth/"):
+                router_id = self.path[len("/_gateauth/"):]
+                router = next((item for item in config["routers"]
+                               if item["routerId"] == router_id), None)
+                if router is None:
+                    self.send_error(403)
+                    return
+                kind = self.gate_kind(router)
+                if not kind:
+                    self.send_error(401)
+                    return
+                self.send_response(200)
+                self.send_header("X-LabProbe-Auth-Kind", kind)
+                self.send_header("Content-Length", "0")
+                self.end_headers()
+                return
             if self.path != "/api/routers":
                 self.send_error(404)
                 return
@@ -441,6 +521,13 @@ def make_registry_handler(config: dict, controller: DefaultRouterController | No
     return RegistryHandler
 
 
+def write_nginx_conf(path: Path, text: str) -> None:
+    # The rendered file now embeds every worker's APP secret, so it must not be
+    # world-readable the way a plain proxy configuration would be.
+    path.write_text(text, encoding="utf-8")
+    os.chmod(path, 0o600)
+
+
 def run(config: dict, runtime_dir: Path) -> None:
     runtime_dir.mkdir(parents=True, exist_ok=True)
     nginx_conf = runtime_dir / "nginx.conf"
@@ -454,18 +541,18 @@ def run(config: dict, runtime_dir: Path) -> None:
             raise RuntimeError("gateway is not running")
         previous = nginx_conf.read_text(encoding="utf-8")
         candidate = runtime_dir / "nginx.next.conf"
-        candidate.write_text(render_nginx_config(view, nginx_pid), encoding="utf-8")
+        write_nginx_conf(candidate, render_nginx_config(view, nginx_pid))
         subprocess.run(["nginx", "-t", "-c", str(candidate)], check=True)
         candidate.replace(nginx_conf)
         try:
             subprocess.run(["nginx", "-s", "reload", "-c", str(nginx_conf)], check=True)
         except Exception:
-            nginx_conf.write_text(previous, encoding="utf-8")
+            write_nginx_conf(nginx_conf, previous)
             subprocess.run(["nginx", "-s", "reload", "-c", str(nginx_conf)], check=True)
             raise
 
     controller = DefaultRouterController(config, config["storageRoot"] / "default-router.json", apply_default_route)
-    nginx_conf.write_text(render_nginx_config(controller.view(), nginx_pid), encoding="utf-8")
+    write_nginx_conf(nginx_conf, render_nginx_config(controller.view(), nginx_pid))
     subprocess.run(["nginx", "-t", "-c", str(nginx_conf)], check=True)
     server = ThreadingHTTPServer(("127.0.0.1", config["registryPort"]), make_registry_handler(config, controller))
     server.daemon_threads = True

@@ -1,4 +1,5 @@
 import json
+import os
 import threading
 from http.server import ThreadingHTTPServer
 from pathlib import Path
@@ -80,7 +81,10 @@ def test_nginx_routes_http_and_websocket_to_isolated_workers(tmp_path):
     assert "proxy_set_header Upgrade $http_upgrade;" in rendered
     assert "proxy_set_header Connection $connection_upgrade;" in rendered
     assert "location = /api/routers" in rendered
-    assert SECRETS["HOME_APP"] not in rendered
+    # G1 moves the worker credential into the rendered file on purpose: the front door
+    # authenticates once and carries each worker's own credential inward. Hooks stay out.
+    assert SECRETS["HOME_HOOK"] not in rendered
+    assert SECRETS["OFFICE_HOOK"] not in rendered
 
 
 @pytest.mark.parametrize("change", [
@@ -261,3 +265,106 @@ def test_failed_default_route_application_preserves_previous_default(tmp_path):
     assert not controller.state_path.exists()
     assert "location / { proxy_pass http://127.0.0.1:58502; }" in gateway.render_nginx_config(
         {**config, "defaultRouterId": "office"}, Path("/tmp/nginx.pid"))
+
+
+def _router_block(rendered: str, router_id: str) -> str:
+    return rendered.split(f"location ^~ /r/{router_id}/ {{")[1].split("    }")[0]
+
+
+def _map_block(rendered: str, slug: str) -> str:
+    return rendered.split(f"  map ${slug}_kind ${slug}_authorization {{")[1].split("  }")[0]
+
+
+def test_front_door_gates_each_channel_and_rewrites_only_management_credentials(tmp_path):
+    config = gateway.load_gateway_config(_config(tmp_path)[0], SECRETS)
+    rendered = gateway.render_nginx_config(config, Path("/tmp/nginx.pid"))
+    assert "location ^~ /_gateauth/ {" in rendered
+    assert "internal;" in rendered
+    assert "proxy_pass_request_body off;" in rendered
+    assert 'proxy_set_header Content-Length "";' in rendered
+    assert "proxy_set_header Authorization $http_authorization;" in rendered
+    assert "proxy_set_header X-LabProbe-Token $http_x_labprobe_token;" in rendered
+    assert "location @denied {" in rendered
+    for router_id, token in (("home", SECRETS["HOME_APP"]), ("office", SECRETS["OFFICE_APP"])):
+        slug = "labprobe_" + router_id
+        block = _router_block(rendered, router_id)
+        assert f"auth_request /_gateauth/{router_id};" in block
+        assert f"auth_request_set ${slug}_kind $upstream_http_x_labprobe_auth_kind;" in block
+        assert "error_page 401 = @denied;" in block
+        # Both header names are rewritten because the realtime WebSocket presents both.
+        assert f"proxy_set_header Authorization ${slug}_authorization;" in block
+        assert f"proxy_set_header X-LabProbe-Token ${slug}_token;" in block
+        assert f'    default "Bearer {token}";' in _map_block(rendered, slug)
+        assert '    "device" $http_authorization;' in _map_block(rendered, slug)
+    assert SECRETS["OFFICE_APP"] not in _map_block(rendered, "labprobe_home")
+    assert "Bearer" not in rendered.split("location / {")[1].split("}")[0]
+
+
+def test_gate_opens_with_management_credential_anywhere_and_worker_credentials_only_themselves(tmp_path):
+    config = gateway.load_gateway_config(_config(tmp_path)[0], SECRETS)
+    server = ThreadingHTTPServer(("127.0.0.1", 0), gateway.make_registry_handler(config))
+    thread = threading.Thread(target=server.serve_forever, daemon=True)
+    thread.start()
+    base = f"http://127.0.0.1:{server.server_port}"
+
+    def outcome(router_id: str, headers: dict) -> tuple[int, str]:
+        try:
+            with urlopen(Request(f"{base}/_gateauth/{router_id}", headers=headers), timeout=2) as probe:
+                return probe.status, probe.headers.get("X-LabProbe-Auth-Kind") or ""
+        except HTTPError as error:
+            return error.code, ""
+
+    def bearer(token: str) -> dict:
+        return {"Authorization": f"Bearer {token}"}
+
+    try:
+        assert outcome("home", bearer(SECRETS["HOME_APP"])) == (200, "management")
+        assert outcome("office", bearer(SECRETS["HOME_APP"])) == (200, "management")
+        assert outcome("office", bearer(SECRETS["OFFICE_APP"])) == (200, "management")
+        # The relay presents HOOK; it must pass through as a device credential so the
+        # worker keeps validating it as HOOK instead of receiving an APP secret.
+        assert outcome("home", {"X-LabProbe-Token": SECRETS["HOME_HOOK"]}) == (200, "device")
+        assert outcome("home", bearer(SECRETS["OFFICE_APP"])) == (401, "")
+        assert outcome("office", {"X-LabProbe-Token": SECRETS["HOME_HOOK"]}) == (401, "")
+        assert outcome("home", bearer("")) == (401, "")
+        assert outcome("home", bearer(SECRETS["HOME_APP"] + "x")) == (401, "")
+        assert outcome("ghost", bearer(SECRETS["HOME_APP"])) == (403, "")
+    finally:
+        server.shutdown()
+        server.server_close()
+
+
+def test_gate_never_echoes_a_secret_back_to_the_proxy(tmp_path):
+    config = gateway.load_gateway_config(_config(tmp_path)[0], SECRETS)
+    server = ThreadingHTTPServer(("127.0.0.1", 0), gateway.make_registry_handler(config))
+    thread = threading.Thread(target=server.serve_forever, daemon=True)
+    thread.start()
+    url = f"http://127.0.0.1:{server.server_port}/_gateauth/home"
+    try:
+        request = Request(url, headers={"Authorization": f"Bearer {SECRETS['HOME_APP']}"})
+        with urlopen(request, timeout=2) as probe:
+            headers = str(probe.headers).lower()
+        assert all(secret.lower() not in headers for secret in SECRETS.values())
+    finally:
+        server.shutdown()
+        server.server_close()
+
+
+def test_secrets_that_could_escape_the_rendered_string_are_rejected(tmp_path):
+    path, _ = _config(tmp_path)
+    # Leading and trailing whitespace is stripped by the loader, so the hostile
+    # character has to sit inside the value to reach the rendered configuration.
+    for hostile in ('"', "$", "\\", "`", " ", "\t"):
+        with pytest.raises(ValueError):
+            gateway.load_gateway_config(path, {**SECRETS, "OFFICE_APP": "A" * 12 + hostile + "A" * 12})
+    with pytest.raises(ValueError):
+        gateway.load_gateway_config(path, {**SECRETS, "OFFICE_HOOK": "B" * 12 + '"' + "B" * 12})
+    loaded = gateway.load_gateway_config(path, {**SECRETS, "OFFICE_APP": "A" * 24 + "_-."})
+    assert loaded["routers"][1]["appToken"].endswith("_-.")
+
+
+@pytest.mark.skipif(os.name != "posix", reason="only the Linux image can represent 0600; the gateway runs there")
+def test_rendered_configuration_carries_no_group_or_other_bits(tmp_path):
+    target = tmp_path / "nginx.conf"
+    gateway.write_nginx_conf(target, "x")
+    assert target.stat().st_mode & 0o077 == 0
