@@ -248,6 +248,36 @@ fn ubus_call(object: &str, method: &str, body: &str) -> bool {
     }
 }
 
+/// A sniffer restart loses the runtime RDPI reference even while UCI still
+/// says it is enabled. Full mode keeps counters; it does not run the detector.
+/// Never re-enable an already running reference on every maintenance tick.
+fn rdpi_recovery_required(configured: bool, status: &serde_json::Value) -> bool {
+    configured && status.get("RDPI").and_then(|value| value.as_u64()) == Some(0)
+}
+
+fn restore_configured_rdpi() -> bool {
+    let configured = std::process::Command::new("uci")
+        .args(["-q", "get", "child_guard.config.rdpi_enable"])
+        .output()
+        .map(|output| output.status.success() && output.stdout.trim_ascii() == b"1")
+        .unwrap_or(false);
+    if !configured {
+        return true;
+    }
+    let status = std::process::Command::new("ubus")
+        .args(["-t", "3", "call", "sniffer", "show_abil"])
+        .output()
+        .ok()
+        .filter(|output| output.status.success())
+        .and_then(|output| serde_json::from_slice::<serde_json::Value>(&output.stdout).ok());
+    match status {
+        Some(value) if rdpi_recovery_required(configured, &value) =>
+            ubus_call("sniffer", "enable", &json!({"mod": "rdpi"}).to_string()),
+        Some(value) => value.get("RDPI").and_then(|value| value.as_u64()).is_some(),
+        None => false,
+    }
+}
+
 /// Turn on the two firmware switches the usage pipeline depends on.
 ///
 /// Neither is set by the vendor's `child_guard` reload path on this model:
@@ -288,7 +318,8 @@ pub fn prepare_sniffer() -> bool {
         "enable",
         &json!({ "mod": "full_mode" }).to_string(),
     );
-    identifiers && full_mode
+    let rdpi = restore_configured_rdpi();
+    identifiers && full_mode && rdpi
 }
 
 /// 有没有受守护设备。`prepare_sniffer` 在没有受守护设备时也返回 `false`，那是
@@ -330,7 +361,15 @@ pub fn restart_sniffer(now: u64) -> bool {
 
 #[cfg(test)]
 mod watchdog_tests {
-    use super::{sniffer_restart_allowed, SNIFFER_RESTART_COOLDOWN_SECS};
+    use super::{rdpi_recovery_required, sniffer_restart_allowed, SNIFFER_RESTART_COOLDOWN_SECS};
+
+    #[test]
+    fn sniffer_restart_with_stale_enabled_uci_requires_rdpi_restore() {
+        assert!(rdpi_recovery_required(true, &serde_json::json!({"RDPI": 0, "FULL_MODE": 1})));
+        assert!(!rdpi_recovery_required(true, &serde_json::json!({"RDPI": 6})));
+        assert!(!rdpi_recovery_required(false, &serde_json::json!({"RDPI": 0})));
+        assert!(!rdpi_recovery_required(true, &serde_json::json!({})));
+    }
 
     #[test]
     fn the_first_failure_restarts_immediately() {
