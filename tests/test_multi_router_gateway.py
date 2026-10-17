@@ -384,3 +384,41 @@ def test_rendered_configuration_carries_no_group_or_other_bits(tmp_path):
     target = tmp_path / "nginx.conf"
     gateway.write_nginx_conf(target, "x")
     assert target.stat().st_mode & 0o077 == 0
+def test_registry_probes_tolerate_a_cold_worker_but_route_checks_stay_fast(tmp_path, monkeypatch):
+    """A worker that needs ~0.3s to boot must not be reported offline, while the eWeb probe
+    stays quick because an unreachable router must not slow the whole list down."""
+    config = gateway.load_gateway_config(_config(tmp_path)[0], SECRETS)
+    home = config["routers"][0]
+    seen = []
+
+    class _ColdWorker:
+        status = 200
+
+        def __enter__(self):
+            return self
+
+        def __exit__(self, *_args):
+            return False
+
+        def read(self):
+            return b'{"routers":[{"deviceCount":3,"onlineDeviceCount":1}]}'
+
+    def fake_urlopen(request, timeout=None):
+        seen.append(timeout)
+        return _ColdWorker()
+
+    monkeypatch.setattr(gateway, "urlopen", fake_urlopen)
+    row = gateway._router_row(home)
+    assert row["hubOnline"] is True
+    assert (row["deviceCount"], row["onlineDeviceCount"]) == (3, 1)
+    assert seen and all(timeout >= 1.0 for timeout in seen), seen
+
+    tcp = []
+
+    def fake_connect(*_args, **kwargs):
+        tcp.append(kwargs.get("timeout"))
+        raise OSError("router away")
+
+    monkeypatch.setattr(gateway.socket, "create_connection", fake_connect)
+    assert gateway.eweb_reachable(home) is False
+    assert tcp and tcp[0] <= 0.5, tcp

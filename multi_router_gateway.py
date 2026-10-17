@@ -31,6 +31,13 @@ ID_PATTERN = re.compile(r"^[a-z][a-z0-9_-]{1,31}$")
 TOPIC_PATTERN = re.compile(r"^[A-Za-z0-9_-]+(?:/[A-Za-z0-9_-]+)*$")
 PLACEHOLDERS = {"", "change-app-token", "change-hook-token", "replace-me", "changeme"}
 
+# A worker that has just started needs ~0.3s to answer /health, so the old shared 0.35s
+# budget reported healthy workers as offline for seconds after every start. The HTTP probes
+# get a generous budget because they run in parallel and bound the list's latency; the eWeb
+# probe stays fast because it is a bare TCP connect against a router that may be away.
+PROBE_HTTP_TIMEOUT_SEC = 1.0
+PROBE_TCP_TIMEOUT_SEC = 0.35
+
 # The front door renders each worker's APP secret into the nginx configuration.
 # A secret that could carry a quote, a backslash, a variable marker or whitespace
 # would let the value end its own string and add directives, so it is refused
@@ -329,7 +336,7 @@ def _device_counts(router: dict) -> dict:
             f"http://127.0.0.1:{router['workerPort']}/api/routers",
             headers={"Authorization": f"Bearer {router['appToken']}"},
         )
-        with urlopen(request, timeout=0.35) as response:
+        with urlopen(request, timeout=PROBE_HTTP_TIMEOUT_SEC) as response:
             payload = json.loads(response.read())
         row = payload["routers"][0]
         for key in ("deviceCount", "onlineDeviceCount"):
@@ -359,7 +366,7 @@ def _device_counts(router: dict) -> dict:
 
 def eweb_reachable(router: dict) -> bool:
     try:
-        with socket.create_connection((router["ewebHost"], router["ewebPort"]), timeout=0.35):
+        with socket.create_connection((router["ewebHost"], router["ewebPort"]), timeout=PROBE_TCP_TIMEOUT_SEC):
             return True
     except (OSError, TimeoutError):
         return False
@@ -367,7 +374,7 @@ def eweb_reachable(router: dict) -> bool:
 
 def _router_row(router: dict) -> dict:
     try:
-        with urlopen(f"http://127.0.0.1:{router['workerPort']}/health", timeout=0.35) as response:
+        with urlopen(f"http://127.0.0.1:{router['workerPort']}/health", timeout=PROBE_HTTP_TIMEOUT_SEC) as response:
             hub_online = response.status == 200
     except (OSError, URLError, TimeoutError):
         hub_online = False
