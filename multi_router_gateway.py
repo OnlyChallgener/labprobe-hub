@@ -260,6 +260,16 @@ def render_nginx_config(config: dict, pid_path: Path) -> str:
             f'    default "{router["appToken"]}";',
             "  }",
         ])
+    # Relays keep pushing at the root path because that is where their Hub used to live.
+    # A HOOK key names exactly one router, so /_routeauth can resolve it and the root can
+    # forward the request there; management keys resolve to nothing and stay refused.
+    lines.extend(["  map $upstream_http_x_labprobe_route $labprobe_root_worker {"])
+    for router in config["routers"]:
+        lines.append(f"    {router['routerId']} http://127.0.0.1:{router['workerPort']};")
+    lines.extend([
+        '    default "";',
+        "  }",
+    ])
     lines.extend([
         "  access_log /dev/stdout;",
         "  error_log /dev/stderr warn;",
@@ -282,6 +292,14 @@ def render_nginx_config(config: dict, pid_path: Path) -> str:
         "    location ^~ /_gateauth/ {",
         "      internal;",
         f"      proxy_pass http://127.0.0.1:{config['registryPort']};",
+        "      proxy_pass_request_body off;",
+        '      proxy_set_header Content-Length "";',
+        "      proxy_set_header Authorization $http_authorization;",
+        "      proxy_set_header X-LabProbe-Token $http_x_labprobe_token;",
+        "    }",
+        "    location = /_routeauth {",
+        "      internal;",
+        f"      proxy_pass http://127.0.0.1:{config['registryPort']}/_routeauth;",
         "      proxy_pass_request_body off;",
         '      proxy_set_header Content-Length "";',
         "      proxy_set_header Authorization $http_authorization;",
@@ -320,12 +338,28 @@ def render_nginx_config(config: dict, pid_path: Path) -> str:
         ])
     lines.append("    location ^~ /r/ { return 404; }")
     default = next(r for r in config["routers"] if r["routerId"] == config["defaultRouterId"])
-    # A root-path API call cannot say which router the caller meant. Silently forwarding it to
-    # the default worker is worse than refusing: the client believes it is reading the router it
-    # selected while it is looking at another one's data. The exact locations above still win, so
-    # the registry and the internal gate keep working, and /health stays open for the container.
+    # A root-path call carrying an owner key still cannot say which router the caller
+    # meant, so it stays refused: silently forwarding it to the default worker would show
+    # the caller another router's data while it believes it selected its own. A HOOK key
+    # is different - it names exactly one router - so those root calls (the relays) are
+    # resolved by /_routeauth and forwarded with the credential untouched, letting each
+    # worker keep enforcing its own HOOK. The exact locations above still win, so the
+    # registry and the internal gates keep working, and /health stays open.
     lines.extend([
         "    location ^~ /api/ {",
+        "      auth_request /_routeauth;",
+        "      error_page 401 = @root_refused;",
+        "      proxy_pass $labprobe_root_worker;",
+        # Declaring any proxy_set_header here drops the server-level ones, so the
+        # WebSocket upgrade and forwarding headers are restated - same trap as /r/<id>/.
+        "      proxy_set_header Host $http_host;",
+        "      proxy_set_header X-Real-IP $remote_addr;",
+        "      proxy_set_header X-Forwarded-For $proxy_add_x_forwarded_for;",
+        "      proxy_set_header X-Forwarded-Proto $scheme;",
+        "      proxy_set_header Upgrade $http_upgrade;",
+        "      proxy_set_header Connection $connection_upgrade;",
+        "    }",
+        "    location @root_refused {",
         "      default_type application/json;",
         "      return 400 '{\"ok\": false, \"error\": \"multi_router_path_required\"}';",
         "    }",
@@ -485,6 +519,36 @@ def make_registry_handler(config: dict, controller: DefaultRouterController | No
                 return "device"
             return ""
 
+        def route_auth(self) -> str:
+            """Which router a *device* credential belongs to, or empty.
+
+            Relays still push at the front door's root path because that is where their
+            Hub used to live. A HOOK key names exactly one router, so the root can route
+            it without guessing. A management key deliberately answers empty: an owner
+            key at the root still cannot say which router the caller meant, and pinning
+            it to one would resurrect the cross-data accident the 400 exists to prevent.
+            """
+            presented = self.credential()
+            if not presented or self.authorized():
+                return ""
+            for router in config["routers"]:
+                if hmac.compare_digest(presented, router["hookToken"].encode("utf-8")):
+                    return router["routerId"]
+            return ""
+
+        def answer_route_auth(self) -> bool:
+            if self.path != "/_routeauth":
+                return False
+            router_id = self.route_auth()
+            if not router_id:
+                self.send_error(401)
+                return True
+            self.send_response(200)
+            self.send_header("X-LabProbe-Route", router_id)
+            self.send_header("Content-Length", "0")
+            self.end_headers()
+            return True
+
         def respond(self, body: dict, status: int = 200) -> None:
             payload = json.dumps(body, ensure_ascii=False).encode("utf-8")
             self.send_response(status)
@@ -495,6 +559,8 @@ def make_registry_handler(config: dict, controller: DefaultRouterController | No
             self.wfile.write(payload)
 
         def do_GET(self) -> None:
+            if self.answer_route_auth():
+                return
             if self.path.startswith("/_gateauth/"):
                 router_id = self.path[len("/_gateauth/"):]
                 router = next((item for item in config["routers"]
@@ -520,6 +586,8 @@ def make_registry_handler(config: dict, controller: DefaultRouterController | No
             self.respond(router_list(controller.view() if controller else config))
 
         def do_POST(self) -> None:
+            if self.answer_route_auth():
+                return
             if self.path != "/api/routers/default":
                 self.send_error(404)
                 return
@@ -543,6 +611,16 @@ def make_registry_handler(config: dict, controller: DefaultRouterController | No
                 self.respond({"ok": False, "error": "default router change failed"}, 503)
                 return
             self.respond({"ok": True, "defaultRouterId": selected})
+
+        def _unsupported_method(self) -> None:
+            # nginx auth_request replays the original method, so PUT/DELETE/PATCH must be
+            # answerable for /_routeauth; anything else keeps its 501.
+            if not self.answer_route_auth():
+                self.send_error(501)
+
+        do_PUT = _unsupported_method
+        do_DELETE = _unsupported_method
+        do_PATCH = _unsupported_method
 
         def log_message(self, format: str, *args: object) -> None:
             pass

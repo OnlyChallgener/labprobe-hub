@@ -426,15 +426,71 @@ def test_registry_probes_tolerate_a_cold_worker_but_route_checks_stay_fast(tmp_p
 
 
 def test_root_api_call_is_refused_instead_of_pinning_to_the_default_worker(tmp_path):
-    """A root-path API request cannot name a router, so it must be refused rather than
-    forwarded to whichever worker happens to be the default."""
+    """A root-path API request carrying an owner key cannot name a router, so it must be
+    refused rather than forwarded to whichever worker happens to be the default."""
     config = gateway.load_gateway_config(_config(tmp_path)[0], SECRETS)
     rendered = gateway.render_nginx_config(config, Path("/tmp/nginx.pid"))
     marker = "location ^~ /api/ {"
     assert marker in rendered
     block = rendered.split(marker, 1)[1].split("\n    }", 1)[0]
-    assert "multi_router_path_required" in block
-    assert "proxy_pass" not in block, "the root API block must not forward at all"
+    # The refusal now lives in the named location the credential gate falls through to.
+    assert "auth_request /_routeauth;" in block
+    assert "error_page 401 = @root_refused;" in block
+    refused = rendered.split("location @root_refused {", 1)[1].split("\n    }", 1)[0]
+    assert "multi_router_path_required" in refused
+    assert "proxy_pass http://127.0.0.1:58501" not in block, "no hard pin to the default worker"
     assert "location = /api/routers" in rendered, "the registry must still answer at the root"
     assert "location / { proxy_pass" in rendered, "/health must stay open for the healthcheck"
     assert rendered.index("location = /api/routers") < rendered.index(marker)
+
+
+def test_root_api_forwards_a_device_credential_to_its_own_worker_only(tmp_path):
+    """Relays keep pushing at the root path, and a HOOK key names exactly one router, so
+    the root resolves it there - while an owner key stays refused (see the test above)."""
+    config = gateway.load_gateway_config(_config(tmp_path)[0], SECRETS)
+    rendered = gateway.render_nginx_config(config, Path("/tmp/nginx.pid"))
+    block = rendered.split("location ^~ /api/ {", 1)[1].split("\n    }", 1)[0]
+    assert "proxy_pass $labprobe_root_worker;" in block
+    # The credential must reach the worker untouched: each worker enforces its own HOOK,
+    # and rewriting it here would hand the relay App-level access.
+    assert "proxy_set_header Authorization" not in block
+    # Same inheritance trap as /r/<id>/: declaring any header drops the server-level ones.
+    for header in ("Host $http_host", "Upgrade $http_upgrade", "Connection $connection_upgrade"):
+        assert f"proxy_set_header {header};" in block
+    map_block = rendered.split(
+        "map $upstream_http_x_labprobe_route $labprobe_root_worker {", 1,
+    )[1].split("\n  }", 1)[0]
+    assert "home http://127.0.0.1:58501;" in map_block
+    assert "office http://127.0.0.1:58502;" in map_block
+    assert '    default "";' in map_block
+    for token in SECRETS.values():
+        assert token not in map_block
+
+
+def test_route_auth_names_the_hook_owner_and_never_an_owner_key(tmp_path):
+    config = gateway.load_gateway_config(_config(tmp_path)[0], SECRETS)
+    server = ThreadingHTTPServer(("127.0.0.1", 0), gateway.make_registry_handler(config))
+    thread = threading.Thread(target=server.serve_forever, daemon=True)
+    thread.start()
+    base = f"http://127.0.0.1:{server.server_port}"
+
+    def outcome(method: str, headers: dict) -> tuple[int, str]:
+        request = Request(f"{base}/_routeauth", headers=headers, method=method)
+        try:
+            with urlopen(request, timeout=2) as probe:
+                return probe.status, probe.headers.get("X-LabProbe-Route") or ""
+        except HTTPError as error:
+            return error.code, ""
+
+    try:
+        assert outcome("POST", {"Authorization": f"Bearer {SECRETS['HOME_HOOK']}"}) == (200, "home")
+        assert outcome("GET", {"X-LabProbe-Token": SECRETS["OFFICE_HOOK"]}) == (200, "office")
+        assert outcome("DELETE", {"Authorization": f"Bearer {SECRETS['HOME_HOOK']}"}) == (200, "home")
+        # An owner key at the root still cannot say which router the caller meant.
+        assert outcome("POST", {"Authorization": f"Bearer {SECRETS['HOME_APP']}"}) == (401, "")
+        assert outcome("POST", {"Authorization": f"Bearer {SECRETS['OFFICE_APP']}"}) == (401, "")
+        assert outcome("POST", {}) == (401, "")
+        assert outcome("POST", {"Authorization": f"Bearer {SECRETS['HOME_HOOK']}x"}) == (401, "")
+    finally:
+        server.shutdown()
+        server.server_close()
