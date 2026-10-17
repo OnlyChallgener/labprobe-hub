@@ -31,11 +31,13 @@ ID_PATTERN = re.compile(r"^[a-z][a-z0-9_-]{1,31}$")
 TOPIC_PATTERN = re.compile(r"^[A-Za-z0-9_-]+(?:/[A-Za-z0-9_-]+)*$")
 PLACEHOLDERS = {"", "change-app-token", "change-hook-token", "replace-me", "changeme"}
 
-# A worker that has just started needs ~0.3s to answer /health, so the old shared 0.35s
-# budget reported healthy workers as offline for seconds after every start. The HTTP probes
-# get a generous budget because they run in parallel and bound the list's latency; the eWeb
-# probe stays fast because it is a bare TCP connect against a router that may be away.
-PROBE_HTTP_TIMEOUT_SEC = 1.0
+# /health is not a trivial liveness stub: it counts revisions and reports database state, so
+# a loaded worker on the 200MB+ library measured up to 1.14s. The old shared 0.35s budget
+# reported healthy workers as offline and even 1.0s flapped. Probes run in parallel, so the
+# list's latency is the maximum, not the sum. A cold worker that is still booting refuses the
+# connection outright (measured ~9s for the small library, ~18s for the 200MB one) - that is
+# correctly reported as offline, not something a longer timeout can fix.
+PROBE_HTTP_TIMEOUT_SEC = 2.5
 PROBE_TCP_TIMEOUT_SEC = 0.35
 
 # The front door renders each worker's APP secret into the nginx configuration.

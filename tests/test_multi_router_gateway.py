@@ -411,7 +411,8 @@ def test_registry_probes_tolerate_a_cold_worker_but_route_checks_stay_fast(tmp_p
     row = gateway._router_row(home)
     assert row["hubOnline"] is True
     assert (row["deviceCount"], row["onlineDeviceCount"]) == (3, 1)
-    assert seen and all(timeout >= 1.0 for timeout in seen), seen
+    # Measured worst case on a loaded worker was 1.14s, so the budget must clear it.
+    assert seen and all(timeout >= 2.0 for timeout in seen), seen
 
     tcp = []
 
