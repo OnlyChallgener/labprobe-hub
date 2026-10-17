@@ -1,5 +1,15 @@
 # LabProbe 变更记录
 
+## 0.14.2（Relay 仍发布 0.2.75）
+
+- 多路由网关成型：前端一次鉴权后按通道类型代换 worker 凭据；worker 自报身份（读网关注入的 `ROUTER_ID`）；`.well-known` 说出自己所在通道，Relay 自动发现不再只会落到根 Hub。
+- 儿童上网：总开关进台账，成员管理默认走路由器原生，只有 `?sync=official` 才同步官方云。
+- RDPI：新增好看签名安装端点（按单空槽合并）；嗅探器重启后按配置恢复 RDPI 引用。
+- STUN：TCP 探测改用 stun.nextcloud.com，并抑制探测引起的瞬断。
+- 修复：范围化历史修复后重算离线设备缓存，避免幽灵行与时长错位。
+- 部署：`docker-compose` 透传 `STRICT_TOKEN_SEPARATION`（此前代码读它但没有任何部署面能设置）；CI 里分支 push 只移动 `latest`，版本 tag 只由 `v*` 事件产生，避免覆盖已发布的 release。
+- Relay 版本未随本次发布：0.2.76 只装到 BE72 真机，没有进仓库也没有发布记录，所以 `LABRELAY_RELEASE_VERSION` 默认仍是 0.2.75。
+
 ## 0.14.1 / LabRelay 0.2.75
 
 - 实时恢复逻辑遵守 BE50 的固件能力判断，避免对不支持的原生 WebSocket 反复认证。

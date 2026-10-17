@@ -192,7 +192,7 @@ jobs:
 
             `sh install.sh`
 
-            Enter your Hub HOOK_TOKEN when prompted. See INSTALL_AND_UPDATE_GUIDE.md in the Hub v0.14.1 release for Docker deployment and APP settings.
+            Enter your Hub HOOK_TOKEN when prompted. See INSTALL_AND_UPDATE_GUIDE.md in the Hub v0.14.2 release for Docker deployment and APP settings.
 
             Existing installation upgrade:
             `sh install.sh upgrade`

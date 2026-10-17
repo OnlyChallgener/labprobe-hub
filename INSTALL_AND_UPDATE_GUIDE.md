@@ -1,6 +1,6 @@
 # LabProbe BE72 与 BE50 安装指南
 
-适用版本：Hub 0.14.1、LabRelay 0.2.75。本文供首次部署用户使用，按 Docker Hub、路由器 Relay、Android APP 的顺序操作。目前已验证的路由器为 BE72 Pro 和 BE50；其他型号需单独验证。N1 盒子可以承担 Docker Hub，但必须运行 64 位 Linux。
+适用版本：Hub 0.14.2、LabRelay 0.2.75。本文供首次部署用户使用，按 Docker Hub、路由器 Relay、Android APP 的顺序操作。目前已验证的路由器为 BE72 Pro 和 BE50；其他型号需单独验证。N1 盒子可以承担 Docker Hub，但必须运行 64 位 Linux。
 
 ## 1 安装前准备
 
@@ -71,7 +71,7 @@ mkdir -p data config backups logs update-repository/agent
 **文件：`~/labprobe-hub/.env`**
 
 ```dotenv
-LABPROBE_IMAGE=onlychallgener/labprobe-hub:v0.14.1
+LABPROBE_IMAGE=onlychallgener/labprobe-hub:v0.14.2
 LABRELAY_RELEASE_VERSION=0.2.75
 PORT=58443
 TZ=Asia/Shanghai
@@ -171,7 +171,7 @@ services:
       start_period: 10s
 
   labprobe-hub:
-    image: ${LABPROBE_IMAGE:-onlychallgener/labprobe-hub:v0.14.1}
+    image: ${LABPROBE_IMAGE:-onlychallgener/labprobe-hub:v0.14.2}
     container_name: labprobe-hub
     network_mode: host
     restart: unless-stopped
@@ -331,7 +331,7 @@ EOF
 
 ```sh
 sudo docker pull eclipse-mosquitto:2
-sudo docker pull onlychallgener/labprobe-hub:v0.14.1
+sudo docker pull onlychallgener/labprobe-hub:v0.14.2
 
 sudo docker run -d \
   --name labprobe-mqtt \
@@ -367,7 +367,7 @@ sudo docker run -d \
   -v "$PWD/backups:/app/backups" \
   -v "$PWD/logs:/app/logs" \
   -v "$PWD/update-repository:/app/update-repository:ro" \
-  onlychallgener/labprobe-hub:v0.14.1
+  onlychallgener/labprobe-hub:v0.14.2
 
 sudo docker inspect --format '{{.State.Health.Status}}' labprobe-hub
 sudo docker logs --tail 100 labprobe-hub
@@ -428,11 +428,11 @@ sudo docker compose up -d --no-build
 sudo docker compose ps
 ```
 
-**docker run 用户：**先将下面下载命令和 2.5 中 Hub 启动命令末尾的 `v0.14.1` 改为目标版本，再执行。只移除旧 Hub 容器：
+**docker run 用户：**先将下面下载命令和 2.5 中 Hub 启动命令末尾的 `v0.14.2` 改为目标版本，再执行。只移除旧 Hub 容器：
 
 ```sh
 cd ~/labprobe-hub
-sudo docker pull onlychallgener/labprobe-hub:v0.14.1
+sudo docker pull onlychallgener/labprobe-hub:v0.14.2
 sudo docker stop labprobe-hub
 sudo docker rm labprobe-hub
 ```
@@ -462,4 +462,4 @@ curl -fsS http://127.0.0.1:58443/health
 
 Compose 用户也可在 `~/labprobe-hub` 执行 `sudo docker compose ps`。端口若改过，健康检查和 APP 地址也要使用新端口。Relay 失败时先核对 Hub 地址和 HOOK_TOKEN，再运行 `labrelay test-hub`。APP 登录失败时核对 Hub 地址、端口和 APP_TOKEN。请隐藏真实令牌与密码后再分享日志。
 
-版本发布页：[Hub 源码与 Release](https://github.com/OnlyChallgener/labprobe-hub/releases/tag/v0.14.1)、[Relay 下载](https://github.com/OnlyChallgener/labprobe-hub/releases/tag/labrelay-v0.2.75)。
+版本发布页：[Hub 源码与 Release](https://github.com/OnlyChallgener/labprobe-hub/releases/tag/v0.14.2)、[Relay 下载](https://github.com/OnlyChallgener/labprobe-hub/releases/tag/labrelay-v0.2.75)。

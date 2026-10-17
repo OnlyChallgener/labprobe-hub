@@ -1,4 +1,4 @@
-# LabProbe Hub 0.14.1
+# LabProbe Hub 0.14.2
 
 LabProbe Hub 可部署在任意 Linux AMD64/ARM64 宿主机，包括服务器、小主机、NAS 和软路由。Hub 使用 SQLite 保存数据；已适配锐捷路由器上的 Rust Agent 继续以 `dev_sta/user_list` 为核心数据源。
 
