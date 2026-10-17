@@ -435,9 +435,12 @@ class DefaultRouterController:
 
 
 def make_registry_handler(config: dict, controller: DefaultRouterController | None = None) -> type[BaseHTTPRequestHandler]:
-    # The initial default worker's token remains the management credential after a switch.
-    initial = next(r for r in config["routers"] if r["routerId"] == config["defaultRouterId"])
-    expected = initial["appToken"].encode("utf-8")
+    # Every worker's APP secret is an owner-level management credential. One front door only
+    # delivers "log in once" if a key the user already holds for any of their routers also
+    # opens the rest; making it depend on which row happened to be the initial default turned
+    # the merge into a silent "wrong token" wall for everyone who kept the second key.
+    # HOOK secrets never gain management rights - they stay device-channel-only.
+    management = [router["appToken"].encode("utf-8") for router in config["routers"]]
 
     class RegistryHandler(BaseHTTPRequestHandler):
         def credential(self) -> bytes:
@@ -448,7 +451,8 @@ def make_registry_handler(config: dict, controller: DefaultRouterController | No
             return candidate.encode("utf-8")
 
         def authorized(self) -> bool:
-            return hmac.compare_digest(self.credential(), expected)
+            presented = self.credential()
+            return any(hmac.compare_digest(presented, secret) for secret in management)
 
         def gate_kind(self, router: dict) -> str:
             """Which credential opened this channel, or empty when none did.
@@ -457,10 +461,9 @@ def make_registry_handler(config: dict, controller: DefaultRouterController | No
             nginx. A device credential is passed through untouched so the worker keeps
             validating it as HOOK - rewriting it would hand the relay App-level access.
             """
-            presented = self.credential()
-            if hmac.compare_digest(presented, expected) or hmac.compare_digest(
-                    presented, router["appToken"].encode("utf-8")):
+            if self.authorized():
                 return "management"
+            presented = self.credential()
             if hmac.compare_digest(presented, router["hookToken"].encode("utf-8")):
                 return "device"
             return ""

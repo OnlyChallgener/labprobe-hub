@@ -123,7 +123,7 @@ def test_duplicate_or_placeholder_secrets_are_rejected(tmp_path):
         gateway.load_gateway_config(path, {**SECRETS, "OFFICE_APP": "replace-me"})
 
 
-def test_registry_requires_default_app_token_and_never_exposes_worker_secrets(tmp_path, monkeypatch):
+def test_registry_accepts_any_worker_app_token_and_rejects_every_hook(tmp_path, monkeypatch):
     config = gateway.load_gateway_config(_config(tmp_path)[0], SECRETS)
     monkeypatch.setattr(gateway, "router_list", lambda _: {
         "ok": True, "defaultRouterId": "home",
@@ -134,13 +134,16 @@ def test_registry_requires_default_app_token_and_never_exposes_worker_secrets(tm
     thread.start()
     url = f"http://127.0.0.1:{server.server_port}/api/routers"
     try:
-        for token in ("", SECRETS["OFFICE_APP"], SECRETS["HOME_HOOK"]):
+        # A device credential must never reach the management surface, whichever router it
+        # belongs to; only APP secrets do.
+        for token in ("", SECRETS["HOME_HOOK"], SECRETS["OFFICE_HOOK"]):
             with pytest.raises(HTTPError) as error:
                 urlopen(Request(url, headers={"Authorization": f"Bearer {token}"}), timeout=2)
             assert error.value.code == 401
-        with urlopen(Request(url, headers={"Authorization": f"Bearer {SECRETS['HOME_APP']}"}), timeout=2) as response:
-            body = response.read().decode("utf-8")
-            assert response.headers["Cache-Control"] == "no-store"
+        for token in (SECRETS["HOME_APP"], SECRETS["OFFICE_APP"]):
+            with urlopen(Request(url, headers={"Authorization": f"Bearer {token}"}), timeout=2) as response:
+                body = response.read().decode("utf-8")
+                assert response.headers["Cache-Control"] == "no-store"
         assert json.loads(body)["routers"][0]["basePath"] == "/r/office"
         assert all(secret not in body for secret in SECRETS.values())
     finally:
@@ -246,10 +249,12 @@ def test_default_switch_persists_and_requires_management_token(tmp_path, monkeyp
             data=json.dumps({"routerId": router_id}).encode(),
             headers={"Authorization": f"Bearer {token}", "Content-Type": "application/json"}), timeout=2)
     try:
+        # A device credential must not move the global default, while any owner-level APP key
+        # may - including one the user originally saved for the other router.
         with pytest.raises(HTTPError) as denied:
-            change(SECRETS["OFFICE_APP"], "office")
+            change(SECRETS["OFFICE_HOOK"], "office")
         assert denied.value.code == 401
-        with change(SECRETS["HOME_APP"], "office") as response:
+        with change(SECRETS["OFFICE_APP"], "office") as response:
             assert json.load(response)["defaultRouterId"] == "office"
         assert applied == ["office"]
         assert gateway.DefaultRouterController(config, tmp_path / "default-router.json").current_id == "office"
@@ -334,7 +339,8 @@ def test_gate_opens_with_management_credential_anywhere_and_worker_credentials_o
         # The relay presents HOOK; it must pass through as a device credential so the
         # worker keeps validating it as HOOK instead of receiving an APP secret.
         assert outcome("home", {"X-LabProbe-Token": SECRETS["HOME_HOOK"]}) == (200, "device")
-        assert outcome("home", bearer(SECRETS["OFFICE_APP"])) == (401, "")
+        # Any owner-level APP key opens any channel; a HOOK key only ever opens its own.
+        assert outcome("home", bearer(SECRETS["OFFICE_APP"])) == (200, "management")
         assert outcome("office", {"X-LabProbe-Token": SECRETS["HOME_HOOK"]}) == (401, "")
         assert outcome("home", bearer("")) == (401, "")
         assert outcome("home", bearer(SECRETS["HOME_APP"] + "x")) == (401, "")
