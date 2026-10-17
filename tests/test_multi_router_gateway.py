@@ -423,3 +423,18 @@ def test_registry_probes_tolerate_a_cold_worker_but_route_checks_stay_fast(tmp_p
     monkeypatch.setattr(gateway.socket, "create_connection", fake_connect)
     assert gateway.eweb_reachable(home) is False
     assert tcp and tcp[0] <= 0.5, tcp
+
+
+def test_root_api_call_is_refused_instead_of_pinning_to_the_default_worker(tmp_path):
+    """A root-path API request cannot name a router, so it must be refused rather than
+    forwarded to whichever worker happens to be the default."""
+    config = gateway.load_gateway_config(_config(tmp_path)[0], SECRETS)
+    rendered = gateway.render_nginx_config(config, Path("/tmp/nginx.pid"))
+    marker = "location ^~ /api/ {"
+    assert marker in rendered
+    block = rendered.split(marker, 1)[1].split("\n    }", 1)[0]
+    assert "multi_router_path_required" in block
+    assert "proxy_pass" not in block, "the root API block must not forward at all"
+    assert "location = /api/routers" in rendered, "the registry must still answer at the root"
+    assert "location / { proxy_pass" in rendered, "/health must stay open for the healthcheck"
+    assert rendered.index("location = /api/routers") < rendered.index(marker)

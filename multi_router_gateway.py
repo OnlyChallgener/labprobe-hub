@@ -320,7 +320,15 @@ def render_nginx_config(config: dict, pid_path: Path) -> str:
         ])
     lines.append("    location ^~ /r/ { return 404; }")
     default = next(r for r in config["routers"] if r["routerId"] == config["defaultRouterId"])
+    # A root-path API call cannot say which router the caller meant. Silently forwarding it to
+    # the default worker is worse than refusing: the client believes it is reading the router it
+    # selected while it is looking at another one's data. The exact locations above still win, so
+    # the registry and the internal gate keep working, and /health stays open for the container.
     lines.extend([
+        "    location ^~ /api/ {",
+        "      default_type application/json;",
+        "      return 400 '{\"ok\": false, \"error\": \"multi_router_path_required\"}';",
+        "    }",
         f"    location / {{ proxy_pass http://127.0.0.1:{default['workerPort']}; }}",
         "  }",
         "}",
