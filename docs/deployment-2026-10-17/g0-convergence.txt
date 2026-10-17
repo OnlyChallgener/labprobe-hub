@@ -17,14 +17,22 @@ G0 收敛前的生产取证与收割判定（2026-10-17）
                     router_rpc.py 等于 HEAD
   两台线上的 hub.py 互差 93 行。HEAD 声明 0.14.1，从未部署过；hub.py 里没有对 relay/agent 版本的门槛检查。
 
-二、「生产独有」四条的判定（结论：只有一条需要动作）
+二、「生产独有」四条的判定（结论：只有第 1 条是线上独有，但它不需要保留）
   1) UPDATE_REPOSITORY_ROOT 默认值 = https://lab.net86.dynv6.net:27772（BE72 与 BE50 的 hub.py 都是这个默认，
      且 BE72 容器 env 里 `UPDATE_REPOSITORY_ROOT=` 是空串，即代码默认值在生效）。
-     → 这是真正需要保留的部署事实。但**不改代码**：HEAD 已有 _AGENT_REPOSITORY_ASSET_PREFIX，
-       只要把该变量按字面值设置，拼出的两条 URL 与生产当前完全一致（/agent/latest.json、/agent/install.sh），
-       同时保留 HEAD 的 GitHub 回退源。值写进 .env.example 的注释与本记录。
-     → 该域名解析到 36.157.252.49，也就是 NAS 自己；宿主 :::27772 处于 LISTEN。从 NAS 访问自己的公网口
-       是静默超时（hairpin，不是拒绝），所以「镜像挂了就没人管」这种判断不能凭 curl 000 下结论。
+     → 这个值不是「自建发布镜像」，而是 Lucky 的一条反代规则：监听 27772、勾了 IPv6、开了 TLS，
+       子规则 Labprobe = 文件服务，匹配域名 lab.net86.dynv6.net，落到名为 labprobe-release 的存储。
+       两条子规则上都带红色禁用标记（我判不准它是「规则停用」还是别的状态，行尾开关看着是开的），
+       所以至少不能假定它正在服务。
+     → 为什么它现在不可用：IPv6 没开 ⇒ 从 NAS 走 v4 打它是静默超时；即使走 v6，Host/SNI 不对也会
+       撞上「未匹配的域名」那条默认规则。这解释了我探到的全部 000（v4/v6/127.0.0.1 × http/https 全 000）。
+       先前写的「hairpin 静默超时」是过度推断，作废。
+     → 处置：留空 UPDATE_REPOSITORY_ROOT，走 HEAD 默认的 GitHub Releases（AGENT_GITHUB_MANIFEST_URL 本来就是第二源）。
+       自建根要不要恢复、是否改成 txt:// 解析（把端口从字面值里拿掉），等 IPv6 这条线定了再说；本轮不动代码。
+       注意 lab.net86.dynv6.net 目前没有 TXT 记录，而同前缀的 hub. = tcp://36.157.252.49:6105、
+       mq. = tcp://36.157.252.49:5714 都有；NAS 上 nslookup 读不到 TXT 是探针假阴性，要用 Windows 侧查询。
+     → 另一半风险照实记着：NAS 侧 v4 访问 GitHub Releases 实测 15s 超时（间歇性），所以「两个源都可靠」
+       并不成立；agent 更新这条链目前是悬空的，只是它不影响 Hub 收敛，按用户决定先不管。
   2) 错误码 entry_limit（生产）vs entry_budget_exceeded（HEAD hub.py:4102）。
      → 不收割。全仓与 LabProbeApp/ShinyaHub 都没有任何消费方按这两个字面量判断；App 只按
        error → message → errorCode 顺序取文案，唯一被特判的码是 HUB_NO_ROUTER_DATA。改名安全。
