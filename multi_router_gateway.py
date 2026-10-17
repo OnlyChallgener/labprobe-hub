@@ -296,6 +296,15 @@ def render_nginx_config(config: dict, pid_path: Path) -> str:
             f"      auth_request_set ${slug}_kind $upstream_http_x_labprobe_auth_kind;",
             "      error_page 401 = @denied;",
             f"      proxy_pass http://127.0.0.1:{port}/;",
+            # nginx inherits proxy_set_header only when the current level declares none,
+            # so rewriting the credential here would silently drop the WebSocket upgrade
+            # and every forwarding header. They are restated inside the location.
+            "      proxy_set_header Host $http_host;",
+            "      proxy_set_header X-Real-IP $remote_addr;",
+            "      proxy_set_header X-Forwarded-For $proxy_add_x_forwarded_for;",
+            "      proxy_set_header X-Forwarded-Proto $scheme;",
+            "      proxy_set_header Upgrade $http_upgrade;",
+            "      proxy_set_header Connection $connection_upgrade;",
             f"      proxy_set_header Authorization ${slug}_authorization;",
             f"      proxy_set_header X-LabProbe-Token ${slug}_token;",
             "    }",

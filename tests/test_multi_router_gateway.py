@@ -81,6 +81,16 @@ def test_nginx_routes_http_and_websocket_to_isolated_workers(tmp_path):
     assert "proxy_set_header Upgrade $http_upgrade;" in rendered
     assert "proxy_set_header Connection $connection_upgrade;" in rendered
     assert "location = /api/routers" in rendered
+    # A location that declares any proxy_set_header stops inheriting the server-level
+    # ones, so the credential rewrite used to leave the WebSocket upgrade headers behind
+    # and every /r/<id>/ channel answered the handshake with 400 while a direct worker
+    # request returned 101. Assert them per location, not somewhere in the text.
+    for router_id in ("home", "office"):
+        block = rendered.split(f"location ^~ /r/{router_id}/ {{")[1].split("\n    }")[0]
+        for header in ("Upgrade $http_upgrade", "Connection $connection_upgrade",
+                       "Host $http_host", "X-Forwarded-Proto $scheme",
+                       "X-Real-IP $remote_addr", "X-Forwarded-For"):
+            assert header in block, (router_id, header)
     # G1 moves the worker credential into the rendered file on purpose: the front door
     # authenticates once and carries each worker's own credential inward. Hooks stay out.
     assert SECRETS["HOME_HOOK"] not in rendered
