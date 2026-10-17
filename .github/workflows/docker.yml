@@ -47,6 +47,21 @@ jobs:
           username: ${{ secrets.DOCKERHUB_USERNAME }}
           password: ${{ secrets.DOCKERHUB_TOKEN }}
 
+      - name: Decide image tags
+        id: meta
+        shell: bash
+        env:
+          DOCKERHUB_USERNAME: ${{ secrets.DOCKERHUB_USERNAME }}
+        run: |
+          # A branch push may only move `latest`. The version tag comes from a
+          # `v*` tag event, so an unreviewed branch can never overwrite a release
+          # that installers already pin to.
+          if [ "$GITHUB_REF_TYPE" = "tag" ]; then
+            echo "tags=$DOCKERHUB_USERNAME/labprobe-hub:latest,$DOCKERHUB_USERNAME/labprobe-hub:$GITHUB_REF_NAME" >> "$GITHUB_OUTPUT"
+          else
+            echo "tags=$DOCKERHUB_USERNAME/labprobe-hub:latest" >> "$GITHUB_OUTPUT"
+          fi
+
       - name: Build and Push Hub
         uses: docker/build-push-action@v6
         with:
@@ -54,6 +69,4 @@ jobs:
           file: ./Dockerfile
           push: true
           platforms: linux/amd64,linux/arm64
-          tags: |
-            ${{ secrets.DOCKERHUB_USERNAME }}/labprobe-hub:latest
-            ${{ secrets.DOCKERHUB_USERNAME }}/labprobe-hub:v0.14.1
+          tags: ${{ steps.meta.outputs.tags }}
