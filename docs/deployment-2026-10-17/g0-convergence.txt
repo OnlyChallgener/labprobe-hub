@@ -1,0 +1,45 @@
+G0 收敛前的生产取证与收割判定（2026-10-17）
+
+方法：把两台容器里的 /app/*.py 原样 base64 取回（存 .workshots/g0-live/，md5 往返一致），
+再对每个文件把「去掉 CR 的内容」与 `git rev-list --all -- <file>` 的**每一个历史 blob** 逐一比 md5。
+匹配上某个提交 = 生产只是旧；一个都不匹配 = 生产独有，必须收割。
+
+一、两台容器与 HEAD 的关系
+  分支 codex/child-internet：HEAD=39ab1a9，远端=97e38c8（ls-remote 实测），领先 12 个提交、落后 0。
+  镜像 labprobe-hub:build-full-39ab1a9（01a751d22624）逐字节等于 HEAD，但没有在跑。
+  labprobe-hub      image=oct07-be72-official-v327  started=2026-10-15T23:22:21Z  APP_VERSION=0.13.31
+                    multi_router_gateway.py = ABSENT（G1 的网关在这台上根本不存在）
+                    router_rpc.py           = 提交 bd02677（2026-08-28）的形状，比 HEAD 旧约 7 周
+                    hub.py / hub_entry.py   = 不匹配任何提交
+  labprobe-hub-be50 image=oct07-be50-official-v327  started=2026-10-07T09:44:49Z  APP_VERSION=0.13.32
+                    multi_router_gateway.py = fee0155（2026-10-08）旧版
+                    hub_entry.py = e298c73（09-26）  child_guard_service.py = fee0155  labprobe_storage.py = 58f4712（07-20）
+                    router_rpc.py 等于 HEAD
+  两台线上的 hub.py 互差 93 行。HEAD 声明 0.14.1，从未部署过；hub.py 里没有对 relay/agent 版本的门槛检查。
+
+二、「生产独有」四条的判定（结论：只有一条需要动作）
+  1) UPDATE_REPOSITORY_ROOT 默认值 = https://lab.net86.dynv6.net:27772（BE72 与 BE50 的 hub.py 都是这个默认，
+     且 BE72 容器 env 里 `UPDATE_REPOSITORY_ROOT=` 是空串，即代码默认值在生效）。
+     → 这是真正需要保留的部署事实。但**不改代码**：HEAD 已有 _AGENT_REPOSITORY_ASSET_PREFIX，
+       只要把该变量按字面值设置，拼出的两条 URL 与生产当前完全一致（/agent/latest.json、/agent/install.sh），
+       同时保留 HEAD 的 GitHub 回退源。值写进 .env.example 的注释与本记录。
+     → 该域名解析到 36.157.252.49，也就是 NAS 自己；宿主 :::27772 处于 LISTEN。从 NAS 访问自己的公网口
+       是静默超时（hairpin，不是拒绝），所以「镜像挂了就没人管」这种判断不能凭 curl 000 下结论。
+  2) 错误码 entry_limit（生产）vs entry_budget_exceeded（HEAD hub.py:4102）。
+     → 不收割。全仓与 LabProbeApp/ShinyaHub 都没有任何消费方按这两个字面量判断；App 只按
+       error → message → errorCode 顺序取文案，唯一被特判的码是 HUB_NO_ROUTER_DATA。改名安全。
+  3) 双 token：生产无条件同时接受 APP_TOKEN 与 HOOK_TOKEN；HEAD hub.py:710/720 用 STRICT_TOKEN_SEPARATION=1 才分离，
+     未设置时与生产等价。
+     → 不收割，但**此前无法开启**：docker-compose.host.yml 没有透传这个变量，.env.example 也没有这一项。
+       本补丁补上透传与说明，否则 G6 的通道分离只能靠手改容器。
+  4) BE50 的 _child_guard_official_membership("add_device"/"remove_device") 直连写法：
+     → 不是生产独有，是生产旧。HEAD 的 4dfcbe3 已按「成员管理默认走路由器原生、?sync=official 才同步云」改过，
+       这正是当时的既定决策，不回退。
+
+三、曾担心、现已排除的
+  usage_aggregate.py「口径可能只存在线上」不成立：BE72 的那份与 HEAD 是同一个 reconcile_guard_membership
+  被挪了位置，按行排序后集合只差一个空行，逻辑零差异。
+
+四、换 HEAD 镜像前仍需人工决定的
+  /api/router/config 的 capabilities 结构：BE72 生产返回旧的内联 features，HEAD 走 firmware_features。
+  这是 App 可见的形状变化，属于收敛目标之一，但要在换镜像的同一次验收里回读确认，不能只测 HTTP 200。
