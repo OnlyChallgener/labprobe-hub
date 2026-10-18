@@ -263,7 +263,7 @@ def render_nginx_config(config: dict, pid_path: Path) -> str:
     # Relays keep pushing at the root path because that is where their Hub used to live.
     # A HOOK key names exactly one router, so /_routeauth can resolve it and the root can
     # forward the request there; management keys resolve to nothing and stay refused.
-    lines.extend(["  map $upstream_http_x_labprobe_route $labprobe_root_worker {"])
+    lines.extend(["  map $labprobe_route $labprobe_root_worker {"])
     for router in config["routers"]:
         lines.append(f"    {router['routerId']} http://127.0.0.1:{router['workerPort']};")
     lines.extend([
@@ -348,6 +348,10 @@ def render_nginx_config(config: dict, pid_path: Path) -> str:
     lines.extend([
         "    location ^~ /api/ {",
         "      auth_request /_routeauth;",
+        # $upstream_http_* from an auth subrequest is only readable once copied out with
+        # auth_request_set; reading it straight from the map evaluated to "" and nginx
+        # answered 500 "invalid URL prefix" for every relay push at the root path.
+        "      auth_request_set $labprobe_route $upstream_http_x_labprobe_route;",
         "      error_page 401 = @root_refused;",
         "      proxy_pass $labprobe_root_worker;",
         # Declaring any proxy_set_header here drops the server-level ones, so the

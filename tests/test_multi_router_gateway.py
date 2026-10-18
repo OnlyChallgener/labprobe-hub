@@ -451,6 +451,10 @@ def test_root_api_forwards_a_device_credential_to_its_own_worker_only(tmp_path):
     rendered = gateway.render_nginx_config(config, Path("/tmp/nginx.pid"))
     block = rendered.split("location ^~ /api/ {", 1)[1].split("\n    }", 1)[0]
     assert "proxy_pass $labprobe_root_worker;" in block
+    # Reading $upstream_http_* straight from the map evaluates to ""; it must be copied
+    # out with auth_request_set or nginx answers 500 "invalid URL prefix".
+    assert "auth_request_set $labprobe_route $upstream_http_x_labprobe_route;" in block
+    assert "map $labprobe_route $labprobe_root_worker {" in rendered
     # The credential must reach the worker untouched: each worker enforces its own HOOK,
     # and rewriting it here would hand the relay App-level access.
     assert "proxy_set_header Authorization" not in block
@@ -458,7 +462,7 @@ def test_root_api_forwards_a_device_credential_to_its_own_worker_only(tmp_path):
     for header in ("Host $http_host", "Upgrade $http_upgrade", "Connection $connection_upgrade"):
         assert f"proxy_set_header {header};" in block
     map_block = rendered.split(
-        "map $upstream_http_x_labprobe_route $labprobe_root_worker {", 1,
+        "map $labprobe_route $labprobe_root_worker {", 1,
     )[1].split("\n  }", 1)[0]
     assert "home http://127.0.0.1:58501;" in map_block
     assert "office http://127.0.0.1:58502;" in map_block
