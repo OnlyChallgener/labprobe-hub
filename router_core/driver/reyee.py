@@ -556,16 +556,6 @@ class ReyeeEWebDriver(RouterDriver):
     _DDNS_PROTOCOL_CFG = "ddnsCfg"
 
     @staticmethod
-    def _ddns_view_unavailable(raw: Any) -> bool:
-        if not isinstance(raw, dict) or isinstance(raw.get("entries"), list):
-            return False
-        code = str(raw.get("rcode") or raw.get("code") or "").strip()
-        message = str(raw.get("rmsg") or raw.get("message") or "").lower()
-        return code == "03510001" or (
-            bool(code) and code not in {"0", "0000"} and ("unavailable" in message or "not support" in message)
-        )
-
-    @staticmethod
     def _validated_ddns_view(raw: Any) -> Tuple[List[Dict[str, Any]], Dict[str, Any]]:
         if not isinstance(raw, dict) or not isinstance(raw.get("entries"), list):
             raise RouterRpcExecutionError("DDNS entries 响应结构异常", "DDNS_INVALID_RESPONSE", 502)
@@ -589,14 +579,16 @@ class ReyeeEWebDriver(RouterDriver):
         if cached and not force:
             return cached
         raw = self._unwrap_json(self.rpc("devSta.get", "ddns_view"))
-        if self._ddns_view_unavailable(raw):
+        if isinstance(raw, dict) and "entries" in raw:
+            _, settings = self._validated_ddns_view(raw)
+            self._ddns_protocol_value = self._DDNS_PROTOCOL_VIEW
+            self._ddns_view_settings = settings
+            return self._DDNS_PROTOCOL_VIEW
+        if isinstance(raw, (dict, list)):
             self._ddns_protocol_value = self._DDNS_PROTOCOL_CFG
             self._ddns_view_settings = {}
             return self._DDNS_PROTOCOL_CFG
-        _, settings = self._validated_ddns_view(raw)
-        self._ddns_protocol_value = self._DDNS_PROTOCOL_VIEW
-        self._ddns_view_settings = settings
-        return self._DDNS_PROTOCOL_VIEW
+        raise RouterRpcExecutionError("DDNS 协议探测响应结构异常", "DDNS_INVALID_RESPONSE", 502)
 
     def _get_raw_ddns_rows(self, protocol: Optional[str] = None) -> List[Dict[str, Any]]:
         protocol = protocol or self._ddns_protocol()
