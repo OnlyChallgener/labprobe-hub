@@ -97,9 +97,9 @@ def test_service_templates_choose_protocol_and_skip_portmap_reservation(tmp_path
     wireguard = service.clean_rule({"serviceType": "WireGuard", "targetIpv4": "192.168.5.47", "targetPort": 51820})
 
     assert https["transportProtocol"] == "TCP"
-    assert https["listenPort"] == 20001
+    assert https["listenPort"] == 30000
     assert wireguard["transportProtocol"] == "UDP"
-    assert wireguard["listenPort"] == 20000
+    assert wireguard["listenPort"] == 30000
     assert https["stunServer"] == DEFAULT_STUN_TCP_SERVER
 
 
