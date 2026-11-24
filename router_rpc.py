@@ -339,6 +339,124 @@ class TinyTtlCache:
                         self._data.pop(key, None)
 
 
+def _ddns_view_unavailable(raw: Any) -> bool:
+    if not isinstance(raw, dict) or isinstance(raw.get("entries"), list):
+        return False
+    code = str(raw.get("rcode") or raw.get("code") or "").strip()
+    message = str(raw.get("rmsg") or raw.get("message") or "").lower()
+    return code == "03510001" or (
+        bool(code) and code not in {"0", "0000"} and ("unavailable" in message or "not support" in message)
+    )
+
+
+def _validated_ddns_view(raw: Any) -> Tuple[List[Dict[str, Any]], Dict[str, Any]]:
+    if not isinstance(raw, dict) or not isinstance(raw.get("entries"), list):
+        raise RouterRpcError("DDNS entries 响应结构异常", "DDNS_INVALID_RESPONSE", 502)
+    rows = []
+    seen = set()
+    for value in raw["entries"]:
+        if not isinstance(value, dict):
+            raise RouterRpcError("DDNS entries 包含无效记录", "DDNS_INVALID_RESPONSE", 502)
+        record_id = str(value.get("id") or "").strip()
+        if not record_id or record_id in seen:
+            raise RouterRpcError("DDNS 记录 ID 缺失或重复", "DDNS_INVALID_RESPONSE", 502)
+        seen.add(record_id)
+        rows.append(dict(value))
+    settings = raw.get("settings")
+    if not isinstance(settings, dict):
+        raise RouterRpcError("DDNS 全局设置响应结构异常", "DDNS_INVALID_RESPONSE", 502)
+    return rows, dict(settings)
+
+
+def _read_ddns_snapshot(client: Any) -> Tuple[str, List[Dict[str, Any]], Dict[str, Any]]:
+    view = client.rpc("devSta.get", "ddns_view")
+    if not _ddns_view_unavailable(view):
+        return "ddns_view", *_validated_ddns_view(view)
+    raw = client.rpc("devSta.get", "ddnsCfg")
+    rows: Any = raw if isinstance(raw, list) else None
+    if isinstance(raw, dict):
+        for key in ("list", "services", "records"):
+            if key in raw:
+                rows = raw[key]
+                break
+        if rows is None:
+            nested = raw.get("data")
+            if isinstance(nested, list):
+                rows = nested
+            elif isinstance(nested, dict):
+                for key in ("list", "services", "records"):
+                    if key in nested:
+                        rows = nested[key]
+                        break
+        if rows is None and any(key in raw for key in ("service", "serviceId", "service_id", "id", "domain")):
+            rows = [raw]
+    if not isinstance(rows, list):
+        raise RouterRpcError("DDNS 记录响应结构异常", "DDNS_INVALID_RESPONSE", 502)
+    result = []
+    seen = set()
+    for row in rows:
+        if not isinstance(row, dict):
+            raise RouterRpcError("DDNS 包含无效记录", "DDNS_INVALID_RESPONSE", 502)
+        record_id = str(row.get("serviceId") or row.get("service_id") or row.get("service") or row.get("id") or "").strip()
+        if not record_id or record_id in seen:
+            raise RouterRpcError("DDNS 记录 ID 缺失或重复", "DDNS_INVALID_RESPONSE", 502)
+        seen.add(record_id)
+        result.append(dict(row))
+    return "ddnsCfg", result, {}
+
+
+def _ddns_target(rows: List[Dict[str, Any]], service_id: str, protocol: str) -> Dict[str, Any]:
+    if not service_id:
+        raise RouterRpcError("DDNS 记录 ID 不能为空", "DDNS_RECORD_ID_REQUIRED", 400)
+    fields = ("id",) if protocol == "ddns_view" else ("serviceId", "service_id", "service", "id")
+    matches = [row for row in rows if any(str(row.get(field) or "").strip() == service_id for field in fields)]
+    if len(matches) != 1:
+        code = "DDNS_RECORD_NOT_FOUND" if not matches else "DDNS_RECORD_ID_NOT_UNIQUE"
+        message = "未找到要操作的 DDNS 记录" if not matches else "DDNS 记录 ID 不唯一，已停止操作"
+        raise RouterRpcError(message, code, 404 if not matches else 409)
+    return matches[0]
+
+
+def _merge_ddns_view_entry(record: Dict[str, Any], password: str, old: Optional[Dict[str, Any]] = None) -> Dict[str, Any]:
+    base = dict(old or {})
+    entry = dict(base)
+    entry["provider"] = str(record.get("provider") or record.get("service_name") or base.get("provider") or "aliyun.com").strip()
+    entry.pop("service_name", None)
+    entry["domain"] = str(record.get("domain") or record.get("host") or base.get("domain") or "").strip()
+    entry["username"] = str(record.get("username") or record.get("user") or base.get("username") or "").strip()
+    enabled = record.get("enabled", record.get("enable", base.get("enabled", True)))
+    entry["enabled"] = str(enabled).lower() in ("1", "true", "yes", "on")
+    entry["record_type"] = str(record.get("record_type") or record.get("recordType") or base.get("record_type") or "A").strip().upper()
+    for key in ("zone", "zone_id", "region", "interface", "txt_template", "txt_family"):
+        if key in record:
+            entry[key] = record[key]
+        elif key in base:
+            entry[key] = base[key]
+    try:
+        entry["external_port"] = int(record.get("external_port", base.get("external_port", 0)) or 0)
+    except (TypeError, ValueError):
+        entry["external_port"] = 0
+    if password:
+        entry["password"] = password
+    for key in ("enable", "serviceId", "service_id", "passwordConfigured", "nativeProtocol", "status", "ip", "id"):
+        entry.pop(key, None)
+    if old and old.get("id") is not None:
+        entry["id"] = old["id"]
+    return entry
+
+
+def _ensure_ddns_rpc_success(result: Any) -> None:
+    if not isinstance(result, dict):
+        return
+    code = str(result.get("rcode") or result.get("code") or "0")
+    if code not in {"0", "0000"}:
+        raise RouterRpcError(
+            str(result.get("rmsg") or result.get("message") or "路由器拒绝了 DDNS 写入"),
+            "DDNS_WRITE_REJECTED",
+            409,
+        )
+
+
 class RuijieRouterClient:
     def __init__(self, store: EncryptedRouterConfigStore, logger: Any):
         self.store = store
@@ -702,28 +820,22 @@ class RuijieRouterClient:
 
     def ddns(self, force: bool = False) -> Dict[str, Any]:
         def load() -> Dict[str, Any]:
-            # 新固件由 ufplugin ddns_view 暴露 entries，ddnsCfg 恒为空。
-            # 先探测新协议，失败再退回老协议，避免把「读不到」误报成「没有记录」。
-            view = self.rpc("devSta.get", "ddns_view")
-            protocol = "ddnsCfg"
-            rows: Any = None
-            if isinstance(view, dict) and isinstance(view.get("entries"), list):
-                protocol = "ddns_view"
-                rows = view["entries"]
-            else:
-                raw = self.rpc("devSta.get", "ddnsCfg")
-                if isinstance(raw, dict):
-                    rows = raw.get("list") or raw.get("data") or []
+            protocol, rows, settings = _read_ddns_snapshot(self)
             clean = []
-            for row in (rows or []):
-                if not isinstance(row, dict):
-                    continue
+            for row in rows:
                 item = {**row}
                 item["password"] = ""
                 item["passwordConfigured"] = bool(row.get("password") or row.get("credential_set"))
                 item["nativeProtocol"] = protocol
+                if protocol == "ddns_view":
+                    item["serviceId"] = str(row.get("id") or "")
+                else:
+                    item["serviceId"] = str(row.get("serviceId") or row.get("service_id") or row.get("service") or row.get("id") or "")
                 clean.append(item)
-            return {"list": clean, "services": clean, "nativeProtocol": protocol}
+            result = {"list": clean, "services": clean, "nativeProtocol": protocol}
+            if protocol == "ddns_view":
+                result["settings"] = settings
+            return result
         return self.cached("ddns", 15.0, load, force)
 
 
@@ -737,6 +849,77 @@ class RouterController:
             self.client.cache.clear(cache_prefix)
             current = read()
             return {"ok": True, "writeResult": write_result, "data": current, "verifiedAt": int(time.time())}
+
+    def mutate_ddns(
+        self,
+        action: str,
+        body: Dict[str, Any],
+        password: str,
+        service_id: str = "",
+    ) -> Dict[str, Any]:
+        with self.client.write_lock:
+            protocol, rows, settings = _read_ddns_snapshot(self.client)
+            if protocol == "ddns_view":
+                before_ids = {str(row["id"]) for row in rows}
+                target = None
+                if action in {"update", "delete"}:
+                    target = _ddns_target(rows, service_id, protocol)
+                if action == "add":
+                    rows.append(_merge_ddns_view_entry(body, password))
+                elif action == "update":
+                    merged = _merge_ddns_view_entry(body, password, target)
+                    target.clear()
+                    target.update(merged)
+                elif action == "delete":
+                    rows.remove(target)
+                else:
+                    raise RouterRpcError("不支持的 DDNS 操作", "DDNS_INVALID_ACTION", 400)
+                result = self.client.rpc("devSta.set", "ddns", {"entries": rows, "settings": settings})
+                _ensure_ddns_rpc_success(result)
+                self.client.cache.clear("ddns")
+                current = self.client.ddns(True)
+                current_ids = {str(row.get("serviceId") or "") for row in current["list"]}
+                verified = (
+                    len(current_ids) == len(before_ids) + 1 and before_ids.issubset(current_ids)
+                    if action == "add"
+                    else service_id in current_ids if action == "update" else service_id not in current_ids
+                )
+                if not verified:
+                    raise RouterRpcError("DDNS 写入回读验证失败", "DDNS_WRITE_VERIFY_FAILED", 502)
+                return current
+
+            if action == "add":
+                result = self.client.rpc("devSta.add", "ddnsCfg", {**body, "password": password})
+            elif action == "update":
+                target = _ddns_target(rows, service_id, protocol)
+                merged = {**target, **body}
+                merged["service"] = str(target.get("service") or target.get("serviceId") or target.get("service_id") or target.get("id") or service_id)
+                if not password:
+                    merged["password"] = target.get("password", "")
+                enabled = body.get("enabled", body.get("enable", target.get("enabled", target.get("enable", "1"))))
+                merged["enabled"] = "1" if str(enabled).lower() in ("1", "true", "yes") else "0"
+                for key in ("enable", "status", "ip", "passwordConfigured", "nativeProtocol", "serviceId", "service_id"):
+                    merged.pop(key, None)
+                result = self.client.rpc("devSta.update", "ddnsCfg", {"data": [merged]})
+            elif action == "delete":
+                target = _ddns_target(rows, service_id, protocol)
+                del_id = target.get("service") or target.get("id") or target.get("serviceId") or target.get("service_id") or service_id
+                result = self.client.rpc("devSta.del", "ddnsCfg", {"data": [del_id]})
+            else:
+                raise RouterRpcError("不支持的 DDNS 操作", "DDNS_INVALID_ACTION", 400)
+            _ensure_ddns_rpc_success(result)
+            self.client.cache.clear("ddns")
+            return self.client.ddns(True)
+
+    def mutate_ddns_response(
+        self,
+        action: str,
+        body: Dict[str, Any],
+        password: str,
+        service_id: str = "",
+    ) -> Dict[str, Any]:
+        current = self.mutate_ddns(action, body, password, service_id)
+        return {"ok": True, "writeResult": current, "data": current, "verifiedAt": int(time.time())}
 
 
 def _json_error(exc: Exception):
@@ -937,37 +1120,21 @@ def create_router_blueprint(check_app_token: Callable[[], bool], logger: Any, co
 
     @bp.post("/ddns")
     def ddns_add():
-        body = request.get_json(silent=True) or {}
-        return jsonify(controller.write_and_verify(
-            "ddns",
-            lambda: client.rpc("devSta.add", "ddnsCfg", body),
-            lambda: client.ddns(True),
-        ))
+        body = request.get_json(silent=True)
+        if not isinstance(body, dict):
+            raise RouterRpcError("DDNS 请求体必须是对象", "DDNS_INVALID_REQUEST", 400)
+        return jsonify(controller.mutate_ddns_response("add", body, str(body.get("password") or "")))
 
     @bp.put("/ddns/<service_id>")
     def ddns_update(service_id: str):
-        body = request.get_json(silent=True) or {}
-        current = client.rpc("devSta.get", "ddnsCfg")
-        rows = (current.get("list") or current.get("data") or []) if isinstance(current, dict) else []
-        old = next((row for row in rows if isinstance(row, dict) and str(row.get("service")) == service_id), {})
-        merged = {**old, **body, "service": service_id}
-        merged.pop("status", None)
-        merged.pop("ip", None)
-        if not body.get("password"):
-            merged["password"] = old.get("password", "")
-        return jsonify(controller.write_and_verify(
-            "ddns",
-            lambda: client.rpc("devSta.update", "ddnsCfg", {"data": [merged]}),
-            lambda: client.ddns(True),
-        ))
+        body = request.get_json(silent=True)
+        if not isinstance(body, dict):
+            raise RouterRpcError("DDNS 请求体必须是对象", "DDNS_INVALID_REQUEST", 400)
+        return jsonify(controller.mutate_ddns_response("update", body, str(body.get("password") or ""), service_id))
 
     @bp.delete("/ddns/<service_id>")
     def ddns_delete(service_id: str):
-        return jsonify(controller.write_and_verify(
-            "ddns",
-            lambda: client.rpc("devSta.del", "ddnsCfg", {"data": [service_id]}),
-            lambda: client.ddns(True),
-        ))
+        return jsonify(controller.mutate_ddns_response("delete", {}, "", service_id))
 
     @bp.get("/diagnostic")
     def diagnostic_get():

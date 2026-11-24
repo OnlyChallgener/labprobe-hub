@@ -377,13 +377,14 @@ def test_reyee_driver_ddns_get_update_delete():
     from router_core.driver.reyee import ReyeeEWebDriver
 
     mock_rpc = MagicMock(spec=ReyeeRpcClient)
-    # Simulate router returning 2 DDNS records for aliyun.com
-    mock_rpc.rpc.return_value = {
-        "list": [
-            {"service": "random-service-a", "service_name": "aliyun.com", "domain": "rj.lab86@shinya.icu", "username": "user1", "enabled": "1", "password": "pwd"},
-            {"service": "random-service-b", "service_name": "aliyun.com", "domain": "op.lab86@shinya.icu", "username": "user2", "enabled": "1", "password": "pwd"},
-        ]
-    }
+    legacy_rows = [
+        {"service": "random-service-a", "service_name": "aliyun.com", "domain": "rj.lab86@shinya.icu", "username": "user1", "enabled": "1", "password": "pwd"},
+        {"service": "random-service-b", "service_name": "aliyun.com", "domain": "op.lab86@shinya.icu", "username": "user2", "enabled": "1", "password": "pwd"},
+    ]
+    mock_rpc.rpc.side_effect = lambda method, module="", data=None, **kwargs: (
+        {"rcode": "03510001", "rmsg": "module unavailable"}
+        if module == "ddns_view" else {"list": [dict(row) for row in legacy_rows]}
+    )
 
     driver = ReyeeEWebDriver(rpc_client=mock_rpc)
     ddns_res = driver.get_ddns(force=True)
@@ -399,7 +400,11 @@ def test_reyee_driver_ddns_get_update_delete():
 
     # App's `enable` contract field must be translated to BE72's `enabled`.
     mock_rpc.rpc.reset_mock()
-    mock_rpc.rpc.side_effect = [{"code": 0}, {"list": []}]
+    mock_rpc.rpc.side_effect = [
+        {"rcode": "03510001", "rmsg": "module unavailable"},
+        {"code": 0},
+        {"list": []},
+    ]
     driver.add_ddns(
         {
             "service_name": "aliyun.com",
@@ -420,7 +425,9 @@ def test_reyee_driver_ddns_get_update_delete():
     # Test update_ddns
     mock_rpc.rpc.reset_mock()
     mock_rpc.rpc.side_effect = [
-        # 1. raw rows inside update_ddns
+        # 1. fresh protocol probe
+        {"rcode": "03510001", "rmsg": "module unavailable"},
+        # 2. raw rows inside update_ddns
         {"list": [
             {"service": "random-service-a", "service_name": "aliyun.com", "domain": "rj.lab86@shinya.icu", "username": "user1", "enabled": "1"},
             {"service": "random-service-b", "service_name": "aliyun.com", "domain": "op.lab86@shinya.icu", "username": "user2", "enabled": "1"},

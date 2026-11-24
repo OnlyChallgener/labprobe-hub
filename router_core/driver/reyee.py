@@ -12,7 +12,7 @@ from typing import Any, Callable, Dict, List, Optional
 from .base import RouterDriver
 from router_core.driver.reyee_rpc import ReyeeRpcClient
 from router_core.driver.reyee_session import ReyeeSessionManager
-from router_core.errors import from_legacy_error
+from router_core.errors import RouterRpcExecutionError, RouterValidationError, from_legacy_error
 from router_capabilities import firmware_features
 
 
@@ -516,27 +516,56 @@ class ReyeeEWebDriver(RouterDriver):
     _DDNS_PROTOCOL_VIEW = "ddns_view"
     _DDNS_PROTOCOL_CFG = "ddnsCfg"
 
-    def _ddns_protocol(self) -> str:
-        cached = getattr(self, "_ddns_protocol_value", self._DDNS_PROTOCOL_UNKNOWN)
-        if cached:
-            return cached
-        try:
-            raw = self._unwrap_json(self.rpc("devSta.get", "ddns_view"))
-            if isinstance(raw, dict) and isinstance(raw.get("entries"), list):
-                self._ddns_protocol_value = self._DDNS_PROTOCOL_VIEW
-                self._ddns_view_settings = raw.get("settings") if isinstance(raw.get("settings"), dict) else {}
-                return self._DDNS_PROTOCOL_VIEW
-        except Exception:
-            pass
-        self._ddns_protocol_value = self._DDNS_PROTOCOL_CFG
-        return self._DDNS_PROTOCOL_CFG
+    @staticmethod
+    def _ddns_view_unavailable(raw: Any) -> bool:
+        if not isinstance(raw, dict) or isinstance(raw.get("entries"), list):
+            return False
+        code = str(raw.get("rcode") or raw.get("code") or "").strip()
+        message = str(raw.get("rmsg") or raw.get("message") or "").lower()
+        return code == "03510001" or (
+            bool(code) and code not in {"0", "0000"} and ("unavailable" in message or "not support" in message)
+        )
 
-    def _get_raw_ddns_rows(self) -> List[Dict[str, Any]]:
-        protocol = self._ddns_protocol()
+    @staticmethod
+    def _validated_ddns_view(raw: Any) -> Tuple[List[Dict[str, Any]], Dict[str, Any]]:
+        if not isinstance(raw, dict) or not isinstance(raw.get("entries"), list):
+            raise RouterRpcExecutionError("DDNS entries 响应结构异常", "DDNS_INVALID_RESPONSE", 502)
+        rows: List[Dict[str, Any]] = []
+        seen = set()
+        for value in raw["entries"]:
+            if not isinstance(value, dict):
+                raise RouterRpcExecutionError("DDNS entries 包含无效记录", "DDNS_INVALID_RESPONSE", 502)
+            record_id = str(value.get("id") or "").strip()
+            if not record_id or record_id in seen:
+                raise RouterRpcExecutionError("DDNS 记录 ID 缺失或重复", "DDNS_INVALID_RESPONSE", 502)
+            seen.add(record_id)
+            rows.append(dict(value))
+        settings = raw.get("settings")
+        if not isinstance(settings, dict):
+            raise RouterRpcExecutionError("DDNS 全局设置响应结构异常", "DDNS_INVALID_RESPONSE", 502)
+        return rows, dict(settings)
+
+    def _ddns_protocol(self, force: bool = False) -> str:
+        cached = getattr(self, "_ddns_protocol_value", self._DDNS_PROTOCOL_UNKNOWN)
+        if cached and not force:
+            return cached
+        raw = self._unwrap_json(self.rpc("devSta.get", "ddns_view"))
+        if self._ddns_view_unavailable(raw):
+            self._ddns_protocol_value = self._DDNS_PROTOCOL_CFG
+            self._ddns_view_settings = {}
+            return self._DDNS_PROTOCOL_CFG
+        _, settings = self._validated_ddns_view(raw)
+        self._ddns_protocol_value = self._DDNS_PROTOCOL_VIEW
+        self._ddns_view_settings = settings
+        return self._DDNS_PROTOCOL_VIEW
+
+    def _get_raw_ddns_rows(self, protocol: Optional[str] = None) -> List[Dict[str, Any]]:
+        protocol = protocol or self._ddns_protocol()
         if protocol == self._DDNS_PROTOCOL_VIEW:
             raw = self._unwrap_json(self.rpc("devSta.get", "ddns_view"))
-            rows = raw.get("entries") if isinstance(raw, dict) else None
-            return [dict(row) for row in (rows or []) if isinstance(row, dict)]
+            rows, settings = self._validated_ddns_view(raw)
+            self._ddns_view_settings = settings
+            return rows
 
         raw_res = self.rpc("devSta.get", "ddnsCfg")
         raw = self._unwrap_json(raw_res)
@@ -544,16 +573,29 @@ class ReyeeEWebDriver(RouterDriver):
         if isinstance(raw, list):
             rows = raw
         elif isinstance(raw, dict):
-            rows = raw.get("list") or raw.get("services") or raw.get("records")
+            for key in ("list", "services", "records"):
+                if key in raw:
+                    rows = raw[key]
+                    break
             if rows is None:
                 nested = self._unwrap_json(raw.get("data"))
                 if isinstance(nested, list):
                     rows = nested
                 elif isinstance(nested, dict):
-                    rows = nested.get("list") or nested.get("services") or nested.get("records")
+                    for key in ("list", "services", "records"):
+                        if key in nested:
+                            rows = nested[key]
+                            break
             if rows is None and ("service" in raw or "domain" in raw or "service_name" in raw):
                 rows = [raw]
-        return [row for row in (rows or []) if isinstance(row, dict)]
+        if not isinstance(rows, list):
+            raise RouterRpcExecutionError("DDNS 记录响应结构异常", "DDNS_INVALID_RESPONSE", 502)
+        result = []
+        for row in rows:
+            if not isinstance(row, dict):
+                raise RouterRpcExecutionError("DDNS 包含无效记录", "DDNS_INVALID_RESPONSE", 502)
+            result.append(dict(row))
+        return result
 
     def get_ddns(self, force: bool = False) -> Dict[str, Any]:
         try:
@@ -568,7 +610,7 @@ class ReyeeEWebDriver(RouterDriver):
                         # 只有读取抛异常才由 _cached / 上层错误分支处理。
                         pass
                     clean_rows = []
-                    for index, row in enumerate(rows):
+                    for row in rows:
                         item = dict(row)
                         domain = str(item.get("domain") or item.get("host") or "").strip()
                         raw_service = str(item.get("service") or "").strip()
@@ -580,14 +622,13 @@ class ReyeeEWebDriver(RouterDriver):
                             or "aliyun.com"
                         ).strip()
                         service_id = str(
-                            item.get("serviceId")
-                            or item.get("service_id")
-                            or item.get("id")
-                            or raw_service
-                            or domain
-                            or service_name
-                            or f"ddns_{index}"
-                        )
+                            item.get("id")
+                            if protocol == self._DDNS_PROTOCOL_VIEW
+                            else item.get("serviceId") or item.get("service_id") or item.get("id") or raw_service
+                            or ""
+                        ).strip()
+                        if not service_id:
+                            raise RouterRpcExecutionError("DDNS 记录缺少唯一 ID", "DDNS_INVALID_RESPONSE", 502)
                         item["serviceId"] = service_id
                         item["service_name"] = service_name
                         item["provider"] = service_name
@@ -603,6 +644,9 @@ class ReyeeEWebDriver(RouterDriver):
                         )
                         item["password"] = ""
                         clean_rows.append(item)
+                    ids = [str(row["serviceId"]) for row in clean_rows]
+                    if len(ids) != len(set(ids)):
+                        raise RouterRpcExecutionError("DDNS 记录 ID 重复", "DDNS_INVALID_RESPONSE", 502)
                     result: Dict[str, Any] = {
                         "list": clean_rows,
                         "services": clean_rows,
@@ -648,17 +692,41 @@ class ReyeeEWebDriver(RouterDriver):
             entry["external_port"] = int(port or 0)
         except (TypeError, ValueError):
             entry["external_port"] = 0
-        # 密码只在真的提供了新值时覆盖；ddns_view 会把密钥存在独立配置里。
         if password:
             entry["password"] = password
-        else:
-            entry.pop("password", None)
-        # APP/HTTP 契约字段不能透传到固件 RPC。
+        # APP/HTTP 契约字段不能透传到固件 RPC；记录 ID 只允许来自原记录。
         for key in ("enable", "serviceId", "service_id", "passwordConfigured", "nativeProtocol", "status", "ip", "id"):
             entry.pop(key, None)
-        if not entry.get("id"):
-            entry["id"] = str(base.get("id") or "")
+        if old and old.get("id") is not None:
+            entry["id"] = old["id"]
         return entry
+
+    @staticmethod
+    def _ddns_target(rows: List[Dict[str, Any]], service_id: str, protocol: str) -> Dict[str, Any]:
+        if not service_id:
+            raise RouterValidationError("DDNS 记录 ID 不能为空", "DDNS_RECORD_ID_REQUIRED")
+        fields = ("id",) if protocol == ReyeeEWebDriver._DDNS_PROTOCOL_VIEW else ("serviceId", "service_id", "service", "id")
+        matches = [
+            row for row in rows
+            if any(str(row.get(field) or "").strip() == service_id for field in fields)
+        ]
+        if len(matches) != 1:
+            code = "DDNS_RECORD_NOT_FOUND" if not matches else "DDNS_RECORD_ID_NOT_UNIQUE"
+            message = "未找到要操作的 DDNS 记录" if not matches else "DDNS 记录 ID 不唯一，已停止操作"
+            raise RouterValidationError(message, code)
+        return matches[0]
+
+    @staticmethod
+    def _ensure_ddns_rpc_success(result: Any) -> None:
+        if not isinstance(result, dict):
+            return
+        code = str(result.get("rcode") or result.get("code") or "0")
+        if code not in {"0", "0000"}:
+            raise RouterRpcExecutionError(
+                str(result.get("rmsg") or result.get("message") or "路由器拒绝了 DDNS 写入"),
+                "DDNS_WRITE_REJECTED",
+                409,
+            )
 
     def _write_ddns_view(
         self,
@@ -667,43 +735,46 @@ class ReyeeEWebDriver(RouterDriver):
         password: str,
         service_id: str,
     ) -> Dict[str, Any]:
-        """ddns_view 固件用整份 entries 提交；增删改都走 devSta.set -m ddns。"""
-        raw = self._unwrap_json(self.rpc("devSta.get", "ddns"))
-        entries = raw.get("entries") if isinstance(raw, dict) else None
-        rows = [dict(row) for row in (entries or []) if isinstance(row, dict)]
+        with self.write_lock:
+            if self._ddns_protocol(force=True) != self._DDNS_PROTOCOL_VIEW:
+                raise RouterRpcExecutionError("DDNS 协议已变化，已停止写入", "DDNS_PROTOCOL_CHANGED", 409)
+            raw = self._unwrap_json(self.rpc("devSta.get", "ddns_view"))
+            rows, settings = self._validated_ddns_view(raw)
+            before_ids = {str(row["id"]) for row in rows}
+            target = None
+            if action in {"update", "delete"}:
+                target = self._ddns_target(rows, service_id, self._DDNS_PROTOCOL_VIEW)
+            if action == "add":
+                rows.append(self._ddns_view_entry(record, password))
+            elif action == "update":
+                merged = self._ddns_view_entry(record, password, old=target)
+                target.clear()
+                target.update(merged)
+            elif action == "delete":
+                rows.remove(target)
+            else:
+                raise NotImplementedError(f"unsupported ddns_view action: {action}")
 
-        def matches(row: Dict[str, Any]) -> bool:
-            values = (row.get("id"), row.get("domain"), row.get("provider"))
-            return any(value and str(value) == service_id for value in values) or (
-                bool(service_id) and str(row.get("domain") or "") == str(record.get("domain") or "")
+            result = self.rpc("devSta.set", "ddns", data={"entries": rows, "settings": settings})
+            self._ensure_ddns_rpc_success(result)
+            self._invalidate("ddns")
+            current = self.get_ddns(force=True)
+            current_ids = {str(row["serviceId"]) for row in current["list"]}
+            verified = (
+                len(current_ids) == len(before_ids) + 1 and before_ids.issubset(current_ids)
+                if action == "add"
+                else service_id in current_ids if action == "update" else service_id not in current_ids
             )
-
-        if action == "add":
-            rows.append(self._ddns_view_entry(record, password))
-        elif action == "update":
-            target = next((r for r in rows if matches(r)), None)
-            if target is None:
-                target = {}
-                rows.append(target)
-            merged = self._ddns_view_entry(record, password, old=target)
-            target.clear()
-            target.update(merged)
-        elif action == "delete":
-            rows = [row for row in rows if not matches(row)]
-        else:
-            raise NotImplementedError(f"unsupported ddns_view action: {action}")
-
-        def do_write() -> None:
-            self.rpc("devSta.set", "ddns", data={"entries": rows})
-
-        return self._write_and_read("ddns", do_write, lambda: self.get_ddns(force=True))
+            if not verified:
+                raise RouterRpcExecutionError("DDNS 写入回读验证失败", "DDNS_WRITE_VERIFY_FAILED", 502)
+            return current
 
     def add_ddns(self, record: Dict[str, Any], password: str) -> Dict[str, Any]:
         try:
             if self._legacy_client and hasattr(self._legacy_client, "add_ddns"):
                 return self._legacy_client.add_ddns(record, password)
             if self._rpc_client:
-                if self._ddns_protocol() == self._DDNS_PROTOCOL_VIEW:
+                if self._ddns_protocol(force=True) == self._DDNS_PROTOCOL_VIEW:
                     return self._write_ddns_view("add", record, password, service_id="")
                 payload = {**record, "password": password}
                 enabled_raw = payload.get("enable") if "enable" in payload else payload.get("enabled")
@@ -724,83 +795,67 @@ class ReyeeEWebDriver(RouterDriver):
             if self._legacy_client and hasattr(self._legacy_client, "update_ddns"):
                 return self._legacy_client.update_ddns(service_id, record, password)
             if self._rpc_client:
-                if self._ddns_protocol() == self._DDNS_PROTOCOL_VIEW:
-                    return self._write_ddns_view("update", record, password or "", service_id)
-                raw_rows = self._get_raw_ddns_rows()
-                target_domain = str(record.get("domain") or record.get("host") or "").strip()
+                with self.write_lock:
+                    protocol = self._ddns_protocol(force=True)
+                    if protocol == self._DDNS_PROTOCOL_VIEW:
+                        return self._write_ddns_view("update", record, password or "", service_id)
+                    raw_rows = self._get_raw_ddns_rows(protocol)
+                    old = self._ddns_target(raw_rows, service_id, protocol)
 
-                old = {}
-                if target_domain:
-                    old = next((r for r in raw_rows if str(r.get("domain") or r.get("host") or "").strip() == target_domain), {})
-                if not old:
-                    old = next(
-                        (
-                            r for r in raw_rows
-                            if str(r.get("service")) == service_id
-                            or str(r.get("serviceId")) == service_id
-                            or str(r.get("id")) == service_id
-                            or str(r.get("domain")) == service_id
-                            or str(r.get("service_name")) == service_id
-                        ),
-                        {},
+                    enable_raw = record.get("enable") if "enable" in record else record.get("enabled")
+                    if enable_raw is not None:
+                        enable_val = "1" if str(enable_raw).lower() in ("1", "true", "yes") else "0"
+                    else:
+                        old_enabled = old.get("enabled") if "enabled" in old else old.get("enable", "1")
+                        enable_val = "1" if str(old_enabled).lower() in ("1", "true", "yes") else "0"
+
+                    service_val = str(
+                        old.get("service")
+                        or old.get("serviceId")
+                        or old.get("id")
+                        or service_id
+                    ).strip()
+                    service_name_val = str(
+                        record.get("service_name")
+                        or record.get("provider")
+                        or old.get("service_name")
+                        or old.get("provider")
+                        or old.get("service")
+                        or "aliyun.com"
+                    ).strip()
+                    domain_val = str(record.get("domain") or record.get("host") or old.get("domain") or old.get("host") or "").strip()
+                    user_val = str(record.get("username") or record.get("user") or old.get("username") or old.get("user") or "").strip()
+                    pass_val = password if password else old.get("password", "")
+                    use_ipv6_raw = record.get("use_ipv6") if "use_ipv6" in record else record.get("useIpv6", old.get("use_ipv6", "1"))
+                    use_ipv6_val = "1" if str(use_ipv6_raw).lower() in ("1", "true", "yes") else "0"
+                    iface_val = str(record.get("interface") or record.get("iface") or old.get("interface") or "wan").strip()
+
+                    merged = {
+                        **old,
+                        **record,
+                        "service": service_val,
+                        "service_name": service_name_val,
+                        "domain": domain_val,
+                        "username": user_val,
+                        "password": pass_val,
+                        "enabled": enable_val,
+                        "use_ipv6": use_ipv6_val,
+                        "interface": iface_val,
+                    }
+                    merged.pop("enable", None)
+                    merged.pop("status", None)
+                    merged.pop("ip", None)
+                    merged.pop("passwordConfigured", None)
+                    merged.pop("serviceId", None)
+
+                    def do_update():
+                        self.rpc("devSta.update", "ddnsCfg", {"data": [merged]})
+
+                    return self._write_and_read(
+                        "ddns",
+                        do_update,
+                        lambda: self.get_ddns(force=True),
                     )
-                
-                enable_raw = record.get("enable") if "enable" in record else record.get("enabled")
-                if enable_raw is not None:
-                    enable_val = "1" if str(enable_raw).lower() in ("1", "true", "yes") else "0"
-                else:
-                    old_enabled = old.get("enabled") if "enabled" in old else old.get("enable", "1")
-                    enable_val = "1" if str(old_enabled).lower() in ("1", "true", "yes") else "0"
-
-                service_val = str(
-                    old.get("service")
-                    or old.get("serviceId")
-                    or old.get("id")
-                    or service_id
-                ).strip()
-                service_name_val = str(
-                    record.get("service_name")
-                    or record.get("provider")
-                    or old.get("service_name")
-                    or old.get("provider")
-                    or old.get("service")
-                    or "aliyun.com"
-                ).strip()
-                domain_val = str(record.get("domain") or record.get("host") or old.get("domain") or old.get("host") or "").strip()
-                user_val = str(record.get("username") or record.get("user") or old.get("username") or old.get("user") or "").strip()
-                pass_val = password if password else old.get("password", "")
-                use_ipv6_raw = record.get("use_ipv6") if "use_ipv6" in record else record.get("useIpv6", old.get("use_ipv6", "1"))
-                use_ipv6_val = "1" if str(use_ipv6_raw).lower() in ("1", "true", "yes") else "0"
-                iface_val = str(record.get("interface") or record.get("iface") or old.get("interface") or "wan").strip()
-
-                merged = {
-                    **old,
-                    **record,
-                    "service": service_val,
-                    "service_name": service_name_val,
-                    "domain": domain_val,
-                    "username": user_val,
-                    "password": pass_val,
-                    "enabled": enable_val,
-                    "use_ipv6": use_ipv6_val,
-                    "interface": iface_val,
-                }
-                # BE72 ddnsCfg wire schema uses `enabled`; App's `enable` is
-                # an HTTP-contract field and must not leak into the router RPC.
-                merged.pop("enable", None)
-                merged.pop("status", None)
-                merged.pop("ip", None)
-                merged.pop("passwordConfigured", None)
-                merged.pop("serviceId", None)
-
-                def do_update():
-                    self.rpc("devSta.update", "ddnsCfg", {"data": [merged]})
-
-                return self._write_and_read(
-                    "ddns",
-                    do_update,
-                    lambda: self.get_ddns(force=True),
-                )
             raise NotImplementedError("update_ddns not available")
         except Exception as exc:
             raise from_legacy_error(exc) from exc
@@ -810,29 +865,22 @@ class ReyeeEWebDriver(RouterDriver):
             if self._legacy_client and hasattr(self._legacy_client, "delete_ddns"):
                 return self._legacy_client.delete_ddns(service_id)
             if self._rpc_client:
-                if self._ddns_protocol() == self._DDNS_PROTOCOL_VIEW:
-                    return self._write_ddns_view("delete", {}, "", service_id)
-                raw_rows = self._get_raw_ddns_rows()
-                target = next(
-                    (
-                        r for r in raw_rows
-                        if str(r.get("domain") or "").strip() == service_id
-                        or str(r.get("service")) == service_id
-                        or str(r.get("serviceId")) == service_id
-                        or str(r.get("id")) == service_id
-                    ),
-                    {},
-                )
-                del_id = target.get("service") or target.get("id") or target.get("domain") or service_id
+                with self.write_lock:
+                    protocol = self._ddns_protocol(force=True)
+                    if protocol == self._DDNS_PROTOCOL_VIEW:
+                        return self._write_ddns_view("delete", {}, "", service_id)
+                    raw_rows = self._get_raw_ddns_rows(protocol)
+                    target = self._ddns_target(raw_rows, service_id, protocol)
+                    del_id = target.get("service") or target.get("id") or service_id
 
-                def do_delete():
-                    self.rpc("devSta.del", "ddnsCfg", {"data": [del_id]})
+                    def do_delete():
+                        self.rpc("devSta.del", "ddnsCfg", {"data": [del_id]})
 
-                return self._write_and_read(
-                    "ddns",
-                    do_delete,
-                    lambda: self.get_ddns(force=True),
-                )
+                    return self._write_and_read(
+                        "ddns",
+                        do_delete,
+                        lambda: self.get_ddns(force=True),
+                    )
             raise NotImplementedError("delete_ddns not available")
         except Exception as exc:
             raise from_legacy_error(exc) from exc
