@@ -1,5 +1,11 @@
 # LabProbe 变更记录
 
+## 0.14.4 / LabRelay 0.2.79
+
+- 修复多路由 nginx `auth_request` 将 `$is_args$args` 当字面路径的问题；原始查询参数改由内部专用请求头传递，恢复 APP_TOKEN 与 Webhook 查询令牌鉴权。
+- 增加注册器请求头查询参数回归测试，覆盖 `/_gateauth` 与 `/_routeauth` 的设备令牌场景。
+- 0.14.3 的 Docker 镜像和 GitHub Release 已标记撤回，请使用 0.14.4。
+
 ## 0.14.3 / LabRelay 0.2.79
 
 - 多路由 Webhook：网关查询令牌鉴权贯通 nginx 子请求，访问日志移除 query，避免 HOOK_TOKEN 进入日志。

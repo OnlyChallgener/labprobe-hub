@@ -298,6 +298,7 @@ def render_nginx_config(config: dict, pid_path: Path) -> str:
         '      proxy_set_header Content-Length "";',
         "      proxy_set_header Authorization $http_authorization;",
         "      proxy_set_header X-LabProbe-Token $http_x_labprobe_token;",
+        "      proxy_set_header X-LabProbe-Original-Args $args;",
         "    }",
         "    location = /_routeauth {",
         "      internal;",
@@ -306,6 +307,7 @@ def render_nginx_config(config: dict, pid_path: Path) -> str:
         '      proxy_set_header Content-Length "";',
         "      proxy_set_header Authorization $http_authorization;",
         "      proxy_set_header X-LabProbe-Token $http_x_labprobe_token;",
+        "      proxy_set_header X-LabProbe-Original-Args $args;",
         "    }",
         "    location @denied {",
         '      default_type application/json;',
@@ -321,7 +323,7 @@ def render_nginx_config(config: dict, pid_path: Path) -> str:
         lines.extend([
             f"    location = /r/{router_id} {{ return 308 /r/{router_id}/; }}",
             f"    location ^~ /r/{router_id}/ {{",
-            f"      auth_request /_gateauth/{router_id}$is_args$args;",
+            f"      auth_request /_gateauth/{router_id};",
             f"      auth_request_set ${slug}_kind $upstream_http_x_labprobe_auth_kind;",
             "      error_page 401 = @denied;",
             f"      proxy_pass http://127.0.0.1:{port}/;",
@@ -349,7 +351,7 @@ def render_nginx_config(config: dict, pid_path: Path) -> str:
     # registry and the internal gates keep working, and /health stays open.
     lines.extend([
         "    location ^~ /api/ {",
-        "      auth_request /_routeauth$is_args$args;",
+        "      auth_request /_routeauth;",
         # $upstream_http_* from an auth subrequest is only readable once copied out with
         # auth_request_set; reading it straight from the map evaluated to "" and nginx
         # answered 500 "invalid URL prefix" for every relay push at the root path.
@@ -509,7 +511,8 @@ def make_registry_handler(config: dict, controller: DefaultRouterController | No
             if not candidate:
                 candidate = self.headers.get("X-LabProbe-Token", "").strip()
             if not candidate and allow_hook_query:
-                query = parse_qs(urlsplit(self.path).query, keep_blank_values=True, max_num_fields=32)
+                original_args = self.headers.get("X-LabProbe-Original-Args", "").strip()
+                query = parse_qs(original_args or urlsplit(self.path).query, keep_blank_values=True, max_num_fields=32)
                 for key in ("token", "hook_token", "hookToken", "key"):
                     candidate = (query.get(key) or [""])[0].strip()
                     if candidate:

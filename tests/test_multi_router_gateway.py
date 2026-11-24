@@ -303,11 +303,12 @@ def test_front_door_gates_each_channel_and_rewrites_only_management_credentials(
     assert 'proxy_set_header Content-Length "";' in rendered
     assert "proxy_set_header Authorization $http_authorization;" in rendered
     assert "proxy_set_header X-LabProbe-Token $http_x_labprobe_token;" in rendered
+    assert "proxy_set_header X-LabProbe-Original-Args $args;" in rendered
     assert "location @denied {" in rendered
     for router_id, token in (("home", SECRETS["HOME_APP"]), ("office", SECRETS["OFFICE_APP"])):
         slug = "labprobe_" + router_id
         block = _router_block(rendered, router_id)
-        assert f"auth_request /_gateauth/{router_id}$is_args$args;" in block
+        assert f"auth_request /_gateauth/{router_id};" in block
         assert f"auth_request_set ${slug}_kind $upstream_http_x_labprobe_auth_kind;" in block
         assert "error_page 401 = @denied;" in block
         # Both header names are rewritten because the realtime WebSocket presents both.
@@ -363,10 +364,18 @@ def test_gate_accepts_only_matching_hook_token_from_webhook_query(tmp_path):
     try:
         with urlopen(f"{base}/_gateauth/home?token={SECRETS['HOME_HOOK']}", timeout=2) as response:
             assert response.headers["X-LabProbe-Auth-Kind"] == "device"
+        with urlopen(Request(f"{base}/_gateauth/home", headers={
+            "X-LabProbe-Original-Args": f"token={SECRETS['HOME_HOOK']}",
+        }), timeout=2) as response:
+            assert response.headers["X-LabProbe-Auth-Kind"] == "device"
         with pytest.raises(HTTPError) as denied:
             urlopen(f"{base}/_gateauth/office?token={SECRETS['HOME_HOOK']}", timeout=2)
         assert denied.value.code == 401
         with urlopen(f"{base}/_routeauth?hook_token={SECRETS['OFFICE_HOOK']}", timeout=2) as response:
+            assert response.headers["X-LabProbe-Route"] == "office"
+        with urlopen(Request(f"{base}/_routeauth", headers={
+            "X-LabProbe-Original-Args": f"hook_token={SECRETS['OFFICE_HOOK']}",
+        }), timeout=2) as response:
             assert response.headers["X-LabProbe-Route"] == "office"
         with pytest.raises(HTTPError) as app_query:
             urlopen(f"{base}/_routeauth?token={SECRETS['HOME_APP']}", timeout=2)
@@ -475,7 +484,7 @@ def test_root_api_call_is_refused_instead_of_pinning_to_the_default_worker(tmp_p
     assert marker in rendered
     block = rendered.split(marker, 1)[1].split("\n    }", 1)[0]
     # The refusal now lives in the named location the credential gate falls through to.
-    assert "auth_request /_routeauth$is_args$args;" in block
+    assert "auth_request /_routeauth;" in block
     assert "error_page 401 = @root_refused;" in block
     refused = rendered.split("location @root_refused {", 1)[1].split("\n    }", 1)[0]
     assert "multi_router_path_required" in refused
@@ -530,6 +539,7 @@ def test_route_auth_names_the_hook_owner_and_never_an_owner_key(tmp_path):
     try:
         assert outcome("POST", {"Authorization": f"Bearer {SECRETS['HOME_HOOK']}"}) == (200, "home")
         assert outcome("GET", {"X-LabProbe-Token": SECRETS["OFFICE_HOOK"]}) == (200, "office")
+        assert outcome("GET", {"X-LabProbe-Original-Args": f"hook_token={SECRETS['OFFICE_HOOK']}"}) == (200, "office")
         assert outcome("DELETE", {"Authorization": f"Bearer {SECRETS['HOME_HOOK']}"}) == (200, "home")
         # An owner key at the root still cannot say which router the caller meant.
         assert outcome("POST", {"Authorization": f"Bearer {SECRETS['HOME_APP']}"}) == (401, "")
