@@ -1,0 +1,6 @@
+#!/bin/sh
+[ -z "${IPKG_INSTROOT:-}" ] || exit 0
+/etc/init.d/mihomo-web stop || true
+[ "${1:-}" != remove ] || /etc/init.d/mihomo-web disable
+# User configuration and per-device secret are retained on upgrade/removal.
+exit 0

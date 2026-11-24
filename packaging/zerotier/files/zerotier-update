@@ -1,0 +1,173 @@
+#!/bin/sh
+# Signed, feed-independent updater; installation runs from a private temporary script.
+set -eu
+umask 077
+die() { echo "ZeroTier: $*" >&2; exit 1; }
+say() { echo "ZeroTier: $*"; }
+check=0
+bootstrap=0
+case "${1:-}" in --check) check=1; shift;; --bootstrap) bootstrap=1; shift;; esac
+[ "$#" -le 1 ] || die 'Usage: zerotier-update [--check] [release-directory | https://release-base]'
+for tool in opkg usign sha256sum curl tar awk wc mktemp uci; do
+    command -v "$tool" >/dev/null 2>&1 || die "Required tool is missing: $tool"
+done
+arch=$(opkg print-architecture | awk '$2 ~ /^(aarch64_cortex-a53|arm_cortex-a7)$/ {print $2}')
+case "$arch" in aarch64_cortex-a53|arm_cortex-a7) :;; *) die 'Unsupported or ambiguous router architecture';; esac
+installed=$(opkg status zerotier-one-static 2>/dev/null | awk '/^Version: / {v=$2} /^Status: .* installed$/ {ok=1} END {if(ok) print v}')
+base=${1:-}
+if [ -z "$base" ]; then base=$(uci -q get zerotier_static.main.update_url 2>/dev/null || true); fi
+[ -n "$base" ] || die 'Configure an HTTPS update_url once, or give the extracted release directory.'
+key=/etc/zerotier-static/update.pub
+if [ "$bootstrap" = 1 ]; then
+    [ -z "$installed" ] || die 'Already installed; use zerotier-update without --bootstrap.'
+    case "$base" in /*) :;; *) die 'Initial installation requires a local, trusted release directory.';; esac
+    key=$base/update.pub
+fi
+[ -s "$key" ] || die 'Trusted update public key is missing.'
+work=$(mktemp -d /tmp/zerotier-update.XXXXXX)
+cleanup() { rm -rf "$work"; }
+trap cleanup EXIT
+trap 'exit 130' INT TERM HUP
+
+fetch() {
+    case "$base" in
+        https://*) curl --fail --silent --show-error --location --max-redirs 3 \
+            --proto '=https' --proto-redir '=https' --connect-timeout 8 --max-time 180 \
+            --max-filesize 10485760 -o "$work/$1" "${base%/}/$arch/$1";;
+        /*) [ -f "$base/$arch/$1" ] || die "Missing release file: $arch/$1"
+            cp "$base/$arch/$1" "$work/$1";;
+        *) die 'Use an absolute local directory or an HTTPS release base.';;
+    esac
+}
+fetch manifest
+fetch manifest.sig
+[ "$(wc -c < "$work/manifest")" -le 4096 ] || die 'Manifest is too large.'
+usign -V -p "$key" -m "$work/manifest" -x "$work/manifest.sig" || die 'Signature verification failed.'
+# Never source or evaluate manifest contents.
+awk -F= 'NF!=2 || seen[$1]++ || $1 !~ /^(format|package|version|upstream|architecture|file|sha256|bytes)$/ {exit 1} END {if (NR!=8) exit 1}' "$work/manifest" || die 'Invalid manifest.'
+field() { awk -F= -v k="$1" '$1==k {print $2}' "$work/manifest"; }
+[ "$(field format)" = 1 ] && [ "$(field package)" = zerotier-one-static ] || die 'Wrong package format.'
+[ "$(field architecture)" = "$arch" ] || die 'Release architecture does not match this router.'
+version=$(field version)
+upstream=$(field upstream)
+case "$version:$upstream" in *[!0-9.:-]*|:*) die 'Invalid release version';; esac
+file=$(field file)
+[ "$file" = "zerotier-one-static_${version}_${arch}.ipk" ] || die 'Invalid package filename.'
+hash=$(field sha256)
+[ "${#hash}" = 64 ] || die 'Invalid SHA256.'
+case "$hash" in *[!0-9a-f]*) die 'Invalid SHA256';; esac
+bytes=$(field bytes)
+case "$bytes" in ''|*[!0-9]*) die 'Invalid package size';; esac
+[ "$bytes" -gt 0 ] && [ "$bytes" -le 10485760 ] || die 'Package exceeds size limit.'
+fetch "$file"
+[ "$(wc -c < "$work/$file")" -eq "$bytes" ] || die 'Package size mismatch.'
+echo "$hash  $work/$file" | sha256sum -c - >/dev/null || die 'Package checksum mismatch.'
+say "Verified $version for $arch; installed: ${installed:-none}"
+[ "$check" = 0 ] || exit 0
+[ "$(id -u)" = 0 ] || die 'Run the installation as root.'
+free=$(df -Pk /etc | awk 'END {print $4}')
+[ "$free" -ge 16384 ] || die 'At least 16 MB of free overlay space is required for a recoverable update.'
+if [ -n "$installed" ]; then
+    if opkg compare-versions "$version" = "$installed"; then say 'Already up to date.'; exit 0; fi
+    opkg compare-versions "$version" '>' "$installed" || die 'Downgrades are refused.'
+fi
+mkdir /var/lock/zerotier-static-update.lock 2>/dev/null || die 'Another update is in progress.'
+unlock() { rmdir /var/lock/zerotier-static-update.lock 2>/dev/null || true; cleanup; }
+trap unlock EXIT
+cp "$key" "$work/update.pub"
+cat > "$work/apply.sh" <<'APPLY'
+#!/bin/sh
+set -eu
+umask 077
+work=$1
+file=$2
+installed=$3
+upstream=$4
+backup=/etc/zerotier-static/rollback
+mkdir -p /etc/zerotier-static/cache
+chmod 700 /etc/zerotier-static/cache
+if [ -n "$installed" ]; then
+    [ -f /etc/zerotier-static/cache/current.ipk ] || {
+        echo 'Previous IPK cache missing. Keep the current IPK and use install.sh for the initial installation.' >&2
+        exit 1
+    }
+    tar -tzf /etc/zerotier-static/cache/current.ipk >/dev/null || { echo 'Previous IPK cache is damaged.' >&2; exit 1; }
+    mkdir -p "$backup"
+    chmod 700 "$backup"
+    cp /etc/zerotier-static/cache/current.ipk "$work/previous.ipk"
+    tar -czf "$work/state.tar.gz" -C / etc/zerotier-one etc/config/zerotier_static
+    if [ -f /etc/zerotier-one/identity.secret ]; then
+        sha256sum /etc/zerotier-one/identity.secret > "$work/identity.sha256"
+    fi
+    cp "$work/previous.ipk" "$backup/previous.ipk"
+    cp "$work/state.tar.gz" "$backup/state.tar.gz"
+fi
+cat > "$work/rollback.sh" <<'ROLLBACK'
+#!/bin/sh
+set -eu
+work=$1
+if [ -f "$work/previous.ipk" ]; then
+    /etc/init.d/zerotier-static stop || true
+    opkg --force-downgrade --force-reinstall install "$work/previous.ipk"
+    /etc/init.d/zerotier-static stop || true
+    tar -xzf "$work/state.tar.gz" -C /
+    cp "$work/previous.ipk" /etc/zerotier-static/cache/current.ipk
+    /etc/init.d/zerotier-static restart
+    echo 'Previous ZeroTier package and configuration restored.'
+else
+    # First installation has no previous version to restore. Preserve any generated identity.
+    /etc/init.d/zerotier-static stop 2>/dev/null || true
+    /etc/init.d/zerotier-static disable 2>/dev/null || true
+    echo 'Initial installation did not pass its local health check; service stopped.' >&2
+fi
+ROLLBACK
+chmod 700 "$work/rollback.sh"
+# A detached watchdog handles a dropped terminal or interrupted parent during an update.
+(trap '' HUP; exec sh -c 'sleep 90; if [ ! -f "$1/committed" ] && [ ! -f "$1/rolled-back" ]; then
+    # Do not race an active installer or claim a failed rollback succeeded.
+    if kill -0 "$2" 2>/dev/null; then echo "Installer is still active; recovery deferred." > "$1/rollback.log"; exit 1; fi
+    if sh "$1/rollback.sh" "$1" > "$1/rollback.log" 2>&1; then
+        touch "$1/rolled-back"
+        rmdir /var/lock/zerotier-static-update.lock 2>/dev/null || true
+    fi
+fi' sh "$work" "$$") >/dev/null 2>&1 </dev/null &
+watchdog=$!
+failed() {
+    trap - EXIT INT TERM HUP
+    kill "$watchdog" 2>/dev/null || true
+    sh "$work/rollback.sh" "$work" || { echo "Rollback failed: keep $work for recovery." >&2; exit 2; }
+    touch "$work/rolled-back"
+    exit 1
+}
+trap failed EXIT INT TERM HUP
+opkg install "$work/$file" || failed
+healthy=0
+enabled=$(uci -q get zerotier_static.main.enabled 2>/dev/null || echo 1)
+i=0
+while [ "$i" -lt 20 ]; do
+    actual=$(/usr/bin/zerotier-one -v 2>/dev/null || true)
+    if [ "$actual" = "$upstream" ]; then
+        if [ "$enabled" = 0 ] || /usr/bin/zerotier-cli info >/dev/null 2>&1; then healthy=1; break; fi
+    fi
+    i=$((i+1))
+    sleep 1
+done
+[ "$healthy" = 1 ] || failed
+if [ -f "$work/identity.sha256" ]; then sha256sum -c "$work/identity.sha256" >/dev/null || failed; fi
+cp "$work/$file" /etc/zerotier-static/cache/current.ipk.new
+mv /etc/zerotier-static/cache/current.ipk.new /etc/zerotier-static/cache/current.ipk
+touch "$work/committed"
+kill "$watchdog" 2>/dev/null || true
+trap - EXIT INT TERM HUP
+echo 'ZeroTier installed; configured service state and node identity are preserved.'
+APPLY
+chmod 700 "$work/apply.sh"
+# Preserve the work directory while detached recovery may still need it.
+trap 'rmdir /var/lock/zerotier-static-update.lock 2>/dev/null || true' EXIT
+trap - INT TERM HUP
+if sh "$work/apply.sh" "$work" "$file" "$installed" "$upstream"; then
+    cleanup
+else
+    say "Update failed. Recovery files are in $work (private; may contain node identity)."
+    exit 1
+fi

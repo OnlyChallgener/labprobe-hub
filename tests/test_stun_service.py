@@ -171,6 +171,28 @@ def test_unowned_matching_router_self_firewall_reports_mapping_without_adopting_
     assert mismatched["firewallState"] == "manual_change"
 
 
+def test_restart_reuses_exact_unowned_stun_permission_without_deleting_it_on_stop(tmp_path):
+    hub = _hub(tmp_path)
+    router = _Client()
+    service = StunService(hub, router)
+    rule = service.clean_rule({"serviceType": "SSH", "targetType": "router_self", "targetPort": 54133, "enabled": False})
+    service._save_rules([rule])
+    router.rules.append({**service._expected_firewall(rule), "uuid": "unowned-existing"})
+    hub.app.register_blueprint(create_stun_blueprint(hub, service))
+    app = hub.app.test_client()
+    before = copy.deepcopy(router.rules)
+    assert app.post(f"/api/stun/{rule['id']}/start", json={}).status_code == 200
+    binding = service._firewall_bindings()[rule["id"]]
+    assert binding["owner"] == "untracked"
+    assert not binding.get("uuid") and not binding.get("fingerprint")
+    assert app.post(f"/api/stun/{rule['id']}/stop", json={}).status_code == 200
+    assert router.rules == before
+    assert router.rpc_calls == []
+    router.rules[0]["destPort"] = "9999"
+    assert app.post(f"/api/stun/{rule['id']}/start", json={}).status_code == 409
+    assert router.rpc_calls == []
+
+
 def test_legacy_tcp_rule_is_migrated_to_a_tcp_stun_server_and_queued(tmp_path):
     hub = _hub(tmp_path)
     legacy = {
@@ -191,7 +213,7 @@ def test_legacy_tcp_rule_is_migrated_to_a_tcp_stun_server_and_queued(tmp_path):
     assert service._commands()[0]["action"] == "upsert"
     assert service._commands()[0]["payload"]["rule"]["stunServer"] == DEFAULT_STUN_TCP_SERVER
 
-def test_stunserver2025_tcp_rule_is_migrated_to_nextcloud_and_queued(tmp_path):
+def test_old_tcp_server_migrates_to_verified_persistent_tcp_endpoint(tmp_path):
     hub = _hub(tmp_path)
     legacy = {
         "id": "stun-tcp-2025",
@@ -207,9 +229,22 @@ def test_stunserver2025_tcp_rule_is_migrated_to_nextcloud_and_queued(tmp_path):
 
     service = StunService(hub, _Client())
 
-    assert service._document()["rules"][0]["stunServer"] == "stun.nextcloud.com:3478"
+    assert service._document()["rules"][0]["stunServer"] == DEFAULT_STUN_TCP_SERVER
     assert service._commands()[0]["action"] == "upsert"
-    assert service._commands()[0]["payload"]["rule"]["stunServer"] == "stun.nextcloud.com:3478"
+    assert service._commands()[0]["payload"]["rule"]["stunServer"] == DEFAULT_STUN_TCP_SERVER
+
+
+def test_tcp_server_migration_does_not_restart_unchanged_wireguard_udp(tmp_path):
+    hub = _hub(tmp_path)
+    client = _Client()
+    original = StunService(hub, client)
+    tcp = original.clean_rule({"id": "tcp-source", "serviceType": "HTTP", "targetIpv4": "192.168.5.46", "targetPort": 80})
+    tcp["stunServer"] = "turn.cloudflare.com:3478"
+    udp = original.clean_rule({"id": "wg-source", "serviceType": "WireGuard", "targetIpv4": "192.168.5.1", "targetPort": 51820})
+    original._save_rules([tcp, udp])
+    migrated = StunService(hub, client)
+    assert next(r for r in migrated._document()["rules"] if r["id"] == udp["id"]) == udp
+    assert [r["payload"]["rule"]["id"] for r in migrated._commands()] == [tcp["id"]]
 
 
 def test_router_self_rule_keeps_local_proxy_across_service_restart(tmp_path):
@@ -702,6 +737,57 @@ def test_status_reconciliation_reuses_same_command_id_for_same_revision(tmp_path
     assert len(second) == 1
     assert second[0]["id"] == first[0]["id"]
     assert second[0]["revision"] == service._document()["revision"]
+
+
+def test_status_native_cleanup_does_not_resurrect_obsolete_firewall_binding(tmp_path):
+    _, router, service, rule, app = _running_rule(tmp_path)
+    assert service.ensure_firewall(rule)["state"] == "ready"
+    assert rule["id"] in service._firewall_bindings()
+
+    response = app.post("/api/router/stun/status?router=router", json={"rules": []})
+
+    assert response.status_code == 200
+    assert router.rules == []
+    assert rule["id"] not in service._firewall_bindings()
+
+
+def test_firewall_conflict_keeps_original_receipt_without_adopting_replacement(tmp_path):
+    _, router, service, rule, _ = _running_rule(tmp_path)
+    assert service.ensure_firewall(rule)["state"] == "ready"
+    receipt = copy.deepcopy(service._firewall_bindings()[rule["id"]])
+    router.rules[0]["uuid"] = "replacement-uuid"
+    before = copy.deepcopy(router.rules)
+    calls = len(router.rpc_calls)
+
+    assert service.ensure_firewall(rule)["state"] == "manual_change"
+    saved = service._firewall_bindings()[rule["id"]]
+    assert saved["uuid"] == receipt["uuid"]
+    assert saved["fingerprint"] == receipt["fingerprint"]
+    assert router.rules == before
+    assert len(router.rpc_calls) == calls
+
+
+def test_router_self_pause_restart_recreates_owned_firewall(tmp_path):
+    hub = _hub(tmp_path)
+    router = _Client()
+    service = StunService(hub, router)
+    rule = service.clean_rule({
+        "serviceType": "SSH", "targetType": "router_self", "targetPort": 54133,
+    })
+    service._save_rules([rule])
+    service._save_commands([])
+    hub.app.register_blueprint(create_stun_blueprint(hub, service))
+    app = hub.app.test_client()
+    assert service.ensure_firewall(rule)["state"] == "ready"
+
+    paused = app.post(f"/api/stun/{rule['id']}/stop", json={})
+    assert paused.status_code == 200
+    assert not service._document()["rules"][0]["enabled"]
+    assert router.rules == []
+    restarted = app.post(f"/api/stun/{rule['id']}/start", json={})
+    assert restarted.status_code == 200
+    assert service._document()["rules"][0]["enabled"]
+    assert service._firewall_bindings()[rule["id"]]["uuid"] == router.rules[0]["uuid"]
 
 
 def test_rows_expose_agent_and_native_mapping_errors_and_stop_disabled_runtime(tmp_path):

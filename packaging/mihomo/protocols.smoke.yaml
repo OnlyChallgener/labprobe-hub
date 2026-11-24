@@ -1,0 +1,70 @@
+# Parser-only compatibility fixture; all credentials below are fake test data.
+# Copy to an isolated core home and run: mihomo -t -d /test/home -f /test/home/config.yaml
+# No active listeners, TUN, DNS service, controller or external connections.
+port: 0
+socks-port: 0
+mixed-port: 0
+allow-lan: false
+bind-address: 127.0.0.1
+mode: rule
+log-level: warning
+ipv6: false
+geo-auto-update: false
+tun:
+  enable: false
+dns:
+  enable: false
+proxies:
+  - name: parser-ss
+    type: ss
+    server: 127.0.0.1
+    port: 443
+    cipher: aes-128-gcm
+    password: parser-test-only
+  - name: parser-trojan
+    type: trojan
+    server: 127.0.0.1
+    port: 443
+    password: parser-test-only
+    sni: example.invalid
+  - name: parser-vmess
+    type: vmess
+    server: 127.0.0.1
+    port: 443
+    uuid: c5c87201-7fbc-4ea1-9d66-39e6a4d12d5f
+    alterId: 0
+    cipher: auto
+  - name: parser-vless
+    type: vless
+    server: 127.0.0.1
+    port: 443
+    uuid: c5c87201-7fbc-4ea1-9d66-39e6a4d12d5f
+    tls: true
+    servername: example.invalid
+  - name: parser-hysteria2
+    type: hysteria2
+    server: 127.0.0.1
+    port: 443
+    password: parser-test-only
+    sni: example.invalid
+  - name: parser-tuic
+    type: tuic
+    server: 127.0.0.1
+    port: 443
+    uuid: c5c87201-7fbc-4ea1-9d66-39e6a4d12d5f
+    password: parser-test-only
+    sni: example.invalid
+    congestion-controller: cubic
+proxy-groups:
+  - name: PARSER-ONLY
+    type: select
+    proxies:
+      - parser-ss
+      - parser-trojan
+      - parser-vmess
+      - parser-vless
+      - parser-hysteria2
+      - parser-tuic
+      - DIRECT
+rules:
+  - MATCH,DIRECT

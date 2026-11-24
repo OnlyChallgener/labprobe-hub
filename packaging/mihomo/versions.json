@@ -1,0 +1,16 @@
+{
+  "mihomoVersion": "1.19.33",
+  "dashboardVersion": "1.273.1",
+  "goVersion": "1.26.10",
+  "goArm64Sha256": "3f4227ce7b206a513e794f1393adb473a07b46e94d18bd15d1c684bbb7319797",
+  "source": {
+    "url": "https://codeload.github.com/MetaCubeX/mihomo/tar.gz/refs/tags/v1.19.33",
+    "sha256": "e7c596b37ff27ec487d19b1920f73e0c97a78067ea35766530ee9659ade72711",
+    "size": 1282993
+  },
+  "dashboard": {
+    "url": "https://github.com/MetaCubeX/metacubexd/releases/download/v1.273.1/compressed-dist.tgz",
+    "sha256": "a178e00b67acabcda2dcef00afa90be6a7bb261e466a67dad58c8478d9553603",
+    "size": 2539072
+  }
+}

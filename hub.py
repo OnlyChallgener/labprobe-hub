@@ -3845,12 +3845,62 @@ def api_child_guard_usage_report(uid: str):
                         "error": "该设备不在管控名单中"}), 404
 
     # 没有 live 回调：页面读取不参与统计，等路由器只会让用户看到迟到的数字。
+    store = _usage_aggregate_store()
+    router_key_name = child_guard_router_alias(router) or "router"
     payload = compose_device_report(
-        _usage_aggregate_store(), macs, date,
-        router=child_guard_router_alias(router) or "router", range_days=days,
+        store, macs, date, router=router_key_name, range_days=days,
     )
-    payload.update({"ok": True, "uid": normalized_uid, "macs": macs, "router": router})
+    # 每日时长限额（0 = 没配）。App 只在大于 0 时把它当分母，否则用 8 小时参考值。
+    limit_minutes = 0
+    if store is not None:
+        limit_minutes = int((store.guard_daily_limits(router_key_name) or {}).get(normalized_uid, 0))
+    online_minutes = payload.get("onlineMinutes")
+    limit_state = "none"
+    if limit_minutes > 0 and isinstance(online_minutes, (int, float)):
+        limit_state = (
+            "reached" if int(online_minutes) >= limit_minutes
+            else "approaching" if int(online_minutes) >= limit_minutes * 0.8
+            else "ok"
+        )
+    payload.update({
+        "ok": True, "uid": normalized_uid, "macs": macs, "router": router,
+        "dailyLimitMinutes": limit_minutes, "limitState": limit_state,
+    })
     return jsonify(payload)
+
+
+@app.route("/api/router/child-guard/devices/<uid>/limit", methods=["PUT", "DELETE"])
+def api_child_guard_device_limit(uid: str):
+    """每日时长限额（分钟）。DELETE 或 minutes=0 表示取消限额。
+
+    只保存 Hub 侧的策略值：固件没有「每日总时长」这个概念，额度判定与
+    跨天重置都发生在 Hub 的分钟聚合侧，App 只负责设置与展示。
+    """
+    if not check_app_token():
+        return jsonify({"ok": False, "error": "unauthorized"}), 401
+    try:
+        normalized_uid = validate_child_guard_uid(uid)
+    except ChildGuardValidationError as error:
+        return jsonify({"ok": False, "errorCode": "invalid_request", "error": str(error)}), 400
+    body = request.get_json(silent=True) or {}
+    if request.method == "DELETE":
+        minutes = 0
+    else:
+        try:
+            minutes = max(0, min(int(body.get("minutes") or 0), 24 * 60))
+        except (TypeError, ValueError):
+            return jsonify({"ok": False, "errorCode": "invalid_request",
+                            "error": "minutes must be a number"}), 400
+    store = _usage_aggregate_store()
+    if store is None:
+        return jsonify({"ok": False, "error": "统计库暂不可用"}), 503
+    router = _child_guard_router(body)
+    saved = store.set_guard_daily_limit(
+        child_guard_router_alias(router) or "router", normalized_uid, minutes)
+    if saved is None:
+        return jsonify({"ok": False, "errorCode": "device_not_found",
+                        "error": "该设备不在管控名单中"}), 404
+    return jsonify({"ok": True, "uid": normalized_uid, "dailyLimitMinutes": saved})
 
 
 @app.route("/api/router/child-guard/devices/<uid>/<action>", methods=["POST"])
@@ -5830,6 +5880,7 @@ def _single_router_row() -> Dict[str, Any]:
         "name": primary_router_name() or clean_saved_value(dashboard.get("router")) or "默认路由器",
         "site": "",
         "model": clean_saved_value(ap.get("model") or identity.get("model")),
+        "serialNumber": clean_saved_value(ap.get("serialNumber") or identity.get("serialNumber")),
         "platform": "reyee",
         "online": online,
         "agentOnline": online,
@@ -6217,6 +6268,10 @@ def api_daily_list():
     if not check_app_token():
         return jsonify({"ok": False, "error": "unauthorized"}), 401
     return jsonify({"ok": True, "dates": recent_dates(7)})
+
+
+from lab_lucky import register_lucky
+register_lucky(app, os.environ.get("LUCKY_STORAGE_DIR", str(DATA_DIR / "lucky")), check_app_token)
 
 
 def command_line() -> int:

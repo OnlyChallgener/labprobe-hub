@@ -8,6 +8,8 @@ PortMap desired state, realtime fan-out, or the Agent heartbeat state machine.
 from __future__ import annotations
 
 import copy
+import ipaddress
+import re
 import threading
 import time
 import uuid
@@ -68,6 +70,7 @@ class TcpSessionService:
         self.lock = threading.RLock()
         self.state_path = Path(hub.DATA_DIR) / "tcp_session_task.json"
         self.commands_path = Path(hub.DATA_DIR) / "tcp_session_commands.json"
+        self.history_path = Path(hub.DATA_DIR) / "tcp_session_history.json"
         self.live_state: Dict[str, Any] | None = None
 
     def _state(self) -> Dict[str, Any]:
@@ -81,7 +84,42 @@ class TcpSessionService:
         self.live_state = value
         if persist:
             self.hub.save_json(self.state_path, value)
+            self._archive(value)
         return value
+
+    def _archive(self, task: Dict[str, Any]) -> None:
+        if task.get("state") not in TERMINAL_STATES or not task.get("id"):
+            return
+        saved = self.hub.load_json(self.history_path, {"tasks": []})
+        saved = saved if isinstance(saved, dict) else {"tasks": []}
+        if task["id"] in saved.get("deletedTaskIds", []):
+            return
+        rows = saved.get("tasks", []) if isinstance(saved, dict) else []
+        row = copy.deepcopy(task)
+        row.pop("config", None)
+        rows = [r for r in rows if isinstance(r, dict) and r.get("id") != row["id"]]
+        rows.insert(0, row)
+        rows.sort(key=lambda r: _integer(r.get("createdEpoch")), reverse=True)
+        saved["tasks"] = rows[:5]
+        self.hub.save_json(self.history_path, saved)
+
+    def remove_history(self, task_id: str) -> List[Dict[str, Any]]:
+        if not task_id:
+            raise ValueError("缺少测试记录 ID")
+        with self.lock:
+            raw = self.hub.load_json(self.history_path, {"tasks": []})
+            saved = raw if isinstance(raw, dict) else {"tasks": []}
+            saved["tasks"] = [r for r in saved.get("tasks", []) if isinstance(r, dict) and r.get("id") != task_id][:5]
+            deleted = saved.get("deletedTaskIds", [])
+            saved["deletedTaskIds"] = ([task_id] + [v for v in deleted if v != task_id])[:128]
+            self.hub.save_json(self.history_path, saved)
+            return self.history()
+
+    def history(self) -> List[Dict[str, Any]]:
+        with self.lock:
+            raw = self.hub.load_json(self.history_path, {"tasks": []})
+            rows = raw.get("tasks", []) if isinstance(raw, dict) else []
+            return [copy.deepcopy(r) for r in rows if isinstance(r, dict)][:5]
 
     def _commands(self) -> List[Dict[str, Any]]:
         raw = self.hub.load_json(self.commands_path, {"commands": []})
@@ -116,9 +154,31 @@ class TcpSessionService:
 
     @staticmethod
     def _config(payload: Dict[str, Any]) -> Dict[str, Any]:
-        host = _text(payload.get("host"), 253).removeprefix("[").removesuffix("]")
-        if not host or any(char.isspace() for char in host) or "://" in host:
+        raw = str(payload.get("host") or "").strip()
+        if not raw or len(raw) > 2048 or "://" in raw:
             raise ValueError("请输入有效的测试目标主机")
+        hosts = []
+        for item in re.split(r"[,，;；\s]+", raw):
+            if not item:
+                continue
+            item = item.removeprefix("[").removesuffix("]").lower().rstrip(".")
+            if ":" in item:
+                try:
+                    item = str(ipaddress.IPv6Address(item))
+                except ValueError as error:
+                    raise ValueError("IPv6 目标格式无效；端口请在目标端口栏填写") from error
+            else:
+                try:
+                    item = item.encode("idna").decode("ascii")
+                except UnicodeError as error:
+                    raise ValueError("测试目标域名格式无效") from error
+                if len(item) > 253 or not all(re.fullmatch(r"[a-z0-9](?:[a-z0-9-]{0,61}[a-z0-9])?", label) for label in item.split(".")):
+                    raise ValueError("请输入有效的 IP 或域名，不含协议头、端口和路径")
+            if item not in hosts:
+                hosts.append(item)
+        if not hosts or len(hosts) > 8:
+            raise ValueError("一次最多填写 8 个目标 IP 或域名")
+        host = ",".join(hosts)
         port = _integer(payload.get("port"), 443)
         if port not in range(1, 65536):
             raise ValueError("目标端口必须是 1–65535")
@@ -178,6 +238,7 @@ class TcpSessionService:
                 "status": "等待 Relay 领取测试任务",
                 "finishReason": "",
                 "config": config,
+                "target": {key: config[key] for key in ("host", "port", "family")},
                 "ipv4": _metric(None),
                 "ipv6": _metric(None),
                 "logs": [],
@@ -302,7 +363,17 @@ def create_tcp_session_blueprint(hub: Any, service: TcpSessionService) -> Bluepr
     def snapshot():
         if not hub.check_read_token():
             return jsonify({"ok": False, "error": "未授权"}), 401
-        return jsonify({"ok": True, "task": service.snapshot(), "serverEpoch": _now()})
+        return jsonify({"ok": True, "task": service.snapshot(), "history": service.history(), "serverEpoch": _now()})
+
+    @bp.post("/tcp-session-test/history/remove")
+    def remove_history():
+        if not hub.check_app_token():
+            return jsonify({"ok": False, "error": "未授权"}), 401
+        try:
+            body = request.get_json(silent=True) or {}
+            return jsonify({"ok": True, "history": service.remove_history(_text(body.get("taskId")))})
+        except ValueError as error:
+            return jsonify({"ok": False, "error": str(error)}), 400
 
     @bp.post("/tcp-session-test/start")
     def start():

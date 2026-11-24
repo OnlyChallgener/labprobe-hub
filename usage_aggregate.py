@@ -432,7 +432,11 @@ _EVIDENCE_COLUMNS = (
     ("new_flows", "INTEGER NOT NULL DEFAULT 0"),
 )
 _ADDED_COLUMNS = {
-    "child_guard_device": (("pass_until", "INTEGER NOT NULL DEFAULT 0"),),
+    "child_guard_device": (
+        ("pass_until", "INTEGER NOT NULL DEFAULT 0"),
+        # 每日时长限额（分钟）。0 = 没有配置，界面只用 8 小时做百分比参考。
+        ("daily_limit", "INTEGER NOT NULL DEFAULT 0"),
+    ),
     # v4：分钟桶带上中继已经算好的证据。老行是 0，含义是「未知」而不是「零字节」，
     # 规则据此退回 v3 口径，绝不拿没有测过的东西当测量值。
     "usage_device_minute": _EVIDENCE_COLUMNS,
@@ -569,6 +573,7 @@ class UsageAggregateStore:
                         blocked       INTEGER NOT NULL DEFAULT 0,
                         blocked_until INTEGER NOT NULL DEFAULT 0,
                         pass_until    INTEGER NOT NULL DEFAULT 0,
+                        daily_limit   INTEGER NOT NULL DEFAULT 0,
                         updated_at    INTEGER NOT NULL DEFAULT 0,
                         PRIMARY KEY (router, uid)
                     ) WITHOUT ROWID;
@@ -818,11 +823,15 @@ class UsageAggregateStore:
                             blocked=int(bool(device["blocked"])) if "blocked" in device else int(old.get("blocked", 0)),
                             blocked_until=_as_count(device.get("blockedUntilEpoch", old.get("blocked_until", 0))),
                             pass_until=_as_count(device.get("pausedUntilEpoch", old.get("pass_until", 0))),
+                            # 每日限额是 Hub 自己的策略，固件快照里没有这个字段；
+                            # 这一层是「整表删了重插」，忘了带就会每次目录同步都把限额清零。
+                            daily_limit=max(0, int(old.get("daily_limit", 0) or 0)),
                             updated_at=int(time.time()))
                 conn.execute("DELETE FROM child_guard_device WHERE router=?", (key,))
                 for row in rows.values():
-                    conn.execute("INSERT INTO child_guard_device(router,uid,name,macs,blocked,blocked_until,pass_until,updated_at) VALUES(?,?,?,?,?,?,?,?)",
-                        (key, row["uid"], row["name"], row["macs"], row["blocked"], row["blocked_until"], row["pass_until"], row["updated_at"]))
+                    conn.execute("INSERT INTO child_guard_device(router,uid,name,macs,blocked,blocked_until,pass_until,daily_limit,updated_at) VALUES(?,?,?,?,?,?,?,?,?)",
+                        (key, row["uid"], row["name"], row["macs"], row["blocked"], row["blocked_until"], row["pass_until"],
+                         max(0, int(row.get("daily_limit", 0) or 0)), row["updated_at"]))
                 conn.execute("DELETE FROM child_guard_plan_cache WHERE router=? AND uid NOT IN (SELECT uid FROM child_guard_device WHERE router=?)", (key,key))
                 conn.execute("INSERT INTO child_guard_membership_version(router,version) VALUES(?,?) ON CONFLICT(router) DO UPDATE SET version=excluded.version", (key,version))
                 conn.commit()
@@ -840,7 +849,7 @@ class UsageAggregateStore:
             conn = self.connect()
             try:
                 rows = conn.execute(
-                    "SELECT uid, name, macs, blocked, blocked_until, pass_until, updated_at "
+                    "SELECT uid, name, macs, blocked, blocked_until, pass_until, daily_limit, updated_at "
                     "FROM child_guard_device WHERE router = ? ORDER BY uid", (key,)
                 ).fetchall()
             finally:
@@ -853,10 +862,47 @@ class UsageAggregateStore:
                 "blocked": bool(int(row["blocked"] or 0)),
                 "blockedUntilEpoch": int(row["blocked_until"] or 0),
                 "passUntilEpoch": int(row["pass_until"] or 0),
+                "dailyLimitMinutes": int(row["daily_limit"] or 0),
                 "updatedAt": int(row["updated_at"] or 0),
             }
             for row in rows
         ]
+
+    def set_guard_daily_limit(self, router: Any, uid: str, minutes: int) -> Optional[int]:
+        """设置设备的每日时长限额（分钟）；0 表示取消限额。
+
+        返回落库后的值；设备不在守护列表里返回 ``None``，让 API 明确报 404
+        而不是静默写进一条不存在的行。
+        """
+        key = router_key(router)
+        value = max(0, int(minutes or 0))
+        stamp = int(time.time())
+        with self._lock:
+            conn = self.connect()
+            try:
+                # 先确认行存在：同值重复写时 SQLite 的 rowcount 不可靠，用它判断
+                # 「设备不存在」会误报 404。
+                exists = conn.execute(
+                    "SELECT 1 FROM child_guard_device WHERE router = ? AND uid = ?",
+                    (key, str(uid)),
+                ).fetchone()
+                if exists is None:
+                    return None
+                conn.execute(
+                    "UPDATE child_guard_device SET daily_limit = ?, updated_at = ? "
+                    "WHERE router = ? AND uid = ?",
+                    (value, stamp, key, str(uid)),
+                )
+            finally:
+                conn.close()
+        return value
+
+    def guard_daily_limits(self, router: Any) -> Dict[str, int]:
+        """uid -> 每日限额分钟数；0 表示没配限额。"""
+        return {
+            str(device["uid"]): int(device.get("dailyLimitMinutes") or 0)
+            for device in self.guard_devices(router)
+        }
 
     def remember_guard_master(self, router: Any, enabled: bool, revision: int = 0) -> None:
         if not isinstance(enabled, bool):
@@ -2248,6 +2294,15 @@ def build_guard_overview(
         has_data = bool(has_rows or seen > 0)
         uid = _guard_uid(device.get("uid"))
         schedule = schedule_state(plans_by_uid.get(uid), stamp)
+        # 每日时长限额只影响「额度」这一层：0 表示没配，App 退回 8 小时参考值。
+        limit_minutes = max(0, int(device.get("dailyLimitMinutes") or 0))
+        limit_state = "none"
+        if limit_minutes > 0:
+            limit_state = (
+                "reached" if today_minutes >= limit_minutes
+                else "approaching" if today_minutes >= limit_minutes * 0.8
+                else "ok"
+            )
         entries.append({
             "uid": str(device.get("uid") or ""),
             "macs": device_macs,
@@ -2255,6 +2310,8 @@ def build_guard_overview(
             "online": _device_online(device_macs, presence),
             "activeNow": bool(active_now),
             "todayMinutes": today_minutes,
+            "dailyLimitMinutes": limit_minutes,
+            "limitState": limit_state,
             "hasData": has_data,
             "topApps": top_apps,
             # 临时放行走的是固件的 skip 通道：pause 期间 block 不生效。所以「此刻是否

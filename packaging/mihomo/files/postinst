@@ -1,0 +1,10 @@
+#!/bin/sh
+set -eu
+[ -z "${IPKG_INSTROOT:-}" ] || exit 0
+mkdir -p /etc/mihomo
+chmod 700 /etc/mihomo
+chmod 600 /etc/config/mihomo_web /etc/mihomo/config.yaml
+[ ! -e /etc/mihomo/api.secret ] || chmod 600 /etc/mihomo/api.secret
+echo 'Installed. Start with: /etc/init.d/mihomo-web enable && /etc/init.d/mihomo-web start'
+echo 'Then run: mihomo-web access'
+exit 0

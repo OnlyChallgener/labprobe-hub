@@ -1,0 +1,35 @@
+# First start replaces this marker with the router's configured LAN IPv4.
+# Existing configuration is kept during opkg upgrades.
+mixed-port: 7890
+allow-lan: true
+bind-address: "@LAN_ADDRESS@"
+mode: rule
+log-level: warning
+ipv6: true
+unified-delay: true
+tcp-concurrent: false
+find-process-mode: off
+
+# The native service overrides the controller address, secret and dashboard.
+external-controller: "127.0.0.1:9090"
+secret: ""
+external-ui: "/usr/share/mihomo-web/ui"
+
+# Manual HTTP/SOCKS proxy only. No routes, firewall or DNS changes on start.
+tun:
+  enable: false
+dns:
+  enable: false
+
+profile:
+  store-selected: true
+  store-fake-ip: false
+
+# Replace this section with your nodes, or follow the provider example in README.
+proxies: []
+proxy-groups:
+  - name: "PROXY"
+    type: select
+    proxies: [DIRECT]
+rules:
+  - MATCH,PROXY

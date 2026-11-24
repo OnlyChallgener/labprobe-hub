@@ -22,21 +22,37 @@
 .labprobe-hub-page .hub-metric { min-width: 120px; color: #939aaa; }
 .labprobe-hub-page .hub-metric strong { display: block; color: #fff; font-size: 16px; font-weight: 600; margin-top: 8px; }
 .labprobe-hub-page .hub-tcp-form .el-autocomplete { width: 220px; max-width: 100%; }
+.labprobe-hub-page .hub-tcp-form .el-autocomplete.hub-tcp-targets { width: 408px; max-width: 100%; }
+.labprobe-hub-page .hub-tcp-form .hub-tcp-targets .el-input { max-width: none; }
 .hub-tcp-history-row { display: flex; align-items: center; justify-content: space-between; gap: 8px; }
 .hub-tcp-history-row span { overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
 .hub-tcp-history-remove { border: 0; background: none; color: #939aaa; cursor: pointer; font-size: 18px; padding: 0 4px; }
 .hub-tcp-history-remove:hover { color: #ff6969; }
 .labprobe-hub-page .hub-section { border-top: 1px solid #36383e; margin-top: 26px; padding-top: 16px; }
 .labprobe-hub-page .hub-section h3 { font-size: 16px; color: #fff; margin: 0; }
+.labprobe-hub-page .hub-wg-clients + .hub-section { border-top: 0; margin-top: 22px; padding-top: 12px; }
 .labprobe-hub-page .hub-link { margin-right: 12px; }
 .labprobe-hub-page .hub-public-key { overflow-wrap: anywhere; }
 .labprobe-hub-page .hub-empty { text-align: center; padding: 40px 16px; color: #939aaa; }
-.labprobe-hub-dialog .el-dialog__body { padding: 24px 32px 10px; }
+.labprobe-hub-dialog .el-dialog__body { padding: 10px 15px; }
 .labprobe-hub-dialog .el-form-item { margin-bottom: 22px; }
-.labprobe-hub-dialog .el-dialog__footer { border-top: 1px solid #292c32; padding: 18px 28px; }
+.labprobe-hub-dialog .el-dialog__footer { border-top: 1px solid #292c32; padding: 10px; }
+.labprobe-hub-dialog .el-form { width: 100%; max-width: 100%; margin: 0; }
 .labprobe-hub-dialog .el-dialog { max-width: calc(100vw - 32px); }
 .labprobe-hub-dialog .el-input, .labprobe-hub-dialog .el-select { width: 100%; max-width: 100%; }
-.hub-ddns-dialog .el-form { width: 540px; max-width: 100%; margin: 0 auto; }
+.hub-ddns-dialog .el-form { width: 100%; max-width: 100%; margin: 0; }
 .hub-ddns-dialog .el-form-item__content { min-width: 0; }
 .labprobe-hub-dialog .hub-note { font-size: 12px; color: #939aaa; line-height: 1.7; }
+.labprobe-hub-page .hub-stun-summary { display: flex; align-items: center; gap: 10px; margin-right: auto; }
+.labprobe-hub-page .hub-stun-toolbar { margin: 20px 0 16px; }
+.labprobe-hub-page .hub-rule-name { color: #fff; overflow-wrap: anywhere; }
+.labprobe-hub-page .hub-endpoint { display: inline-flex; align-items: center; gap: 10px; max-width: 100%; overflow-wrap: anywhere; }
+.labprobe-hub-page .hub-row-actions { display: inline-flex; align-items: center; gap: 4px; white-space: nowrap; }
+.labprobe-hub-page .hub-stun-footnote { margin-top: 14px; }
+.labprobe-hub-dialog .hub-result-meta { display: flex; align-items: center; gap: 18px; flex-wrap: wrap; margin-bottom: 18px; color: #939aaa; }
+.labprobe-hub-dialog .hub-result-meta strong { color: #fff; font-weight: 500; }
+.labprobe-hub-dialog .hub-metrics { display: flex; flex-wrap: wrap; gap: 28px; padding: 20px 0 12px; }
+.labprobe-hub-dialog .hub-metric { color: #939aaa; font-size: 13px; }
+.labprobe-hub-dialog .hub-metric strong { display: block; margin-top: 7px; color: #fff; font-size: 16px; font-weight: 500; }
+.el-submenu__title.labprobe-hub-nav, .el-submenu__title.labprobe-hub-nav > span { color: #fff !important; }
 @media (max-width: 980px) { .labprobe-hub-page .hub-split { grid-template-columns: 1fr; } .labprobe-hub-page .hub-chart { height: 280px; } }

@@ -1,0 +1,20 @@
+#!/bin/sh
+set -eu
+. /usr/libexec/mihomo-web/functions.sh
+case "${1:-}" in
+    access)
+        mihomo_lan_address
+        [ -s "$MIHOMO_HOME/api.secret" ] || { echo 'Start mihomo-web first.' >&2; exit 1; }
+        printf 'Web: http://%s:%s/ui/\nAPI: http://%s:%s\nSecret: ' \
+            "$MIHOMO_LAN_ADDRESS" "$MIHOMO_CONTROLLER_PORT" "$MIHOMO_LAN_ADDRESS" "$MIHOMO_CONTROLLER_PORT"
+        cat "$MIHOMO_HOME/api.secret"
+        ;;
+    check)
+        mihomo_prepare
+        exec /usr/bin/mihomo -t -d "$MIHOMO_HOME" -f "$MIHOMO_HOME/config.yaml"
+        ;;
+    *)
+        echo 'Usage: mihomo-web {access|check}' >&2
+        exit 2
+        ;;
+esac

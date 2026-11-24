@@ -356,7 +356,9 @@ def install_speedtest_service(hub: Any, logger: Optional[Callable[..., Any]] = N
         if not hub.check_app_token():
             return jsonify({"ok": False, "error": "unauthorized"}), 401
         from router_capabilities import is_be50_firmware
-        if is_be50_firmware() and request.path != "/api/router/speedtest/ports":
+        if is_be50_firmware() and request.path not in {
+            "/api/router/speedtest/ports", "/api/router/speedtest/capability"
+        }:
             return jsonify({"ok": False, "error": "unsupported_feature",
                             "message": "当前路由器固件不支持网络测速"}), 422
         return None
@@ -384,9 +386,42 @@ def install_speedtest_service(hub: Any, logger: Optional[Callable[..., Any]] = N
     @bp.get("/servers")
     def get_servers():
         driver = _resolve_driver(hub)
-        payload = _call(driver, {"type": "get_servers"}, READ_TIMEOUT)
+        payload = _call(driver, {"type": "get_servers", "sdk": "globalspeed"}, READ_TIMEOUT)
         data = normalize_servers(payload)
         return jsonify({"ok": True, "data": data})
+
+    @bp.get("/capability")
+    def get_capability():
+        """Read-only firmware probe for new router models; node access is not an engine."""
+        driver = _resolve_driver(hub)
+        try:
+            nodes = normalize_servers(_call(
+                driver, {"type": "get_servers", "sdk": "globalspeed"}, READ_TIMEOUT))
+            state_payload = _call(driver, {"type": "get_proc_stat"}, READ_TIMEOUT)
+        except SpeedTestError:
+            return jsonify({"ok": True, "data": {
+                "supported": False, "ready": False, "engine": None,
+                "nodeSource": None, "testableIntfs": [],
+                "reason": "firmware_contract_unavailable"}})
+        if nodes["errorCode"] not in {"0", "-0"} or not nodes["servers"]:
+            return jsonify({"ok": True, "data": {
+                "supported": False, "ready": False, "engine": None,
+                "nodeSource": None, "testableIntfs": [],
+                "reason": "no_globalspeed_nodes"}})
+        if str(state_payload.get("get_proc_stat")) not in {"0", "1"}:
+            return jsonify({"ok": True, "data": {
+                "supported": False, "ready": False, "engine": None,
+                "nodeSource": None, "testableIntfs": [],
+                "reason": "firmware_contract_unavailable"}})
+        try:
+            ports = normalize_ports(_call(driver, None, READ_TIMEOUT, module="port_status"))
+            testable = ports["testable"]
+        except SpeedTestError:
+            testable = []
+        return jsonify({"ok": True, "data": {
+            "supported": True, "ready": bool(testable), "engine": "firmware",
+            "nodeSource": "globalspeed", "testableIntfs": testable,
+            "reason": None if testable else "no_connected_wan"}})
 
     @bp.get("/state")
     def get_state():
@@ -417,7 +452,11 @@ def install_speedtest_service(hub: Any, logger: Optional[Callable[..., Any]] = N
         nodes = clean_nodes(body.get("nodes"), interfaces)
         if not nodes:
             nodes = {name: [DEFAULT_NODE] for name in interfaces}
-        data: Dict[str, Any] = {"type": "start_test", "intf": interfaces, "set_nodes": nodes}
+        # The firmware node catalog uses GlobalSpeed. Explicitly select the
+        # same SDK for the test instead of relying on start_test's different
+        # LibreSpeed default.
+        data: Dict[str, Any] = {"type": "start_test", "sdk": "globalspeed",
+                                "intf": interfaces, "set_nodes": nodes}
         driver = _resolve_driver(hub)
         # 已经在测速时再发一次 start_test，固件回的是 error_code != 0 —— 那不是故障，
         # 是重复点击（界面一次按下会连着发两个 POST，实测 09:14:15 同一秒 202 + 409）。

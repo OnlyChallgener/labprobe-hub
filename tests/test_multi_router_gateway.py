@@ -425,6 +425,21 @@ def test_registry_probes_tolerate_a_cold_worker_but_route_checks_stay_fast(tmp_p
     assert tcp and tcp[0] <= 0.5, tcp
 
 
+def test_registry_preserves_worker_physical_identity_for_phone_card_migration(tmp_path, monkeypatch):
+    config = gateway.load_gateway_config(_config(tmp_path)[0], SECRETS)
+
+    class Reply:
+        def __enter__(self): return self
+        def __exit__(self, *_args): pass
+        def read(self):
+            return b'{"routers":[{"serialNumber":"g1tq88t702111","deviceCount":26,"onlineDeviceCount":8}]}'
+
+    monkeypatch.setattr(gateway, "urlopen", lambda *args, **kwargs: Reply())
+    assert gateway._device_counts(config["routers"][1]) == {
+        "serialNumber": "G1TQ88T702111", "deviceCount": 26, "onlineDeviceCount": 8,
+    }
+
+
 def test_root_api_call_is_refused_instead_of_pinning_to_the_default_worker(tmp_path):
     """A root-path API request carrying an owner key cannot name a router, so it must be
     refused rather than forwarded to whichever worker happens to be the default."""

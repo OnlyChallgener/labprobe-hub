@@ -23,6 +23,7 @@ mod child_guard;
 mod ddns_address;
 mod minute_stats;
 mod rdpi;
+mod speedtest;
 mod tcp_session_test;
 mod usage_stats;
 mod wireguard;
@@ -33,7 +34,7 @@ const DEFAULT_SOCKET: &str = "/tmp/labrelay.sock";
 const DEFAULT_STATE: &str = "/tmp/labrelay/state.json";
 const DEFAULT_PID: &str = "/tmp/labrelay.pid";
 const DEFAULT_UDP_STUN_SERVER: &str = "stun.cloudflare.com:3478";
-const DEFAULT_TCP_STUN_SERVER: &str = "stun.nextcloud.com:3478";
+const DEFAULT_TCP_STUN_SERVER: &str = "turn.cloudflare.com:3478";
 const LEGACY_TCP_STUN_SERVER: &str = DEFAULT_UDP_STUN_SERVER;
 const STUN_TCP_KEEPALIVE_INTERVAL: Duration = Duration::from_secs(10);
 const STUN_MAPPING_FAILURE_GRACE: Duration = Duration::from_secs(90);
@@ -247,6 +248,7 @@ struct Manager {
     runtimes: Arc<Mutex<HashMap<String, RuntimeHandle>>>,
     operation_lock: Arc<Mutex<()>>,
     tcp_session_tests: tcp_session_test::TcpSessionTestManager,
+    speed_tests: speedtest::SpeedTestManager,
     last_status: Arc<RwLock<HashMap<String, RuntimeSnapshot>>>,
     config_path: PathBuf,
     state_path: PathBuf,
@@ -270,6 +272,7 @@ impl Manager {
             runtimes: Arc::new(Mutex::new(HashMap::new())),
             operation_lock: Arc::new(Mutex::new(())),
             tcp_session_tests: tcp_session_test::TcpSessionTestManager::new(),
+            speed_tests: speedtest::SpeedTestManager::new(),
             last_status: Arc::new(RwLock::new(HashMap::new())),
             config_path,
             state_path,
@@ -1808,7 +1811,7 @@ fn normalize_rule(rule: &mut Rule) {
     rule.idle_timeout_sec = rule.idle_timeout_sec.clamp(30, 3600);
 }
 
-fn validate_rule(rule: &Rule, port_min: u16, port_max: u16) -> Result<()> {
+fn validate_rule(rule: &Rule, _port_min: u16, _port_max: u16) -> Result<()> {
     if rule.id.is_empty()
         || !rule
             .id
@@ -1840,8 +1843,8 @@ fn validate_rule(rule: &Rule, port_min: u16, port_max: u16) -> Result<()> {
         if rule.listen_port < 1024 {
             bail!("STUN 中间端口超出允许范围 1024-65535");
         }
-    } else if rule.listen_port < port_min || rule.listen_port > port_max {
-        bail!("监听端口超出允许范围 {}-{}", port_min, port_max);
+    } else if rule.listen_port == 0 {
+        bail!("监听端口范围必须为 1-65535");
     }
     if rule.target_port == 0 {
         bail!("目标端口无效");
@@ -1990,6 +1993,10 @@ async fn handle_command_fixed(manager: Manager, raw: &str) -> Value {
                 .await
         }
         "tcp_session_status" => Ok(manager.tcp_session_tests.status().await),
+        "speedtest_start" => manager.speed_tests.start(&v).await,
+        "speedtest_cancel" => manager.speed_tests.cancel(v.get("taskId").and_then(Value::as_str).unwrap_or("")).await,
+        "speedtest_status" => Ok(manager.speed_tests.status().await),
+        "speedtest_capability" => Ok(manager.speed_tests.capability()),
         _ => Err(anyhow!("unknown action")),
     };
     result.unwrap_or_else(|e| json!({"ok": false, "error": e.to_string()}))
@@ -2804,18 +2811,20 @@ mod tests {
             tcp_session_tests: tcp_session_test::TcpSessionTestManager::new(),
             last_status: Arc::new(RwLock::new(HashMap::new())),
             config_path: root.join("config.json"),
+            speed_tests: speedtest::SpeedTestManager::new(),
             state_path: root.join("state.json"),
             port_min: listen_port,
             port_max: listen_port,
             lan_if: "lo".into(),
         };
-        let rule = Rule {
+        let mut rule = Rule {
             id: "stun-nonblocking".into(),
             name: "STUN nonblocking".into(),
             enabled: true,
             kind: "stun".into(),
             mode: "stun".into(),
             listen_port,
+            target_type: "router_self".into(),
             target_mode: "ipv4".into(),
             target_ipv4: "127.0.0.1".into(),
             target_port: 443,
@@ -2824,6 +2833,15 @@ mod tests {
             stun_server: "203.0.113.1:3478".into(),
             ..Rule::default()
         };
+
+        // Keep the peer connected without replying. An unroutable public
+        // address can fail immediately in a container, racing this assertion.
+        let peer = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        rule.stun_server = peer.local_addr().unwrap().to_string();
+        let peer_task = tokio::spawn(async move {
+            let (_stream, _) = peer.accept().await.unwrap();
+            std::future::pending::<()>().await;
+        });
 
         timeout(Duration::from_secs(1), manager.upsert(rule))
             .await
@@ -2841,6 +2859,7 @@ mod tests {
         let state = runtime.get("state").and_then(Value::as_str);
         assert!(state == Some("starting") || state == Some("mapping"));
         manager.stop_runtime("stun-nonblocking", false).await;
+        peer_task.abort();
         fs::remove_dir_all(&root).unwrap();
     }
 
@@ -2879,6 +2898,7 @@ mod tests {
             tcp_session_tests: tcp_session_test::TcpSessionTestManager::new(),
             last_status: Arc::new(RwLock::new(HashMap::new())),
             config_path,
+            speed_tests: speedtest::SpeedTestManager::new(),
             state_path,
             port_min: 20000,
             port_max: 20020,

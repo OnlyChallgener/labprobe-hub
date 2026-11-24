@@ -23,6 +23,8 @@ local helper = {ok=true, name="labwg0", peers={{publicKey="test-public-key", lat
 package.loaded["luci.sys"] = {exec=function(command)
     if command:find("labprobe%-wg%-status") then return json.encode(helper) end
     assert(command:find("/usr/bin/curl", 1, true))
+    assert(command:find("--url 'http://192.168.5.46:58443/r/be72/api/", 1, true),
+        "every eWeb request must explicitly select the BE72 worker")
     calls[#calls+1]=command
     assert(#replies>0, "unexpected network request")
     return table.remove(replies, 1)
@@ -66,4 +68,15 @@ replies={reply(good)}; calls={}
 local mutation=bridge.request({op="wg.save", payload={expectedRevision=7}})
 assert(mutation.ok and #calls==1 and not files[cache_path], "successful mutations invalidate the read cache and are never replayed")
 
-print("6 bridge failure/recovery cases passed; mock network and private RAM caches only")
+for _, op in ipairs({"tcp.get", "ddns.get"}) do
+    replies={reply({ok=true})}; calls={}
+    assert(bridge.request({op=op}).ok and #calls==1)
+end
+
+local wrong={routerName=config.routerName, hubUrl=config.hubUrl, routerId="be50"}
+files["/etc/labprobe/eweb-hub.json"]=json.encode(wrong); calls={}; replies={}
+local refused=bridge.request({op="ddns.get"})
+assert(not refused.ok and refused.httpStatus==409 and #calls==0,
+    "a BE72 page must never route to another router")
+
+print("9 bridge routing/failure/recovery cases passed; mock network and private RAM caches only")

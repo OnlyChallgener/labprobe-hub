@@ -1,0 +1,11 @@
+#!/bin/sh
+set -eu
+[ -z "${IPKG_INSTROOT:-}" ] || exit 0
+if ! opkg status mihomo-web 2>/dev/null | grep -q '^Status: .* installed$'; then
+    [ ! -e /usr/bin/mihomo ] || { echo 'Existing unmanaged /usr/bin/mihomo; migrate it first.' >&2; exit 1; }
+    if pidof mihomo >/dev/null 2>&1; then
+        echo 'An unmanaged Mihomo process is running; stop it before installing.' >&2
+        exit 1
+    fi
+fi
+exit 0

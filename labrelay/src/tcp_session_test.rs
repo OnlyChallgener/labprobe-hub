@@ -24,12 +24,13 @@ const EXTREME_CONNTRACK_MAX: usize = 131_072;
 const MIN_PENDING_CONNECTS: usize = 256;
 const MAX_PENDING_CONNECTS: usize = 1_024;
 const EXTREME_MIN_PENDING_CONNECTS: usize = 2_048;
-const EXTREME_MAX_PENDING_CONNECTS: usize = 16_384;
+const EXTREME_MAX_PENDING_CONNECTS: usize = 4_096;
 const CONSECUTIVE_FAILURE_LIMIT: usize = 200;
 const RECENT_OUTCOME_WINDOW: usize = 200;
 const STATUS_INTERVAL: Duration = Duration::from_secs(1);
 const HEAVY_RESOURCE_SAMPLE_INTERVAL: Duration = Duration::from_secs(10);
 const LOOP_INTERVAL: Duration = Duration::from_millis(5);
+const CPU_PACING_INTERVAL: Duration = Duration::from_millis(250);
 const CPU_HIGH_SAMPLE_PERCENT: f64 = 99.0;
 const CPU_RECOVERY_PERCENT: f64 = 94.0;
 const CPU_HIGH_SAMPLE_LIMIT: u8 = 3;
@@ -523,7 +524,7 @@ impl TcpSessionTestManager {
                     self.update(&control.task_id, |snapshot| {
                         push_log(
                             snapshot,
-                            "极限模式已启用：目标 64000 连接，临时源端口 1024-65535、Conntrack 上限 131072，测试结束自动恢复".into(),
+                            format!("极限模式已启用：目标 {} 连接，临时源端口 1024-65535、Conntrack 上限 131072，测试结束自动恢复", config.target_connections),
                         );
                     })
                     .await;
@@ -727,6 +728,8 @@ impl TcpSessionTestManager {
         let mut consecutive_failures = 0usize;
         let mut recent_outcomes = VecDeque::with_capacity(RECENT_OUTCOME_WINDOW);
         let mut previous_cpu = read_cpu_counters();
+        let mut pacing_cpu = previous_cpu;
+        let mut last_cpu_pacing = Instant::now();
         let mut high_cpu_samples = 0u8;
         let mut cpu_scale = 1.0f64;
         let mut cached_fd_used = plan.baseline_fd;
@@ -824,7 +827,18 @@ impl TcpSessionTestManager {
                 }
             }
 
-            let tick_seconds = now.duration_since(last_tick).as_secs_f64();
+            if config.extreme_mode && last_cpu_pacing.elapsed() >= CPU_PACING_INTERVAL {
+                let counters = read_cpu_counters();
+                if let Some(percent) = cpu_percent_between(pacing_cpu, counters) {
+                    cpu_scale = next_extreme_cpu_scale(cpu_scale, percent);
+                }
+                pacing_cpu = counters;
+                last_cpu_pacing = Instant::now();
+            }
+            // A delayed reactor tick must not turn its missed time into a burst
+            // of thousands of connects. Keep at most two ticks of launch credit.
+            let tick_seconds = now.duration_since(last_tick).as_secs_f64()
+                .min(LOOP_INTERVAL.as_secs_f64() * 2.0);
             last_tick = now;
             let load = (held.len() + pending.len()) as f64 / safe_target.max(1) as f64;
             let load_scale = load_rate_scale(load, config.extreme_mode);
@@ -833,7 +847,7 @@ impl TcpSessionTestManager {
                 credit = 0.0;
             } else {
                 credit = (credit + config.cps as f64 * rate_scale * tick_seconds)
-                    .min(pending_limit as f64);
+                    .min(launch_credit_limit(config.cps, rate_scale, pending_limit));
             }
             let available = safe_target.saturating_sub(held.len() + pending.len());
             let launches = if rate_scale <= f64::EPSILON {
@@ -900,11 +914,9 @@ impl TcpSessionTestManager {
                 let effective_source_ports = cached_source_ports.max(approximate_source_ports);
                 let sample = sample_resources(previous_cpu, effective_fd, effective_source_ports);
                 previous_cpu = sample.cpu_counters;
-                cpu_scale = if config.extreme_mode {
-                    extreme_cpu_rate_scale(sample.cpu_percent)
-                } else {
-                    cpu_rate_scale(sample.cpu_percent)
-                };
+                if !config.extreme_mode {
+                    cpu_scale = cpu_rate_scale(sample.cpu_percent);
+                }
                 if sample.cpu_percent >= CPU_HIGH_SAMPLE_PERCENT {
                     high_cpu_samples = high_cpu_samples.saturating_add(1);
                 } else if sample.cpu_percent < CPU_RECOVERY_PERCENT {
@@ -1212,14 +1224,27 @@ fn connection_quality_launch_budget(
     }
 }
 
-fn extreme_cpu_rate_scale(cpu_percent: f64) -> f64 {
-    if cpu_percent >= 99.8 {
-        0.10
-    } else if cpu_percent >= 99.0 {
-        0.50
+fn next_extreme_cpu_scale(current: f64, cpu_percent: f64) -> f64 {
+    // Reduce the current rate, rather than returning to a fixed fraction of
+    // the requested maximum on every sample. Retain established sockets while
+    // cooling down; the test still searches the full connection budget.
+    if cpu_percent >= 90.0 {
+        0.0
+    } else if cpu_percent >= 75.0 {
+        (current * 0.5).max(0.01)
+    } else if cpu_percent >= 65.0 {
+        (current * 0.8).max(0.01)
+    } else if cpu_percent < 50.0 {
+        (current + 0.05).min(1.0)
     } else {
-        1.0
+        current.max(0.01)
     }
+}
+
+fn launch_credit_limit(cps: u64, scale: f64, pending_limit: usize) -> f64 {
+    (cps as f64 * scale * LOOP_INTERVAL.as_secs_f64() * 2.0)
+        .max(1.0)
+        .min(pending_limit as f64)
 }
 
 fn cpu_rate_scale(cpu_percent: f64) -> f64 {
@@ -1474,18 +1499,7 @@ fn sample_resources(
     source_ports_used: usize,
 ) -> ResourceSample {
     let counters = read_cpu_counters();
-    let cpu_percent = match (previous_cpu, counters) {
-        (Some(previous), Some(current)) => {
-            let total = current.total.saturating_sub(previous.total);
-            let idle = current.idle.saturating_sub(previous.idle);
-            if total == 0 {
-                0.0
-            } else {
-                100.0 * (total - idle) as f64 / total as f64
-            }
-        }
-        _ => 0.0,
-    };
+    let cpu_percent = cpu_percent_between(previous_cpu, counters).unwrap_or(0.0);
     let (_, memory_available_mb) = memory_megabytes();
     ResourceSample {
         fd_used,
@@ -1494,6 +1508,21 @@ fn sample_resources(
         source_ports_used,
         cpu_percent,
         cpu_counters: counters,
+    }
+}
+
+fn cpu_percent_between(previous: Option<CpuCounters>, current: Option<CpuCounters>) -> Option<f64> {
+    match (previous, current) {
+        (Some(previous), Some(current)) => {
+            let total = current.total.saturating_sub(previous.total);
+            let idle = current.idle.saturating_sub(previous.idle);
+            if total == 0 {
+                None
+            } else {
+                Some(100.0 * total.saturating_sub(idle) as f64 / total as f64)
+            }
+        }
+        _ => None,
     }
 }
 
@@ -1692,11 +1721,16 @@ mod tests {
         assert_eq!(connection_quality_launch_budget(true, 0, 1_024), usize::MAX);
         assert_eq!(connection_quality_launch_budget(false, 0, 200), 0);
         assert_eq!(pending_connect_limit(1_000, 65_535, true), 2_048);
-        assert_eq!(pending_connect_limit(4_000, 65_535, true), 8_000);
-        assert_eq!(pending_connect_limit(10_000, 65_535, true), 16_384);
-        assert_eq!(extreme_cpu_rate_scale(98.9), 1.0);
-        assert_eq!(extreme_cpu_rate_scale(99.0), 0.50);
-        assert_eq!(extreme_cpu_rate_scale(99.8), 0.10);
+        assert_eq!(pending_connect_limit(4_000, 65_535, true), 4_096);
+        assert_eq!(pending_connect_limit(10_000, 65_535, true), 4_096);
+        assert_eq!(next_extreme_cpu_scale(1.0, 80.0), 0.5);
+        assert_eq!(next_extreme_cpu_scale(0.5, 80.0), 0.25);
+        assert_eq!(next_extreme_cpu_scale(0.25, 95.0), 0.0);
+        assert_eq!(next_extreme_cpu_scale(0.0, 45.0), 0.05);
+        assert_eq!(next_extreme_cpu_scale(0.25, 60.0), 0.25);
+        assert_eq!(next_extreme_cpu_scale(1.0, 0.0), 1.0);
+        assert_eq!(launch_credit_limit(10_000, 1.0, 4096), 100.0);
+        assert_eq!(launch_credit_limit(10_000, 0.25, 4096), 25.0);
     }
 
     #[test]

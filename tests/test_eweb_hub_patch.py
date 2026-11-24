@@ -18,7 +18,7 @@ def test_native_bundle_preserved_and_menu_is_last():
     assert b'fullPath:["admin","alone","store"]},{label:"HUB"' in result
     assert b'"fullPath": ["admin", "alone", "hub", "ddns"]' in result
     assert gzip.decompress(gzip.compress(result, mtime=0)) == result
-    assert result.count(b'window.LabProbeEweb.createComponent(kind') == 3
+    assert result.count(b'window.LabProbeEweb.createComponent(kind') == 5
 
 def test_bridge_inherits_authentication_and_exposes_only_request():
     fixture = b'    entry({"api", "common"}, call("rpc_common"), nil)'
@@ -34,6 +34,6 @@ def test_proxy_is_fixed_to_router_hub_and_uses_private_header_file():
     assert 'config.hubUrl ~= agent.hubUrl' in source
     assert 'HTTP_X_LABPROBE_EWEB' in source
     assert 'HTTP_ORIGIN' in source
-    assert 'config.hubUrl..path' in source
+    assert 'shellquote(hub_api..path)' in source
     assert 'Authorization:' not in source
     assert 'nixio.open(temporary, "w", "600")' in source

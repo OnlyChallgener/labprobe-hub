@@ -210,6 +210,7 @@ def worker_environment(router: dict, config: dict, parent_env: dict[str, str] | 
         "LABPROBE_BASE_DIR": str(root),
         "CONFIG_DIR": str(root / "config"),
         "DATA_DIR": str(root / "data"),
+        "LUCKY_STORAGE_DIR": str(root.parent / "lucky"),
         "BACKUPS_DIR": str(root / "backups"),
         "LOGS_DIR": str(root / "logs"),
         "CONFIG_PATH": str(root / "config" / "config.yaml"),
@@ -387,13 +388,16 @@ def _device_counts(router: dict) -> dict:
         with urlopen(request, timeout=PROBE_HTTP_TIMEOUT_SEC) as response:
             payload = json.loads(response.read())
         row = payload["routers"][0]
+        serial = row.get("serialNumber")
+        if isinstance(serial, str) and re.fullmatch(r"[A-Za-z0-9_-]{4,64}", serial.strip()):
+            result["serialNumber"] = serial.strip().upper()
         for key in ("deviceCount", "onlineDeviceCount"):
             value = row.get(key)
             if isinstance(value, int) and not isinstance(value, bool) and value >= 0:
                 result[key] = value
     except (OSError, URLError, TimeoutError, AttributeError, ValueError, TypeError, KeyError, IndexError):
         pass
-    if len(result) == 2:
+    if all(key in result for key in ("deviceCount", "onlineDeviceCount")):
         return result
     try:
         payload = json.loads((router["root"] / "data" / "devices.json").read_text(encoding="utf-8"))

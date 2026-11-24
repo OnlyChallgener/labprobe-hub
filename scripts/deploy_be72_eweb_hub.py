@@ -43,9 +43,9 @@ def deploy(router, nas, nas_password):
     if not token or any(c in token for c in '\r\n"\\'):
         raise RuntimeError('Hub app credential unavailable/invalid')
     curl_config = ('header = "Authorization: Bearer ' + token + '"\nheader = "Content-Type: application/json"\nnoproxy = "*"\n').encode()
-    native_config = json.dumps({'routerName': agent['routerName'], 'hubUrl': agent['hubUrl']}).encode()
+    native_config = json.dumps({'routerName': agent['routerName'], 'hubUrl': agent['hubUrl'], 'routerId': 'be72'}).encode()
     # Verify the BE72 endpoint before committing files. Never emit the secret.
-    status = json.loads(run(router, 'curl --silent --max-time 8 --config - --url ' + shlex.quote(agent['hubUrl'] + '/api/wireguard/server'), stdin=curl_config))
+    status = json.loads(run(router, 'curl --silent --max-time 8 --config - --url ' + shlex.quote(agent['hubUrl'] + '/r/be72/api/wireguard/server'), stdin=curl_config))
     if not status.get('ok') or status.get('agentStatus', {}).get('router') != 'BE72':
         raise RuntimeError('Hub returned a different router identity')
 

@@ -1,0 +1,5 @@
+#!/bin/sh
+[ -z "${IPKG_INSTROOT:-}" ] || exit 0
+/etc/init.d/zerotier-static stop || true
+[ "${1:-}" != remove ] || /etc/init.d/zerotier-static disable
+exit 0

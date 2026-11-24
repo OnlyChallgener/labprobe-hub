@@ -225,6 +225,26 @@ def test_ports_route_passes_port_status_with_no_data():
     assert driver.calls[0]["data"] is None
 
 
+def test_capability_requires_nodes_state_and_live_wan():
+    client, driver = build_client({"get_servers": SERVERS,
+                                   "get_proc_stat": PROC_STAT,
+                                   "port_status": PORT_STATUS})
+    data = client.get("/api/router/speedtest/capability").get_json()["data"]
+    assert data == {"supported": True, "ready": True, "engine": "firmware",
+                    "nodeSource": "globalspeed", "testableIntfs": ["wan"],
+                    "reason": None}
+    assert driver.calls[0]["data"] == {"type": "get_servers", "sdk": "globalspeed"}
+
+
+def test_capability_does_not_mistake_catalog_for_engine():
+    client, driver = build_client({"get_servers": SERVERS,
+                                   "get_proc_stat": {"error_code": "1"}})
+    data = client.get("/api/router/speedtest/capability").get_json()["data"]
+    assert data["supported"] is False
+    assert data["reason"] == "firmware_contract_unavailable"
+    assert len(driver.calls) == 2
+
+
 def test_start_route_builds_firmware_set_nodes_shape():
     client, driver = build_client({})
     response = client.post("/api/router/speedtest/start",
@@ -232,7 +252,7 @@ def test_start_route_builds_firmware_set_nodes_shape():
     assert response.status_code == 202
     assert response.get_json()["ok"] is True
     sent = driver.calls[-1]["data"]
-    assert sent == {"type": "start_test", "intf": ["wan"],
+    assert sent == {"type": "start_test", "sdk": "globalspeed", "intf": ["wan"],
                     "set_nodes": {"wan": ["308000101"]}}
 
 
@@ -293,7 +313,7 @@ def test_unauthorized_is_rejected():
     assert hub.app.test_client().get("/api/router/speedtest/ports").status_code == 401
 
 
-def test_be50_hides_native_speedtest_and_never_calls_firmware(monkeypatch):
+def test_be50_hides_native_speedtest_but_allows_read_only_capability(monkeypatch):
     monkeypatch.setenv("ROUTER_FIRMWARE_FAMILY", "be50-stock")
     client, driver = build_client({"port_status": PORT_STATUS})
     for path in ("servers", "state", "progress", "history"):
@@ -301,3 +321,6 @@ def test_be50_hides_native_speedtest_and_never_calls_firmware(monkeypatch):
     assert client.post("/api/router/speedtest/start", json={}).status_code == 422
     assert driver.calls == []
     assert client.get("/api/router/speedtest/ports").status_code == 200
+    assert client.get("/api/router/speedtest/capability").get_json()["data"]["supported"] is False
+    assert all(call["data"] is None or call["data"].get("type") != "start_test"
+               for call in driver.calls)

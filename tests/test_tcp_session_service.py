@@ -45,6 +45,28 @@ def build(tmp_path):
     return hub.app.test_client(), service
 
 
+def test_history_deletion_survives_late_status_and_restart(tmp_path):
+    client, service = build(tmp_path)
+    row = {"id": "tcp-delete", "state": "completed", "createdEpoch": 1, "target": {"host": "example.com", "port": 443}}
+    service._save_state(row)
+    response = client.post("/api/tcp-session-test/history/remove", json={"taskId": row["id"]})
+    assert response.status_code == 200 and response.json["history"] == []
+    service._save_state({**row, "updatedEpoch": 2})
+    assert service.history() == []
+    assert TcpSessionService(service.hub).history() == []
+    assert service.snapshot()["id"] == row["id"]
+    assert client.post("/api/tcp-session-test/history/remove", json={}).status_code == 400
+
+
+def test_multiple_targets_are_normalized_and_bounded():
+    value = TcpSessionService._config(start_payload(host=" EXAMPLE.com，192.0.2.1; [2001:db8::1]\nexample.com "))
+    assert value["host"] == "example.com,192.0.2.1,2001:db8::1"
+    import pytest
+    for host in [",".join(f"host{i}.example" for i in range(9)), "https://example.com", "example.com/path", "example.com:443"]:
+        with pytest.raises(ValueError):
+            TcpSessionService._config(start_payload(host=host))
+
+
 def start_payload(**overrides):
     return {
         "host": "example.com",
@@ -56,6 +78,34 @@ def start_payload(**overrides):
         "maxDurationSeconds": 180,
         **overrides,
     }
+
+
+def test_result_history_keeps_five_terminal_tasks_with_target_after_restart(tmp_path, monkeypatch):
+    client, service = build(tmp_path)
+    latest = None
+    for i in range(7):
+        monkeypatch.setattr(module, '_now', lambda i=i: 1000 + i)
+        task = client.post('/api/tcp-session-test/start', json=start_payload(host=f'host{i}.example')).get_json()['task']
+        assert all(row['id'] != task['id'] for row in service.history()), 'queued tasks are not results'
+        latest = {'id': task['id'], 'state': 'completed', 'ipv4': {'success': 10, 'peak': 10}, 'resourcesReleased': True}
+        assert service.accept_status(latest)
+    history = client.get('/api/tcp-session-test').get_json()['history']
+    assert [r['target']['host'] for r in history] == [f'host{i}.example' for i in range(6, 1, -1)]
+    assert all('config' not in row for row in history)
+    assert service.accept_status({**latest, 'ipv4': {'success': 12, 'peak': 12}})
+    restarted = TcpSessionService(FakeHub(tmp_path))
+    assert len(restarted.history()) == 5
+    assert restarted.history()[0]['ipv4']['peak'] == 12
+    assert len({r['id'] for r in restarted.history()}) == 5
+
+
+def test_result_histories_are_isolated_by_router_data_directory(tmp_path):
+    _, first = build(tmp_path / 'be72')
+    _, second = build(tmp_path / 'be50')
+    task = first.start(start_payload())
+    first.accept_status({'id': task['id'], 'state': 'stopped', 'resourcesReleased': True})
+    assert len(first.history()) == 1
+    assert second.history() == []
 
 
 def test_start_is_bounded_and_rejects_duplicate(tmp_path):

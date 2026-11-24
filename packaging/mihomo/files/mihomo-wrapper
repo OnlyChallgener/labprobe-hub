@@ -1,0 +1,128 @@
+#!/bin/sh
+# Native service entry point. The exact pinned static core runs from private tmpfs.
+set -eu
+umask 077
+CORE_SHA256='@CORE_SHA256@'
+CORE_GZIP_SHA256='@CORE_GZIP_SHA256@'
+CORE_BYTES='@CORE_BYTES@'
+CORE_SHARE='/usr/lib/mihomo-web'
+CORE_UI='/usr/share/mihomo-web/ui'
+CORE_CACHE_BASE='/tmp/mihomo-web-core'
+CORE_TEMP=''
+
+core_error() {
+    echo "mihomo: $*" >&2
+    exit 1
+}
+
+core_private_dir() {
+    [ ! -L "$1" ] && [ -d "$1" ] && [ "$(stat -c '%u:%a' "$1")" = '0:700' ] ||
+        core_error "Refusing untrusted private directory: $1"
+}
+
+core_regular_file() {
+    [ ! -L "$1" ] && [ -f "$1" ] && [ "$(stat -c '%u:%a' "$1")" = "0:$2" ] ||
+        core_error "Refusing untrusted file: $1"
+}
+
+core_hash() {
+    sha256sum "$1" | awk '{print $1}'
+}
+
+core_cached() {
+    [ -e "$CORE_CACHE/mihomo" ] || [ -L "$CORE_CACHE/mihomo" ] || return 1
+    core_regular_file "$CORE_CACHE/mihomo" 700
+    [ "$(stat -c %s "$CORE_CACHE/mihomo")" = "$CORE_BYTES" ] &&
+        [ "$(core_hash "$CORE_CACHE/mihomo")" = "$CORE_SHA256" ]
+}
+
+core_cleanup() {
+    [ -z "$CORE_TEMP" ] || rm -f "$CORE_TEMP"
+}
+trap core_cleanup EXIT
+trap 'exit 129' HUP
+trap 'exit 130' INT
+trap 'exit 143' TERM
+
+# This override is only for isolated root-run validation of an unpacked package.
+# It cannot select arbitrary system paths or a cache outside its private test tree.
+case "${MIHOMO_WEB_TEST_ROOT:-}" in
+    '') ;;
+    /tmp/mihomo-web-test.*)
+        CORE_TEST_NAME="${MIHOMO_WEB_TEST_ROOT#/tmp/}"
+        case "$CORE_TEST_NAME" in *[!A-Za-z0-9_.-]*) core_error 'Invalid test root.';; esac
+        core_private_dir "$MIHOMO_WEB_TEST_ROOT"
+        CORE_SHARE="$MIHOMO_WEB_TEST_ROOT/usr/lib/mihomo-web"
+        CORE_UI="$MIHOMO_WEB_TEST_ROOT/usr/share/mihomo-web/ui"
+        CORE_CACHE_BASE="$MIHOMO_WEB_TEST_ROOT/cache"
+        ;;
+    *) core_error 'Test root must be a private /tmp/mihomo-web-test.* directory.';;
+esac
+
+# The bundled dashboard is intentionally outside the writable config home.
+# Keep upstream path checks enabled and allow only this exact additional tree.
+case ":${SAFE_PATHS:-}:" in
+    *":$CORE_UI:"*) ;;
+    *)
+        if [ -n "${SAFE_PATHS:-}" ]; then
+            SAFE_PATHS="$SAFE_PATHS:$CORE_UI"
+        else
+            SAFE_PATHS="$CORE_UI"
+        fi
+        ;;
+esac
+export SAFE_PATHS
+
+if [ ! -e "$CORE_CACHE_BASE" ] && [ ! -L "$CORE_CACHE_BASE" ]; then
+    mkdir -m 700 "$CORE_CACHE_BASE" 2>/dev/null || [ -d "$CORE_CACHE_BASE" ] ||
+        core_error 'Unable to create private core cache.'
+fi
+core_private_dir "$CORE_CACHE_BASE"
+# Immutable per-hash paths also protect concurrent old/new package invocations.
+CORE_CACHE="$CORE_CACHE_BASE/$CORE_SHA256"
+if [ ! -e "$CORE_CACHE" ] && [ ! -L "$CORE_CACHE" ]; then
+    mkdir -m 700 "$CORE_CACHE" 2>/dev/null || [ -d "$CORE_CACHE" ] ||
+        core_error 'Unable to create versioned core cache.'
+fi
+core_private_dir "$CORE_CACHE"
+
+if ! core_cached; then
+    # Root-owned private parent plus a fixed regular lock file prevent symlink
+    # redirection. flock releases the lock automatically even if startup crashes.
+    if [ -e "$CORE_CACHE/.lock" ] || [ -L "$CORE_CACHE/.lock" ]; then
+        core_regular_file "$CORE_CACHE/.lock" 600
+    fi
+    : >> "$CORE_CACHE/.lock"
+    core_regular_file "$CORE_CACHE/.lock" 600
+    exec 9>> "$CORE_CACHE/.lock"
+    CORE_WAIT=0
+    until flock -n 9; do
+        CORE_WAIT=$((CORE_WAIT + 1))
+        [ "$CORE_WAIT" -lt 30 ] || core_error 'Timed out waiting for another core startup.'
+        sleep 1
+    done
+    # Another simultaneous invocation may have already published the core.
+    if ! core_cached; then
+        core_regular_file "$CORE_SHARE/mihomo.gz" 644
+        [ "$(core_hash "$CORE_SHARE/mihomo.gz")" = "$CORE_GZIP_SHA256" ] ||
+            core_error 'Bundled compressed core checksum mismatch.'
+        # A forced kill may leave an unpublished tempfile. Only the lock holder
+        # can clean these exact private mktemp names before allocating another.
+        for CORE_STALE in "$CORE_CACHE"/mihomo.??????; do
+            [ -e "$CORE_STALE" ] || [ -L "$CORE_STALE" ] || continue
+            [ ! -L "$CORE_STALE" ] && [ -f "$CORE_STALE" ] &&
+                [ "$(stat -c %u "$CORE_STALE")" = 0 ] || core_error 'Untrusted temporary core cache file.'
+            rm -f "$CORE_STALE"
+        done
+        CORE_TEMP="$(mktemp "$CORE_CACHE/mihomo.XXXXXX")" || core_error 'Cannot allocate core cache file.'
+        gzip -dc "$CORE_SHARE/mihomo.gz" > "$CORE_TEMP" || core_error 'Unable to decompress core.'
+        [ "$(stat -c %s "$CORE_TEMP")" = "$CORE_BYTES" ] &&
+            [ "$(core_hash "$CORE_TEMP")" = "$CORE_SHA256" ] || core_error 'Decompressed core verification failed.'
+        chmod 700 "$CORE_TEMP"
+        mv -f "$CORE_TEMP" "$CORE_CACHE/mihomo"
+        CORE_TEMP=''
+    fi
+    flock -u 9
+    exec 9>&-
+fi
+exec "$CORE_CACHE/mihomo" "$@"

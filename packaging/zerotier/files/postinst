@@ -1,0 +1,12 @@
+#!/bin/sh
+set -eu
+[ -z "${IPKG_INSTROOT:-}" ] || exit 0
+mkdir -p /etc/zerotier-one /etc/zerotier-static/cache
+chmod 700 /etc/zerotier-one /etc/zerotier-static/cache
+if [ "$(uci -q get zerotier_static.main.enabled 2>/dev/null || echo 1)" = 0 ]; then
+    /etc/init.d/zerotier-static disable
+    /etc/init.d/zerotier-static stop
+else
+    /etc/init.d/zerotier-static enable
+    /etc/init.d/zerotier-static restart
+fi

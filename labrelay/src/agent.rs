@@ -2455,6 +2455,36 @@ async fn sync_tcp_session_test(client: &Client, config: &AgentConfig) -> Result<
     Ok(())
 }
 
+// A separate bounded control lane keeps status polling and cancellation responsive.
+// Reading status never launches a measurement; only an explicit start command does.
+async fn sync_speedtest(client: &Client, config: &AgentConfig) -> Result<()> {
+    let router = url_encode(&config.router_name);
+    let root = get_json(client, config,
+        &format!("/api/router/speedtest/commands?router={}&limit=5", router)).await?;
+    let mut acks = Vec::new();
+    if let Some(commands) = root.get("commands").and_then(Value::as_array) {
+        for command in commands.iter().take(5) {
+            let payload = command.get("payload").cloned().unwrap_or_else(|| json!({}));
+            let local = match command.get("action").and_then(Value::as_str).unwrap_or("") {
+                "start" => json!({"action":"speedtest_start", "taskId":payload.get("taskId"), "config":payload.get("config")}),
+                "cancel" | "stop" => json!({"action":"speedtest_cancel", "taskId":payload.get("taskId")}),
+                _ => json!({"action":"invalid"}),
+            };
+            let result = tcp_session_ctl(config, local).await;
+            acks.push(json!({"id":command.get("id"), "ok":result.get("ok").and_then(Value::as_bool).unwrap_or(false),"result":result}));
+        }
+    }
+    if !acks.is_empty() {
+        post_json(client, config, "/api/router/speedtest/ack", &json!({"acks":acks})).await?;
+    }
+    if Path::new(&config.relay_socket).exists() {
+        let capability = tcp_session_ctl(config, json!({"action":"speedtest_capability"})).await;
+        let status = tcp_session_ctl(config, json!({"action":"speedtest_status"})).await;
+        post_json(client, config, "/api/router/speedtest/status", &json!({"capability":capability,"status":status})).await?;
+    }
+    Ok(())
+}
+
 async fn agent_cycle(client: &Client, config: &AgentConfig, state: &mut AgentState) -> Result<()> {
     let user_list = collect_user_list()?;
     let mut current = BTreeMap::new();
@@ -2482,6 +2512,24 @@ pub async fn run(args: &[String], once: bool) -> Result<()> {
     let mut last_agent_cycle_at = 0u64;
     let mut last_status_at = 0u64;
     log_line(&config, "INFO", "Rust agent started");
+    let _speedtest_sync = if once { None } else {
+        let speed_client = client.clone();
+        let speed_config = config.clone();
+        Some(tokio::spawn(async move {
+            let mut last_error_log = 0u64;
+            loop {
+                if let Err(error) = sync_speedtest(&speed_client, &speed_config).await {
+                    let now = now_epoch();
+                    if now.saturating_sub(last_error_log) >= 60 {
+                        let message = redact(&format!("speedtest sync: {error:#}"), &speed_config.hook_token);
+                        log_line(&speed_config, "WARN", &message);
+                        last_error_log = now;
+                    }
+                }
+                sleep(Duration::from_secs(1)).await;
+            }
+        }))
+    };
     let _tcp_session_sync = if once {
         None
     } else {
@@ -2554,6 +2602,9 @@ pub async fn run(args: &[String], once: bool) -> Result<()> {
         let status_due = once || last_status_at == 0 || now.saturating_sub(last_status_at) >= config.status_interval_seconds.clamp(3, 5);
         if status_due {
             if once {
+                if let Err(error) = sync_speedtest(&client, &config).await {
+                    log_limited(&config, &mut state, "WARN", "speedtest", &format!("speedtest sync: {error:#}"));
+                }
                 if let Err(error) = sync_tcp_session_test(&client, &config).await {
                     let text = redact(&format!("TCP 峰值连接数测试同步：{:#}", error), &config.hook_token);
                     log_limited(&config, &mut state, "WARN", "tcp-session-test", &text);

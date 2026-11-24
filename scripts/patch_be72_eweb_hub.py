@@ -9,7 +9,7 @@ from pathlib import Path
 
 APP_NAME = "app6894ab6e311358c0df7b.js"
 APP_HASH = "a4623980f36bf95e300389a90b404d06ab87cbffe6c6251cb03ee566ba475a5a"
-VERSION = "20261008-5"
+VERSION = "20261020-4"
 STATIC = "/luci-static/eweb-ehr-exp/static/labprobe/"
 MARKER = "labprobe-eweb-hub-" + VERSION
 
@@ -39,7 +39,7 @@ function(kind){return function(){
     loader = "".join(line.strip() for line in loader.splitlines())
     children = []
     for index, (path, kind, label) in enumerate([
-        ("wireguard", "wireguard", "WireGuard"), ("tcp_peak", "tcp", "TCP 峰值测试"), ("ddns", "ddns", "DDNS")], 1):
+        ("wireguard", "wireguard", "WireGuard"), ("tcp_peak", "tcp", "TCP 峰值测试"), ("ddns", "ddns", "DDNS"), ("stun", "stun", "STUN 穿透"), ("ipv6_mapping", "portmaps", "IPv6 映射")], 1):
         row = json.dumps({"label": label, "path": path, "children": [], "id": f"1.1.14.{index}", "fullPath": ["admin", "alone", "hub", path]}, ensure_ascii=True)
         row = row[:-1] + ',"compPath":(' + loader + ')(' + json.dumps(kind) + ')}'
         children.append(row)
@@ -50,8 +50,17 @@ function(kind){return function(){
     uri = "data:image/svg+xml," + quote("".join(line.strip() for line in svg.splitlines()), safe="")
     icon_css = ('.labprobe-hub-icon{display:inline-block;width:1em;height:1em;vertical-align:middle;'
                 'background:currentColor;-webkit-mask:url("' + uri + '") center/contain no-repeat;'
-                'mask:url("' + uri + '") center/contain no-repeat;}')
+                'mask:url("' + uri + '") center/contain no-repeat;}'
+                '.el-submenu__title.labprobe-hub-nav,.el-submenu__title.labprobe-hub-nav>span{color:#fff!important;}')
     initialize = '/*' + MARKER + '*/var labprobeIconStyle=document.createElement("style");labprobeIconStyle.textContent=' + json.dumps(icon_css) + ';document.head.appendChild(labprobeIconStyle);'
+    initialize += '''if(window.MutationObserver&&!window.LabProbeEwebNavObserver){
+window.LabProbeEwebNavObserver=new MutationObserver(function(){
+var icon=document.querySelector('.labprobe-hub-icon');if(!icon)return;
+var title=icon.closest('.el-submenu__title');if(title)title.classList.add('labprobe-hub-nav');
+var menu=icon.closest('.el-menu'),ref=menu&&Array.prototype.find.call(menu.querySelectorAll('.el-menu-item i,.el-submenu__title i'),function(v){return !v.classList.contains('labprobe-hub-icon')&&!v.classList.contains('el-submenu__icon-arrow');});
+if(ref){var s=getComputedStyle(ref),w=ref.getBoundingClientRect().width;if(w>0){icon.style.width=w+'px';icon.style.height=s.fontSize;icon.style.marginLeft=s.marginLeft;icon.style.marginRight=s.marginRight;}}});
+window.LabProbeEwebNavObserver.observe(document.documentElement,{childList:true,subtree:true});}
+'''.replace('\n', '')
     anchor = b'var i=function(){return Promise.all([n.e(0),n.e(13)]).then(n.bind(null,"OH6J"))},r=['
     return replace_once(data, anchor, initialize.encode("ascii") + anchor)
 

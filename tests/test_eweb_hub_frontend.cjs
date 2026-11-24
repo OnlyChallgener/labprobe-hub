@@ -46,6 +46,96 @@ test('TCP history caps at five, merges canonical duplicates, survives reload and
   root.sn='BE50-test';state.loadTcpHistory();assert.equal(state.tcpHistory.length,0);
 });
 
+test('only a successfully completed TCP task records its target, and deleted addresses stay deleted', () => {
+  const {state,root}=setup('tcp');const storage={};root.sn='BE72';root.URL=URL;
+  root.localStorage={getItem:k=>storage[k],setItem:(k,v)=>{storage[k]=v;}};state.$refs={};
+  const task={id:'task-a',target:{host:'EXAMPLE.COM.',port:443},ipv4:{success:3},state:'running'};
+  state.acceptTask(task);assert.equal(state.tcpHistory.length,0);
+  state.acceptTask({...task,state:'failed',ipv4:{success:0}});assert.equal(state.tcpHistory.length,0);
+  state.acceptTask({...task,state:'completed',ipv4:{success:0}});assert.equal(state.tcpHistory.length,0);
+  state.acceptTask({...task,state:'completed'});assert.equal(state.tcpHistory[0],'example.com');
+  state.removeTcpHost('example.com');state._rememberedTcpTask=null;
+  state.acceptTask({...task,state:'completed'});assert.equal(state.tcpHistory.length,0,'polls/reloads must not restore deleted entries');
+  state.acceptTask({...task,id:'task-b',state:'completed'});assert.equal(state.tcpHistory.length,1);
+  state.tcpForm.host='';state.loadTcpHistory();assert.equal(state.tcpForm.host,'example.com','saved address is restored into the input');
+  state.acceptTask({...task,id:'task-c',target:{host:'stopped.example'},state:'stopped'});
+  assert.equal(state.tcpHistory[0],'stopped.example','successful connections remain useful when the test is stopped');
+  state.acceptTask({...task,id:'task-partial',target:{host:'partial.example'},state:'failed'});
+  assert.equal(state.tcpHistory[0],'partial.example','one failed protocol must not discard a target that established connections');
+});
+
+test('TCP multiple targets normalize pasted lists and save the successful group', async () => {
+  const {state,root}=setup('tcp');root.URL=URL;root.sn='test-multiple';
+  const storage={};root.localStorage={getItem:k=>storage[k],setItem:(k,v)=>{storage[k]=v;}};
+  state.$refs={tcpHost:{query:'[2001:db8::1]，EXAMPLE.COM.'}};
+  state.tcpForm.host='192.0.2.1';state.$confirm=()=>Promise.resolve();let sent;
+  state.mutate=async(op,body)=>{sent={op,body};return null;};
+  state.startTcp();await new Promise(r=>setImmediate(r));
+  assert.equal(sent.op,'tcp.start');assert.equal(sent.body.host,'192.0.2.1,2001:db8::1,example.com');
+  state.acceptTask({id:'multi',state:'completed',target:{host:sent.body.host},ipv4:{success:1}});
+  assert.equal(JSON.stringify(state.tcpHistory),JSON.stringify(['192.0.2.1,2001:db8::1,example.com']));
+  assert.equal(state.resultTarget({target:{host:'192.0.2.1,2001:db8::1',port:443}}),'192.0.2.1:443，[2001:db8::1]:443');
+  sent=null;state.$refs.tcpHost.query='';state.tcpForm.host=Array.from({length:9},(_,i)=>'host'+i+'.example').join(',');
+  state.startTcp();await new Promise(r=>setImmediate(r));assert.equal(sent,null);
+});
+
+test('TCP suggestions return whole saved groups for replacement and deduplicate members', () => {
+  const {state}=setup('tcp'); state.tcpHistory=['www.taobao.com,www.baidu.com','www.jd.com'];
+  let suggestions;state.tcpSuggestions('www.bai', v=>suggestions=v);
+  assert.equal(suggestions.length,1);
+  assert.equal(suggestions[0].host,'www.taobao.com,www.baidu.com');
+  assert.equal(suggestions[0].value,'www.taobao.com,www.baidu.com');
+  state.rememberTcpHost('WWW.TAOBAO.COM., www.baidu.com,www.baidu.com');
+  assert.equal(state.tcpHistory.length,2);
+});
+
+test('TCP complete groups persist, cap at five, restore together and delete together', () => {
+  const storage={};const {state,root}=setup('tcp');root.URL=URL;
+  root.localStorage={getItem:k=>storage[k],setItem:(k,v)=>{storage[k]=v;}};
+  for(let i=0;i<6;i++)state.rememberTcpHost('host'+i+'.example,second.example');
+  assert.equal(state.tcpHistory.length,5);
+  const group=state.tcpHistory[0];state.tcpHistory=[];state.tcpForm.host='';state.loadTcpHistory();
+  assert.equal(state.tcpForm.host,group);assert.equal(state.tcpHistory.length,5);
+  state.removeTcpHost(group);state.loadTcpHistory();assert.equal(state.tcpHistory.includes(group),false);
+});
+
+test('TCP finished curve freezes across idle polls and page reload, next test resets it', () => {
+  const storage={};const {state,root}=setup('tcp');
+  root.localStorage={getItem:k=>storage[k],setItem:(k,v)=>{storage[k]=v;}};
+  const task={id:'curve-a',state:'running',updatedEpoch:100,ipv6:{current:10}};
+  state.acceptTask(task);state.acceptTask({...task,updatedEpoch:101,ipv6:{current:20}});
+  const done={...task,state:'completed',finishedEpoch:102,updatedEpoch:103,ipv6:{current:0}};
+  state.acceptTask(done);const frozen=JSON.stringify(state.samples);
+  state.acceptTask({...done,updatedEpoch:500});assert.equal(JSON.stringify(state.samples),frozen);
+  const other=setup('tcp');other.root.localStorage=root.localStorage;
+  other.state.acceptTask({...done,updatedEpoch:600});assert.equal(JSON.stringify(other.state.samples),frozen);
+  other.state.acceptTask({...task,id:'curve-b',updatedEpoch:700});
+  assert.equal(other.state.samples.length,1);assert.equal(other.state.samples[0].at,700);
+});
+
+test('STUN editor sends only intended fields and failed saves preserve the editor', async () => {
+  const {state}=setup('stun');let request;
+  state.editStun({id:'rule-1',name:'NAS',serviceType:'HTTPS',transportProtocol:'TCP',targetType:'manual',targetIpv4:'192.168.1.20',targetPort:443,enabled:false,runtime:{publicEndpoint:'old'}});
+  state.mutate=async(op,body,id)=>{request={op,body,id};return null;};
+  state.saveStun();await new Promise(resolve=>setImmediate(resolve));
+  assert.equal(request.op,'stun.save');assert.equal(request.id,'rule-1');assert.equal(request.body.runtime,undefined);
+  assert.equal(state.dialog,'stun');
+  state.editStun();state.editor.serviceType='WireGuard';state.serviceChanged('WireGuard');
+  assert.equal(state.editor.transportProtocol,'UDP');assert.equal(state.editor.targetPort,51820);
+});
+
+test('IPv6 mapping editor preserves advanced fields and keeps failed edits open', async () => {
+  const {state}=setup('portmaps');let sent;
+  state.snapshot={rules:[{listenPort:20000}],portRange:{min:20000,max:20020}};
+  state.editPortmap();assert.equal(state.editor.listenPort,20001);
+  Object.assign(state.editor,{id:'map-a',name:'IPv6 service',mode:'6to6',targetType:'manual',targetMode:'ipv6_suffix',targetIpv6Suffix:'::1234',runtime:{state:'running'},expiresAt:12345,maxConnections:99});
+  state.mutate=async(op,body,id)=>{sent={op,body,id};return null;};
+  state.savePortmap();await new Promise(r=>setImmediate(r));
+  assert.equal(sent.op,'portmaps.save');assert.equal(sent.body.targetIpv6Suffix,'::1234');
+  assert.equal(sent.body.runtime,undefined);assert.equal(sent.body.expiresAt,undefined);assert.equal(sent.body.maxConnections,undefined);
+  assert.equal(state.dialog,'portmap');assert.equal(state.portmapStatus({enabled:true,runtime:{}}),'等待路由器确认');
+});
+
 test('WG membership survives idle periods and failed samples without claiming historical traffic is online', () => {
   const {state,root}=setup('wireguard');const now=Math.floor(Date.now()/1000);root.testNow=now;
   state.snapshot={server:{interfaceName:'labwg0',peers:[{name:'Phone',publicKey:'phone-key'},{name:'Idle',publicKey:'idle-key'},{name:'Never',publicKey:'never-key'}]},localWireguard:{peerStatusAvailable:true,running:true,receivedEpoch:now,latestHandshakeAt:now-30,peers:[

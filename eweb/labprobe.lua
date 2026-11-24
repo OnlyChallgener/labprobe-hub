@@ -16,9 +16,22 @@ local operations = {
     ["wg.save"] = {"PUT", "/api/wireguard/server"},
     ["wg.remove"] = {"DELETE", "/api/wireguard/peers/", true},
     ["stun.get"] = {"GET", "/api/stun"},
+    ["stun.add"] = {"POST", "/api/stun"},
+    ["stun.save"] = {"PUT", "/api/stun/", true},
+    ["stun.remove"] = {"DELETE", "/api/stun/", true},
+    ["stun.start"] = {"POST", "/api/stun/", true, "/start"},
+    ["stun.stop"] = {"POST", "/api/stun/", true, "/stop"},
+    ["stun.addresses"] = {"GET", "/api/stun/", true, "/addresses"},
     ["tcp.get"] = {"GET", "/api/tcp-session-test"},
     ["tcp.start"] = {"POST", "/api/tcp-session-test/start"},
     ["tcp.stop"] = {"POST", "/api/tcp-session-test/stop"},
+    ["tcp.history.remove"] = {"POST", "/api/tcp-session-test/history/remove"},
+    ["portmaps.get"] = {"GET", "/api/portmaps"},
+    ["portmaps.add"] = {"POST", "/api/portmaps"},
+    ["portmaps.save"] = {"PUT", "/api/portmaps/", true},
+    ["portmaps.remove"] = {"DELETE", "/api/portmaps/", true},
+    ["portmaps.start"] = {"POST", "/api/portmaps/", true, "/start"},
+    ["portmaps.stop"] = {"POST", "/api/portmaps/", true, "/stop"},
     ["ddns.get"] = {"GET", "/api/ddns"},
     ["ddns.add"] = {"POST", "/api/ddns"},
     ["ddns.save"] = {"PUT", "/api/ddns/", true},
@@ -137,6 +150,13 @@ function request(params)
     if config.routerName~="BE72" or config.hubUrl~="http://192.168.5.46:58443" then
         return failure("当前路由器未启用 HUB 页面", 403)
     end
+    -- The gateway no longer routes owner credentials at /api implicitly.
+    -- This extension is bound to BE72; keep the agent's root URL unchanged.
+    local router_id = config.routerId or "be72"
+    if router_id ~= "be72" then
+        return failure("HUB 路由器路径与当前设备不一致", 409)
+    end
+    local hub_api = config.hubUrl.."/r/"..router_id
     -- Private curl config contains Authorization; it never enters argv or replies.
     local temporary = os.tmpname()
     local serialized = json.encode(body)
@@ -145,10 +165,10 @@ function request(params)
     if not file then return failure("暂时无法提交请求", 500) end
     file:writeall(serialized)
     file:close()
-    local timeout = params.op=="wg.get" and 4 or params.op:match("^ddns%.") and op[1]~="GET" and 30 or 8
+    local timeout = params.op=="wg.get" and 4 or (params.op:match("^ddns%.") or params.op:match("^stun%.") or params.op:match("^portmaps%.")) and op[1]~="GET" and 30 or 8
     local command = "/usr/bin/curl --silent --max-filesize 1048576 --connect-timeout 2 --max-time "..timeout..
         " --config /etc/labprobe/eweb-hub.curl --request "..op[1]..
-        " --url "..shellquote(config.hubUrl..path).." --write-out '\\n%{http_code}'"
+        " --url "..shellquote(hub_api..path).." --write-out '\\n%{http_code}'"
     if op[1]~="GET" and op[1]~="DELETE" then command=command.." --data-binary @"..shellquote(temporary) end
     local function fetch(command_text)
         local success, raw = pcall(sys.exec, command_text.." 2>/dev/null")

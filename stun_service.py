@@ -41,9 +41,9 @@ SERVICE_TEMPLATES = {
 # Cloudflare publishes its free STUN endpoint for UDP only. A TCP rule must
 # use a server that explicitly accepts STUN Binding requests over TCP.
 DEFAULT_STUN_UDP_SERVER = "stun.cloudflare.com:3478"
-DEFAULT_STUN_TCP_SERVER = "stun.nextcloud.com:3478"
+DEFAULT_STUN_TCP_SERVER = "turn.cloud-rtc.com:80"
 LEGACY_TCP_STUN_SERVER = DEFAULT_STUN_UDP_SERVER
-LEGACY_TCP_STUN_SERVERS = {DEFAULT_STUN_UDP_SERVER, "stunserver2025.stunprotocol.org:3478"}
+LEGACY_TCP_STUN_SERVERS = {DEFAULT_STUN_UDP_SERVER, "stunserver2025.stunprotocol.org:3478", "stunserver2025.stunprotocol.org.:3478", "stun.nextcloud.com:3478", "stun.nextcloud.com:443", "turn.cloudflare.com:3478"}
 STUN_MAPPING_FRESH_SECONDS = 90
 
 # Fields that change Relay execution or the router-owned forwarding path.
@@ -206,7 +206,8 @@ class StunService:
             return
         saved = self._save_rules(migrated)
         for rule in migrated:
-            if _bool(rule.get("enabled")) and _text(rule.get("kind")).lower() == "stun":
+            old = next((row for row in document["rules"] if row.get("id") == rule.get("id")), {})
+            if rule != old and _bool(rule.get("enabled")) and _text(rule.get("kind")).lower() == "stun":
                 self.queue("upsert", {"rule": rule}, revision=saved["revision"])
 
     def _router_name(self) -> str:
@@ -635,8 +636,18 @@ class StunService:
                 None,
             )
             if same_name:
+                # Reusing an exact existing STUN ingress permission does not
+                # grant ownership. Stop/delete must continue to leave it alone.
+                # Forwarding policies (e.g. WireGuard LAN) still require a receipt.
+                if owner == "labprobe-stun" and not binding.get("uuid") and self._firewall_matches(same_name, expected):
+                    result = {"owner": "untracked", "state": "ready", "message": "沿用内容一致的现有放行规则；不接管或删除该规则"}
+                    bindings[rule["id"]] = {**binding, **result}
+                    self._save_firewall_bindings(bindings)
+                    return result
                 result = {"owner": owner, "state": "manual_change", "message": "检测到同名但不属于 LabProbe 的防火墙规则，未接管"}
-                bindings[rule["id"]] = result
+                # Keep the original ownership receipt for diagnosis/recovery.
+                # A conflict must not erase the UUID and fingerprint we wrote.
+                bindings[rule["id"]] = {**binding, **result}
                 self._save_firewall_bindings(bindings)
                 return result
         if existing:
@@ -1132,7 +1143,6 @@ def create_stun_blueprint(hub: Any, service: StunService) -> Blueprint:
             record = {"router": _text(request.args.get("router")) or service._router_name(), "receivedAt": _now_text(), "receivedEpoch": _now(), "status": payload}
             service.hub.save_json(service.status_path, record)
             runtime = service._runtime()
-            firewall_bindings = service._firewall_bindings()
             rules = document["rules"]
             desired = {rule["id"]: rule for rule in rules}
             local_rules = {}
@@ -1168,8 +1178,12 @@ def create_stun_blueprint(hub: Any, service: StunService) -> Blueprint:
                         result = service.ensure_firewall(rule)
                     except Exception as error:
                         result = {"state": "error", "message": str(error)}
+                    # ensure/remove_firewall persist their own changes. Reload
+                    # after each call so an earlier snapshot cannot resurrect a
+                    # removed binding or discard a newly written receipt.
+                    firewall_bindings = service._firewall_bindings()
                     firewall_bindings[rule["id"]] = {**firewall_bindings.get(rule["id"], {}), **result}
-            service._save_firewall_bindings(firewall_bindings)
+                    service._save_firewall_bindings(firewall_bindings)
             return jsonify({"ok": True, "receivedAt": record["receivedAt"]})
 
     return bp
