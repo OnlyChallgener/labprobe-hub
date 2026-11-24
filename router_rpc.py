@@ -702,17 +702,28 @@ class RuijieRouterClient:
 
     def ddns(self, force: bool = False) -> Dict[str, Any]:
         def load() -> Dict[str, Any]:
-            raw = self.rpc("devSta.get", "ddnsCfg")
-            if isinstance(raw, dict):
-                rows = raw.get("list") or raw.get("data") or []
-                if isinstance(rows, list):
-                    clean = []
-                    for row in rows:
-                        if isinstance(row, dict):
-                            clean.append({**row, "password": "", "passwordConfigured": bool(row.get("password"))})
-                    raw = {**raw, "list": clean}
-                return raw
-            return {"list": []}
+            # 新固件由 ufplugin ddns_view 暴露 entries，ddnsCfg 恒为空。
+            # 先探测新协议，失败再退回老协议，避免把「读不到」误报成「没有记录」。
+            view = self.rpc("devSta.get", "ddns_view")
+            protocol = "ddnsCfg"
+            rows: Any = None
+            if isinstance(view, dict) and isinstance(view.get("entries"), list):
+                protocol = "ddns_view"
+                rows = view["entries"]
+            else:
+                raw = self.rpc("devSta.get", "ddnsCfg")
+                if isinstance(raw, dict):
+                    rows = raw.get("list") or raw.get("data") or []
+            clean = []
+            for row in (rows or []):
+                if not isinstance(row, dict):
+                    continue
+                item = {**row}
+                item["password"] = ""
+                item["passwordConfigured"] = bool(row.get("password") or row.get("credential_set"))
+                item["nativeProtocol"] = protocol
+                clean.append(item)
+            return {"list": clean, "services": clean, "nativeProtocol": protocol}
         return self.cached("ddns", 15.0, load, force)
 
 

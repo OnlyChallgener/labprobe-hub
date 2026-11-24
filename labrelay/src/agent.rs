@@ -1195,10 +1195,14 @@ fn telemetry_from_fast(fast: &Value, online_devices: usize, cached_storage_perce
         "uptimeSeconds": number(fast.get("runtime")) as u64,
         "onlineDeviceCount": online_devices,
         "wan": {
+            // eWeb ws_sysinfo 的 tx_rate_bps / tx_rate / up 已经是 bit/s，实测 BE72Pro
+            // 的 up/down 与 total_up 字节增量 ×8 同量级。再乘 8 会让 agent 通道比
+            // eWeb WS 通道高 8 倍，20 秒后数据源切换时速率会突然跳变。
+            // local procfs 那条路径单独走 wan_rate_bps()，那里已经做了 bytes→bit 转换。
             "uploadRaw": upload_raw,
             "downloadRaw": download_raw,
-            "uploadBps": (upload_raw * 8.0) as u64,
-            "downloadBps": (download_raw * 8.0) as u64,
+            "uploadBps": upload_raw as u64,
+            "downloadBps": download_raw as u64,
             "totalUploadBytes": total_upload as u64,
             "totalDownloadBytes": total_download as u64
         },
@@ -2802,9 +2806,35 @@ mod local_telemetry_tests {
         let fast = json!({"cpu_usage":23,"memutil":68,"runtime":1234,"wan_stat":{"wans":{"tx_rate":12}}});
         let value = fast_telemetry_with_local_fallback(&config, &mut state, &fast, metadata);
         assert_eq!(value["cpuPercent"], 23.0);
-        assert_eq!(value["wan"]["uploadBps"], 96);
+        // eWeb 的速率字段本身就是 bit/s，不做二次 ×8。
+        assert_eq!(value["wan"]["uploadBps"], 12);
         assert!(value["wan"].get("downloadRaw").is_none());
         assert!(state.local_cpu_total > 0, "missing fields must read actual procfs rather than fabricate zero");
+    }
+
+    #[test]
+    fn be72pro_eweb_fast_rates_are_not_multiplied_twice() {
+        // 2026-11-24 BE72Pro 实测：dev_sta get -m ws_sysinfo '{"get":"fast"}'
+        // wan_stat.wan 只有 up/down（bit/s），与 total_up 字节增量 ×8 同量级。
+        // 1 秒窗口 total_up 增 4627 字节 → 37016 bit/s，上报 up=24372 同量级。
+        let fast = json!({
+            "cpu_usage": 14.0,
+            "memutil": 44.0,
+            "runtime": 365420,
+            "wan_stat": {"wan": {
+                "up": "24372",
+                "down": "19361",
+                "total_up": "3672912896",
+                "total_down": "13989216196"
+            }}
+        });
+        let telemetry = telemetry_from_fast(&fast, 30, None);
+        assert_eq!(telemetry["wan"]["uploadBps"], 24372);
+        assert_eq!(telemetry["wan"]["downloadBps"], 19361);
+        assert_eq!(telemetry["wan"]["totalUploadBytes"], 3672912896u64);
+        // 同一帧经 HUB eWeb WS 通道 normalize_fast_message 得到同样的 bit/s，
+        // 两条通道不再差 8 倍。
+        assert_eq!(telemetry["wan"]["uploadBps"].as_u64().unwrap(), 24372);
     }
 
     #[test]
