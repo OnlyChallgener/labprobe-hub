@@ -54,7 +54,7 @@ services:
       retries: 5
 
   labprobe-hub:
-    image: ${LABPROBE_IMAGE:-onlychallgener/labprobe-hub:v0.14.2}
+    image: ${LABPROBE_IMAGE:-onlychallgener/labprobe-hub:v0.14.3}
     build:
       context: .
       dockerfile: Dockerfile
@@ -74,7 +74,7 @@ services:
       BACKUPS_DIR: ./backups
       LOGS_DIR: ./logs
       UPDATE_REPOSITORY_DIR: /app/update-repository
-      LABRELAY_RELEASE_VERSION: ${LABRELAY_RELEASE_VERSION:-0.2.75}
+      LABRELAY_RELEASE_VERSION: ${LABRELAY_RELEASE_VERSION:-0.2.79}
       LOG_LEVEL: ${LOG_LEVEL:-INFO}
       LOG_RETENTION_DAYS: ${LOG_RETENTION_DAYS:-14}
       REVISION_MAX_ROWS: ${REVISION_MAX_ROWS:-5000}
