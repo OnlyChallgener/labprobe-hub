@@ -104,7 +104,7 @@ jobs:
         run: |
           cargo install cross --locked
           sudo apt-get update
-          sudo apt-get install -y qemu-user-static file
+          sudo apt-get install -y qemu-user file
 
       - name: Build static ARM64 router binary
         env:
@@ -123,7 +123,7 @@ jobs:
           set -euo pipefail
           BINARY="$RUNNER_TEMP/labrelay-cross-target/aarch64-unknown-linux-musl/release/labrelay"
           test -x "$BINARY"
-          OUTPUT="$(qemu-aarch64-static "$BINARY" version)"
+          OUTPUT="$(qemu-aarch64 "$BINARY" version)"
           printf '%s\n' "$OUTPUT"
           test "$OUTPUT" = "labrelay $VERSION"
 
@@ -135,7 +135,7 @@ jobs:
           ARM64="$RUNNER_TEMP/labrelay-cross-target/aarch64-unknown-linux-musl/release/labrelay"
           ARMV7="$RUNNER_TEMP/labrelay-cross-target/armv7-unknown-linux-musleabi/release/labrelay"
           test -x "$ARMV7"
-          OUTPUT="$(qemu-arm-static "$ARMV7" version)"
+          OUTPUT="$(qemu-arm "$ARMV7" version)"
           printf '%s\n' "$OUTPUT"
           test "$OUTPUT" = "labrelay $VERSION"
           file "$ARM64" | grep -Eqi 'aarch64|ARM aarch64|ARM64'
