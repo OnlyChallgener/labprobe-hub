@@ -134,12 +134,15 @@ class RouterDeviceLiveSync:
                     "todayOnlineDate": today,
                 }
             )
-            if raw.get("flowUp") is not None:
-                row["uploadBps"] = _as_int(raw.get("flowUp"))
-            if raw.get("flowDown") is not None:
-                row["downloadBps"] = _as_int(raw.get("flowDown"))
-            if raw.get("flow_cnt") is not None:
-                row["connectionCount"] = _as_int(raw.get("flow_cnt"))
+            upload_value = raw.get("uploadBps") if raw.get("uploadBps") is not None else raw.get("flowUp")
+            download_value = raw.get("downloadBps") if raw.get("downloadBps") is not None else raw.get("flowDown")
+            connection_value = raw.get("connectionCount") if raw.get("connectionCount") is not None else raw.get("flow_cnt")
+            if upload_value is not None:
+                row["uploadBps"] = _as_int(upload_value)
+            if download_value is not None:
+                row["downloadBps"] = _as_int(download_value)
+            if connection_value is not None:
+                row["connectionCount"] = _as_int(connection_value)
             rows.append(row)
         rows = self.hub.attach_hub_local_ipv6_to_nas_devices(rows)
         rows.sort(key=lambda row: self.hub.norm_mac(row.get("mac")))

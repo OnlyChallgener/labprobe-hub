@@ -450,7 +450,7 @@ def test_full_device_snapshot_publishes_raw_rate_without_hub_smoothing():
     }
 
     rows, total = sync._hydrate({
-        "list": [{"mac": "aa", "raw": {"flowUp": 800, "flowDown": 1200, "flow_cnt": 3}}],
+        "list": [{"mac": "aa", "raw": {"uploadBps": 800, "flowUp": 999, "downloadBps": 1200, "flowDown": 9999, "connectionCount": 3, "flow_cnt": 9}}],
         "total": 1,
     })
 
