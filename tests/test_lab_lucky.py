@@ -267,6 +267,26 @@ def test_certificate_download_endpoint_streams_authorized_zip(tmp_path):
     assert not packaged_path.exists()
 
 
+def test_certificate_download_response_close_removes_unconsumed_zip(tmp_path):
+    app = Flask(__name__)
+    register_lucky(app, tmp_path, lambda: True)
+    store = LuckyStore(tmp_path)
+    with patch.object(LuckyClient, 'call', return_value={'ruleList': [], 'list': []}):
+        key = store.save({'url': 'http://localhost', 'name': 'test', 'token': 'secret'})
+    packaged_path = tmp_path / 'unconsumed.zip'
+    packaged_path.write_bytes(b'PK-test-zip')
+    source = io.BytesIO(b'official-zip')
+    with patch.object(LuckyClient, 'certificates', return_value=[{'Key': 'c', 'Remark': 'NAS'}]), \
+         patch.object(LuckyClient, 'download_certificate', return_value=source), \
+         patch('lab_lucky.package_certificate_download_file', return_value=packaged_path):
+        with app.test_request_context(f'/api/lucky/{key}/certificates/c/download'):
+            response = app.view_functions['lucky.certificate_download'](key, 'c')
+    assert packaged_path.exists()
+    response.close()
+    assert not packaged_path.exists()
+    assert source.closed
+
+
 def test_connection_url_change_never_reuses_old_token(tmp_path):
     store = LuckyStore(tmp_path)
     with patch.object(LuckyClient, 'call', return_value={'ruleList': [], 'list': []}):

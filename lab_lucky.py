@@ -737,11 +737,13 @@ def register_lucky(app, root, authorized):
             finally:
                 packaged.unlink(missing_ok=True)
 
-        return Response(stream_with_context(generate()), mimetype='application/zip', headers={
+        response = Response(stream_with_context(generate()), mimetype='application/zip', headers={
             'Content-Disposition': 'attachment; filename="' + filename + '"',
             'Cache-Control': 'no-store',
             'X-Content-Type-Options': 'nosniff',
         })
+        response.call_on_close(lambda: packaged.unlink(missing_ok=True))
+        return response
 
     @bp.route('/<key>/certificates/<cid>/<action>', methods=['POST'])
     def cert_action(key, cid, action):
