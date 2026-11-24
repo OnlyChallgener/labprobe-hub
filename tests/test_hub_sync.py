@@ -100,6 +100,22 @@ class HubSyncApiTests(unittest.TestCase):
         self.assertEqual(created["serviceType"], "HTTPS")
         self.assertEqual(updated["serviceType"], "HTTPS")
 
+    def test_portmap_listen_port_accepts_full_valid_range(self):
+        for port in (1, 3499, 65535):
+            cleaned = hub._clean_portmap_rule({
+                "id": f"map-port-{port}", "name": "Port range", "enabled": True, "mode": "6to6",
+                "listenPort": port, "targetMode": "ipv6_full", "targetIpv6": "2001:db8::53",
+                "targetPort": 443,
+            })
+            self.assertEqual(port, cleaned["listenPort"])
+        for port in (0, 65536):
+            with self.assertRaisesRegex(ValueError, "1-65535"):
+                hub._clean_portmap_rule({
+                    "id": f"map-invalid-{port}", "name": "Invalid", "enabled": True, "mode": "6to6",
+                    "listenPort": port, "targetMode": "ipv6_full", "targetIpv6": "2001:db8::53",
+                    "targetPort": 443,
+                })
+
     def test_portmap_permanent_expiry_is_null_and_timezone_neutral(self):
         cleaned = hub._clean_portmap_rule({
             "id": "permanent", "name": "Permanent", "enabled": True, "mode": "6to4",

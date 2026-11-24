@@ -5084,8 +5084,8 @@ def _clean_portmap_rule(payload: Dict[str, Any], existing: Optional[Dict[str, An
         raise ValueError("映射类型只能是 6to4 或 6to6")
     listen_port = to_int(src.get("listenPort"), 0)
     target_port = to_int(src.get("targetPort"), 0)
-    if not 20000 <= listen_port <= 20020:
-        raise ValueError("监听端口必须在 20000-20020")
+    if not 1 <= listen_port <= 65535:
+        raise ValueError("监听端口范围必须为 1-65535")
     if not 1 <= target_port <= 65535:
         raise ValueError("目标端口无效")
     name = clean_saved_value(src.get("name"))[:64]

@@ -2150,10 +2150,10 @@ async fn daemon(args: &[String]) -> Result<()> {
     let pid = PathBuf::from(arg_value(args, "--pid").unwrap_or_else(|| DEFAULT_PID.to_string()));
     let port_min = arg_value(args, "--port-min")
         .and_then(|x| x.parse().ok())
-        .unwrap_or(20000);
+        .unwrap_or(1);
     let port_max = arg_value(args, "--port-max")
         .and_then(|x| x.parse().ok())
-        .unwrap_or(20020);
+        .unwrap_or(65535);
     let lan_if = arg_value(args, "--lan-if").unwrap_or_else(|| "br-lan".to_string());
     if port_min > port_max {
         bail!("端口范围无效");
@@ -2650,7 +2650,7 @@ mod tests {
     }
 
     #[test]
-    fn stun_middle_port_can_be_outside_managed_portmap_range() {
+    fn portmap_accepts_full_u16_range_and_stun_keeps_privileged_port_guard() {
         let mut stun = Rule {
             id: "stun-middle-port".into(),
             name: "router ssh".into(),
@@ -2661,19 +2661,30 @@ mod tests {
             ..Rule::default()
         };
         normalize_rule(&mut stun);
-        validate_rule(&stun, 20000, 32767).unwrap();
+        validate_rule(&stun, 1, 65535).unwrap();
         assert_eq!(stun.target_ipv4, "127.0.0.1");
         assert_eq!(stun.forward_mode, "relay_proxy");
 
-        let mut portmap = Rule {
-            id: "portmap-low-port".into(),
-            listen_port: 3499,
+        for port in [1u16, 3499, 65535] {
+            let mut portmap = Rule {
+                id: "portmap-full-range".into(),
+                listen_port: port,
+                target_ipv4: "192.168.5.46".into(),
+                target_port: 443,
+                ..Rule::default()
+            };
+            normalize_rule(&mut portmap);
+            validate_rule(&portmap, 1, 65535).unwrap();
+        }
+        let mut invalid = Rule {
+            id: "portmap-zero".into(),
+            listen_port: 0,
             target_ipv4: "192.168.5.46".into(),
             target_port: 443,
             ..Rule::default()
         };
-        normalize_rule(&mut portmap);
-        assert!(validate_rule(&portmap, 20000, 32767).is_err());
+        normalize_rule(&mut invalid);
+        assert!(validate_rule(&invalid, 1, 65535).is_err());
     }
 
     #[test]
