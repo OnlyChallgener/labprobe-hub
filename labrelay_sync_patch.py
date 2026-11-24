@@ -15,8 +15,8 @@ from typing import Any, Dict, List
 
 from flask import jsonify, request
 
-PORTMAP_PORT_MIN = 20000
-PORTMAP_PORT_MAX = 29999
+PORTMAP_PORT_MIN = 1
+PORTMAP_PORT_MAX = 65535
 STUN_LOCAL_PORT_MIN = 30000
 STUN_LOCAL_PORT_MAX = 32767
 

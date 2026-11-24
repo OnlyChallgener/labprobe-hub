@@ -96,16 +96,17 @@ jobs:
           )
           print(f'LabRelay {version} consistent across Cargo.toml and Cargo.lock')
           PY
-          grep -q 'PORTMAP_PORT_MAX = 29999' labrelay_sync_patch.py
+          grep -q 'PORTMAP_PORT_MIN = 1' labrelay_sync_patch.py
+          grep -q 'PORTMAP_PORT_MAX = 65535' labrelay_sync_patch.py
           grep -q 'STUN_LOCAL_PORT_MIN = 30000' labrelay_sync_patch.py
           grep -q 'STUN_LOCAL_PORT_MAX = 32767' labrelay_sync_patch.py
           sh -n agent/install.sh
           sh -n scripts/labprobe-install.sh
           grep -q 'procd_set_param limits nofile="131072 131072"' agent/install.sh
           grep -q "ulimit -n 131072; exec /usr/bin/labrelay daemon" agent/install.sh
-          grep -q -- '--port-max 32767' agent/install.sh
+          grep -q -- '--port-min 1 --port-max 65535' agent/install.sh
           grep -q 'procd_set_param limits nofile="131072 131072"' scripts/labprobe-install.sh
-          grep -q -- '--port-max 32767' scripts/labprobe-install.sh
+          grep -q -- '--port-min 1 --port-max 65535' scripts/labprobe-install.sh
 
       - name: Test and build LabRelay
         working-directory: labrelay

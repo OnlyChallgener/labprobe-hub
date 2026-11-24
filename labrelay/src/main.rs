@@ -266,7 +266,14 @@ impl Manager {
         lan_if: String,
     ) -> Result<Self> {
         let cfg = load_config(&config_path)?;
-        let rules = cfg.rules.into_iter().map(|r| (r.id.clone(), r)).collect();
+        let mut rules = HashMap::new();
+        for mut rule in cfg.rules {
+            normalize_rule(&mut rule);
+            validate_rule(&rule, port_min, port_max)?;
+            if rules.insert(rule.id.clone(), rule).is_some() {
+                bail!("规则 ID 重复");
+            }
+        }
         Ok(Self {
             rules: Arc::new(RwLock::new(rules)),
             runtimes: Arc::new(Mutex::new(HashMap::new())),
@@ -2155,7 +2162,7 @@ async fn daemon(args: &[String]) -> Result<()> {
         .and_then(|x| x.parse().ok())
         .unwrap_or(65535);
     let lan_if = arg_value(args, "--lan-if").unwrap_or_else(|| "br-lan".to_string());
-    if port_min > port_max {
+    if port_min == 0 || port_max == 0 || port_min > port_max {
         bail!("端口范围无效");
     }
     if let Some(parent) = pid.parent() {
@@ -2269,6 +2276,26 @@ async fn main() -> Result<()> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[tokio::test]
+    async fn manager_load_rejects_invalid_saved_rule() {
+        let path = std::env::temp_dir().join(format!(
+            "labrelay-invalid-config-{}-{}.json",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        fs::write(
+            &path,
+            r#"{"version":1,"rules":[{"id":"bad","kind":"portmap","name":"bad","enabled":false,"mode":"6to4","listenPort":0,"targetPort":443,"targetIpv4":"192.168.5.46"}]}"#,
+        )
+        .unwrap();
+        let result = Manager::load(path.clone(), path.with_extension("state"), 1, 65535, "br-lan".into()).await;
+        fs::remove_file(path).unwrap();
+        assert!(result.is_err());
+    }
 
     #[test]
     fn parses_ipv6_suffix64() {

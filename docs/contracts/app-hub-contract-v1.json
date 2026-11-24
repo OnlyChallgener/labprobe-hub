@@ -1799,8 +1799,8 @@
             "agentRevision": "Long (default 0L)",
             "capabilities": "Array of Strings (optional)",
             "portRange": {
-              "min": "Int (default 20000)",
-              "max": "Int (default 20020)"
+              "min": "Int (default 1)",
+              "max": "Int (default 65535)"
             }
           }
         },

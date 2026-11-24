@@ -341,7 +341,7 @@ _SPECS: List[Dict[str, Any]] = [
     ),
     _spec(
         "router.portmap.create", "创建端口映射",
-        "创建一条 IPv6 端口映射规则（监听端口 20000-20020），经 APP 二次确认后执行。",
+        "创建一条 IPv6 端口映射规则（监听端口 1-65535），经 APP 二次确认后执行。",
         ["给 NAS 创建一条 20001 到 5001 的端口映射"],
         "router.write", "write", "always",
         {

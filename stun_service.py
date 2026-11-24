@@ -231,7 +231,7 @@ class StunService:
 
     def _allocated_port(self, protocol: str, excluding: str = "") -> int:
         used = self._used_ports(protocol, excluding)
-        for port in range(20000, 20021):
+        for port in range(30000, 32768):
             if port not in used:
                 return port
         raise ValueError("中继端口已用完，请先停止一个映射或穿透规则")

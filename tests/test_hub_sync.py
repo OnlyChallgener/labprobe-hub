@@ -105,6 +105,9 @@ class HubSyncApiTests(unittest.TestCase):
         self.assertEqual(updated["serviceType"], "HTTPS")
 
     def test_portmap_listen_port_accepts_full_valid_range(self):
+        from labrelay_sync_patch import PORTMAP_PORT_MAX, PORTMAP_PORT_MIN, STUN_LOCAL_PORT_MAX, STUN_LOCAL_PORT_MIN
+        self.assertEqual((PORTMAP_PORT_MIN, PORTMAP_PORT_MAX), (1, 65535))
+        self.assertEqual((STUN_LOCAL_PORT_MIN, STUN_LOCAL_PORT_MAX), (30000, 32767))
         for port in (1, 3499, 65535):
             cleaned = hub._clean_portmap_rule({
                 "id": f"map-port-{port}", "name": "Port range", "enabled": True, "mode": "6to6",
