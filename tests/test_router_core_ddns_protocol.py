@@ -29,6 +29,8 @@ BE72_ENTRIES = [
      "enabled": True, "id": "ddns_6affba6f_4", "rcode": "0", "credential_set": True},
 ]
 
+_DEFAULT_VIEW_RESPONSE = object()
+
 
 class FakeRpc:
     def __init__(self, view):
@@ -41,11 +43,14 @@ class FakeRpc:
         self.fail_view = False
         self.malformed_view = False
         self.missing_settings = False
+        self.view_response = _DEFAULT_VIEW_RESPONSE
 
     def rpc(self, method, module="", data=None, **kwargs):
         with self.lock:
             self.calls.append((method, module, data))
             if method == "devSta.get" and module == "ddns_view":
+                if self.view_response is not _DEFAULT_VIEW_RESPONSE:
+                    return self.view_response
                 if self.fail_view:
                     raise RouterUnreachableError("temporary network failure")
                 if self.malformed_view:
@@ -121,6 +126,25 @@ def test_legacy_firmware_still_uses_ddnscfg():
     result = driver(rpc).get_ddns(force=True)
     assert result["nativeProtocol"] == "ddnsCfg"
     assert any(m == "devSta.get" and mod == "ddnsCfg" for m, mod, _ in rpc.calls)
+
+
+@pytest.mark.parametrize("response", [{}, []])
+def test_legacy_empty_view_response_falls_back_to_ddnscfg(response):
+    rpc = FakeRpc(view=False)
+    rpc.view_response = response
+    result = driver(rpc).get_ddns(force=True)
+    assert result["nativeProtocol"] == "ddnsCfg"
+    assert any(module == "ddnsCfg" for _, module, _ in rpc.calls)
+
+
+def test_unexpected_view_error_never_falls_back_to_legacy_write():
+    rpc = FakeRpc(view=True)
+    rpc.view_response = {"rcode": "9999", "rmsg": "internal error"}
+    with pytest.raises(RouterRpcExecutionError) as raised:
+        driver(rpc).add_ddns({"provider": "aliyun.com", "domain": "new.example.com"}, "secret")
+    assert raised.value.code == "DDNS_INVALID_RESPONSE"
+    assert not any(module == "ddnsCfg" for _, module, _ in rpc.calls)
+    assert not any(method == "devSta.set" for method, _, _ in rpc.calls)
 
 
 def test_ddns_view_write_uses_devsta_set_not_legacy_add():

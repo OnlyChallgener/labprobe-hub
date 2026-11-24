@@ -574,6 +574,20 @@ class ReyeeEWebDriver(RouterDriver):
             raise RouterRpcExecutionError("DDNS 全局设置响应结构异常", "DDNS_INVALID_RESPONSE", 502)
         return rows, dict(settings)
 
+    @staticmethod
+    def _ddns_view_unavailable(raw: Any) -> bool:
+        if isinstance(raw, list):
+            return True
+        if not isinstance(raw, dict) or isinstance(raw.get("entries"), list):
+            return False
+        if not raw:
+            return True
+        code = str(raw.get("rcode") or raw.get("code") or "").strip()
+        message = str(raw.get("rmsg") or raw.get("message") or "").lower()
+        return code == "03510001" or (
+            bool(code) and code not in {"0", "0000"} and ("unavailable" in message or "not support" in message)
+        )
+
     def _ddns_protocol(self, force: bool = False) -> str:
         cached = getattr(self, "_ddns_protocol_value", self._DDNS_PROTOCOL_UNKNOWN)
         if cached and not force:
@@ -584,7 +598,7 @@ class ReyeeEWebDriver(RouterDriver):
             self._ddns_protocol_value = self._DDNS_PROTOCOL_VIEW
             self._ddns_view_settings = settings
             return self._DDNS_PROTOCOL_VIEW
-        if isinstance(raw, (dict, list)):
+        if self._ddns_view_unavailable(raw):
             self._ddns_protocol_value = self._DDNS_PROTOCOL_CFG
             self._ddns_view_settings = {}
             return self._DDNS_PROTOCOL_CFG
