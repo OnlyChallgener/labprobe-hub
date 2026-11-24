@@ -2695,6 +2695,7 @@ mod tests {
         for port in [1u16, 3499, 65535] {
             let mut portmap = Rule {
                 id: "portmap-full-range".into(),
+                name: "HTTPS port map".into(),
                 listen_port: port,
                 target_ipv4: "192.168.5.46".into(),
                 target_port: 443,
