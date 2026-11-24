@@ -465,3 +465,53 @@ def test_reyee_driver_ddns_get_update_delete():
     assert update_payload["data"][0]["enabled"] == "0"
     assert "enable" not in update_payload["data"][0]
     assert "user" not in update_payload["data"][0]
+
+
+def test_reyee_driver_device_rates_keep_bps_and_convert_bytes_once():
+    from router_core.driver.reyee import ReyeeEWebDriver
+
+    mock_rpc = MagicMock(spec=ReyeeRpcClient)
+    mock_rpc.rpc.return_value = {
+        "list": [{"mac": "AA:BB:CC:DD:EE:01", "flowUp": 2680, "flowDown": 12000, "flow_cnt": 3}]
+    }
+    driver = ReyeeEWebDriver(rpc_client=mock_rpc)
+
+    row = driver.get_devices(force=True)[0]
+
+    assert row["uploadBps"] == 2680
+    assert row["downloadBps"] == 12000
+    assert row["realtimeUpBytes"] == 335
+    assert row["realtimeDownBytes"] == 1500
+    assert row["connectionCount"] == 3
+
+
+def test_reyee_driver_preserves_existing_byte_rate_fields():
+    from router_core.driver.reyee import ReyeeEWebDriver
+
+    mock_rpc = MagicMock(spec=ReyeeRpcClient)
+    mock_rpc.rpc.return_value = {
+        "list": [{"mac": "AA:BB:CC:DD:EE:01", "flowUp": 2680, "realtimeUpBytes": 335}]
+    }
+    driver = ReyeeEWebDriver(rpc_client=mock_rpc)
+
+    row = driver.get_devices(force=True)[0]
+
+    assert row["realtimeUpBytes"] == 335
+    assert "realtimeDownBytes" not in row
+    assert "downloadBps" not in row
+
+
+def test_reyee_driver_omits_unknown_rate_fields_instead_of_zero():
+    from router_core.driver.reyee import ReyeeEWebDriver
+
+    mock_rpc = MagicMock(spec=ReyeeRpcClient)
+    mock_rpc.rpc.return_value = {"list": [{"mac": "AA:BB:CC:DD:EE:01"}]}
+    driver = ReyeeEWebDriver(rpc_client=mock_rpc)
+
+    row = driver.get_devices(force=True)[0]
+
+    assert "uploadBps" not in row
+    assert "downloadBps" not in row
+    assert "realtimeUpBytes" not in row
+    assert "realtimeDownBytes" not in row
+    assert "connectionCount" not in row

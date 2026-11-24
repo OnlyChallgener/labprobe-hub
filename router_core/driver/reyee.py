@@ -16,6 +16,22 @@ from router_core.errors import RouterRpcExecutionError, RouterValidationError, f
 from router_capabilities import firmware_features
 
 
+def _rate_bps(value: Any) -> int:
+    try:
+        return max(0, int(float(str(value or "0").strip())))
+    except (TypeError, ValueError):
+        return 0
+
+
+def _rate_bytes_from_bps(value: Any) -> int:
+    bits = _rate_bps(value)
+    return bits // 8 + (1 if bits % 8 >= 4 else 0)
+
+
+def _rate_bps_from_bytes(value: Any) -> int:
+    return _rate_bps(value) * 8
+
+
 class ReyeeEWebDriver(RouterDriver):
     """Router Driver for Reyee eWeb OS router hardware."""
 
@@ -277,15 +293,38 @@ class ReyeeEWebDriver(RouterDriver):
                     for item in rows:
                         if not isinstance(item, dict):
                             continue
-                        result.append({
+                        normalized_item = {
                             **item,
                             "mac": str(item.get("mac") or "").lower(),
                             "ipv4": item.get("userIp") or "",
                             "online": True,
-                            "realtimeUpBytes": int(item.get("flowUp") or 0),
-                            "realtimeDownBytes": int(item.get("flowDown") or 0),
-                            "connectionCount": int(item.get("flow_cnt") or 0),
-                        })
+                        }
+                        upload_value = item.get("uploadBps") if item.get("uploadBps") is not None else item.get("flowUp")
+                        download_value = item.get("downloadBps") if item.get("downloadBps") is not None else item.get("flowDown")
+                        if upload_value is None and item.get("realtimeUpBytes") is not None:
+                            upload_value = _rate_bps_from_bytes(item.get("realtimeUpBytes"))
+                        if download_value is None and item.get("realtimeDownBytes") is not None:
+                            download_value = _rate_bps_from_bytes(item.get("realtimeDownBytes"))
+                        if upload_value is not None:
+                            upload_bps = _rate_bps(upload_value)
+                            normalized_item["uploadBps"] = upload_bps
+                            normalized_item["realtimeUpBytes"] = (
+                                _rate_bps(item.get("realtimeUpBytes"))
+                                if item.get("realtimeUpBytes") is not None
+                                else _rate_bytes_from_bps(upload_bps)
+                            )
+                        if download_value is not None:
+                            download_bps = _rate_bps(download_value)
+                            normalized_item["downloadBps"] = download_bps
+                            normalized_item["realtimeDownBytes"] = (
+                                _rate_bps(item.get("realtimeDownBytes"))
+                                if item.get("realtimeDownBytes") is not None
+                                else _rate_bytes_from_bps(download_bps)
+                            )
+                        connection_value = item.get("connectionCount") if item.get("connectionCount") is not None else item.get("flow_cnt")
+                        if connection_value is not None:
+                            normalized_item["connectionCount"] = _rate_bps(connection_value)
+                        result.append(normalized_item)
                     return result
                 return self._cached("devices", 2.0, load, force)
             return []

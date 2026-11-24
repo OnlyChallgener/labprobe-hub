@@ -44,6 +44,26 @@ def _integer(value: Any, default: int = 0) -> int:
         return default
 
 
+def _device_rate_bps(item: Dict[str, Any], byte_key: str, bps_key: str, raw_key: str) -> Optional[int]:
+    bits_value = item.get(bps_key)
+    if bits_value is not None:
+        return max(0, _integer(bits_value))
+    byte_value = item.get(byte_key)
+    if byte_value is not None:
+        return max(0, _integer(byte_value)) * 8
+    raw_value = item.get(raw_key)
+    if raw_value is not None:
+        return max(0, _integer(raw_value))
+    return None
+
+
+def _device_rate_bytes(item: Dict[str, Any], byte_key: str, bps_key: str, raw_key: str) -> Optional[int]:
+    bits = _device_rate_bps(item, byte_key, bps_key, raw_key)
+    if bits is None:
+        return None
+    return bits // 8 + (1 if bits % 8 >= 4 else 0)
+
+
 def _unwrap(value: Any) -> Any:
     current = value
     for _ in range(5):
@@ -229,25 +249,37 @@ class RouterRpcCompatibilitySync:
         raw_rows = raw.get("items", []) if isinstance(raw, dict) else []
         payload = {"list": raw_rows, "total": raw.get("total", len(raw_rows)) if isinstance(raw, dict) else len(raw_rows)}
         online, total = self.hub.parse_ruijie_devices(payload)
-        realtime_by_mac: Dict[str, Dict[str, int]] = {}
+        realtime_by_mac: Dict[str, Dict[str, Any]] = {}
         for item in raw_rows:
             if not isinstance(item, dict):
                 continue
             mac = self.hub.norm_mac(item.get("mac"))
             if not mac:
                 continue
-            realtime_by_mac[mac] = {
-                "realtimeUpload": _integer(item.get("realtimeUpBytes", item.get("flowUp"))),
-                "realtimeDownload": _integer(item.get("realtimeDownBytes", item.get("flowDown"))),
-                "connectionCount": _integer(item.get("connectionCount", item.get("flow_cnt"))),
-            }
+            rate: Dict[str, Any] = {}
+            upload_bps = _device_rate_bps(item, "realtimeUpBytes", "uploadBps", "flowUp")
+            download_bps = _device_rate_bps(item, "realtimeDownBytes", "downloadBps", "flowDown")
+            if upload_bps is not None:
+                rate["uploadBps"] = upload_bps
+                rate["realtimeUpload"] = _device_rate_bytes(item, "realtimeUpBytes", "uploadBps", "flowUp")
+            if download_bps is not None:
+                rate["downloadBps"] = download_bps
+                rate["realtimeDownload"] = _device_rate_bytes(item, "realtimeDownBytes", "downloadBps", "flowDown")
+            connection_value = item.get("connectionCount") if item.get("connectionCount") is not None else item.get("flow_cnt")
+            if connection_value is not None:
+                rate["connectionCount"] = _integer(connection_value)
+            if rate:
+                rate["realtimeRateUnit"] = "bytes/s"
+            realtime_by_mac[mac] = rate
 
         archive = self.hub.load_device_archive()
         normalized: List[Dict[str, Any]] = []
         for device in online:
             mac = self.hub.norm_mac(device.get("mac"))
-            device.update(realtime_by_mac.get(mac, {}))
             device = self.hub.hydrate_device_with_archive(device, archive)
+            for key in ("uploadBps", "downloadBps", "realtimeUpload", "realtimeDownload", "realtimeRateUnit", "connectionCount"):
+                device.pop(key, None)
+            device.update(realtime_by_mac.get(mac, {}))
             device["online"] = True
             device["lastSeenAt"] = self.hub.now_str()
             self.hub.archive_device_snapshot(device)
@@ -261,6 +293,8 @@ class RouterRpcCompatibilitySync:
             "onlineDeviceCount": total,
             "updatedAt": updated_at,
             "source": "router_rpc",
+            "realtimeRateUnit": "bytes/s",
+            "realtimeRateContractVersion": 2,
         }
         with self.hub.DATA_LOCK:
             self.hub.save_json(self.hub.DEVICES_FILE, document)

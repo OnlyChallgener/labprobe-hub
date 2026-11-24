@@ -9,6 +9,7 @@ from flask import Flask
 
 import router_lite_realtime_patch as realtime_patch
 from router_core.realtime.router_realtime import RouterRealtimeEngine
+from router_device_live_sync_patch import RouterDeviceLiveSync
 from router_lite_realtime_patch import RouterLiteRealtimeService, install_router_lite_realtime_patch
 from router_ws_patch import RouterWebSocketMonitor, normalize_fast_message
 
@@ -429,3 +430,55 @@ def test_ws_fast_dispatch_does_not_touch_http_dashboard_or_device_sync():
     assert calls[0][0]["uploadBps"] == 5
     assert calls[0][0]["downloadBps"] == 6
     assert calls[0][0]["cpuPercent"] == 7.0
+
+
+def test_full_device_snapshot_publishes_raw_rate_without_hub_smoothing():
+    hub = SimpleNamespace(
+        LOGGER=SimpleNamespace(info=lambda *_args: None, warning=lambda *_args: None),
+        norm_mac=lambda value: str(value or "").strip().lower().replace("-", ":"),
+        parse_ruijie_devices=lambda payload: (payload["list"], payload.get("total", len(payload["list"]))),
+        load_device_archive=lambda: {},
+        now_str=lambda: "2026-11-24 12:00:00",
+        hydrate_device_with_archive=lambda device, archive: dict(device),
+        attach_hub_local_ipv6_to_nas_devices=lambda rows: rows,
+        human_duration=lambda seconds: f"{seconds}s",
+    )
+    sync = RouterDeviceLiveSync(hub, client=None, start=False)
+    sync.latest = {
+        "sampleEpochMs": 1,
+        "devices": [{"mac": "aa", "uploadBps": 8000, "downloadBps": 16000}],
+    }
+
+    rows, total = sync._hydrate({
+        "list": [{"mac": "aa", "raw": {"flowUp": 800, "flowDown": 1200, "flow_cnt": 3}}],
+        "total": 1,
+    })
+
+    assert total == 1
+    assert rows[0]["uploadBps"] == 800
+    assert rows[0]["downloadBps"] == 1200
+    assert rows[0]["connectionCount"] == 3
+
+
+def test_full_device_snapshot_omits_unknown_rates_instead_of_zero():
+    hub = SimpleNamespace(
+        LOGGER=SimpleNamespace(info=lambda *_args: None, warning=lambda *_args: None),
+        norm_mac=lambda value: str(value or "").strip().lower().replace("-", ":"),
+        parse_ruijie_devices=lambda payload: (payload["list"], payload.get("total", len(payload["list"]))),
+        load_device_archive=lambda: {},
+        now_str=lambda: "2026-11-24 12:00:00",
+        hydrate_device_with_archive=lambda device, archive: dict(device),
+        attach_hub_local_ipv6_to_nas_devices=lambda rows: rows,
+        human_duration=lambda seconds: f"{seconds}s",
+    )
+    sync = RouterDeviceLiveSync(hub, client=None, start=False)
+    sync.latest = {
+        "sampleEpochMs": 1,
+        "devices": [{"mac": "aa", "uploadBps": 8000, "downloadBps": 16000, "connectionCount": 9}],
+    }
+
+    rows, _ = sync._hydrate({"list": [{"mac": "aa", "raw": {}}], "total": 1})
+
+    assert "uploadBps" not in rows[0]
+    assert "downloadBps" not in rows[0]
+    assert "connectionCount" not in rows[0]
