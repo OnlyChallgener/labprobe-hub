@@ -76,6 +76,10 @@ class HubSyncApiTests(unittest.TestCase):
         self.assertEqual(body["rulesUpdatedAt"], "2026-08-10 10:00:00")
         self.assertEqual(body["rules"][0]["syncState"], "syncing")
 
+    def test_lucky_requests_bypass_global_data_lock(self):
+        self.assertFalse(hub.request_uses_data_lock('/api/lucky/connections'))
+        self.assertFalse(hub.request_uses_data_lock('/api/lucky/instance/certificates/cert/download'))
+
     def test_portmap_service_type_is_preserved_by_the_hub_model(self):
         payload = {
             "id": "map-service-type",

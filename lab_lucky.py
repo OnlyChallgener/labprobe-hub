@@ -1,18 +1,28 @@
 """Independent Lucky adapter. Never return upstream configuration or secrets to clients."""
+import base64
 import copy
 import hashlib
+import io
+import ipaddress
 import json
 import os
 import re
 import sqlite3
 import tempfile
+import threading
 import uuid
+import zipfile
 from pathlib import Path
-from urllib.parse import urlsplit, quote
+from urllib.parse import urlencode, urlsplit, quote
 
 import requests
+from cryptography import x509
 from cryptography.fernet import Fernet
-from flask import Blueprint, jsonify, request
+from cryptography.hazmat.primitives import serialization
+from flask import Blueprint, Response, jsonify, request, stream_with_context
+
+
+LUCKY_CALL_SEMAPHORE = threading.BoundedSemaphore(8)
 
 
 class LuckyError(Exception):
@@ -58,6 +68,32 @@ def rule_fields(body):
     if not name or len(name) > 120:
         raise LuckyError('请填写服务名称（最多 120 字）')
     return name, domain, backend, port, bool(body.get('tls'))
+
+
+def rule_listener(body, existing=None):
+    existing = existing or {}
+    defaults = {'tcp4': '0.0.0.0', 'tcp6': '', 'tcp': ''}
+    if 'network' not in body and existing:
+        network = str(existing.get('Network') or 'tcp4').strip().lower()
+        listen_ip = str(existing.get('ListenIP') or '')
+    else:
+        network = str(body.get('network', existing.get('Network') or 'tcp4')).strip().lower()
+        if 'listenIp' in body:
+            listen_ip = str(body.get('listenIp') or '').strip()
+        elif existing.get('Network') == network:
+            listen_ip = str(existing.get('ListenIP') or '')
+        else:
+            listen_ip = defaults.get(network, '')
+    if network not in defaults:
+        raise LuckyError('监听网络须为 IPv4、IPv6 或双栈')
+    if listen_ip:
+        try:
+            address = ipaddress.ip_address(listen_ip)
+        except ValueError:
+            raise LuckyError('监听地址格式无效')
+        if network == 'tcp4' and address.version != 4 or network == 'tcp6' and address.version != 6:
+            raise LuckyError('监听地址与网络类型不匹配')
+    return network, listen_ip
 
 
 def subrule_editable(sub):
@@ -134,13 +170,22 @@ class LuckyStore:
         r = self.get(key)
         return LuckyClient(r['url'], self.cipher.decrypt(r['secret']).decode())
 
-    def save(self, body):
+    def resolve_token(self, body):
         url = endpoint(body.get('url', ''))
-        key = body.get('id') or str(uuid.uuid4())
         token = str(body.get('token', '')).strip()
         if not token and body.get('id'):
-            token = self.cipher.decrypt(self.get(key)['secret']).decode()
-        if not token or not str(body.get('name', '')).strip():
+            saved = self.get(body['id'])
+            if endpoint(saved['url']) != url:
+                raise LuckyError('修改管理地址必须重新填写 OpenToken')
+            token = self.cipher.decrypt(saved['secret']).decode()
+        if not token:
+            raise LuckyError('请填写 OpenToken')
+        return url, token
+
+    def save(self, body):
+        url, token = self.resolve_token(body)
+        key = body.get('id') or str(uuid.uuid4())
+        if not str(body.get('name', '')).strip():
             raise LuckyError('请填写连接名称和 OpenToken')
         client = LuckyClient(url, token)
         client.rules()  # auth AND module readiness AND response schema
@@ -165,11 +210,12 @@ class LuckyStore:
                 if old['digest'] != digest:
                     raise LuckyError('操作标识已用于其他内容', 409)
                 if old['state'] == 'done':
-                    return
+                    return False
                 raise LuckyError('上次操作结果待核对，请刷新 Lucky 列表后确认，勿重复新建', 409)
         action()
         with self.db() as db:
             db.execute("UPDATE operations SET state='done' WHERE id=?", (operation,))
+        return True
 
 
 class LuckyClient:
@@ -178,8 +224,9 @@ class LuckyClient:
 
     def call(self, method, path, body=None):
         try:
-            r = requests.request(method, self.url + path, json=body,
-                                 headers={'openToken': self.token}, timeout=(5, 25), allow_redirects=False)
+            with LUCKY_CALL_SEMAPHORE:
+                r = requests.request(method, self.url + path, json=body,
+                                     headers={'openToken': self.token}, timeout=(5, 25), allow_redirects=False)
             data = r.json()
         except requests.exceptions.SSLError:
             raise LuckyError('Lucky HTTPS 证书校验失败，请使用证书有效的域名，或 Hub 可达的 HTTP 内网地址', 502)
@@ -214,6 +261,7 @@ class LuckyClient:
                         'domain': ', '.join(dict.fromkeys(d for s in subs for d in (s.get('Domains') or []))),
                         'backend': ', '.join(dict.fromkeys(d for s in subs for d in (s.get('Locations') or []))),
                         'port': r.get('ListenPort'), 'tls': bool(r.get('EnableTLS')), 'subruleCount': len(subs),
+                        'network': r.get('Network', 'tcp4'), 'listenIp': r.get('ListenIP', ''),
                         'enabled': bool(r.get('Enable')), 'editable': simple})
         return out
 
@@ -224,6 +272,203 @@ class LuckyClient:
         if not isinstance(data.get('list'), list):
             raise LuckyError('Lucky 证书响应格式异常', 502)
         return data['list']
+
+    def download_certificate(self, certificate_id):
+        ticket = self.call('POST', '/api/temp-access-tickets', {
+            'method': 'GET', 'path': '/api/ssl/download', 'query': {'key': str(certificate_id)},
+            'module': 'ssl', 'action': 'download', 'ttlSeconds': 60,
+        })
+        value = str(ticket.get('ticket') or '').strip()
+        if not value:
+            raise LuckyError('Lucky 未返回下载票据', 502)
+        param = str(ticket.get('ticketParam') or 'ticket')
+        url = self.url + '/api/ssl/download?' + urlencode({'key': str(certificate_id), param: value})
+        response = None
+        spool = None
+        try:
+            with LUCKY_CALL_SEMAPHORE:
+                response = requests.get(url, headers={'openToken': self.token}, timeout=(5, 25), allow_redirects=False, stream=True)
+                if not response.ok:
+                    raise LuckyError('Lucky 拒绝了证书下载，请检查权限或票据有效期', 502)
+                if 'json' in response.headers.get('Content-Type', '').lower():
+                    raise LuckyError('Lucky 证书下载响应格式异常', 502)
+                spool = tempfile.SpooledTemporaryFile(max_size=1024 * 1024)
+                total = 0
+                for chunk in response.iter_content(chunk_size=64 * 1024):
+                    if not chunk:
+                        continue
+                    total += len(chunk)
+                    if total > 5 * 1024 * 1024:
+                        raise LuckyError('Lucky 证书下载内容超过 5 MB', 502)
+                    spool.write(chunk)
+                if total == 0:
+                    raise LuckyError('Lucky 证书下载内容为空', 502)
+                spool.seek(0)
+                return spool
+        except LuckyError:
+            if spool is not None:
+                spool.close()
+            raise
+        except requests.exceptions.SSLError:
+            if spool is not None:
+                spool.close()
+            raise LuckyError('Lucky HTTPS 证书校验失败', 502)
+        except requests.exceptions.Timeout:
+            if spool is not None:
+                spool.close()
+            raise LuckyError('Hub 下载 Lucky 证书超时', 502)
+        except requests.RequestException:
+            if spool is not None:
+                spool.close()
+            raise LuckyError('Lucky 证书下载请求失败', 502)
+        except OSError:
+            if spool is not None:
+                spool.close()
+            raise LuckyError('Lucky 证书下载读取失败', 502)
+        finally:
+            if response is not None:
+                response.close()
+
+
+def certificate_payload(raw, saved_accounts):
+    items = []
+    accounts = [{'id': a['id'], 'name': a['name'], 'provider': 'alidns'} for a in saved_accounts]
+    for row in raw:
+        info, ext = row.get('CertsInfo') or {}, row.get('ExtParams') or {}
+        items.append({'id': row['Key'], 'name': row.get('Remark', ''), 'domains': info.get('Domains') or ext.get('acmeDomains') or [],
+                      'expires': info.get('NotAfterTime', ''), 'enabled': bool(row.get('Enable')),
+                      'issuing': bool(row.get('ACMEing')), 'failed': bool(row.get('ACMEErrMsg')), 'automatic': row.get('AddFrom') == 'acme'})
+        if ext.get('acmeDNSServer'):
+            accounts.append({'id': row['Key'], 'name': row.get('Remark') or ext['acmeDNSServer'], 'provider': ext['acmeDNSServer']})
+    return items, accounts
+
+
+def _pem_certificates(value):
+    blocks = re.findall(b'-----BEGIN CERTIFICATE-----.*?-----END CERTIFICATE-----', value, re.S)
+    if blocks:
+        return [x509.load_pem_x509_certificate(block) for block in blocks]
+    return [x509.load_der_x509_certificate(value)]
+
+
+def _certificate_pem(cert):
+    return cert.public_bytes(serialization.Encoding.PEM)
+
+
+def package_certificate_download_file(content):
+    source = io.BytesIO(content) if isinstance(content, (bytes, bytearray)) else content
+    try:
+        with zipfile.ZipFile(source) as archive:
+            infos = archive.infolist()
+            if sum(info.file_size for info in infos) > 5 * 1024 * 1024:
+                raise LuckyError('Lucky 证书包过大', 502)
+            files = {info.filename: archive.read(info) for info in infos if not info.is_dir()}
+    except LuckyError:
+        raise
+    except (zipfile.BadZipFile, RuntimeError, OSError):
+        raise LuckyError('Lucky 证书下载不是有效 ZIP', 502)
+
+    full_candidates = []
+    chain_candidates = []
+    key_candidates = []
+    for name, value in files.items():
+        lower = name.lower()
+        if lower.endswith('.key') or lower.endswith('privkey.pem'):
+            key_candidates.append(value)
+        if b'BEGIN CERTIFICATE' in value or lower.endswith(('.crt', '.der')):
+            try:
+                certs = _pem_certificates(value)
+            except Exception:
+                continue
+            if 'issuer' in lower or 'chain' in lower:
+                chain_candidates.append(certs)
+            elif lower.endswith(('.pem', '.crt')):
+                full_candidates.append(certs)
+    if not full_candidates or not key_candidates:
+        raise LuckyError('Lucky 证书包缺少证书或私钥', 502)
+    fullchain = max(full_candidates, key=len)
+    chain = max(chain_candidates, key=len) if chain_candidates else fullchain[1:]
+    try:
+        key_value = key_candidates[0]
+        try:
+            private_key = serialization.load_pem_private_key(key_value, password=None)
+        except ValueError:
+            private_key = serialization.load_der_private_key(key_value, password=None)
+    except Exception:
+        raise LuckyError('Lucky 证书包私钥格式无效', 502)
+    cert_public = fullchain[0].public_key().public_bytes(
+        serialization.Encoding.DER, serialization.PublicFormat.SubjectPublicKeyInfo
+    )
+    key_public = private_key.public_key().public_bytes(
+        serialization.Encoding.DER, serialization.PublicFormat.SubjectPublicKeyInfo
+    )
+    if cert_public != key_public:
+        raise LuckyError('Lucky 证书与私钥不匹配', 502)
+
+    fd, output_path = tempfile.mkstemp(prefix='labprobe-lucky-cert-', suffix='.zip')
+    os.close(fd)
+    try:
+        with zipfile.ZipFile(output_path, 'w', zipfile.ZIP_DEFLATED) as target:
+            target.writestr('fullchain.pem', b''.join(_certificate_pem(cert) for cert in fullchain))
+            target.writestr('privkey.pem', private_key.private_bytes(
+                serialization.Encoding.PEM, serialization.PrivateFormat.PKCS8, serialization.NoEncryption()
+            ))
+            target.writestr('cert.pem', _certificate_pem(fullchain[0]))
+            target.writestr('chain.pem', b''.join(_certificate_pem(cert) for cert in chain))
+        return Path(output_path)
+    except Exception:
+        Path(output_path).unlink(missing_ok=True)
+        raise
+
+
+def package_certificate_download(content):
+    path = package_certificate_download_file(content)
+    try:
+        return path.read_bytes()
+    finally:
+        path.unlink(missing_ok=True)
+
+
+def certificate_import_payload(body):
+    name = str(body.get('name', '')).strip()
+    if not name or len(name) > 120:
+        raise LuckyError('请填写证书名称（最多 120 字）')
+
+    def decode(value, label):
+        if not isinstance(value, str) or not value.strip():
+            raise LuckyError(label + '不能为空')
+        try:
+            raw = base64.b64decode(value, validate=True)
+        except Exception:
+            raise LuckyError(label + 'Base64 格式无效')
+        if not raw or len(raw) > 2 * 1024 * 1024:
+            raise LuckyError(label + '内容为空或超过 2 MB')
+        return raw
+
+    cert_raw = decode(body.get('certificateBase64'), '证书文件')
+    key_raw = decode(body.get('keyBase64'), '私钥文件')
+    chain_raw = decode(body['issuerCertificateBase64'], '证书链') if body.get('issuerCertificateBase64') else b''
+    try:
+        certs = _pem_certificates(cert_raw)
+        private_key = serialization.load_pem_private_key(key_raw, password=None)
+    except Exception:
+        raise LuckyError('证书或私钥 PEM 格式无效')
+    cert_public = certs[0].public_key().public_bytes(serialization.Encoding.DER, serialization.PublicFormat.SubjectPublicKeyInfo)
+    key_public = private_key.public_key().public_bytes(serialization.Encoding.DER, serialization.PublicFormat.SubjectPublicKeyInfo)
+    if cert_public != key_public:
+        raise LuckyError('证书与私钥不匹配')
+    if chain_raw:
+        try:
+            _pem_certificates(chain_raw)
+        except Exception:
+            raise LuckyError('证书链 PEM 格式无效')
+    return {
+        'Key': '', 'Remark': name, 'Enable': True, 'AddFrom': 'file',
+        'CertBase64': base64.b64encode(cert_raw).decode('ascii'),
+        'KeyBase64': base64.b64encode(key_raw).decode('ascii'),
+        'IssuerCertificate': base64.b64encode(chain_raw).decode('ascii') if chain_raw else '',
+        'MappingToPath': False, 'MappingPath': '', 'MappingChangeScript': '',
+        'ExtParams': {}, 'AllSyncClient': False, 'SyncClientList': [],
+    }
 
 
 def register_lucky(app, root, authorized):
@@ -255,25 +500,27 @@ def register_lucky(app, root, authorized):
     @bp.route('/connections/test', methods=['POST'])
     def test_connection():
         body = request.get_json() or {}
-        token = str(body.get('token', '')).strip()
-        if not token and body.get('id'):
-            token = store.cipher.decrypt(store.get(body['id'])['secret']).decode()
-        if not token:
-            raise LuckyError('请填写 OpenToken')
-        client = LuckyClient(endpoint(body.get('url', '')), token)
+        url, token = store.resolve_token(body)
+        client = LuckyClient(url, token)
         client.rules()
         client.certificates()
         return jsonify(ok=True)
 
-    @bp.route('/<key>/accounts', methods=['POST'])
-    def add_account(key):
+    @bp.route('/<key>/accounts', methods=['GET', 'POST'])
+    def accounts(key):
         store.get(key)
+        if request.method == 'GET':
+            client = store.client(key)
+            raw = client.certificates()
+            with store.db() as db:
+                saved_accounts = [dict(r) for r in db.execute('SELECT * FROM dns_accounts WHERE instance=?', (key,))]
+            _, items = certificate_payload(raw, saved_accounts)
+            return jsonify(ok=True, items=items)
         body = request.get_json() or {}
         if not all(isinstance(body.get(k), str) and body[k].strip() for k in ('name', 'accessId', 'accessSecret')):
             raise LuckyError('请填写账户名称、AccessKey ID 和 Secret')
         # Only the DNS provider verified against this Lucky version is exposed.
         ext = {'acmeDNSServer': 'alidns', 'acmeDNSID': body['accessId'].strip(), 'acmeDNSSecret': body['accessSecret'].strip(),
-               'acmeKeyType': '2048', 'acmeOnlyUseIPv4': True, 'acmeDNSForceIPv4': True,
                'acmePropagationTimeout': 120, 'acmeWaitforcertificateTimeout': 120, 'acmeEmail': ''}
         account = str(uuid.uuid4())
         with store.db() as db:
@@ -286,10 +533,11 @@ def register_lucky(app, root, authorized):
         if request.method == 'POST':
             body = request.get_json() or {}
             name, domain, backend, port, tls = rule_fields(body)
+            network, listen_ip = rule_listener(body)
             sub = {'Key': '', 'Remark': name, 'Domains': [domain], 'Locations': [backend], 'Enable': True,
                    'WebServiceType': 'reverseproxy', 'OtherParams': {}, 'SafeIPMode': 'disable',
                    'SafeUserAgentMode': 'disable', 'BasicAuthUserList': '', 'SecurityGroupKeys': []}
-            raw = {'RuleKey': '', 'RuleName': name, 'Network': 'tcp4', 'ListenIP': '0.0.0.0', 'ListenPort': port,
+            raw = {'RuleKey': '', 'RuleName': name, 'Network': network, 'ListenIP': listen_ip, 'ListenPort': port,
                    'EnableTLS': tls, 'Enable': True, 'IPFilterRule': 'disable', 'GlobalBasicAuthUserList': '',
                    'GlobalAllowThirdAuthLoginUserList': '', 'ProxyList': [sub],
                    'DefaultProxy': dict(sub, Enable=False, Domains=[], Locations=[])}
@@ -322,16 +570,43 @@ def register_lucky(app, root, authorized):
                 if not row['editable']:
                     raise LuckyError('复杂规则请在 Lucky 后台编辑')
                 name, domain, backend, port, tls = rule_fields(body)
-                raw.update(RuleName=name, ListenPort=port, EnableTLS=tls)
+                network, listen_ip = rule_listener(body, raw)
+                raw.update(RuleName=name, ListenPort=port, EnableTLS=tls, Network=network, ListenIP=listen_ip)
                 raw['ProxyList'][0].update(Domains=[domain], Locations=[backend])
             raw['ExpectedVersion'] = version
             client.call('PUT', path, raw)
             after = client.call('GET', path)
             expected = {k: v for k, v in raw.items() if k != 'ExpectedVersion'}
-            if any(after['rule'].get(k) != v for k, v in expected.items() if k in ('RuleName', 'ListenPort', 'EnableTLS', 'Enable', 'ProxyList')):
+            if any(after['rule'].get(k) != v for k, v in expected.items() if k in ('RuleName', 'ListenPort', 'EnableTLS', 'Enable', 'Network', 'ListenIP', 'ProxyList')):
                 raise LuckyError('保存回读不一致，请在 Lucky 后台核对', 502)
             version = after['version']
         return jsonify(ok=True, version=version)
+
+    @bp.route('/<key>/rules/<rid>/subrules', methods=['POST'])
+    def add_subrule(key, rid):
+        client = store.client(key)
+        body = request.get_json() or {}
+        name, domains, backends = subrule_fields(body)
+        parent_path = '/api/webservice/rule/' + quote(rid, safe='')
+        detail = client.call('GET', parent_path)
+        parent, version = detail['rule'], detail['version']
+        if not isinstance(parent.get('ProxyList'), list):
+            raise LuckyError('父规则结构异常，未新增子规则', 502)
+        sub = {'Key': '', 'Remark': name, 'Domains': domains, 'Locations': backends, 'Enable': True,
+               'WebServiceType': 'reverseproxy', 'OtherParams': {}, 'SafeIPMode': 'disable',
+               'SafeUserAgentMode': 'disable', 'BasicAuthUserList': '', 'SecurityGroupKeys': []}
+        before_count = len(detail['rule'].get('ProxyList') or [])
+        parent['ProxyList'].append(sub)
+        parent['ExpectedVersion'] = version
+        executed = store.once(body.get('operationId'), {'instance': key, 'parent': rid, 'subrule': body},
+                              lambda: client.call('PUT', parent_path, parent))
+        after = client.call('GET', parent_path)
+        rows = after['rule'].get('ProxyList') or []
+        created = next((row for row in rows if row.get('Key') and row.get('Remark') == name
+                        and row.get('Domains') == domains and row.get('Locations') == backends), None)
+        if created is None or len(rows) != before_count + (1 if executed else 0):
+            raise LuckyError('子规则新增回读未确认，请刷新核对，勿重复创建', 502)
+        return jsonify(ok=True, item=subrule_dto(created), version=after['version'], ruleVersion=after['version'])
 
     @bp.route('/<key>/rules/<rid>/subrules/<sid>', methods=['GET', 'PUT', 'DELETE'])
     def subrule(key, rid, sid):
@@ -383,11 +658,22 @@ def register_lucky(app, root, authorized):
     @bp.route('/<key>/certificates', methods=['GET', 'POST'])
     def certificates(key):
         client = store.client(key)
-        raw = client.certificates()
         with store.db() as db:
             saved_accounts = [dict(r) for r in db.execute('SELECT * FROM dns_accounts WHERE instance=?', (key,))]
+        if request.method == 'GET':
+            raw = client.certificates()
         if request.method == 'POST':
             body = request.get_json() or {}
+            if body.get('certificateBase64') or body.get('keyBase64'):
+                cert = certificate_import_payload(body)
+                store.once(body.get('operationId'), {'instance': key, 'import': body},
+                           lambda: client.call('POST', '/api/ssl', cert))
+                raw = client.certificates()
+                if not any(row.get('Key') and row.get('Remark') == cert['Remark'] and row.get('AddFrom') == 'file' for row in raw):
+                    raise LuckyError('证书导入回读未确认，请刷新核对，勿重复导入', 502)
+                items, accounts = certificate_payload(raw, saved_accounts)
+                return jsonify(ok=True, items=items, accounts=accounts)
+            raw = client.certificates()
             source = next((r for r in raw if r['Key'] == body.get('accountId') and (r.get('ExtParams') or {}).get('acmeDNSServer')), None)
             saved = next((a for a in saved_accounts if a['id'] == body.get('accountId')), None)
             if not source and not saved:
@@ -396,9 +682,7 @@ def register_lucky(app, root, authorized):
             if not domains or any(not re.fullmatch(r'(?:\*\.)?[a-z0-9][a-z0-9.-]*\.[a-z0-9-]+', s) for s in domains):
                 raise LuckyError('请输入有效域名，多个域名用英文逗号隔开')
             ext = json.loads(store.cipher.decrypt(saved['secret'])) if saved else copy.deepcopy(source['ExtParams'])
-            ext.update(acmeDomains=domains, acmeCADirURL='https://acme-v02.api.letsencrypt.org/directory', acmeUseGlobalPrivateKey=False)
-            for field in ('acmeKid', 'acmeHMAC', 'acmeProxyPassword', 'acmeProxyUser', 'acmeProxyAddr'):
-                ext[field] = ''
+            ext['acmeDomains'] = domains
             cert = {'Key': '', 'Remark': domains[0], 'Enable': True, 'AddFrom': 'acme', 'CertBase64': '', 'KeyBase64': '',
                     'IssuerCertificate': '', 'MappingToPath': False, 'MappingPath': '', 'MappingChangeScript': '',
                     'ExtParams': ext, 'AllSyncClient': False, 'SyncClientList': []}
@@ -406,16 +690,39 @@ def register_lucky(app, root, authorized):
             raw = client.certificates()
             if not any(set((r.get('ExtParams') or {}).get('acmeDomains') or []) == set(domains) for r in raw):
                 raise LuckyError('证书订单回读未确认，请刷新核对，勿重复申请', 502)
-        items = []
-        accounts = [{'id': a['id'], 'name': a['name'], 'provider': 'alidns'} for a in saved_accounts]
-        for r in raw:
-            info, ext = r.get('CertsInfo') or {}, r.get('ExtParams') or {}
-            items.append({'id': r['Key'], 'name': r.get('Remark', ''), 'domains': info.get('Domains') or ext.get('acmeDomains') or [],
-                          'expires': info.get('NotAfterTime', ''), 'enabled': bool(r.get('Enable')),
-                          'issuing': bool(r.get('ACMEing')), 'failed': bool(r.get('ACMEErrMsg')), 'automatic': r.get('AddFrom') == 'acme'})
-            if ext.get('acmeDNSServer'):
-                accounts.append({'id': r['Key'], 'name': r.get('Remark') or ext['acmeDNSServer'], 'provider': ext['acmeDNSServer']})
+        items, accounts = certificate_payload(raw, saved_accounts)
         return jsonify(ok=True, items=items, accounts=accounts)
+
+    @bp.route('/<key>/certificates/<cid>/download', methods=['GET'])
+    def certificate_download(key, cid):
+        client = store.client(key)
+        target = next((row for row in client.certificates() if row.get('Key') == cid), None)
+        if target is None:
+            raise LuckyError('证书不存在或已删除', 404)
+        source = client.download_certificate(cid)
+        try:
+            packaged = package_certificate_download_file(source)
+        finally:
+            source.close()
+        label = re.sub(r'[^A-Za-z0-9._-]+', '_', str(target.get('Remark') or cid)).strip('._') or 'certificate'
+        filename = label[:80] + '.zip'
+
+        def generate():
+            try:
+                with packaged.open('rb') as stream:
+                    while True:
+                        chunk = stream.read(64 * 1024)
+                        if not chunk:
+                            break
+                        yield chunk
+            finally:
+                packaged.unlink(missing_ok=True)
+
+        return Response(stream_with_context(generate()), mimetype='application/zip', headers={
+            'Content-Disposition': 'attachment; filename="' + filename + '"',
+            'Cache-Control': 'no-store',
+            'X-Content-Type-Options': 'nosniff',
+        })
 
     @bp.route('/<key>/certificates/<cid>/<action>', methods=['POST'])
     def cert_action(key, cid, action):

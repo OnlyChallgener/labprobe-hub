@@ -95,6 +95,7 @@ DATA_LOCK_BYPASS_PREFIXES = (
     "/api/router/tcp-session-test",
     "/api/router/child-guard",
     "/api/router/rdpi",
+    "/api/lucky",
 )
 REFRESH_RUNNING = False
 STATUS_REFRESH_TTL_SEC = int(os.environ.get("STATUS_REFRESH_TTL_SEC", "180"))
