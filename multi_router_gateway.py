@@ -258,7 +258,7 @@ def render_nginx_config(config: dict, pid_path: Path) -> str:
             f'    default "Bearer {router["appToken"]}";',
             "  }",
             f"  map ${slug}_kind ${slug}_token {{",
-            '    "device" $http_x_labprobe_token;',
+            '    "device" $labprobe_device_token;',
             f'    default "{router["appToken"]}";',
             "  }",
         ])
@@ -299,6 +299,7 @@ def render_nginx_config(config: dict, pid_path: Path) -> str:
         "      proxy_set_header Authorization $http_authorization;",
         "      proxy_set_header X-LabProbe-Token $http_x_labprobe_token;",
         "      proxy_set_header X-LabProbe-Original-Args $args;",
+        "      proxy_set_header X-LabProbe-Original-URI $request_uri;",
         "    }",
         "    location = /_routeauth {",
         "      internal;",
@@ -308,6 +309,7 @@ def render_nginx_config(config: dict, pid_path: Path) -> str:
         "      proxy_set_header Authorization $http_authorization;",
         "      proxy_set_header X-LabProbe-Token $http_x_labprobe_token;",
         "      proxy_set_header X-LabProbe-Original-Args $args;",
+        "      proxy_set_header X-LabProbe-Original-URI $request_uri;",
         "    }",
         "    location @denied {",
         '      default_type application/json;',
@@ -325,6 +327,7 @@ def render_nginx_config(config: dict, pid_path: Path) -> str:
             f"    location ^~ /r/{router_id}/ {{",
             f"      auth_request /_gateauth/{router_id};",
             f"      auth_request_set ${slug}_kind $upstream_http_x_labprobe_auth_kind;",
+            "      auth_request_set $labprobe_device_token $upstream_http_x_labprobe_token;",
             "      error_page 401 = @denied;",
             f"      proxy_pass http://127.0.0.1:{port}/;",
             # nginx inherits proxy_set_header only when the current level declares none,
@@ -356,6 +359,7 @@ def render_nginx_config(config: dict, pid_path: Path) -> str:
         # auth_request_set; reading it straight from the map evaluated to "" and nginx
         # answered 500 "invalid URL prefix" for every relay push at the root path.
         "      auth_request_set $labprobe_route $upstream_http_x_labprobe_route;",
+        "      auth_request_set $labprobe_device_token $upstream_http_x_labprobe_token;",
         "      error_page 401 = @root_refused;",
         "      proxy_pass $labprobe_root_worker;",
         # Declaring any proxy_set_header here drops the server-level ones, so the
@@ -366,6 +370,7 @@ def render_nginx_config(config: dict, pid_path: Path) -> str:
         "      proxy_set_header X-Forwarded-Proto $scheme;",
         "      proxy_set_header Upgrade $http_upgrade;",
         "      proxy_set_header Connection $connection_upgrade;",
+        "      proxy_set_header X-LabProbe-Token $labprobe_device_token;",
         "    }",
         "    location @root_refused {",
         "      default_type application/json;",
@@ -512,7 +517,9 @@ def make_registry_handler(config: dict, controller: DefaultRouterController | No
                 candidate = self.headers.get("X-LabProbe-Token", "").strip()
             if not candidate and allow_hook_query:
                 original_args = self.headers.get("X-LabProbe-Original-Args", "").strip()
-                query = parse_qs(original_args or urlsplit(self.path).query, keep_blank_values=True, max_num_fields=32)
+                original_uri = self.headers.get("X-LabProbe-Original-URI", "").strip()
+                query = parse_qs(original_args or urlsplit(original_uri).query or urlsplit(self.path).query,
+                    keep_blank_values=True, max_num_fields=32)
                 for key in ("token", "hook_token", "hookToken", "key"):
                     candidate = (query.get(key) or [""])[0].strip()
                     if candidate:
@@ -563,6 +570,9 @@ def make_registry_handler(config: dict, controller: DefaultRouterController | No
                 return True
             self.send_response(200)
             self.send_header("X-LabProbe-Route", router_id)
+            presented = self.credential(allow_hook_query=True)
+            if presented:
+                self.send_header("X-LabProbe-Token", presented.decode("utf-8"))
             self.send_header("Content-Length", "0")
             self.end_headers()
             return True
@@ -592,6 +602,10 @@ def make_registry_handler(config: dict, controller: DefaultRouterController | No
                     return
                 self.send_response(200)
                 self.send_header("X-LabProbe-Auth-Kind", kind)
+                if kind == "device":
+                    presented = self.credential(allow_hook_query=True)
+                    if presented:
+                        self.send_header("X-LabProbe-Token", presented.decode("utf-8"))
                 self.send_header("Content-Length", "0")
                 self.end_headers()
                 return

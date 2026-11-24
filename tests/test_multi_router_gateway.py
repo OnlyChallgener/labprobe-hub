@@ -304,17 +304,20 @@ def test_front_door_gates_each_channel_and_rewrites_only_management_credentials(
     assert "proxy_set_header Authorization $http_authorization;" in rendered
     assert "proxy_set_header X-LabProbe-Token $http_x_labprobe_token;" in rendered
     assert "proxy_set_header X-LabProbe-Original-Args $args;" in rendered
+    assert "proxy_set_header X-LabProbe-Original-URI $request_uri;" in rendered
     assert "location @denied {" in rendered
     for router_id, token in (("home", SECRETS["HOME_APP"]), ("office", SECRETS["OFFICE_APP"])):
         slug = "labprobe_" + router_id
         block = _router_block(rendered, router_id)
         assert f"auth_request /_gateauth/{router_id};" in block
         assert f"auth_request_set ${slug}_kind $upstream_http_x_labprobe_auth_kind;" in block
+        assert "auth_request_set $labprobe_device_token $upstream_http_x_labprobe_token;" in block
         assert "error_page 401 = @denied;" in block
         # Both header names are rewritten because the realtime WebSocket presents both.
         assert f"proxy_set_header Authorization ${slug}_authorization;" in block
         assert f"proxy_set_header X-LabProbe-Token ${slug}_token;" in block
         assert f'    default "Bearer {token}";' in _map_block(rendered, slug)
+        assert '"device" $labprobe_device_token;' in rendered
         assert '    "device" $http_authorization;' in _map_block(rendered, slug)
     assert SECRETS["OFFICE_APP"] not in _map_block(rendered, "labprobe_home")
     assert "Bearer" not in rendered.split("location / {")[1].split("}")[0]
@@ -364,6 +367,7 @@ def test_gate_accepts_only_matching_hook_token_from_webhook_query(tmp_path):
     try:
         with urlopen(f"{base}/_gateauth/home?token={SECRETS['HOME_HOOK']}", timeout=2) as response:
             assert response.headers["X-LabProbe-Auth-Kind"] == "device"
+            assert response.headers["X-LabProbe-Token"] == SECRETS["HOME_HOOK"]
         with urlopen(Request(f"{base}/_gateauth/home", headers={
             "X-LabProbe-Original-Args": f"token={SECRETS['HOME_HOOK']}",
         }), timeout=2) as response:
@@ -373,8 +377,9 @@ def test_gate_accepts_only_matching_hook_token_from_webhook_query(tmp_path):
         assert denied.value.code == 401
         with urlopen(f"{base}/_routeauth?hook_token={SECRETS['OFFICE_HOOK']}", timeout=2) as response:
             assert response.headers["X-LabProbe-Route"] == "office"
+            assert response.headers["X-LabProbe-Token"] == SECRETS["OFFICE_HOOK"]
         with urlopen(Request(f"{base}/_routeauth", headers={
-            "X-LabProbe-Original-Args": f"hook_token={SECRETS['OFFICE_HOOK']}",
+            "X-LabProbe-Original-URI": f"/api/router/status?hook_token={SECRETS['OFFICE_HOOK']}",
         }), timeout=2) as response:
             assert response.headers["X-LabProbe-Route"] == "office"
         with pytest.raises(HTTPError) as app_query:
@@ -504,6 +509,8 @@ def test_root_api_forwards_a_device_credential_to_its_own_worker_only(tmp_path):
     # Reading $upstream_http_* straight from the map evaluates to ""; it must be copied
     # out with auth_request_set or nginx answers 500 "invalid URL prefix".
     assert "auth_request_set $labprobe_route $upstream_http_x_labprobe_route;" in block
+    assert "auth_request_set $labprobe_device_token $upstream_http_x_labprobe_token;" in block
+    assert "proxy_set_header X-LabProbe-Token $labprobe_device_token;" in block
     assert "map $labprobe_route $labprobe_root_worker {" in rendered
     # The credential must reach the worker untouched: each worker enforces its own HOOK,
     # and rewriting it here would hand the relay App-level access.
@@ -539,7 +546,7 @@ def test_route_auth_names_the_hook_owner_and_never_an_owner_key(tmp_path):
     try:
         assert outcome("POST", {"Authorization": f"Bearer {SECRETS['HOME_HOOK']}"}) == (200, "home")
         assert outcome("GET", {"X-LabProbe-Token": SECRETS["OFFICE_HOOK"]}) == (200, "office")
-        assert outcome("GET", {"X-LabProbe-Original-Args": f"hook_token={SECRETS['OFFICE_HOOK']}"}) == (200, "office")
+        assert outcome("GET", {"X-LabProbe-Original-URI": f"/api/router/status?hook_token={SECRETS['OFFICE_HOOK']}"}) == (200, "office")
         assert outcome("DELETE", {"Authorization": f"Bearer {SECRETS['HOME_HOOK']}"}) == (200, "home")
         # An owner key at the root still cannot say which router the caller meant.
         assert outcome("POST", {"Authorization": f"Bearer {SECRETS['HOME_APP']}"}) == (401, "")

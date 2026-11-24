@@ -1,5 +1,11 @@
 # LabProbe 变更记录
 
+## 0.14.5 / LabRelay 0.2.79
+
+- 完成多路由查询令牌修复：nginx 通过 `X-LabProbe-Original-URI` 传递原始请求，注册器将设备令牌回传内部鉴权变量，worker 收到 `X-LabProbe-Token`。
+- 真实 nginx 临时容器验证 APP_TOKEN、设备查询令牌与 `/r/<id>` 通道鉴权；HUB 数据繁忙时返回 503，不再误报 401/500。
+- 0.14.3 与 0.14.4 已标记撤回，请使用 0.14.5。
+
 ## 0.14.4 / LabRelay 0.2.79
 
 - 修复多路由 nginx `auth_request` 将 `$is_args$args` 当字面路径的问题；原始查询参数改由内部专用请求头传递，恢复 APP_TOKEN 与 Webhook 查询令牌鉴权。
