@@ -10,12 +10,15 @@ import re
 import sqlite3
 import tempfile
 import threading
+import time
 import uuid
 import zipfile
+from contextlib import contextmanager
 from pathlib import Path
 from urllib.parse import urlencode, urlsplit, quote
 
 import requests
+from urllib3.util import Timeout
 from cryptography import x509
 from cryptography.fernet import Fernet
 from cryptography.hazmat.primitives import serialization
@@ -23,6 +26,16 @@ from flask import Blueprint, Response, jsonify, request, stream_with_context
 
 
 LUCKY_CALL_SEMAPHORE = threading.BoundedSemaphore(8)
+
+
+@contextmanager
+def _lucky_request_slot():
+    if not LUCKY_CALL_SEMAPHORE.acquire(timeout=5):
+        raise LuckyError('Lucky 请求繁忙，请稍后重试', 503)
+    try:
+        yield
+    finally:
+        LUCKY_CALL_SEMAPHORE.release()
 
 
 class LuckyError(Exception):
@@ -224,9 +237,10 @@ class LuckyClient:
 
     def call(self, method, path, body=None):
         try:
-            with LUCKY_CALL_SEMAPHORE:
+            with _lucky_request_slot():
                 r = requests.request(method, self.url + path, json=body,
-                                     headers={'openToken': self.token}, timeout=(5, 25), allow_redirects=False)
+                                     headers={'openToken': self.token},
+                                     timeout=Timeout(total=30, connect=5, read=25), allow_redirects=False)
             data = r.json()
         except requests.exceptions.SSLError:
             raise LuckyError('Lucky HTTPS 证书校验失败，请使用证书有效的域名，或 Hub 可达的 HTTP 内网地址', 502)
@@ -286,8 +300,11 @@ class LuckyClient:
         response = None
         spool = None
         try:
-            with LUCKY_CALL_SEMAPHORE:
-                response = requests.get(url, headers={'openToken': self.token}, timeout=(5, 25), allow_redirects=False, stream=True)
+            with _lucky_request_slot():
+                deadline = time.monotonic() + 30
+                response = requests.get(url, headers={'openToken': self.token},
+                                        timeout=Timeout(total=30, connect=5, read=25),
+                                        allow_redirects=False, stream=True)
                 if not response.ok:
                     raise LuckyError('Lucky 拒绝了证书下载，请检查权限或票据有效期', 502)
                 if 'json' in response.headers.get('Content-Type', '').lower():
@@ -295,6 +312,8 @@ class LuckyClient:
                 spool = tempfile.SpooledTemporaryFile(max_size=1024 * 1024)
                 total = 0
                 for chunk in response.iter_content(chunk_size=64 * 1024):
+                    if time.monotonic() > deadline:
+                        raise LuckyError('Hub 下载 Lucky 证书超时', 502)
                     if not chunk:
                         continue
                     total += len(chunk)
@@ -604,7 +623,7 @@ def register_lucky(app, root, authorized):
         rows = after['rule'].get('ProxyList') or []
         created = next((row for row in rows if row.get('Key') and row.get('Remark') == name
                         and row.get('Domains') == domains and row.get('Locations') == backends), None)
-        if created is None or len(rows) != before_count + (1 if executed else 0):
+        if created is None or (executed and len(rows) != before_count + 1):
             raise LuckyError('子规则新增回读未确认，请刷新核对，勿重复创建', 502)
         return jsonify(ok=True, item=subrule_dto(created), version=after['version'], ruleVersion=after['version'])
 

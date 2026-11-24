@@ -213,6 +213,36 @@ def test_lucky_download_streams_bounded_chunks_and_closes_response():
         stream.close()
 
 
+def test_lucky_request_slot_wait_is_bounded():
+    client = LuckyClient('http://localhost', 'token')
+    with patch('lab_lucky.LUCKY_CALL_SEMAPHORE.acquire', return_value=False), \
+         patch('lab_lucky.requests.request') as request:
+        with pytest.raises(LuckyError) as raised:
+            client.rules()
+    assert raised.value.status == 503
+    request.assert_not_called()
+
+
+def test_lucky_download_total_deadline_stops_slow_trickle():
+    class Response:
+        ok = True
+        headers = {'Content-Type': 'application/zip'}
+        closed = False
+        def iter_content(self, chunk_size):
+            yield b'x'
+        def close(self):
+            self.closed = True
+    response = Response()
+    client = LuckyClient('http://localhost', 'token')
+    with patch.object(client, 'call', return_value={'ret': 0, 'ticket': 'temporary'}), \
+         patch('lab_lucky.requests.get', return_value=response), \
+         patch('lab_lucky.time.monotonic', side_effect=[0.0, 31.0]):
+        with pytest.raises(LuckyError) as raised:
+            client.download_certificate('cert')
+    assert raised.value.status == 502
+    assert response.closed
+
+
 def test_certificate_download_endpoint_streams_authorized_zip(tmp_path):
     app = Flask(__name__)
     register_lucky(app, tmp_path, lambda: True)
