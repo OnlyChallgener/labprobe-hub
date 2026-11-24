@@ -582,6 +582,8 @@ class ReyeeEWebDriver(RouterDriver):
             return False
         if not raw:
             return True
+        if any(key in raw for key in ("list", "services", "records", "service", "domain", "service_name")):
+            return True
         code = str(raw.get("rcode") or raw.get("code") or "").strip()
         message = str(raw.get("rmsg") or raw.get("message") or "").lower()
         return code == "03510001" or (
@@ -648,12 +650,8 @@ class ReyeeEWebDriver(RouterDriver):
                 return self._legacy_client.ddns(force=force)
             if self._rpc_client:
                 def load() -> Dict[str, Any]:
-                    rows = self._get_raw_ddns_rows()
-                    protocol = self._ddns_protocol()
-                    if not rows and protocol == self._DDNS_PROTOCOL_CFG:
-                        # 接口确实返回了成功但空的结果，仍交给上层显示真实空列表；
-                        # 只有读取抛异常才由 _cached / 上层错误分支处理。
-                        pass
+                    protocol = self._ddns_protocol(force=force)
+                    rows = self._get_raw_ddns_rows(protocol)
                     clean_rows = []
                     for row in rows:
                         item = dict(row)
@@ -829,7 +827,7 @@ class ReyeeEWebDriver(RouterDriver):
                 return self._write_and_read(
                     "ddns",
                     lambda: self.rpc("devSta.add", "ddnsCfg", data=payload),
-                    lambda: self.get_ddns(force=True),
+                    lambda: self.get_ddns(),
                 )
             raise NotImplementedError("add_ddns not available")
         except Exception as exc:
@@ -899,7 +897,7 @@ class ReyeeEWebDriver(RouterDriver):
                     return self._write_and_read(
                         "ddns",
                         do_update,
-                        lambda: self.get_ddns(force=True),
+                        lambda: self.get_ddns(),
                     )
             raise NotImplementedError("update_ddns not available")
         except Exception as exc:
@@ -924,7 +922,7 @@ class ReyeeEWebDriver(RouterDriver):
                     return self._write_and_read(
                         "ddns",
                         do_delete,
-                        lambda: self.get_ddns(force=True),
+                        lambda: self.get_ddns(),
                     )
             raise NotImplementedError("delete_ddns not available")
         except Exception as exc:

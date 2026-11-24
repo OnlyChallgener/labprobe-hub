@@ -121,6 +121,16 @@ def test_be72pro_ddns_view_returns_all_three_records():
     assert not any(m == "devSta.get" and mod == "ddnsCfg" for m, mod, _ in rpc.calls)
 
 
+def test_force_refresh_reprobes_protocol_after_firmware_change():
+    rpc = FakeRpc(view=True)
+    d = driver(rpc)
+    d._ddns_protocol_value = d._DDNS_PROTOCOL_CFG
+    result = d.get_ddns(force=True)
+    assert result["nativeProtocol"] == "ddns_view"
+    assert len(result["list"]) == 3
+    assert any(module == "ddns_view" for _, module, _ in rpc.calls)
+
+
 def test_legacy_firmware_still_uses_ddnscfg():
     rpc = FakeRpc(view=False)
     result = driver(rpc).get_ddns(force=True)

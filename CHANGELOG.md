@@ -1,5 +1,11 @@
 # LabProbe 变更记录
 
+## 0.14.6 / LabRelay 0.2.79
+
+- 原生 DDNS 强制刷新重新探测 `ddns_view` / `ddnsCfg` 协议，避免固件升级后仍沿用旧协议而显示空列表。
+- 旧固件 DDNS 写入后的回读复用已确认协议，不再重复探测；兼容直接返回旧列表形状的响应。
+- 新增强制刷新协议切换回归测试。
+
 ## 0.14.5 / LabRelay 0.2.79
 
 - 完成多路由查询令牌修复：nginx 通过 `X-LabProbe-Original-URI` 传递原始请求，注册器将设备令牌回传内部鉴权变量，worker 收到 `X-LabProbe-Token`。
