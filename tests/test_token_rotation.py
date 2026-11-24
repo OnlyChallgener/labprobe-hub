@@ -49,6 +49,24 @@ def test_failed_attempts_trigger_and_expire_throttle(hub_app):
         assert hub_module.check_app_token() is True
 
 
+def test_lucky_webhook_accepts_hook_query_and_rejects_app_token_under_strict_separation(hub_app, monkeypatch):
+    monkeypatch.setenv("STRICT_TOKEN_SEPARATION", "1")
+    client = hub_app.app.test_client()
+    accepted = client.post(
+        "/hook/lucky?token=current-hook-token",
+        json={"msgtype": "text", "text": {"content": "Lucky: null"}},
+    )
+    assert accepted.status_code == 200
+    assert accepted.get_json()["ignored"] is True
+    denied = client.post(
+        "/hook/lucky?token=current-app-token",
+        json={"msgtype": "text", "text": {"content": "Lucky: null"}},
+    )
+    assert denied.status_code == 401
+    assert "current-hook-token" not in accepted.get_data(as_text=True)
+    assert "current-app-token" not in denied.get_data(as_text=True)
+
+
 def test_strict_worker_tokens_do_not_cross_authenticate(hub_app, monkeypatch):
     monkeypatch.setenv("STRICT_TOKEN_SEPARATION", "1")
     app = hub_app.app

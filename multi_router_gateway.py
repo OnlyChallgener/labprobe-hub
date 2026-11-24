@@ -22,7 +22,7 @@ from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
 from urllib.error import URLError
 from urllib.request import Request, urlopen
-from urllib.parse import urlsplit
+from urllib.parse import parse_qs, urlsplit
 
 import yaml
 
@@ -244,6 +244,7 @@ def render_nginx_config(config: dict, pid_path: Path) -> str:
         f"pid {pid_path};",
         "events { worker_connections 1024; }",
         "http {",
+        '  log_format labprobe_without_query \'$remote_addr - $remote_user [$time_local] "$request_method $uri $server_protocol" $status $body_bytes_sent\';',
         "  map $http_upgrade $connection_upgrade { default upgrade; '' close; }",
     ]
     # A relay presents its own HOOK credential and the worker must keep seeing it as
@@ -272,7 +273,7 @@ def render_nginx_config(config: dict, pid_path: Path) -> str:
         "  }",
     ])
     lines.extend([
-        "  access_log /dev/stdout;",
+        "  access_log /dev/stdout labprobe_without_query;",
         "  error_log /dev/stderr warn;",
         "  server {",
         f"    listen {config['listenPort']};",
@@ -320,7 +321,7 @@ def render_nginx_config(config: dict, pid_path: Path) -> str:
         lines.extend([
             f"    location = /r/{router_id} {{ return 308 /r/{router_id}/; }}",
             f"    location ^~ /r/{router_id}/ {{",
-            f"      auth_request /_gateauth/{router_id};",
+            f"      auth_request /_gateauth/{router_id}$is_args$args;",
             f"      auth_request_set ${slug}_kind $upstream_http_x_labprobe_auth_kind;",
             "      error_page 401 = @denied;",
             f"      proxy_pass http://127.0.0.1:{port}/;",
@@ -348,7 +349,7 @@ def render_nginx_config(config: dict, pid_path: Path) -> str:
     # registry and the internal gates keep working, and /health stays open.
     lines.extend([
         "    location ^~ /api/ {",
-        "      auth_request /_routeauth;",
+        "      auth_request /_routeauth$is_args$args;",
         # $upstream_http_* from an auth subrequest is only readable once copied out with
         # auth_request_set; reading it straight from the map evaluated to "" and nginx
         # answered 500 "invalid URL prefix" for every relay push at the root path.
@@ -502,11 +503,17 @@ def make_registry_handler(config: dict, controller: DefaultRouterController | No
     management = [router["appToken"].encode("utf-8") for router in config["routers"]]
 
     class RegistryHandler(BaseHTTPRequestHandler):
-        def credential(self) -> bytes:
+        def credential(self, allow_hook_query: bool = False) -> bytes:
             header = self.headers.get("Authorization", "").strip()
             candidate = header[7:].strip() if header.lower().startswith("bearer ") else header
             if not candidate:
                 candidate = self.headers.get("X-LabProbe-Token", "").strip()
+            if not candidate and allow_hook_query:
+                query = parse_qs(urlsplit(self.path).query, keep_blank_values=True, max_num_fields=32)
+                for key in ("token", "hook_token", "hookToken", "key"):
+                    candidate = (query.get(key) or [""])[0].strip()
+                    if candidate:
+                        break
             return candidate.encode("utf-8")
 
         def authorized(self) -> bool:
@@ -522,7 +529,7 @@ def make_registry_handler(config: dict, controller: DefaultRouterController | No
             """
             if self.authorized():
                 return "management"
-            presented = self.credential()
+            presented = self.credential(allow_hook_query=True)
             if hmac.compare_digest(presented, router["hookToken"].encode("utf-8")):
                 return "device"
             return ""
@@ -536,7 +543,7 @@ def make_registry_handler(config: dict, controller: DefaultRouterController | No
             key at the root still cannot say which router the caller meant, and pinning
             it to one would resurrect the cross-data accident the 400 exists to prevent.
             """
-            presented = self.credential()
+            presented = self.credential(allow_hook_query=True)
             if not presented or self.authorized():
                 return ""
             for router in config["routers"]:
@@ -545,7 +552,7 @@ def make_registry_handler(config: dict, controller: DefaultRouterController | No
             return ""
 
         def answer_route_auth(self) -> bool:
-            if self.path != "/_routeauth":
+            if urlsplit(self.path).path != "/_routeauth":
                 return False
             router_id = self.route_auth()
             if not router_id:
@@ -569,8 +576,8 @@ def make_registry_handler(config: dict, controller: DefaultRouterController | No
         def do_GET(self) -> None:
             if self.answer_route_auth():
                 return
-            if self.path.startswith("/_gateauth/"):
-                router_id = self.path[len("/_gateauth/"):]
+            if urlsplit(self.path).path.startswith("/_gateauth/"):
+                router_id = urlsplit(self.path).path[len("/_gateauth/"):]
                 router = next((item for item in config["routers"]
                                if item["routerId"] == router_id), None)
                 if router is None:

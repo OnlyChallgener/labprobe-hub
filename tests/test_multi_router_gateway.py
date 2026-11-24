@@ -81,6 +81,10 @@ def test_nginx_routes_http_and_websocket_to_isolated_workers(tmp_path):
     assert "proxy_set_header Upgrade $http_upgrade;" in rendered
     assert "proxy_set_header Connection $connection_upgrade;" in rendered
     assert "location = /api/routers" in rendered
+    assert 'log_format labprobe_without_query' in rendered
+    assert '"$request_method $uri $server_protocol"' in rendered
+    assert "access_log /dev/stdout labprobe_without_query;" in rendered
+    assert '"$request "' not in rendered
     # A location that declares any proxy_set_header stops inheriting the server-level
     # ones, so the credential rewrite used to leave the WebSocket upgrade headers behind
     # and every /r/<id>/ channel answered the handshake with 400 while a direct worker
@@ -303,7 +307,7 @@ def test_front_door_gates_each_channel_and_rewrites_only_management_credentials(
     for router_id, token in (("home", SECRETS["HOME_APP"]), ("office", SECRETS["OFFICE_APP"])):
         slug = "labprobe_" + router_id
         block = _router_block(rendered, router_id)
-        assert f"auth_request /_gateauth/{router_id};" in block
+        assert f"auth_request /_gateauth/{router_id}$is_args$args;" in block
         assert f"auth_request_set ${slug}_kind $upstream_http_x_labprobe_auth_kind;" in block
         assert "error_page 401 = @denied;" in block
         # Both header names are rewritten because the realtime WebSocket presents both.
@@ -345,6 +349,28 @@ def test_gate_opens_with_management_credential_anywhere_and_worker_credentials_o
         assert outcome("home", bearer("")) == (401, "")
         assert outcome("home", bearer(SECRETS["HOME_APP"] + "x")) == (401, "")
         assert outcome("ghost", bearer(SECRETS["HOME_APP"])) == (403, "")
+    finally:
+        server.shutdown()
+        server.server_close()
+
+
+def test_gate_accepts_only_matching_hook_token_from_webhook_query(tmp_path):
+    config = gateway.load_gateway_config(_config(tmp_path)[0], SECRETS)
+    server = ThreadingHTTPServer(("127.0.0.1", 0), gateway.make_registry_handler(config))
+    thread = threading.Thread(target=server.serve_forever, daemon=True)
+    thread.start()
+    base = f"http://127.0.0.1:{server.server_port}"
+    try:
+        with urlopen(f"{base}/_gateauth/home?token={SECRETS['HOME_HOOK']}", timeout=2) as response:
+            assert response.headers["X-LabProbe-Auth-Kind"] == "device"
+        with pytest.raises(HTTPError) as denied:
+            urlopen(f"{base}/_gateauth/office?token={SECRETS['HOME_HOOK']}", timeout=2)
+        assert denied.value.code == 401
+        with urlopen(f"{base}/_routeauth?hook_token={SECRETS['OFFICE_HOOK']}", timeout=2) as response:
+            assert response.headers["X-LabProbe-Route"] == "office"
+        with pytest.raises(HTTPError) as app_query:
+            urlopen(f"{base}/_routeauth?token={SECRETS['HOME_APP']}", timeout=2)
+        assert app_query.value.code == 401
     finally:
         server.shutdown()
         server.server_close()
@@ -449,7 +475,7 @@ def test_root_api_call_is_refused_instead_of_pinning_to_the_default_worker(tmp_p
     assert marker in rendered
     block = rendered.split(marker, 1)[1].split("\n    }", 1)[0]
     # The refusal now lives in the named location the credential gate falls through to.
-    assert "auth_request /_routeauth;" in block
+    assert "auth_request /_routeauth$is_args$args;" in block
     assert "error_page 401 = @root_refused;" in block
     refused = rendered.split("location @root_refused {", 1)[1].split("\n    }", 1)[0]
     assert "multi_router_path_required" in refused
