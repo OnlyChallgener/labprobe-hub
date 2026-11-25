@@ -1,6 +1,7 @@
 import json
 from pathlib import Path
 
+import pytest
 from flask import Flask
 
 import tcp_session_service as module
@@ -12,6 +13,14 @@ class FakeHub:
         self.DATA_DIR = root
         self.app = Flask(__name__)
         self.save_counts = {}
+        self.presence = {}
+
+    @staticmethod
+    def primary_router_name():
+        return "Router"
+
+    def agent_presence_snapshot(self, router=""):
+        return self.presence(router) if callable(self.presence) else self.presence
 
     @staticmethod
     def load_json(path, default):
@@ -61,7 +70,6 @@ def test_history_deletion_survives_late_status_and_restart(tmp_path):
 def test_multiple_targets_are_normalized_and_bounded():
     value = TcpSessionService._config(start_payload(host=" EXAMPLE.com，192.0.2.1; [2001:db8::1]\nexample.com "))
     assert value["host"] == "example.com,192.0.2.1,2001:db8::1"
-    import pytest
     for host in [",".join(f"host{i}.example" for i in range(9)), "https://example.com", "example.com/path", "example.com:443"]:
         with pytest.raises(ValueError):
             TcpSessionService._config(start_payload(host=host))
@@ -216,3 +224,149 @@ def test_invalid_host_and_family_return_chinese_errors(tmp_path):
     assert "目标主机" in invalid_host.get_json()["error"]
     assert invalid_family.status_code == 400
     assert "IPv4" in invalid_family.get_json()["error"]
+
+
+@pytest.mark.parametrize("wan_payload", [{}, {"wanId": ""}, {"wanId": "   "}])
+def test_legacy_blank_wan_keeps_default_behavior_without_presence(tmp_path, wan_payload):
+    client, service = build(tmp_path)
+    response = client.post("/api/tcp-session-test/start", json=start_payload(**wan_payload))
+    assert response.status_code == 200
+    task = response.get_json()["task"]
+    assert task["wanId"] == ""
+    assert task["config"]["wanId"] == ""
+    commands = client.get("/api/router/tcp-session-test/commands?router=Router").get_json()["commands"]
+    assert commands[0]["wanId"] == ""
+    assert commands[0]["payload"]["wanId"] == ""
+    assert service.accept_status({"id": task["id"], "state": "running"}) is True
+
+
+@pytest.mark.parametrize("capability", ["relay.perWanTcpSession", "relay.multiWan"])
+def test_explicit_wan1_is_accepted_with_advertised_capability(tmp_path, capability):
+    client, service = build(tmp_path)
+    service.hub.presence = {"agentOnline": True, "agentCapabilities": [capability]}
+    response = client.post("/api/tcp-session-test/start", json=start_payload(wanId=" WAN1 "))
+    assert response.status_code == 200
+    task = response.get_json()["task"]
+    assert task["router"] == "Router"
+    assert task["wanId"] == "wan1"
+    assert task["config"]["wanId"] == "wan1"
+    command = client.get("/api/router/tcp-session-test/commands?router=Router").get_json()["commands"][0]
+    assert command["router"] == "Router"
+    assert command["wanId"] == "wan1"
+    assert command["payload"]["taskId"] == task["id"]
+    assert command["payload"]["router"] == "Router"
+    assert command["payload"]["wanId"] == "wan1"
+    assert command["payload"]["config"]["wanId"] == "wan1"
+
+
+@pytest.mark.parametrize("presence", [
+    {},
+    {"agentOnline": True, "agentCapabilities": ["relay.wanTelemetry"]},
+    {"agentOnline": False, "agentCapabilities": ["relay.perWanTcpSession"]},
+    {"agentOnline": True, "agentCapabilities": "relay.perWanTcpSession"},
+])
+def test_explicit_wan1_is_rejected_before_queueing_without_online_capability(tmp_path, presence):
+    client, service = build(tmp_path)
+    service.hub.presence = presence
+    response = client.post("/api/tcp-session-test/start", json=start_payload(wanId="wan1"))
+    assert response.status_code == 409
+    assert response.get_json()["error"] == "RELAY_MULTI_WAN_UNSUPPORTED"
+    assert service.snapshot() == {}
+    assert not (tmp_path / "tcp_session_task.json").exists()
+    assert not (tmp_path / "tcp_session_commands.json").exists()
+
+
+def test_explicit_wan_status_and_ack_mismatches_do_not_mutate_state(tmp_path):
+    client, service = build(tmp_path)
+    service.hub.presence = {"agentOnline": True, "agentCapabilities": ["relay.perWanTcpSession"]}
+    task = client.post("/api/tcp-session-test/start", json=start_payload(wanId="wan1")).get_json()["task"]
+    command = client.get("/api/router/tcp-session-test/commands?router=Router").get_json()["commands"][0]
+    before = service._state()
+
+    assert client.post("/api/router/tcp-session-test/status", json={
+        "id": task["id"], "router": "Router", "wanId": "wan2", "state": "completed",
+    }).get_json()["accepted"] is False
+    assert client.post("/api/router/tcp-session-test/status", json={
+        "id": task["id"], "router": "Other", "wanId": "wan1", "state": "completed",
+    }).get_json()["accepted"] is False
+    assert client.post("/api/router/tcp-session-test/status", json={
+        "id": task["id"], "router": "Router", "state": "completed",
+    }).get_json()["accepted"] is False
+    assert client.post("/api/router/tcp-session-test/status", json={
+        "id": "other-task", "router": "Router", "wanId": "wan1", "state": "completed",
+    }).get_json()["accepted"] is False
+    assert client.post("/api/router/tcp-session-test/status", json={
+        "id": task["id"], "taskId": "other-task", "router": "Router", "wanId": "wan1", "state": "completed",
+    }).get_json()["accepted"] is False
+    assert client.post("/api/router/tcp-session-test/status", json={
+        "id": task["id"], "router": "Router", "wanId": "bad wan", "state": "completed",
+    }).get_json()["accepted"] is False
+    assert service._state() == before
+
+    ack = {"id": command["id"], "taskId": task["id"], "router": "Router", "wanId": "wan2", "ok": True}
+    assert client.post("/api/router/tcp-session-test/ack", json={"acks": [ack]}).get_json()["acknowledged"] == 0
+    for mismatch in [
+        {**ack, "taskId": "other-task"},
+        {**ack, "router": "Other"},
+        {key: value for key, value in ack.items() if key != "wanId"},
+        {key: value for key, value in ack.items() if key != "router"},
+    ]:
+        assert client.post("/api/router/tcp-session-test/ack", json={"acks": [mismatch]}).get_json()["acknowledged"] == 0
+        assert service._state() == before
+    stored = json.loads((tmp_path / "tcp_session_commands.json").read_text(encoding="utf-8"))["commands"]
+    assert stored[0]["status"] == "delivered"
+
+    ack["wanId"] = "wan1"
+    assert client.post("/api/router/tcp-session-test/ack", json={"acks": [ack]}).get_json()["acknowledged"] == 1
+    assert service.snapshot(wan_id="wan1")["state"] == "accepted"
+
+
+def test_active_tasks_are_scoped_by_router_and_wan_with_legacy_single_active(tmp_path):
+    client, service = build(tmp_path)
+    service.hub.presence = {"agentOnline": True, "agentCapabilities": ["relay.perWanTcpSession"]}
+    wan1 = client.post("/api/tcp-session-test/start", json=start_payload(wanId="wan1")).get_json()["task"]
+    wan2 = client.post("/api/tcp-session-test/start", json=start_payload(wanId="wan2")).get_json()["task"]
+    assert wan1["id"] != wan2["id"]
+    assert service.snapshot(wan_id="wan1")["id"] == wan1["id"]
+    assert service.snapshot(wan_id="wan2")["id"] == wan2["id"]
+    assert client.post("/api/tcp-session-test/start", json=start_payload(wanId="wan1")).status_code == 409
+    assert client.post("/api/tcp-session-test/start", json=start_payload()).status_code == 409
+
+    other = client.post("/api/tcp-session-test/start", json=start_payload(router="Other", wanId="wan1"))
+    assert other.status_code == 200
+    assert service.snapshot(router="Other", wan_id="wan1")["id"] == other.get_json()["task"]["id"]
+
+    assert service.accept_status({"id": wan1["id"], "router": "Router", "wanId": "wan1", "state": "completed", "resourcesReleased": True})
+    assert service.snapshot(wan_id="wan1")["state"] == "completed"
+    assert service.snapshot(wan_id="wan2")["state"] == "queued"
+
+
+def test_legacy_active_task_still_blocks_explicit_wan_start(tmp_path):
+    client, service = build(tmp_path)
+    service.hub.presence = {"agentOnline": True, "agentCapabilities": ["relay.perWanTcpSession"]}
+    assert client.post("/api/tcp-session-test/start", json=start_payload()).status_code == 200
+    response = client.post("/api/tcp-session-test/start", json=start_payload(wanId="wan1"))
+    assert response.status_code == 409
+    assert "正在运行" in response.get_json()["error"]
+    assert service.snapshot()["wanId"] == ""
+
+
+def test_per_wan_history_preserves_wan_identity_and_five_item_limit_after_restart(tmp_path):
+    client, service = build(tmp_path)
+    service.hub.presence = {"agentOnline": True, "agentCapabilities": ["relay.perWanTcpSession"]}
+    expected = []
+    for index in range(7):
+        wan_id = "wan1" if index % 2 == 0 else ""
+        payload = start_payload(host=f"host{index}.example", wanId=wan_id)
+        task = client.post("/api/tcp-session-test/start", json=payload).get_json()["task"]
+        status = {"id": task["id"], "router": "Router", "state": "completed", "resourcesReleased": True}
+        if wan_id:
+            status["wanId"] = wan_id
+        assert service.accept_status(status)
+        expected.insert(0, (task["id"], wan_id))
+
+    history = client.get("/api/tcp-session-test").get_json()["history"]
+    assert [(row["id"], row["wanId"]) for row in history] == expected[:5]
+    assert all("config" not in row for row in history)
+    restarted = TcpSessionService(service.hub)
+    assert [(row["id"], row["wanId"]) for row in restarted.history()] == expected[:5]

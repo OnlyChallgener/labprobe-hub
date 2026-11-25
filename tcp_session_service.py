@@ -9,6 +9,7 @@ from __future__ import annotations
 
 import copy
 import ipaddress
+import json
 import re
 import threading
 import time
@@ -26,6 +27,16 @@ COMMAND_RETRY_SECONDS = 12
 COMMAND_MAX_ATTEMPTS = 5
 STATUS_STALE_SECONDS = 25
 QUEUE_TIMEOUT_SECONDS = 35
+PER_WAN_CAPABILITIES = {"relay.perWanTcpSession", "relay.multiWan"}
+
+
+class RelayMultiWanUnsupported(RuntimeError):
+    """An explicit WAN was requested from a Relay that cannot honor it."""
+
+    code = "RELAY_MULTI_WAN_UNSUPPORTED"
+
+    def __init__(self) -> None:
+        super().__init__(self.code)
 
 
 def _now() -> int:
@@ -48,6 +59,13 @@ def _decimal(value: Any, default: float = 0.0) -> float:
         return float(value)
     except (TypeError, ValueError):
         return default
+
+
+def _wan_id(value: Any) -> str:
+    wan_id = "" if value is None else str(value).strip().lower()
+    if len(wan_id) > 64 or (wan_id and not re.fullmatch(r"[a-z0-9][a-z0-9_.-]*", wan_id)):
+        raise ValueError("WAN ID 格式无效")
+    return wan_id
 
 
 def _metric(value: Any) -> Dict[str, Any]:
@@ -73,19 +91,86 @@ class TcpSessionService:
         self.history_path = Path(hub.DATA_DIR) / "tcp_session_history.json"
         self.live_state: Dict[str, Any] | None = None
 
-    def _state(self) -> Dict[str, Any]:
-        if self.live_state is not None:
+    def _default_router(self) -> str:
+        primary = getattr(self.hub, "primary_router_name", None)
+        return _text(primary() if callable(primary) else "") or "router"
+
+    def _router(self, value: Any = "") -> str:
+        preferred = _text(value) or self._default_router()
+        resolve = getattr(self.hub, "resolve_agent_router", None)
+        return _text(resolve(preferred) if callable(resolve) else preferred) or preferred or "router"
+
+    @staticmethod
+    def _task_key(router: str, wan_id: str) -> str:
+        return json.dumps([_text(router), _wan_id(wan_id)], ensure_ascii=False, separators=(",", ":"))
+
+    def _document(self) -> Dict[str, Any]:
+        if isinstance(self.live_state, dict) and isinstance(self.live_state.get("tasks"), dict):
             return copy.deepcopy(self.live_state)
         raw = self.hub.load_json(self.state_path, {})
-        return copy.deepcopy(raw) if isinstance(raw, dict) else {}
+        if isinstance(raw, dict) and isinstance(raw.get("tasks"), dict):
+            return copy.deepcopy(raw)
+        # A pre-contract state file contains one task directly.  Keep accepting
+        # that shape while moving new multi-WAN state to the task envelope.
+        task = copy.deepcopy(raw) if isinstance(raw, dict) and raw.get("id") else {}
+        if task:
+            task["router"] = _text(task.get("router")) or self._default_router()
+            task["wanId"] = _wan_id(task.get("wanId"))
+            key = self._task_key(task["router"], task["wanId"])
+            return {"version": 2, "currentKey": key, "tasks": {key: task}}
+        return {"version": 2, "currentKey": "", "tasks": {}}
+
+    def _save_document(self, document: Dict[str, Any]) -> None:
+        value = copy.deepcopy(document)
+        self.live_state = value
+        tasks = value.get("tasks", {})
+        # Preserve the legacy on-disk shape while only one logical task exists.
+        persisted = next(iter(tasks.values())) if len(tasks) == 1 else value
+        self.hub.save_json(self.state_path, persisted)
 
     def _save_state(self, task: Dict[str, Any], persist: bool = True) -> Dict[str, Any]:
         value = copy.deepcopy(task)
-        self.live_state = value
+        value["router"] = _text(value.get("router")) or self._default_router()
+        value["wanId"] = _wan_id(value.get("wanId"))
+        document = self._document()
+        key = self._task_key(value["router"], value["wanId"])
+        document["version"] = 2
+        document["currentKey"] = key
+        document["tasks"][key] = value
         if persist:
-            self.hub.save_json(self.state_path, value)
+            self._save_document(document)
             self._archive(value)
+        else:
+            self.live_state = document
         return value
+
+    def _select_task(
+        self,
+        document: Dict[str, Any],
+        router: str = "",
+        wan_id: str | None = None,
+        task_id: str = "",
+    ) -> Dict[str, Any]:
+        tasks = document.get("tasks", {})
+        rows = [row for row in tasks.values() if isinstance(row, dict)]
+        if task_id:
+            rows = [row for row in rows if _text(row.get("id")) == task_id]
+        if router:
+            rows = [row for row in rows if _text(row.get("router")) == router]
+        if wan_id is not None:
+            rows = [row for row in rows if _wan_id(row.get("wanId")) == wan_id]
+        if not rows:
+            return {}
+        if len(rows) == 1:
+            return copy.deepcopy(rows[0])
+        current_key = _text(document.get("currentKey"))
+        current = tasks.get(current_key)
+        if isinstance(current, dict) and current in rows:
+            return copy.deepcopy(current)
+        return copy.deepcopy(max(rows, key=lambda row: (_integer(row.get("updatedEpoch")), _integer(row.get("createdEpoch")))))
+
+    def _state(self) -> Dict[str, Any]:
+        return self._select_task(self._document())
 
     def _archive(self, task: Dict[str, Any]) -> None:
         if task.get("state") not in TERMINAL_STATES or not task.get("id"):
@@ -131,17 +216,30 @@ class TcpSessionService:
         for source in rows:
             row = dict(source)
             if row.get("status") in {"done", "failed"}:
-                row["payload"] = {"taskId": _text(row.get("taskId"))}
+                payload = {"taskId": _text(row.get("taskId"))}
+                if _text(row.get("wanId")):
+                    payload["router"] = _text(row.get("router"))
+                    payload["wanId"] = _wan_id(row.get("wanId"))
+                row["payload"] = payload
             compact.append(row)
         terminal = [row for row in compact if row.get("status") in {"done", "failed"}][-30:]
         active = [row for row in compact if row.get("status") not in {"done", "failed"}][-10:]
         self.hub.save_json(self.commands_path, {"commands": active + terminal})
 
-    def _queue(self, action: str, task_id: str, payload: Dict[str, Any]) -> Dict[str, Any]:
+    def _queue(
+        self,
+        action: str,
+        task_id: str,
+        payload: Dict[str, Any],
+        router: str = "",
+        wan_id: str = "",
+    ) -> Dict[str, Any]:
         rows = self._commands()
         command = {
             "id": f"tcp-session-{uuid.uuid4().hex[:16]}",
             "taskId": task_id,
+            "router": _text(router),
+            "wanId": _wan_id(wan_id),
             "action": action,
             "payload": copy.deepcopy(payload),
             "status": "pending",
@@ -189,6 +287,7 @@ class TcpSessionService:
             "host": host,
             "port": port,
             "family": family,
+            "wanId": _wan_id(payload.get("wanId")),
             "targetConnections": max(1, min(131072, _integer(payload.get("targetConnections"), 131072))),
             "cps": max(1, min(10000, _integer(payload.get("cps"), 500))),
             "extremeMode": payload.get("extremeMode") is True,
@@ -213,26 +312,71 @@ class TcpSessionService:
                 "updatedEpoch": _now(),
             })
             value.pop("config", None)
-            self._save_state(value)
         value["statusAgeSeconds"] = age
         return value
 
-    def snapshot(self) -> Dict[str, Any]:
+    def _materialized_document(self) -> Dict[str, Any]:
+        document = self._document()
+        changed = False
+        for key, source in list(document.get("tasks", {}).items()):
+            if not isinstance(source, dict):
+                continue
+            task = self._materialized(source)
+            if task.get("state") != source.get("state"):
+                document["tasks"][key] = task
+                self._archive(task)
+                changed = True
+        if changed:
+            self._save_document(document)
+        return document
+
+    def snapshot(self, router: str = "", wan_id: str | None = None) -> Dict[str, Any]:
         with self.lock:
-            return self._materialized(self._state())
+            document = self._materialized_document()
+            return self._select_task(document, self._router(router) if router else "", wan_id)
+
+    def _require_per_wan(self, router: str, wan_id: str) -> None:
+        if not wan_id:
+            return
+        presence_fn = getattr(self.hub, "agent_presence_snapshot", None)
+        try:
+            presence = presence_fn(router) if callable(presence_fn) else {}
+        except Exception:
+            presence = {}
+        presence = presence if isinstance(presence, dict) else {}
+        capabilities = presence.get("agentCapabilities", presence.get("capabilities", []))
+        capabilities = {item for item in capabilities if isinstance(item, str)} if isinstance(capabilities, (list, tuple, set)) else set()
+        online = presence.get("agentOnline", presence.get("online")) is True
+        if not online or not capabilities.intersection(PER_WAN_CAPABILITIES):
+            raise RelayMultiWanUnsupported()
 
     def start(self, payload: Dict[str, Any]) -> Dict[str, Any]:
         config = self._config(payload)
+        router = self._router(payload.get("router"))
+        wan_id = config["wanId"]
+        # Capability validation deliberately precedes any state or queue write.
+        self._require_per_wan(router, wan_id)
         with self.lock:
-            current = self._materialized(self._state())
-            cur_state = _text(current.get("state"))
-            if cur_state in ACTIVE_STATES:
-                status_desc = current.get("status") or cur_state
+            document = self._materialized_document()
+            active = [
+                row for row in document.get("tasks", {}).values()
+                if isinstance(row, dict) and _text(row.get("state")) in ACTIVE_STATES
+            ]
+            router_active = [row for row in active if _text(row.get("router")) == router]
+            same_wan = any(_wan_id(row.get("wanId")) == wan_id for row in router_active)
+            legacy_active = any(not _wan_id(row.get("wanId")) for row in router_active)
+            # Blank WAN keeps the original one-active-task contract.  Explicit
+            # WANs may run concurrently only when their (router, WAN) keys differ.
+            if (not wan_id and router_active) or same_wan or legacy_active:
+                current = self._select_task(document, router, wan_id) or (router_active[0] if router_active else {})
+                status_desc = current.get("status") or _text(current.get("state"))
                 raise RuntimeError(f"已有 TCP 峰值连接数测试正在运行（状态：{status_desc}），请等待完成或点击停止")
             now = _now()
             task_id = f"tcp-{uuid.uuid4().hex[:16]}"
             task = {
                 "id": task_id,
+                "router": router,
+                "wanId": wan_id,
                 "side": "relay",
                 "state": "queued",
                 "status": "等待 Relay 领取测试任务",
@@ -253,33 +397,40 @@ class TcpSessionService:
                 "finishedEpoch": 0,
             }
             self._save_state(task)
-            self._queue("start", task_id, {"taskId": task_id, "config": config})
+            self._queue("start", task_id, {"taskId": task_id, "router": router, "wanId": wan_id, "config": config}, router, wan_id)
             return task
 
-    def stop(self, task_id: str = "") -> Dict[str, Any]:
+    def stop(self, task_id: str = "", router: str = "", wan_id: str | None = None) -> Dict[str, Any]:
         with self.lock:
-            current = self._materialized(self._state())
+            document = self._materialized_document()
+            router = self._router(router) if router else ""
+            current = self._select_task(document, router, wan_id, task_id)
+            if task_id and not current:
+                raise RuntimeError("测试任务已经变化，请刷新后重试")
             if not current:
                 raise RuntimeError("当前没有可停止的测试")
             current_id = _text(current.get("id"))
-            if task_id and task_id != current_id:
-                raise RuntimeError("测试任务已经变化，请刷新后重试")
             if _text(current.get("state")) in TERMINAL_STATES:
                 return current
+            current_router = _text(current.get("router")) or self._default_router()
+            current_wan = _wan_id(current.get("wanId"))
             if _text(current.get("state")) != "stop_requested":
-                self._queue("stop", current_id, {"taskId": current_id})
+                self._queue("stop", current_id, {"taskId": current_id, "router": current_router, "wanId": current_wan}, current_router, current_wan)
             current.update({"state": "stop_requested", "status": "正在通知 Relay 停止并释放连接", "updatedEpoch": _now()})
             return self._save_state(current)
 
     def deliver(self, router: str, limit: int) -> List[Dict[str, Any]]:
-        del router  # The deployment currently has one authenticated Relay identity.
+        router = self._router(router)
         with self.lock:
             rows, selected, changed, now = self._commands(), [], False, _now()
             for row in rows:
+                row_router = _text(row.get("router"))
+                if row_router and self._router(row_router) != router:
+                    continue
                 retry = row.get("status") == "delivered" and now - _integer(row.get("deliveredEpoch")) >= COMMAND_RETRY_SECONDS and _integer(row.get("attempts")) < COMMAND_MAX_ATTEMPTS
                 if row.get("status") == "pending" or retry:
                     row.update({"status": "delivered", "deliveredEpoch": now, "attempts": _integer(row.get("attempts")) + 1})
-                    selected.append({key: row.get(key) for key in ("id", "taskId", "action", "payload", "createdEpoch")})
+                    selected.append({key: row.get(key) for key in ("id", "taskId", "router", "wanId", "action", "payload", "createdEpoch")})
                     changed = True
                     if len(selected) >= limit:
                         break
@@ -287,45 +438,104 @@ class TcpSessionService:
                 self._save_commands(rows)
             return selected
 
-    def acknowledge(self, acknowledgements: Any) -> int:
+    @staticmethod
+    def _correlation_matches(
+        task: Dict[str, Any],
+        payload: Dict[str, Any],
+        router: str = "",
+        *,
+        require_wan: bool = False,
+    ) -> bool:
+        task_router = _text(task.get("router"))
+        payload_router = _text(payload.get("router"))
+        if payload_router:
+            if payload_router != task_router:
+                return False
+        elif router and router != task_router:
+            return False
+        elif task_router and _text(task.get("wanId")):
+            # Explicit-WAN commands must echo the complete correlation tuple.
+            return False
+        try:
+            task_wan = _wan_id(task.get("wanId"))
+            payload_wan = _wan_id(payload.get("wanId")) if "wanId" in payload else None
+        except ValueError:
+            return False
+        if task_wan or require_wan or "wanId" in payload:
+            if "wanId" not in payload or payload_wan != task_wan:
+                return False
+        return True
+
+    def acknowledge(self, acknowledgements: Any, router: str = "") -> int:
         values = {
             _text(row.get("id")): row
             for row in acknowledgements if isinstance(row, dict) and _text(row.get("id"))
         } if isinstance(acknowledgements, list) else {}
+        router = self._router(router) if router else ""
         with self.lock:
             rows, changed = self._commands(), 0
-            task = self._state()
+            document = self._document()
             for row in rows:
                 ack = values.get(_text(row.get("id")))
                 if not ack:
                     continue
+                task_id = _text(row.get("taskId"))
+                row_router = _text(row.get("router")) or self._default_router()
+                row_wan = _wan_id(row.get("wanId"))
+                if _text(ack.get("taskId")) and _text(ack.get("taskId")) != task_id:
+                    continue
+                if row_wan and not _text(ack.get("taskId")):
+                    continue
+                identity = {"router": row_router, "wanId": row_wan}
+                if not self._correlation_matches(identity, ack, router, require_wan=bool(row_wan)):
+                    continue
+                key = self._task_key(row_router, row_wan)
+                task = document.get("tasks", {}).get(key)
+                if not isinstance(task, dict) or _text(task.get("id")) != task_id:
+                    continue
                 ok = bool(ack.get("ok"))
                 row.update({"status": "done" if ok else "failed", "result": ack.get("result"), "finishedEpoch": _now()})
-                if _text(task.get("id")) == _text(row.get("taskId")):
-                    if not ok:
-                        task.update({
-                            "state": "failed",
-                            "status": "Relay 未能执行测试任务",
-                            "finishReason": _text((ack.get("result") or {}).get("error") if isinstance(ack.get("result"), dict) else ack.get("result")) or "Relay 命令执行失败",
-                            "updatedEpoch": _now(),
-                            "finishedEpoch": _now(),
-                        })
-                        task.pop("config", None)
-                    elif row.get("action") == "start" and _text(task.get("state")) == "queued":
-                        task.update({"state": "accepted", "status": "Relay 已领取测试任务", "updatedEpoch": _now()})
-                    self._save_state(task)
+                if not ok:
+                    task.update({
+                        "state": "failed",
+                        "status": "Relay 未能执行测试任务",
+                        "finishReason": _text((ack.get("result") or {}).get("error") if isinstance(ack.get("result"), dict) else ack.get("result")) or "Relay 命令执行失败",
+                        "updatedEpoch": _now(),
+                        "finishedEpoch": _now(),
+                    })
+                    task.pop("config", None)
+                    saved = self._save_state(task)
+                    document["tasks"][key] = saved
+                elif row.get("action") == "start" and _text(task.get("state")) == "queued":
+                    task.update({"state": "accepted", "status": "Relay 已领取测试任务", "updatedEpoch": _now()})
+                    saved = self._save_state(task)
+                    document["tasks"][key] = saved
                 changed += 1
             if changed:
                 self._save_commands(rows)
             return changed
 
-    def accept_status(self, payload: Dict[str, Any]) -> bool:
-        task_id = _text(payload.get("id") or payload.get("taskId"))
+    def accept_status(self, payload: Dict[str, Any], router: str = "") -> bool:
+        payload_id = _text(payload.get("id"))
+        payload_task_id = _text(payload.get("taskId"))
+        if payload_id and payload_task_id and payload_id != payload_task_id:
+            return False
+        task_id = payload_id or payload_task_id
         if not task_id:
             return False
+        router = self._router(router) if router else ""
         with self.lock:
-            current = self._state()
-            if _text(current.get("id")) != task_id:
+            document = self._document()
+            candidates = [
+                row for row in document.get("tasks", {}).values()
+                if isinstance(row, dict) and _text(row.get("id")) == task_id
+            ]
+            if router:
+                candidates = [row for row in candidates if _text(row.get("router")) == router]
+            if len(candidates) != 1:
+                return False
+            current = candidates[0]
+            if not self._correlation_matches(current, payload, router):
                 return False
             previous_state = _text(current.get("state"))
             state = _text(payload.get("state"))
@@ -363,7 +573,11 @@ def create_tcp_session_blueprint(hub: Any, service: TcpSessionService) -> Bluepr
     def snapshot():
         if not hub.check_read_token():
             return jsonify({"ok": False, "error": "未授权"}), 401
-        return jsonify({"ok": True, "task": service.snapshot(), "history": service.history(), "serverEpoch": _now()})
+        try:
+            wan_id = _wan_id(request.args.get("wanId")) if "wanId" in request.args else None
+        except ValueError as error:
+            return jsonify({"ok": False, "error": str(error)}), 400
+        return jsonify({"ok": True, "task": service.snapshot(_text(request.args.get("router")), wan_id), "history": service.history(), "serverEpoch": _now()})
 
     @bp.post("/tcp-session-test/history/remove")
     def remove_history():
@@ -381,6 +595,8 @@ def create_tcp_session_blueprint(hub: Any, service: TcpSessionService) -> Bluepr
             return jsonify({"ok": False, "error": "未授权"}), 401
         try:
             return jsonify({"ok": True, "task": service.start(request.get_json(silent=True) or {})})
+        except RelayMultiWanUnsupported as error:
+            return jsonify({"ok": False, "error": error.code, "code": error.code, "message": "Relay 不支持或未在线提供指定 WAN 的 TCP 会话测试"}), 409
         except RuntimeError as error:
             return jsonify({"ok": False, "error": str(error)}), 409
         except ValueError as error:
@@ -392,9 +608,12 @@ def create_tcp_session_blueprint(hub: Any, service: TcpSessionService) -> Bluepr
             return jsonify({"ok": False, "error": "未授权"}), 401
         try:
             body = request.get_json(silent=True) or {}
-            return jsonify({"ok": True, "task": service.stop(_text(body.get("taskId")))})
+            wan_id = _wan_id(body.get("wanId")) if "wanId" in body else None
+            return jsonify({"ok": True, "task": service.stop(_text(body.get("taskId")), _text(body.get("router")), wan_id)})
         except RuntimeError as error:
             return jsonify({"ok": False, "error": str(error)}), 409
+        except ValueError as error:
+            return jsonify({"ok": False, "error": str(error)}), 400
 
     @bp.get("/router/tcp-session-test/commands")
     def agent_commands():
@@ -408,13 +627,16 @@ def create_tcp_session_blueprint(hub: Any, service: TcpSessionService) -> Bluepr
         if not hub.check_hook_token():
             return jsonify({"ok": False, "error": "Hook 令牌无效"}), 401
         body = request.get_json(silent=True) or {}
-        return jsonify({"ok": True, "acknowledged": service.acknowledge(body.get("acks", []))})
+        router = _text(body.get("router") or request.args.get("router"))
+        return jsonify({"ok": True, "acknowledged": service.acknowledge(body.get("acks", []), router)})
 
     @bp.post("/router/tcp-session-test/status")
     def agent_status():
         if not hub.check_hook_token():
             return jsonify({"ok": False, "error": "Hook 令牌无效"}), 401
-        accepted = service.accept_status(request.get_json(silent=True) or {})
+        body = request.get_json(silent=True) or {}
+        router = _text(body.get("router") or request.args.get("router"))
+        accepted = service.accept_status(body, router)
         return jsonify({"ok": True, "accepted": accepted, "receivedEpoch": _now()})
 
     return bp
