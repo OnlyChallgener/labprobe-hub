@@ -92,6 +92,7 @@ jobs:
             ${{ secrets.DOCKERHUB_USERNAME }}/labprobe-hub:${{ env.TEST_IMAGE_TAG }}
 
   labrelay:
+    needs: hub-docker
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4

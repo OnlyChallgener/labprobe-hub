@@ -110,7 +110,7 @@ def test_native_driver_uses_production_module_envelopes():
     rpc.rpc.assert_any_call(
         method="devSta.set",
         module="upnp",
-        data={"enable_upnp": "true", "upnpds": [], "upnp_line": "1", "wan": "WAN"},
+        data={"enable_upnp": "true", "upnpds": [], "upnp_line": "1", "wan": "wan"},
         no_parse=False,
         params=None,
     )

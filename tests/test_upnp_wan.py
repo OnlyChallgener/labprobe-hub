@@ -47,3 +47,13 @@ def test_upnp_rejects_unknown_line_before_write():
         driver(rpc).set_upnp(True, "WAN2")
     assert raised.value.code == "UPNP_WAN_UNSUPPORTED"
     assert not rpc.calls
+
+
+@pytest.mark.parametrize("ui_wan", ["AUTO", "WAN", "WAN1"])
+def test_upnp_keeps_display_name_separate_from_wire_id(ui_wan):
+    rpc = FakeRpc()
+    result = driver(rpc).set_upnp(True, ui_wan)
+    payload = next(data for method, module, data in rpc.calls if method == "devSta.set")
+    assert payload["wan"] == ui_wan.lower()
+    assert result["wan"] == ui_wan
+    assert result["wanId"] == ui_wan.lower()
