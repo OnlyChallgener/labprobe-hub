@@ -1,7 +1,9 @@
 use anyhow::{anyhow, bail, Context, Result};
 use serde::{Deserialize, Serialize};
 use serde_json::{json, Value};
-use socket2::{Domain, Protocol, SockRef, Socket, Type};
+#[cfg(unix)]
+use socket2::SockRef;
+use socket2::{Domain, Protocol, Socket, Type};
 use std::collections::HashMap;
 use std::fs;
 use std::io::{BufRead, BufReader, Read, Write};
@@ -58,6 +60,9 @@ fn default_rule_kind() -> String {
 fn default_forward_mode() -> String {
     "relay_proxy".to_string()
 }
+fn default_wan_id() -> String {
+    "wan".to_string()
+}
 fn default_stun_server(protocol: &str) -> String {
     if protocol.eq_ignore_ascii_case("TCP") {
         DEFAULT_TCP_STUN_SERVER.to_string()
@@ -85,6 +90,7 @@ struct Rule {
     transport_protocol: String,
     service_type: String,
     forward_mode: String,
+    wan_id: String,
     stun_server: String,
     prefer_current_prefix: bool,
     expires_at: Option<u64>,
@@ -115,6 +121,7 @@ impl Default for Rule {
             transport_protocol: "TCP".to_string(),
             service_type: "Custom".to_string(),
             forward_mode: default_forward_mode(),
+            wan_id: default_wan_id(),
             stun_server: default_stun_server("TCP"),
             prefer_current_prefix: default_true(),
             expires_at: None,
@@ -131,12 +138,18 @@ struct ConfigFile {
     rules: Vec<Rule>,
 }
 
-#[derive(Debug, Clone, Serialize, Deserialize)]
-#[serde(rename_all = "camelCase")]
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+#[serde(default, rename_all = "camelCase")]
 struct RuntimeSnapshot {
     id: String,
     name: String,
     mode: String,
+    #[serde(default = "default_wan_id")]
+    wan_id: String,
+    egress_verification: wan::WanVerification,
+    egress_source: String,
+    egress_device: String,
+    egress_verified_at: Option<u64>,
     state: String,
     listen: String,
     resolved_target: String,
@@ -162,6 +175,11 @@ impl RuntimeSnapshot {
             id: rule.id.clone(),
             name: rule.name.clone(),
             mode: rule.mode.clone(),
+            wan_id: rule.wan_id.clone(),
+            egress_verification: wan::WanVerification::Unknown,
+            egress_source: String::new(),
+            egress_device: String::new(),
+            egress_verified_at: None,
             state: if is_expired(rule) {
                 "expired"
             } else {
@@ -316,15 +334,10 @@ impl Manager {
     async fn restore_previous_rule(&self, id: &str, previous: Option<&Rule>) -> Result<()> {
         match previous {
             Some(old) => {
-                self.rules
-                    .write()
-                    .await
-                    .insert(id.to_string(), old.clone());
+                self.rules.write().await.insert(id.to_string(), old.clone());
                 self.persist().await.context("保存原有规则失败")?;
                 if old.enabled {
-                    self.start_rule(id)
-                        .await
-                        .context("重启原有运行任务失败")?;
+                    self.start_rule(id).await.context("重启原有运行任务失败")?;
                 } else {
                     self.stop_runtime(id, true).await;
                     self.set_cached_state(old, "stopped", "").await;
@@ -332,7 +345,9 @@ impl Manager {
             }
             None => {
                 self.rules.write().await.remove(id);
-                self.persist().await.context("清理创建失败的新规则时保存失败")?;
+                self.persist()
+                    .await
+                    .context("清理创建失败的新规则时保存失败")?;
                 self.stop_runtime(id, false).await;
                 self.last_status.write().await.remove(id);
             }
@@ -354,7 +369,17 @@ impl Manager {
         {
             let runtime_present = self.runtimes.lock().await.contains_key(&id);
             if runtime_present {
-                return Ok(json!({"ok": true, "id": id, "state": "running", "unchanged": true}));
+                let runtime_shared = self
+                    .runtimes
+                    .lock()
+                    .await
+                    .get(&id)
+                    .map(|handle| handle.shared.clone());
+                let state = match runtime_shared {
+                    Some(shared) => shared.snapshot().await.state,
+                    None => "running".to_string(),
+                };
+                return Ok(json!({"ok": true, "id": id, "state": state, "unchanged": true}));
             }
         }
         self.rules.write().await.insert(id.clone(), rule);
@@ -371,9 +396,7 @@ impl Manager {
         }
         if enabled {
             if let Err(error) = self.start_rule(&id).await {
-                if let Err(restore_error) = self
-                    .restore_previous_rule(&id, previous.as_ref())
-                    .await
+                if let Err(restore_error) = self.restore_previous_rule(&id, previous.as_ref()).await
                 {
                     let combined = format!(
                         "新运行任务启动失败：{error:#}；原有运行任务恢复失败：{restore_error:#}"
@@ -405,8 +428,7 @@ impl Manager {
         validate_rule(&rule, self.port_min, self.port_max)?;
         self.ensure_port_available(&rule).await?;
         if is_expired(&rule) {
-            self.set_cached_state(&rule, "expired", "规则已过期")
-                .await;
+            self.set_cached_state(&rule, "expired", "规则已过期").await;
             bail!("规则已过期");
         }
         self.stop_runtime(id, true).await;
@@ -416,6 +438,11 @@ impl Manager {
             id: rule.id.clone(),
             name: rule.name.clone(),
             mode: rule.mode.clone(),
+            wan_id: rule.wan_id.clone(),
+            egress_verification: wan::WanVerification::Unknown,
+            egress_source: String::new(),
+            egress_device: String::new(),
+            egress_verified_at: None,
             state: "starting".to_string(),
             listen: if rule.kind == "stun" {
                 format!("0.0.0.0:{}", rule.listen_port)
@@ -464,10 +491,11 @@ impl Manager {
             mapping_updated_at: previous.as_ref().and_then(|x| x.mapping_updated_at),
         };
         let shared = Arc::new(RuntimeShared::new(snapshot));
-        let (initial_target, initial_target_error) = match resolve_rule_target(&rule, &self.lan_if).await {
-            Ok(target) => (Some(target), None),
-            Err(error) => (None, Some(error.to_string())),
-        };
+        let (initial_target, initial_target_error) =
+            match resolve_rule_target(&rule, &self.lan_if).await {
+                Ok(target) => (Some(target), None),
+                Err(error) => (None, Some(error.to_string())),
+            };
         let target = Arc::new(RwLock::new(initial_target));
         update_target_status(
             &shared,
@@ -492,22 +520,13 @@ impl Manager {
                 // Binding the local channel port is an apply-time requirement,
                 // not a transient STUN failure.  Do it before spawning so an
                 // occupied/invalid port still fails the upsert atomically.
-                let initial_socket = match prepare_tcp_stun_socket(rule.listen_port) {
-                    Ok(socket) => socket,
-                    Err(error) => {
-                        self.set_cached_state(&rule, "error", &error.to_string())
-                            .await;
-                        return Err(error);
-                    }
-                };
+                if let Err(error) = prepare_tcp_stun_socket_for_rule(&rule).await {
+                    self.set_cached_state(&rule, "error", &error.to_string())
+                        .await;
+                    return Err(error);
+                }
                 tokio::spawn(async move {
-                    run_tcp_stun_keepalive(
-                        rule_task,
-                        shared_task,
-                        cancel_rx,
-                        Some(initial_socket),
-                    )
-                    .await;
+                    run_tcp_stun_keepalive(rule_task, shared_task, cancel_rx).await;
                 })
             }
             "TCP" => match if rule.kind == "stun" {
@@ -532,16 +551,32 @@ impl Manager {
                     return Err(error);
                 }
             },
-            "UDP" => match if rule.kind == "stun" {
-                create_ipv4_udp_listener(rule.listen_port)
-            } else {
-                create_ipv6_udp_listener(rule.listen_port)
-            } {
-                Ok(socket) if rule.kind == "stun" && rule.forward_mode == "router_native" => {
+            "UDP" if rule.kind == "stun" => match prepare_stun_udp_socket(&rule).await {
+                Ok((socket, binding)) if rule.forward_mode == "router_native" => {
                     tokio::spawn(async move {
-                        run_udp_stun_keepalive(socket, rule_task, shared_task, cancel_rx).await;
+                        run_udp_stun_keepalive(socket, rule_task, shared_task, cancel_rx, binding)
+                            .await;
                     })
                 }
+                Ok((socket, binding)) => tokio::spawn(async move {
+                    run_udp_listener(
+                        socket,
+                        rule_task,
+                        lan_if,
+                        target_task,
+                        shared_task,
+                        cancel_rx,
+                        binding,
+                    )
+                    .await;
+                }),
+                Err(error) => {
+                    self.set_cached_state(&rule, "error", &error.to_string())
+                        .await;
+                    return Err(error);
+                }
+            },
+            "UDP" => match create_ipv6_udp_listener(rule.listen_port) {
                 Ok(socket) => tokio::spawn(async move {
                     run_udp_listener(
                         socket,
@@ -550,6 +585,7 @@ impl Manager {
                         target_task,
                         shared_task,
                         cancel_rx,
+                        None,
                     )
                     .await;
                 }),
@@ -566,7 +602,11 @@ impl Manager {
         // command immediately. DNS, remote connect and STUN Binding failures
         // are transient runtime work and must never hold the Agent's single
         // command/status loop for the old 30-second confirmation window.
-        let startup_state = if rule.kind == "stun" { "mapping" } else { "running" };
+        let startup_state = if rule.kind == "stun" {
+            "mapping"
+        } else {
+            "running"
+        };
         self.runtimes.lock().await.insert(
             id.to_string(),
             RuntimeHandle {
@@ -670,6 +710,13 @@ impl Manager {
             .unwrap_or_else(|| RuntimeSnapshot::stopped(rule));
         snap.state = state.to_string();
         snap.last_error = err.to_string();
+        snap.wan_id = rule.wan_id.clone();
+        if state == "error" {
+            snap.egress_verification = wan::WanVerification::Unknown;
+            snap.egress_source.clear();
+            snap.egress_device.clear();
+            snap.egress_verified_at = None;
+        }
         self.last_status.write().await.insert(rule.id.clone(), snap);
     }
 
@@ -703,6 +750,9 @@ impl Manager {
             if is_expired(&rule) && snap.state != "running" {
                 snap.state = "expired".to_string();
             }
+            // The configured rule is authoritative. Echoing its normalized WAN
+            // id lets HUB reject a stale/mismatched runtime assignment.
+            snap.wan_id = rule.wan_id.clone();
             rows.push(json!({"rule": rule, "runtime": snap}));
         }
         rows.sort_by_key(|v| {
@@ -787,18 +837,6 @@ fn create_ipv6_udp_listener(port: u16) -> Result<UdpSocket> {
     Ok(UdpSocket::from_std(std_socket)?)
 }
 
-fn create_ipv4_udp_listener(port: u16) -> Result<UdpSocket> {
-    let socket = Socket::new(Domain::IPV4, Type::DGRAM, Some(Protocol::UDP))?;
-    socket.set_reuse_address(true)?;
-    socket.set_nonblocking(true)?;
-    let addr = SocketAddrV4::new(Ipv4Addr::UNSPECIFIED, port);
-    socket
-        .bind(&addr.into())
-        .with_context(|| format!("bind UDP 0.0.0.0:{}", port))?;
-    let std_socket: std::net::UdpSocket = socket.into();
-    Ok(UdpSocket::from_std(std_socket)?)
-}
-
 static STUN_TRANSACTION_COUNTER: AtomicU64 = AtomicU64::new(1);
 const STUN_MAGIC_COOKIE: u32 = 0x2112_A442;
 
@@ -848,7 +886,12 @@ fn parse_stun_mapped_address(
         }
         if matches!(kind, 0x0001 | 0x0020) && len >= 8 && message[value + 1] == 0x01 {
             let mut port = u16::from_be_bytes([message[value + 2], message[value + 3]]);
-            let mut octets = [message[value + 4], message[value + 5], message[value + 6], message[value + 7]];
+            let mut octets = [
+                message[value + 4],
+                message[value + 5],
+                message[value + 6],
+                message[value + 7],
+            ];
             if kind == 0x0020 {
                 port ^= (STUN_MAGIC_COOKIE >> 16) as u16;
                 let cookie = STUN_MAGIC_COOKIE.to_be_bytes();
@@ -856,21 +899,117 @@ fn parse_stun_mapped_address(
                     octets[index] ^= cookie[index];
                 }
             }
-            return Ok(SocketAddr::V4(SocketAddrV4::new(Ipv4Addr::from(octets), port)));
+            return Ok(SocketAddr::V4(SocketAddrV4::new(
+                Ipv4Addr::from(octets),
+                port,
+            )));
         }
         offset = value + ((len + 3) & !3);
     }
     bail!("STUN 响应未包含 IPv4 映射地址")
 }
 
-async fn mark_stun_mapping(shared: &Arc<RuntimeShared>, endpoint: SocketAddr) {
+fn resolve_stun_wan_from_discovery(
+    wan_id: &str,
+    discovery: Result<wan::WanSnapshot>,
+) -> Result<wan::WanBinding> {
+    let snapshot = discovery.with_context(|| format!("WAN discovery failed for {wan_id}"))?;
+    wan::resolve_binding(&snapshot, wan_id, wan::WanFamily::V4)
+        .with_context(|| format!("resolve STUN WAN {wan_id}"))
+}
+
+async fn resolve_stun_wan(wan_id: &str) -> Result<wan::WanBinding> {
+    resolve_stun_wan_from_discovery(wan_id, wan::discover_snapshot_async().await)
+}
+
+fn same_binding_plan(left: &wan::WanBinding, right: &wan::WanBinding) -> bool {
+    left.wan_id == right.wan_id
+        && left.family == right.family
+        && left.source_address == right.source_address
+        && left.device == right.device
+        && left.route_table == right.route_table
+}
+
+fn require_stun_mapping_verification(rule: &Rule, binding: Option<&wan::WanBinding>) -> Result<()> {
+    match binding {
+        Some(binding)
+            if binding.verified
+                && binding.verification == wan::WanVerification::Verified
+                && binding.wan_id.eq_ignore_ascii_case(&rule.wan_id) =>
+        {
+            Ok(())
+        }
+        Some(binding) => bail!(
+            "WAN {} egress verification {} does not permit a STUN mapping",
+            binding.wan_id,
+            binding.verification.as_str()
+        ),
+        None => bail!("WAN {} has no verified egress binding", rule.wan_id),
+    }
+}
+
+fn apply_egress_state(snapshot: &mut RuntimeSnapshot, binding: Option<&wan::WanBinding>) {
+    match binding {
+        Some(binding) => {
+            snapshot.egress_verification = binding.verification;
+            snapshot.egress_source = binding.source_address.clone();
+            snapshot.egress_device = binding.device.clone().unwrap_or_default();
+            snapshot.egress_verified_at = binding.verified.then(now_epoch);
+        }
+        None => {
+            snapshot.egress_verification = wan::WanVerification::Unknown;
+            snapshot.egress_source.clear();
+            snapshot.egress_device.clear();
+            snapshot.egress_verified_at = None;
+        }
+    }
+}
+
+async fn record_stun_egress(shared: &Arc<RuntimeShared>, binding: Option<&wan::WanBinding>) {
     let mut base = shared.base.write().await;
+    apply_egress_state(&mut base, binding);
+    if base.state != "expired" && base.state != "stopped" {
+        // Any endpoint retained from an earlier connection/probe is history
+        // until a fresh Binding response is accepted.
+        base.state = "mapping".to_string();
+    }
+}
+
+async fn mark_stun_binding_failure(
+    shared: &Arc<RuntimeShared>,
+    binding: Option<&wan::WanBinding>,
+    message: String,
+) {
+    let mut base = shared.base.write().await;
+    apply_egress_state(&mut base, binding);
+    if base.state != "expired" && base.state != "stopped" {
+        // WAN selection/verification failures bypass the transient mapping
+        // grace period. The old endpoint may remain visible, but only while the
+        // runtime is explicitly non-ready (`mapping`).
+        base.state = "mapping".to_string();
+    }
+    base.last_error = message;
+}
+
+async fn mark_stun_mapping(
+    shared: &Arc<RuntimeShared>,
+    rule: &Rule,
+    endpoint: SocketAddr,
+    binding: Option<&wan::WanBinding>,
+) -> Result<()> {
+    require_stun_mapping_verification(rule, binding)?;
+    let mut base = shared.base.write().await;
+    if base.state == "expired" || base.state == "stopped" {
+        bail!("STUN runtime is not active");
+    }
+    apply_egress_state(&mut base, binding);
     base.state = "mapped".to_string();
     base.public_endpoint = endpoint.to_string();
     base.public_ip = endpoint.ip().to_string();
     base.public_port = endpoint.port();
     base.mapping_updated_at = Some(now_epoch());
     base.last_error.clear();
+    Ok(())
 }
 
 async fn mark_stun_transient_failure(shared: &Arc<RuntimeShared>, message: String) {
@@ -897,6 +1036,7 @@ async fn resolve_stun_server(value: &str) -> Result<SocketAddr> {
         .ok_or_else(|| anyhow!("STUN 服务器没有可用的 IPv4 地址"))
 }
 
+#[cfg(test)]
 fn prepare_tcp_stun_socket(local_port: u16) -> Result<TcpSocket> {
     // TcpSocket owns the nonblocking connect state and lets Tokio handle
     // EINPROGRESS/EALREADY consistently on musl/BusyBox routers.  The old
@@ -910,19 +1050,96 @@ fn prepare_tcp_stun_socket(local_port: u16) -> Result<TcpSocket> {
     SockRef::from(&socket)
         .set_reuse_port(true)
         .context("设置 STUN TCP 端口复用失败")?;
-    socket.bind(SocketAddr::V4(SocketAddrV4::new(
-        Ipv4Addr::UNSPECIFIED,
-        local_port,
-    )))
-    .with_context(|| format!("绑定 STUN TCP 本地端口 {local_port} 失败"))?;
+    socket
+        .bind(SocketAddr::V4(SocketAddrV4::new(
+            Ipv4Addr::UNSPECIFIED,
+            local_port,
+        )))
+        .with_context(|| format!("绑定 STUN TCP 本地端口 {local_port} 失败"))?;
     Ok(socket)
 }
 
+#[cfg(test)]
 async fn connect_prepared_tcp_stun(socket: TcpSocket, server: SocketAddr) -> Result<TcpStream> {
     timeout(Duration::from_secs(8), socket.connect(server))
         .await
         .context("STUN TCP 连接超时")?
         .context("STUN TCP 连接失败")
+}
+
+async fn prepare_tcp_stun_socket_for_rule(rule: &Rule) -> Result<()> {
+    let binding = resolve_stun_wan(&rule.wan_id).await?;
+    drop(wan::prepare_tcp_bound(&binding, rule.listen_port)?);
+    Ok(())
+}
+
+async fn connect_stun_tcp_for_wan(
+    rule: &Rule,
+    shared: &Arc<RuntimeShared>,
+    server: SocketAddr,
+) -> Result<(TcpStream, Option<wan::WanBinding>)> {
+    let mut binding = match resolve_stun_wan(&rule.wan_id).await {
+        Ok(binding) => binding,
+        Err(error) => {
+            let message = format!("{error:#}");
+            mark_stun_binding_failure(shared, None, message.clone()).await;
+            return Err(error.context(message));
+        }
+    };
+    let socket = match wan::prepare_tcp_bound(&binding, rule.listen_port) {
+        Ok(socket) => socket,
+        Err(error) => {
+            let message = format!("{error:#}");
+            mark_stun_binding_failure(shared, Some(&binding), message.clone()).await;
+            return Err(error.context(message));
+        }
+    };
+    let connected = wan::connect_prepared_tcp_bound(socket, server, &mut binding).await;
+    if let Err(error) = &connected {
+        mark_stun_binding_failure(shared, Some(&binding), format!("{error:#}")).await;
+    }
+    let stream = connected?;
+    record_stun_egress(shared, Some(&binding)).await;
+    if let Err(error) = wan::require_verified_binding(&binding, server) {
+        mark_stun_binding_failure(shared, Some(&binding), format!("{error:#}")).await;
+        return Err(error);
+    }
+    Ok((stream, Some(binding)))
+}
+
+async fn refresh_stun_tcp_binding(
+    rule: &Rule,
+    shared: &Arc<RuntimeShared>,
+    server: SocketAddr,
+    stream: &TcpStream,
+    current: &mut Option<wan::WanBinding>,
+) -> Result<()> {
+    let mut binding = match resolve_stun_wan(&rule.wan_id).await {
+        Ok(binding) => binding,
+        Err(error) => {
+            mark_stun_binding_failure(shared, None, format!("{error:#}")).await;
+            return Err(error);
+        }
+    };
+    let matches_current = current
+        .as_ref()
+        .is_some_and(|current| same_binding_plan(current, &binding));
+    if !matches_current {
+        mark_stun_binding_failure(
+            shared,
+            Some(&binding),
+            format!("WAN {} binding changed; reconnect STUN TCP", binding.wan_id),
+        )
+        .await;
+        bail!("WAN {} binding changed; reconnect STUN TCP", binding.wan_id);
+    }
+    if let Err(error) = wan::verify_connected_tcp_egress(server, &mut binding, stream).await {
+        mark_stun_binding_failure(shared, Some(&binding), format!("{error:#}")).await;
+        return Err(error);
+    }
+    *current = Some(binding.clone());
+    record_stun_egress(shared, Some(&binding)).await;
+    Ok(())
 }
 
 #[cfg(test)]
@@ -942,7 +1159,6 @@ async fn run_tcp_stun_keepalive(
     rule: Rule,
     shared: Arc<RuntimeShared>,
     mut cancel: watch::Receiver<bool>,
-    mut initial_socket: Option<TcpSocket>,
 ) {
     let mut consecutive_failures = 0u32;
     loop {
@@ -951,11 +1167,8 @@ async fn run_tcp_stun_keepalive(
         }
         let result: Result<()> = async {
             let server = resolve_stun_server(&rule.stun_server).await?;
-            let socket = match initial_socket.take() {
-                Some(socket) => socket,
-                None => prepare_tcp_stun_socket(rule.listen_port)?,
-            };
-            let mut stream = connect_prepared_tcp_stun(socket, server).await?;
+            let (mut stream, mut binding) =
+                connect_stun_tcp_for_wan(&rule, &shared, server).await?;
             // RFC 8489 recommends an abortive close before reopening an idle
             // TCP STUN flow that has failed.  Linger zero prevents the old
             // four-tuple from trapping the fixed local channel port in
@@ -974,6 +1187,14 @@ async fn run_tcp_stun_keepalive(
                         if *cancel.borrow() { return Ok(()); }
                     }
                     _ = tick.tick() => {
+                        refresh_stun_tcp_binding(
+                            &rule,
+                            &shared,
+                            server,
+                            &stream,
+                            &mut binding,
+                        )
+                        .await?;
                         let (request, transaction_id) = stun_binding_request();
                         stream
                             .write_all(&request)
@@ -994,14 +1215,17 @@ async fn run_tcp_stun_keepalive(
                             .context("读取 STUN TCP 响应内容失败")?;
                         mark_stun_mapping(
                             &shared,
+                            &rule,
                             parse_stun_mapped_address(&message, &transaction_id)?,
+                            binding.as_ref(),
                         )
-                        .await;
+                        .await?;
                         consecutive_failures = 0;
                     }
                 }
             }
-        }.await;
+        }
+        .await;
         if let Err(error) = result {
             consecutive_failures = consecutive_failures.saturating_add(1);
             mark_stun_transient_failure(&shared, format!("{error:#}")).await;
@@ -1027,7 +1251,6 @@ async fn run_tcp_listener(
             rule.clone(),
             shared.clone(),
             cancel.clone(),
-            None,
         )))
     } else {
         None
@@ -1120,16 +1343,60 @@ async fn run_tcp_listener(
     }
 }
 
+fn same_optional_binding_plan(
+    left: Option<&wan::WanBinding>,
+    right: Option<&wan::WanBinding>,
+) -> bool {
+    match (left, right) {
+        (Some(left), Some(right)) => same_binding_plan(left, right),
+        (None, None) => true,
+        _ => false,
+    }
+}
+
+fn bind_udp_stun_socket(local_port: u16, binding: Option<&wan::WanBinding>) -> Result<UdpSocket> {
+    let binding = binding.ok_or_else(|| anyhow!("STUN UDP requires a verified WAN binding"))?;
+    wan::bind_udp_bound(binding, local_port)
+}
+
+async fn prepare_stun_udp_socket(rule: &Rule) -> Result<(UdpSocket, Option<wan::WanBinding>)> {
+    let binding = Some(resolve_stun_wan(&rule.wan_id).await?);
+    let socket = bind_udp_stun_socket(rule.listen_port, binding.as_ref())?;
+    Ok((socket, binding))
+}
+
+async fn prepare_udp_stun_probe(
+    rule: &Rule,
+    shared: &Arc<RuntimeShared>,
+    server: SocketAddr,
+) -> Result<([u8; 20], StunTransactionId, Option<wan::WanBinding>)> {
+    let mut binding = match resolve_stun_wan(&rule.wan_id).await {
+        Ok(binding) => binding,
+        Err(error) => {
+            mark_stun_binding_failure(shared, None, format!("{error:#}")).await;
+            return Err(error);
+        }
+    };
+    if let Err(error) = wan::verify_udp_egress(server, &mut binding).await {
+        mark_stun_binding_failure(shared, Some(&binding), format!("{error:#}")).await;
+        return Err(error);
+    }
+    record_stun_egress(shared, Some(&binding)).await;
+    let (request, transaction_id) = stun_binding_request();
+    Ok((request, transaction_id, Some(binding)))
+}
+
 // Lucky's direct UDP mode follows the same split as direct TCP: the router
 // owns WAN -> LAN delivery, while this socket uses the channel port only to
 // maintain the upstream NAT mapping and learn the current public endpoint.
 // Packets from arbitrary visitors are deliberately ignored here; the router's
 // native DNAT rule sends those directly to the selected LAN service.
 async fn run_udp_stun_keepalive(
-    socket: UdpSocket,
+    mut socket: UdpSocket,
     rule: Rule,
     shared: Arc<RuntimeShared>,
     mut cancel: watch::Receiver<bool>,
+    mut current_binding: Option<wan::WanBinding>,
 ) {
     let mut recv_buffer = vec![0u8; 65_535];
     let mut stun_tick = tokio::time::interval(Duration::from_secs(20));
@@ -1152,7 +1419,38 @@ async fn run_udp_stun_keepalive(
                 match resolve_stun_server(&rule.stun_server).await {
                     Ok(server) => {
                         stun_server = Some(server);
-                        let (request, transaction_id) = stun_binding_request();
+                        let (request, transaction_id, desired_binding) =
+                            match prepare_udp_stun_probe(&rule, &shared, server).await {
+                                Ok(probe) => probe,
+                                Err(_) => {
+                                    stun_server = None;
+                                    continue;
+                                }
+                            };
+                        if !same_optional_binding_plan(
+                            current_binding.as_ref(),
+                            desired_binding.as_ref(),
+                        ) {
+                            match bind_udp_stun_socket(
+                                rule.listen_port,
+                                desired_binding.as_ref(),
+                            ) {
+                                Ok(replacement) => {
+                                    socket = replacement;
+                                }
+                                Err(error) => {
+                                    mark_stun_binding_failure(
+                                        &shared,
+                                        desired_binding.as_ref(),
+                                        format!("{error:#}"),
+                                    )
+                                    .await;
+                                    stun_server = None;
+                                    continue;
+                                }
+                            }
+                        }
+                        current_binding = desired_binding;
                         if let Err(error) = socket.send_to(&request, server).await {
                             mark_stun_transient_failure(
                                 &shared,
@@ -1175,7 +1473,21 @@ async fn run_udp_stun_keepalive(
                             match parse_stun_mapped_address(&recv_buffer[..size], &expected) {
                                 Ok(endpoint) => {
                                     pending_transaction = None;
-                                    mark_stun_mapping(&shared, endpoint).await;
+                                    if let Err(error) = mark_stun_mapping(
+                                        &shared,
+                                        &rule,
+                                        endpoint,
+                                        current_binding.as_ref(),
+                                    )
+                                    .await
+                                    {
+                                        mark_stun_binding_failure(
+                                            &shared,
+                                            current_binding.as_ref(),
+                                            format!("{error:#}"),
+                                        )
+                                        .await;
+                                    }
                                 }
                                 Err(error) => {
                                     mark_stun_transient_failure(&shared, error.to_string()).await;
@@ -1198,6 +1510,26 @@ async fn run_udp_stun_keepalive(
     if base.state != "expired" {
         base.state = "stopped".to_string();
     }
+}
+
+async fn send_from_current_udp_listener(
+    listener: &watch::Receiver<Arc<UdpSocket>>,
+    payload: &[u8],
+    peer: SocketAddr,
+) -> std::io::Result<usize> {
+    // Clone the current socket and drop the watch guard before awaiting. This
+    // keeps spawned tasks Send and lets a WAN rebind replace the socket without
+    // leaving peer tasks attached to stale SO_REUSEPORT egress.
+    let socket = listener.borrow().clone();
+    socket.send_to(payload, peer).await
+}
+
+async fn recv_from_current_udp_listener(
+    listener: &mut watch::Receiver<Arc<UdpSocket>>,
+    buffer: &mut [u8],
+) -> std::io::Result<(usize, SocketAddr)> {
+    let socket = listener.borrow_and_update().clone();
+    socket.recv_from(buffer).await
 }
 
 async fn udp_upstream_socket(target: SocketAddr) -> Result<UdpSocket> {
@@ -1228,8 +1560,9 @@ async fn run_udp_listener(
     target: Arc<RwLock<Option<IpAddr>>>,
     shared: Arc<RuntimeShared>,
     mut cancel: watch::Receiver<bool>,
+    mut current_binding: Option<wan::WanBinding>,
 ) {
-    let listener = Arc::new(socket);
+    let (listener_tx, mut listener_rx) = watch::channel(Arc::new(socket));
     let peers: Arc<Mutex<HashMap<SocketAddr, UdpPeer>>> = Arc::new(Mutex::new(HashMap::new()));
     let next_token = Arc::new(AtomicU64::new(1));
     let mut peer_tasks = JoinSet::new();
@@ -1257,8 +1590,44 @@ async fn run_udp_listener(
                 match resolve_stun_server(&rule.stun_server).await {
                     Ok(server) => {
                         stun_server = Some(server);
-                        let (request, transaction_id) = stun_binding_request();
-                        if let Err(error) = listener.send_to(&request, server).await {
+                        let (request, transaction_id, desired_binding) =
+                            match prepare_udp_stun_probe(&rule, &shared, server).await {
+                                Ok(probe) => probe,
+                                Err(_) => {
+                                    stun_server = None;
+                                    continue;
+                                }
+                            };
+                        if !same_optional_binding_plan(
+                            current_binding.as_ref(),
+                            desired_binding.as_ref(),
+                        ) {
+                            match bind_udp_stun_socket(
+                                rule.listen_port,
+                                desired_binding.as_ref(),
+                            ) {
+                                Ok(replacement) => {
+                                    // Peer tasks retain a watch receiver rather
+                                    // than the old socket, so a WAN change cannot
+                                    // leave SO_REUSEPORT traffic on stale egress.
+                                    let _ = listener_tx.send(Arc::new(replacement));
+                                }
+                                Err(error) => {
+                                    mark_stun_binding_failure(
+                                        &shared,
+                                        desired_binding.as_ref(),
+                                        format!("{error:#}"),
+                                    )
+                                    .await;
+                                    stun_server = None;
+                                    continue;
+                                }
+                            }
+                        }
+                        current_binding = desired_binding;
+                        if let Err(error) =
+                            send_from_current_udp_listener(&listener_rx, &request, server).await
+                        {
                             mark_stun_transient_failure(
                                 &shared,
                                 format!("STUN UDP 发送失败：{}", error),
@@ -1294,7 +1663,7 @@ async fn run_udp_listener(
                     }
                 }
             }
-            received = listener.recv_from(&mut recv_buffer) => {
+            received = recv_from_current_udp_listener(&mut listener_rx, &mut recv_buffer) => {
                 let (size, client) = match received {
                     Ok(value) => value,
                     Err(error) => {
@@ -1309,7 +1678,21 @@ async fn run_udp_listener(
                         match parse_stun_mapped_address(&recv_buffer[..size], &expected) {
                             Ok(endpoint) => {
                                 pending_transaction = None;
-                                mark_stun_mapping(&shared, endpoint).await;
+                                if let Err(error) = mark_stun_mapping(
+                                    &shared,
+                                    &rule,
+                                    endpoint,
+                                    current_binding.as_ref(),
+                                )
+                                .await
+                                {
+                                    mark_stun_binding_failure(
+                                        &shared,
+                                        current_binding.as_ref(),
+                                        format!("{error:#}"),
+                                    )
+                                    .await;
+                                }
                             }
                             Err(error) => {
                                 mark_stun_transient_failure(&shared, error.to_string()).await;
@@ -1364,7 +1747,7 @@ async fn run_udp_listener(
                                 };
                                 peers.lock().await.insert(client, peer.clone());
                                 shared.active_peers.fetch_add(1, Ordering::Relaxed);
-                                let task_listener = listener.clone();
+                                let task_listener = listener_rx.clone();
                                 let task_peers = peers.clone();
                                 let task_shared = shared.clone();
                                 let task_last_seen = peer.last_seen.clone();
@@ -1423,7 +1806,7 @@ async fn run_udp_listener(
 }
 
 async fn run_udp_peer(
-    listener: Arc<UdpSocket>,
+    listener: watch::Receiver<Arc<UdpSocket>>,
     upstream: Arc<UdpSocket>,
     client: SocketAddr,
     token: u64,
@@ -1448,7 +1831,7 @@ async fn run_udp_peer(
             }
             received = upstream.recv(&mut buffer) => {
                 match received {
-                    Ok(size) => match listener.send_to(&buffer[..size], client).await {
+                    Ok(size) => match send_from_current_udp_listener(&listener, &buffer[..size], client).await {
                         Ok(sent) => {
                             last_seen.store(now_epoch(), Ordering::Relaxed);
                             shared.download.fetch_add(sent as u64, Ordering::Relaxed);
@@ -1541,7 +1924,12 @@ async fn update_target_status(
     if let Some(ip) = target {
         base.resolved_target = format_target(ip, rule.target_port);
         base.last_resolved_at = Some(now_epoch());
-        base.state = if rule.kind == "stun" { "mapping" } else { "running" }.to_string();
+        base.state = if rule.kind == "stun" {
+            "mapping"
+        } else {
+            "running"
+        }
+        .to_string();
         base.last_error.clear();
     } else {
         base.state = "waiting_target".to_string();
@@ -1781,6 +2169,10 @@ fn normalize_rule(rule: &mut Rule) {
     rule.transport_protocol = rule.transport_protocol.trim().to_ascii_uppercase();
     rule.service_type = rule.service_type.trim().to_string();
     rule.forward_mode = rule.forward_mode.trim().to_ascii_lowercase();
+    rule.wan_id = rule.wan_id.trim().to_ascii_lowercase();
+    if rule.wan_id.is_empty() {
+        rule.wan_id = default_wan_id();
+    }
     rule.stun_server = rule.stun_server.trim().to_string();
     if rule.target_type == "router_self" && rule.kind != "stun" {
         if rule.mode == "6to6" {
@@ -1807,7 +2199,9 @@ fn normalize_rule(rule: &mut Rule) {
             "router_native".to_string()
         };
         if rule.stun_server.is_empty()
-            || (rule.transport_protocol == "TCP" && (rule.stun_server == LEGACY_TCP_STUN_SERVER || rule.stun_server == "stunserver2025.stunprotocol.org:3478"))
+            || (rule.transport_protocol == "TCP"
+                && (rule.stun_server == LEGACY_TCP_STUN_SERVER
+                    || rule.stun_server == "stunserver2025.stunprotocol.org:3478"))
         {
             rule.stun_server = default_stun_server(&rule.transport_protocol);
         }
@@ -1831,7 +2225,17 @@ fn validate_rule(rule: &Rule, _port_min: u16, _port_max: u16) -> Result<()> {
     if rule.name.is_empty() || rule.name.len() > 64 {
         bail!("规则名称无效");
     }
-    if !matches!(rule.target_type.as_str(), "router_self" | "device" | "manual") {
+    if !rule
+        .wan_id
+        .strip_prefix("wan")
+        .is_some_and(|suffix| suffix.bytes().all(|byte| byte.is_ascii_digit()))
+    {
+        bail!("WAN ID 必须是 wan 或 wan 加数字");
+    }
+    if !matches!(
+        rule.target_type.as_str(),
+        "router_self" | "device" | "manual"
+    ) {
         bail!("目标类型只能是路由器本机、内网设备或手动目标");
     }
     if !rule.target_mac.is_empty() {
@@ -1866,7 +2270,8 @@ fn validate_rule(rule: &Rule, _port_min: u16, _port_max: u16) -> Result<()> {
     if rule.kind == "stun" && !rule.stun_server.contains(':') {
         bail!("STUN 服务器地址无效");
     }
-    if rule.kind == "stun" && !matches!(rule.forward_mode.as_str(), "router_native" | "relay_proxy") {
+    if rule.kind == "stun" && !matches!(rule.forward_mode.as_str(), "router_native" | "relay_proxy")
+    {
         bail!("不支持的 STUN 转发模式：{}", rule.forward_mode);
     }
     if matches!(rule.mode.as_str(), "6to4" | "stun") {
@@ -2002,7 +2407,12 @@ async fn handle_command_fixed(manager: Manager, raw: &str) -> Value {
         }
         "tcp_session_status" => Ok(manager.tcp_session_tests.status().await),
         "speedtest_start" => manager.speed_tests.start(&v).await,
-        "speedtest_cancel" => manager.speed_tests.cancel(v.get("taskId").and_then(Value::as_str).unwrap_or("")).await,
+        "speedtest_cancel" => {
+            manager
+                .speed_tests
+                .cancel(v.get("taskId").and_then(Value::as_str).unwrap_or(""))
+                .await
+        }
         "speedtest_status" => Ok(manager.speed_tests.status().await),
         "speedtest_capability" => Ok(manager.speed_tests.capability()),
         _ => Err(anyhow!("unknown action")),
@@ -2293,7 +2703,14 @@ mod tests {
             r#"{"version":1,"rules":[{"id":"bad","kind":"portmap","name":"bad","enabled":false,"mode":"6to4","listenPort":0,"targetPort":443,"targetIpv4":"192.168.5.46"}]}"#,
         )
         .unwrap();
-        let result = Manager::load(path.clone(), path.with_extension("state"), 1, 65535, "br-lan".into()).await;
+        let result = Manager::load(
+            path.clone(),
+            path.with_extension("state"),
+            1,
+            65535,
+            "br-lan".into(),
+        )
+        .await;
         fs::remove_file(path).unwrap();
         assert!(result.is_err());
     }
@@ -2393,6 +2810,135 @@ mod tests {
     }
 
     #[test]
+    fn legacy_rule_defaults_wan_and_explicit_wan_serializes_camel_case() {
+        let legacy: Rule = serde_json::from_value(json!({
+            "id": "legacy",
+            "name": "Legacy",
+            "mode": "6to4",
+            "listenPort": 20001,
+            "targetIpv4": "192.168.1.50",
+            "targetPort": 443
+        }))
+        .unwrap();
+        assert_eq!(legacy.wan_id, "wan");
+
+        let mut blank = Rule {
+            wan_id: "  ".into(),
+            ..Rule::default()
+        };
+        normalize_rule(&mut blank);
+        assert_eq!(blank.wan_id, "wan");
+
+        let mut explicit = Rule {
+            wan_id: " WAN1 ".into(),
+            ..Rule::default()
+        };
+        normalize_rule(&mut explicit);
+        let value = serde_json::to_value(&explicit).unwrap();
+        assert_eq!(value["wanId"], "wan1");
+        assert!(value.get("wan_id").is_none());
+
+        let runtime = serde_json::to_value(RuntimeSnapshot::stopped(&explicit)).unwrap();
+        assert_eq!(runtime["wanId"], "wan1");
+        assert_eq!(runtime["egressVerification"], "unknown");
+        let legacy_runtime: RuntimeSnapshot = serde_json::from_value(json!({"id": "old"})).unwrap();
+        assert_eq!(legacy_runtime.wan_id, "wan");
+        assert_eq!(
+            legacy_runtime.egress_verification,
+            wan::WanVerification::Unknown
+        );
+    }
+
+    fn stun_wan_snapshot(up: bool, addresses: Value) -> wan::WanSnapshot {
+        serde_json::from_value(json!({
+            "wans": [{
+                "wanId": "wan1",
+                "logicalInterface": "wan1",
+                "l3Device": "eth1",
+                "kind": "ethernet",
+                "devices": ["eth1"],
+                "addresses": addresses,
+                "gateways": [],
+                "routeTables": [],
+                "mwan3Member": null,
+                "up": up,
+                "defaultV4": false,
+                "defaultV6": false
+            }],
+            "defaultWanIdV4": "wan",
+            "defaultWanIdV6": null,
+            "observedAt": 1,
+            "source": "test"
+        }))
+        .unwrap()
+    }
+
+    #[test]
+    fn explicit_stun_wan_missing_offline_or_ambiguous_fails_closed() {
+        let address = json!({
+            "address": "198.51.100.2",
+            "prefixLen": 24,
+            "scope": "global",
+            "temporary": false,
+            "deprecated": false,
+            "tentative": false,
+            "interface": "eth1"
+        });
+        let mut missing = stun_wan_snapshot(true, Value::Array(vec![]));
+        missing.wans.clear();
+        assert!(resolve_stun_wan_from_discovery("wan1", Ok(missing)).is_err());
+
+        let offline = stun_wan_snapshot(false, Value::Array(vec![address.clone()]));
+        assert!(resolve_stun_wan_from_discovery("wan1", Ok(offline)).is_err());
+
+        let mut second = address.clone();
+        second["address"] = json!("198.51.100.3");
+        let ambiguous = stun_wan_snapshot(true, Value::Array(vec![address, second]));
+        assert!(resolve_stun_wan_from_discovery("wan1", Ok(ambiguous)).is_err());
+    }
+
+    #[test]
+    fn discovery_failure_and_missing_binding_never_fall_back_to_unbound_stun() {
+        assert!(resolve_stun_wan_from_discovery("wan", Err(anyhow!("uci unavailable"))).is_err());
+        assert!(resolve_stun_wan_from_discovery("wan1", Err(anyhow!("uci unavailable"))).is_err());
+
+        let legacy = Rule {
+            wan_id: "wan".into(),
+            ..Rule::default()
+        };
+        assert!(require_stun_mapping_verification(&legacy, None).is_err());
+        let explicit = Rule {
+            wan_id: "wan1".into(),
+            ..Rule::default()
+        };
+        assert!(require_stun_mapping_verification(&explicit, None).is_err());
+        assert!(bind_udp_stun_socket(0, None).is_err());
+    }
+
+    #[test]
+    fn route_mismatch_or_unknown_verification_never_reports_mapped() {
+        let rule = Rule {
+            wan_id: "wan1".into(),
+            ..Rule::default()
+        };
+        let mut binding = wan::WanBinding {
+            wan_id: "wan1".into(),
+            family: wan::WanFamily::V4,
+            source_address: "198.51.100.2".into(),
+            device: Some("eth1".into()),
+            route_table: None,
+            verified: false,
+            verification: wan::WanVerification::Mismatch,
+        };
+        assert!(require_stun_mapping_verification(&rule, Some(&binding)).is_err());
+        binding.verification = wan::WanVerification::Unknown;
+        assert!(require_stun_mapping_verification(&rule, Some(&binding)).is_err());
+        binding.verification = wan::WanVerification::Verified;
+        binding.verified = true;
+        require_stun_mapping_verification(&rule, Some(&binding)).unwrap();
+    }
+
+    #[test]
     fn tcp_and_udp_can_share_listen_port_but_same_protocol_cannot() {
         let tcp = Rule {
             id: "tcp".into(),
@@ -2482,6 +3028,7 @@ mod tests {
             target,
             shared.clone(),
             cancel_rx,
+            None,
         ));
         let destination: SocketAddr = format!("[::1]:{listen_port}").parse().unwrap();
         let first = UdpSocket::bind("[::1]:0").await.unwrap();
@@ -2559,6 +3106,7 @@ mod tests {
             target.clone(),
             shared,
             cancel_rx,
+            None,
         ));
         let client = UdpSocket::bind("[::1]:0").await.unwrap();
         let destination = format!("[::1]:{listen_port}");
@@ -2625,6 +3173,7 @@ mod tests {
             target,
             shared.clone(),
             cancel_rx,
+            None,
         ));
         let client = UdpSocket::bind("[::1]:0").await.unwrap();
         client
@@ -2792,9 +3341,8 @@ mod tests {
         snapshot.public_endpoint = "198.51.100.8:20001".into();
         snapshot.public_ip = "198.51.100.8".into();
         snapshot.public_port = 20001;
-        snapshot.mapping_updated_at = Some(
-            now_epoch().saturating_sub(STUN_MAPPING_FAILURE_GRACE.as_secs() + 1),
-        );
+        snapshot.mapping_updated_at =
+            Some(now_epoch().saturating_sub(STUN_MAPPING_FAILURE_GRACE.as_secs() + 1));
         let shared = Arc::new(RuntimeShared::new(snapshot));
 
         mark_stun_transient_failure(&shared, "STUN TCP 连接失败".into()).await;
@@ -2810,7 +3358,10 @@ mod tests {
         assert_eq!(STUN_TCP_KEEPALIVE_INTERVAL, Duration::from_secs(10));
         assert_eq!(STUN_MAPPING_FAILURE_GRACE, Duration::from_secs(90));
         assert_eq!(stun_retry_delay(1), Duration::from_secs(5));
-        assert_eq!(stun_retry_delay(STUN_FAST_RETRY_LIMIT), Duration::from_secs(5));
+        assert_eq!(
+            stun_retry_delay(STUN_FAST_RETRY_LIMIT),
+            Duration::from_secs(5)
+        );
         assert_eq!(
             stun_retry_delay(STUN_FAST_RETRY_LIMIT + 1),
             Duration::from_secs(15)
@@ -2979,10 +3530,13 @@ mod tests {
         let server = TcpListener::bind("127.0.0.1:0").await.unwrap();
         let server_addr = server.local_addr().unwrap();
 
-        let stream = timeout(Duration::from_secs(2), connect_tcp_stun(source_port, server_addr))
-            .await
-            .unwrap()
-            .unwrap();
+        let stream = timeout(
+            Duration::from_secs(2),
+            connect_tcp_stun(source_port, server_addr),
+        )
+        .await
+        .unwrap()
+        .unwrap();
         assert_eq!(stream.local_addr().unwrap().port(), source_port);
         let (_, peer) = timeout(Duration::from_secs(2), server.accept())
             .await

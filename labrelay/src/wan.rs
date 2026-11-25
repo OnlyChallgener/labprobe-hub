@@ -7,6 +7,8 @@
 
 use anyhow::{bail, Context, Result};
 use serde::{Deserialize, Serialize};
+#[cfg(unix)]
+use socket2::SockRef;
 use socket2::{Domain, Protocol, Socket, Type};
 use std::collections::{BTreeMap, BTreeSet};
 use std::fs;
@@ -427,19 +429,24 @@ pub fn resolve_binding(
     })
 }
 
-/// Connect TCP after binding the selected source address and device. A route
-/// mismatch is fatal. Route-query/parse failures leave the binding `unknown`
-/// and return the connected socket without claiming verified egress.
-pub async fn connect_tcp_bound(peer: SocketAddr, binding: &mut WanBinding) -> Result<TcpStream> {
-    let local = socket_bind_address(binding, peer)?;
+/// Prepare a TCP socket on the selected source/device and fixed local port.
+/// Port reuse lets Relay keep a wildcard inbound listener and a STUN channel
+/// socket on the same port without changing routes, rules, firewall, or marks.
+pub fn prepare_tcp_bound(binding: &WanBinding, local_port: u16) -> Result<TcpSocket> {
+    let local = socket_bind_address_with_port(binding, binding.family, local_port)?;
     let bind_device = validated_bind_device(binding)?.map(str::to_string);
-    binding.set_verification(WanVerification::Unknown);
-
-    let socket = match peer {
-        SocketAddr::V4(_) => TcpSocket::new_v4(),
-        SocketAddr::V6(_) => TcpSocket::new_v6(),
+    let socket = match binding.family {
+        WanFamily::V4 => TcpSocket::new_v4(),
+        WanFamily::V6 => TcpSocket::new_v6(),
     }
     .context("create WAN TCP socket")?;
+    socket
+        .set_reuseaddr(true)
+        .context("set WAN TCP SO_REUSEADDR")?;
+    #[cfg(unix)]
+    SockRef::from(&socket)
+        .set_reuse_port(true)
+        .context("set WAN TCP SO_REUSEPORT")?;
     #[cfg(any(target_os = "linux", target_os = "android"))]
     set_so_bind_to_device(socket.as_raw_fd(), bind_device.as_deref())?;
     #[cfg(not(any(target_os = "linux", target_os = "android")))]
@@ -447,6 +454,25 @@ pub async fn connect_tcp_bound(peer: SocketAddr, binding: &mut WanBinding) -> Re
     socket
         .bind(local)
         .with_context(|| format!("bind WAN TCP source {local}"))?;
+    Ok(socket)
+}
+
+/// Connect a prepared WAN TCP socket. A route mismatch is fatal. Route
+/// query/parse failures leave the binding `unknown` and return the connected
+/// socket without claiming verified egress.
+pub async fn connect_prepared_tcp_bound(
+    socket: TcpSocket,
+    peer: SocketAddr,
+    binding: &mut WanBinding,
+) -> Result<TcpStream> {
+    let _ = socket_bind_address_with_port(binding, binding.family, 0)?;
+    if !binding.family.matches(peer.ip()) {
+        bail!("WAN binding and TCP peer address families differ");
+    }
+    if peer.ip().is_unspecified() {
+        bail!("WAN peer address cannot be unspecified");
+    }
+    binding.set_verification(WanVerification::Unknown);
     let stream = timeout(CONNECT_TIMEOUT, socket.connect(peer))
         .await
         .context("WAN TCP connect timed out")?
@@ -455,6 +481,74 @@ pub async fn connect_tcp_bound(peer: SocketAddr, binding: &mut WanBinding) -> Re
     let verification = query_and_evaluate_egress(binding, peer, connected_local).await;
     require_non_mismatch(binding, peer, verification)?;
     Ok(stream)
+}
+
+/// Connect TCP after binding the selected source address and device.
+pub async fn connect_tcp_bound(peer: SocketAddr, binding: &mut WanBinding) -> Result<TcpStream> {
+    connect_tcp_bound_with_local_port(peer, binding, 0).await
+}
+
+/// Connect TCP on a fixed local channel port using the selected WAN source and
+/// device. Route-query failures remain `unknown`; callers that require a
+/// verified egress must also call [`require_verified_binding`].
+pub async fn connect_tcp_bound_with_local_port(
+    peer: SocketAddr,
+    binding: &mut WanBinding,
+    local_port: u16,
+) -> Result<TcpStream> {
+    let socket = prepare_tcp_bound(binding, local_port)?;
+    connect_prepared_tcp_bound(socket, peer, binding).await
+}
+
+/// Re-run connected route verification for an existing TCP keepalive socket.
+/// This is intentionally read-only and never installs a route or policy mark.
+pub async fn verify_connected_tcp_egress(
+    peer: SocketAddr,
+    binding: &mut WanBinding,
+    stream: &TcpStream,
+) -> Result<()> {
+    let connected_local = stream.local_addr().ok();
+    let verification = query_and_evaluate_egress(binding, peer, connected_local).await;
+    require_non_mismatch(binding, peer, verification)?;
+    require_verified_binding(binding, peer)
+}
+
+/// Bind an unconnected UDP socket to the selected WAN source/device and fixed
+/// local port. Relay uses this for its shared STUN/visitor channel socket.
+pub fn bind_udp_bound(binding: &WanBinding, local_port: u16) -> Result<UdpSocket> {
+    let local = socket_bind_address_with_port(binding, binding.family, local_port)?;
+    let bind_device = validated_bind_device(binding)?.map(str::to_string);
+    let domain = if binding.family == WanFamily::V4 {
+        Domain::IPV4
+    } else {
+        Domain::IPV6
+    };
+    let socket =
+        Socket::new(domain, Type::DGRAM, Some(Protocol::UDP)).context("create WAN UDP socket")?;
+    socket
+        .set_reuse_address(true)
+        .context("set WAN UDP SO_REUSEADDR")?;
+    #[cfg(unix)]
+    socket
+        .set_reuse_port(true)
+        .context("set WAN UDP SO_REUSEPORT")?;
+    if binding.family == WanFamily::V6 {
+        socket
+            .set_only_v6(true)
+            .context("make WAN UDP socket IPv6-only")?;
+    }
+    #[cfg(any(target_os = "linux", target_os = "android"))]
+    set_so_bind_to_device(socket.as_raw_fd(), bind_device.as_deref())?;
+    #[cfg(not(any(target_os = "linux", target_os = "android")))]
+    reject_unsupported_device_binding(bind_device.as_deref())?;
+    socket
+        .bind(&local.into())
+        .with_context(|| format!("bind WAN UDP source {local}"))?;
+    socket
+        .set_nonblocking(true)
+        .context("make WAN UDP socket nonblocking")?;
+    let std_socket: std::net::UdpSocket = socket.into();
+    UdpSocket::from_std(std_socket).context("create Tokio WAN UDP socket")
 }
 
 /// Connect UDP after binding the selected source address and device. The
@@ -499,20 +593,53 @@ pub async fn connect_udp_bound(peer: SocketAddr, binding: &mut WanBinding) -> Re
     Ok(socket)
 }
 
+/// Verify UDP egress with a short-lived connected socket bound to the same WAN
+/// source/device as the fixed-port shared STUN socket. No UDP packet is sent.
+pub async fn verify_udp_egress(peer: SocketAddr, binding: &mut WanBinding) -> Result<()> {
+    let _socket = connect_udp_bound(peer, binding).await?;
+    require_verified_binding(binding, peer)
+}
+
+/// Require successful connected route verification before a WAN-bound STUN
+/// mapping may be reported.
+pub fn require_verified_binding(binding: &WanBinding, peer: SocketAddr) -> Result<()> {
+    if binding.verification != WanVerification::Verified || !binding.verified {
+        bail!(
+            "WAN {} egress verification {} for {peer} (source {}, device {:?})",
+            binding.wan_id,
+            binding.verification.as_str(),
+            binding.source_address,
+            binding.device
+        );
+    }
+    Ok(())
+}
+
 /// Pure validation/planning helper shared by both socket paths. The returned
-/// address contains the selected source and ephemeral port zero; no route table
-/// or mark is applied.
+/// address contains the selected source and requested local port (zero for an
+/// ephemeral port); no route table or mark is applied.
 fn socket_bind_address(binding: &WanBinding, peer: SocketAddr) -> Result<SocketAddr> {
+    if !binding.family.matches(peer.ip()) {
+        bail!("WAN binding and peer address families differ");
+    }
+    if peer.ip().is_unspecified() {
+        bail!("WAN peer address cannot be unspecified");
+    }
+    socket_bind_address_with_port(binding, binding.family, 0)
+}
+
+pub(crate) fn socket_bind_address_with_port(
+    binding: &WanBinding,
+    family: WanFamily,
+    local_port: u16,
+) -> Result<SocketAddr> {
     if binding.wan_id.trim().is_empty() {
         bail!("WAN binding has no logical WAN id");
     }
     let source = IpAddr::from_str(binding.source_address.trim())
         .context("WAN binding source address is invalid")?;
-    if !binding.family.matches(source) || !binding.family.matches(peer.ip()) {
-        bail!("WAN binding, source, and peer address families differ");
-    }
-    if peer.ip().is_unspecified() {
-        bail!("WAN peer address cannot be unspecified");
+    if !binding.family.matches(source) || !family.matches(source) {
+        bail!("WAN binding, source, and requested address families differ");
     }
     if source.is_unspecified()
         || source.is_loopback()
@@ -529,7 +656,7 @@ fn socket_bind_address(binding: &WanBinding, peer: SocketAddr) -> Result<SocketA
         bail!("WAN binding source address is not safe for egress");
     }
     validated_bind_device(binding)?;
-    Ok(SocketAddr::new(source, 0))
+    Ok(SocketAddr::new(source, local_port))
 }
 
 fn validated_bind_device(binding: &WanBinding) -> Result<Option<&str>> {
@@ -2119,6 +2246,10 @@ default via fe80::2 dev pppoe-wan1 proto static table 101 metric 20 pref medium
         assert_eq!(
             socket_bind_address(&binding, peer).unwrap(),
             SocketAddr::new("192.0.2.2".parse().unwrap(), 0)
+        );
+        assert_eq!(
+            socket_bind_address_with_port(&binding, WanFamily::V4, 34_789).unwrap(),
+            SocketAddr::new("192.0.2.2".parse().unwrap(), 34_789)
         );
         assert_eq!(validated_bind_device(&binding).unwrap(), Some("eth0.2"));
         assert!(socket_bind_address(&binding, "[2001:db8::1]:443".parse().unwrap()).is_err());
