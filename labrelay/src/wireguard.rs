@@ -11,7 +11,9 @@ use std::io::Write;
 use std::net::IpAddr;
 use std::path::{Path, PathBuf};
 use std::process::Command;
-use wireguard_control::{Backend, Device, DeviceUpdate, InterfaceName, Key, KeyPair, PeerConfigBuilder};
+use wireguard_control::{
+    Backend, Device, DeviceUpdate, InterfaceName, Key, KeyPair, PeerConfigBuilder,
+};
 
 const DEFAULT_PRIVATE_KEY_PATH: &str = "/etc/labprobe/wireguard/private.key";
 
@@ -156,10 +158,18 @@ pub struct WireGuardApplyResult {
     pub control_backend: String,
 }
 
-pub fn default_interface_name() -> String { "labwg0".into() }
-fn default_server_address() -> String { "10.77.0.1/24".into() }
-fn default_listen_port() -> u16 { 51820 }
-fn default_true() -> bool { true }
+pub fn default_interface_name() -> String {
+    "labwg0".into()
+}
+fn default_server_address() -> String {
+    "10.77.0.1/24".into()
+}
+fn default_listen_port() -> u16 {
+    51820
+}
+fn default_true() -> bool {
+    true
+}
 
 /// Per-interface WireGuard status. Public key is safe to report; the private
 /// key is never read, parsed, logged or serialized.
@@ -215,7 +225,11 @@ impl WireGuardStatus {
             kernel_supported: kernel_support,
             control_tool_available: false,
             provisioning_ready: kernel_support,
-            control_backend: if kernel_support { "kernel-netlink".into() } else { "unavailable".into() },
+            control_backend: if kernel_support {
+                "kernel-netlink".into()
+            } else {
+                "unavailable".into()
+            },
             kernel_support,
             installed: kernel_support,
             configured: false,
@@ -236,7 +250,11 @@ impl WireGuardStatus {
             kernel_supported: kernel_support,
             control_tool_available: true,
             provisioning_ready: kernel_support,
-            control_backend: if kernel_support { "kernel-netlink".into() } else { "unavailable".into() },
+            control_backend: if kernel_support {
+                "kernel-netlink".into()
+            } else {
+                "unavailable".into()
+            },
             kernel_support,
             installed: true,
             configured: false,
@@ -420,10 +438,7 @@ pub fn parse_wg_dump(raw: &str) -> Vec<WireGuardInterfaceStatus> {
             continue;
         }
         let (interface, _peer_public_key) = (fields[0], fields[1]);
-        let Some(item) = interfaces
-            .iter_mut()
-            .find(|item| item.name == interface)
-        else {
+        let Some(item) = interfaces.iter_mut().find(|item| item.name == interface) else {
             continue;
         };
         // Columns: interface, peer public key, preshared key, endpoint,
@@ -451,7 +466,9 @@ pub fn parse_ip_addresses(raw: &str) -> Vec<String> {
     let mut addresses = Vec::new();
     for line in raw.lines() {
         let fields: Vec<&str> = line.split_whitespace().collect();
-        let Some(index) = fields.iter().position(|field| *field == "inet" || *field == "inet6")
+        let Some(index) = fields
+            .iter()
+            .position(|field| *field == "inet" || *field == "inet6")
         else {
             continue;
         };
@@ -492,9 +509,8 @@ pub fn parse_link_up(raw: &str) -> bool {
 /// counts. A value that merely contains the string "wireguard" (e.g. a peer
 /// name or a hostname) must not be treated as a configured interface.
 pub fn parse_uci_wireguard_configured(raw: &str) -> bool {
-    raw.lines().any(|line| {
-        line.contains("proto='wireguard'") || line.contains("proto=\"wireguard\"")
-    })
+    raw.lines()
+        .any(|line| line.contains("proto='wireguard'") || line.contains("proto=\"wireguard\""))
 }
 
 /// Total peer count across all parsed interfaces.
@@ -565,7 +581,10 @@ pub fn validate_server_desired(config: &WireGuardServerDesired) -> Result<()> {
         bail!("WireGuard server requires a fixed UDP listen port");
     }
     if config.mtu != 0 && !(1280..=1500).contains(&config.mtu) {
-        bail!("WireGuard server MTU must be between 1280 and 1500 (received {})", config.mtu);
+        bail!(
+            "WireGuard server MTU must be between 1280 and 1500 (received {})",
+            config.mtu
+        );
     }
     let (server_ip, _) = parse_cidr(&config.address)?;
     if !server_ip.is_ipv4() {
@@ -615,7 +634,8 @@ pub fn validate_server_desired(config: &WireGuardServerDesired) -> Result<()> {
         if peer.id.is_empty() || !peer_ids.insert(peer.id.as_str()) {
             bail!("peer ids must be unique");
         }
-        Key::from_base64(peer.public_key.trim()).map_err(|_| anyhow::anyhow!("invalid peer public key"))?;
+        Key::from_base64(peer.public_key.trim())
+            .map_err(|_| anyhow::anyhow!("invalid peer public key"))?;
         if !peer_keys.insert(peer.public_key.trim()) {
             bail!("peer public keys must be unique");
         }
@@ -659,22 +679,47 @@ fn load_or_create_keypair(path: &Path) -> Result<KeyPair> {
     let mut file = options.open(path).context("create local WireGuard key")?;
     file.write_all(pair.private.to_base64().as_bytes())
         .context("write local WireGuard key")?;
-    file.write_all(b"\n").context("finish local WireGuard key")?;
+    file.write_all(b"\n")
+        .context("finish local WireGuard key")?;
     file.sync_all().context("sync local WireGuard key")?;
     Ok(pair)
 }
 
 #[cfg(target_os = "linux")]
 fn configure_link(config: &WireGuardServerDesired) -> Result<()> {
-    let ip = find_tool("ip").ok_or_else(|| anyhow::anyhow!("ip tool is required to assign the tunnel address"))?;
-    let mtu = if (1280..=1500).contains(&config.mtu) { config.mtu } else { 1420 };
+    let ip = find_tool("ip")
+        .ok_or_else(|| anyhow::anyhow!("ip tool is required to assign the tunnel address"))?;
+    let mtu = if (1280..=1500).contains(&config.mtu) {
+        config.mtu
+    } else {
+        1420
+    };
     let mtu_str = mtu.to_string();
     // No shell is involved; every argument is validated and passed directly.
-    run_capture(&ip, &["address", "replace", &config.address, "dev", &config.interface_name])?;
-    run_capture(&ip, &["link", "set", "dev", &config.interface_name, "mtu", &mtu_str, if config.enabled { "up" } else { "down" }])?;
+    run_capture(
+        &ip,
+        &[
+            "address",
+            "replace",
+            &config.address,
+            "dev",
+            &config.interface_name,
+        ],
+    )?;
+    run_capture(
+        &ip,
+        &[
+            "link",
+            "set",
+            "dev",
+            &config.interface_name,
+            "mtu",
+            &mtu_str,
+            if config.enabled { "up" } else { "down" },
+        ],
+    )?;
     Ok(())
 }
-
 
 #[cfg(target_os = "linux")]
 fn ensure_interface(ip_tool: &str, interface_name: &str) -> Result<()> {
@@ -713,11 +758,14 @@ fn ensure_interface(ip_tool: &str, interface_name: &str) -> Result<()> {
 pub fn apply_server(config: &WireGuardServerDesired) -> Result<WireGuardApplyResult> {
     validate_server_desired(config)?;
     let _ = ensure_openwrt_wg_zone(config.listen_port);
-    let ip = find_tool("ip").ok_or_else(|| anyhow::anyhow!("ip tool is required to create the WireGuard interface"))?;
+    let ip = find_tool("ip")
+        .ok_or_else(|| anyhow::anyhow!("ip tool is required to create the WireGuard interface"))?;
     ensure_interface(&ip, &config.interface_name)?;
     ensure_wg_zone_iface_bound(&config.interface_name);
     let keypair = load_or_create_keypair(&private_key_path())?;
-    let interface: InterfaceName = config.interface_name.parse()
+    let interface: InterfaceName = config
+        .interface_name
+        .parse()
         .map_err(|_| anyhow::anyhow!("invalid WireGuard interface name"))?;
     let mut update = DeviceUpdate::new()
         .set_private_key(keypair.private.clone())
@@ -738,7 +786,9 @@ pub fn apply_server(config: &WireGuardServerDesired) -> Result<WireGuardApplyRes
         }
         update = update.add_peer(builder);
     }
-    update.apply(&interface, Backend::Kernel).context("apply WireGuard kernel configuration")?;
+    update
+        .apply(&interface, Backend::Kernel)
+        .context("apply WireGuard kernel configuration")?;
     configure_link(config)?;
     Ok(WireGuardApplyResult {
         ok: true,
@@ -778,7 +828,8 @@ pub fn delete_server(interface_name: &str) -> Result<()> {
     }
     #[cfg(target_os = "linux")]
     {
-        let interface: InterfaceName = interface_name.parse()
+        let interface: InterfaceName = interface_name
+            .parse()
             .map_err(|_| anyhow::anyhow!("invalid WireGuard interface name"))?;
         let exists = Device::list(Backend::Kernel)
             .context("list WireGuard devices")?
@@ -797,7 +848,12 @@ pub fn delete_server(interface_name: &str) -> Result<()> {
 /// Find a tool on PATH, preferring the plain name and falling back to a couple
 /// of conventional absolute locations used on OpenWrt.
 fn find_tool(name: &str) -> Option<String> {
-    let candidates = [name, &format!("/usr/bin/{name}"), &format!("/sbin/{name}"), &format!("/usr/sbin/{name}")];
+    let candidates = [
+        name,
+        &format!("/usr/bin/{name}"),
+        &format!("/sbin/{name}"),
+        &format!("/usr/sbin/{name}"),
+    ];
     for candidate in candidates.iter() {
         let probe = match name {
             "wg" => Command::new(candidate).arg("--version").output(),
@@ -989,10 +1045,16 @@ pub fn ensure_openwrt_wg_zone(listen_port: u16) -> Result<()> {
 
     if !has_inbound {
         let _ = run_capture(&uci, &["add", "firewall", "rule"]);
-        let _ = run_capture(&uci, &["set", "firewall.@rule[-1].name=Allow-WireGuard-Inbound"]);
+        let _ = run_capture(
+            &uci,
+            &["set", "firewall.@rule[-1].name=Allow-WireGuard-Inbound"],
+        );
         let _ = run_capture(&uci, &["set", "firewall.@rule[-1].src=wan"]);
         let _ = run_capture(&uci, &["set", "firewall.@rule[-1].proto=udp"]);
-        let _ = run_capture(&uci, &["set", &format!("firewall.@rule[-1].dest_port={port}")]);
+        let _ = run_capture(
+            &uci,
+            &["set", &format!("firewall.@rule[-1].dest_port={port}")],
+        );
         let _ = run_capture(&uci, &["set", "firewall.@rule[-1].target=ACCEPT"]);
         changed = true;
     }
@@ -1022,10 +1084,11 @@ pub fn ensure_wg_zone_iface_bound(interface_name: &str) {
     if run_capture(&ipset, &["list", set.as_str()]).is_err() {
         return;
     }
-    let _ = run_capture(&ipset, &["add", set.as_str(), &format!("0.0.0.0/0,{interface_name}")]);
+    let _ = run_capture(
+        &ipset,
+        &["add", set.as_str(), &format!("0.0.0.0/0,{interface_name}")],
+    );
 }
-
-
 
 /// Read-only UCI check: does the current network configuration contain a
 /// `proto wireguard` interface? Never writes to UCI.
@@ -1040,7 +1103,6 @@ fn uci_wireguard_configured() -> (bool, Option<String>) {
     }
 }
 
-
 /// Collect link state and CIDR addresses for an interface with a single
 /// `ip link show` call. `link_up` is `None` only when the command failed.
 fn collect_interface_link(
@@ -1048,11 +1110,23 @@ fn collect_interface_link(
     name: &str,
 ) -> (Option<bool>, Vec<String>, Option<String>) {
     if !is_ascii_interface_name(name) {
-        return (None, Vec::new(), Some(format!("skip unsafe interface name {name:?}")));
+        return (
+            None,
+            Vec::new(),
+            Some(format!("skip unsafe interface name {name:?}")),
+        );
     }
     match run_capture(ip_tool, &["addr", "show", name]) {
-        Ok(output) => (Some(parse_link_up(&output)), parse_ip_addresses(&output), None),
-        Err(error) => (None, Vec::new(), Some(format!("ip link show {name} failed: {error:#}"))),
+        Ok(output) => (
+            Some(parse_link_up(&output)),
+            parse_ip_addresses(&output),
+            None,
+        ),
+        Err(error) => (
+            None,
+            Vec::new(),
+            Some(format!("ip link show {name} failed: {error:#}")),
+        ),
     }
 }
 
@@ -1122,7 +1196,11 @@ pub fn detect_wireguard() -> WireGuardStatus {
         kernel_supported: kernel_support,
         control_tool_available: true,
         provisioning_ready: kernel_support,
-        control_backend: if kernel_support { "kernel-netlink".into() } else { "unavailable".into() },
+        control_backend: if kernel_support {
+            "kernel-netlink".into()
+        } else {
+            "unavailable".into()
+        },
         kernel_support,
         installed: wg_and_kernel,
         configured: uci_configured || !interfaces.is_empty(),
@@ -1147,18 +1225,10 @@ mod tests {
     const PK_B: &str = "bJhXrK8YQ6V8k1gJfR0n2wBq4sD6fG8hJ1kL3mN5pQ7=";
 
     fn interface_line(name: &str, public_key: &str, port: u16) -> String {
-        format!(
-            "{name}\tPRIVATE-KEY-SHOULD-NEVER-LEAK\t{public_key}\t{port}\toff"
-        )
+        format!("{name}\tPRIVATE-KEY-SHOULD-NEVER-LEAK\t{public_key}\t{port}\toff")
     }
 
-    fn peer_line(
-        interface: &str,
-        public_key: &str,
-        handshake: u64,
-        rx: u64,
-        tx: u64,
-    ) -> String {
+    fn peer_line(interface: &str, public_key: &str, handshake: u64, rx: u64, tx: u64) -> String {
         format!(
             "{interface}\t{public_key}\t(0)\t192.0.2.1:51820\t10.88.0.0/24\t{handshake}\t{rx}\t{tx}\toff"
         )
@@ -1202,9 +1272,12 @@ mod tests {
     fn missing_interface_gets_parameterized_create_command() {
         assert_eq!(
             interface_create_args(false, "labwg0"),
-            Some(vec![
-                "link", "add", "dev", "labwg0", "type", "wireguard"
-            ].into_iter().map(String::from).collect())
+            Some(
+                vec!["link", "add", "dev", "labwg0", "type", "wireguard"]
+                    .into_iter()
+                    .map(String::from)
+                    .collect()
+            )
         );
     }
 
@@ -1289,7 +1362,6 @@ mod tests {
         };
         assert!(validate_server_desired(&desired).is_err());
     }
-
 
     #[test]
     fn automatic_endpoint_updates_are_owned_versioned_and_idempotent() {
@@ -1449,9 +1521,7 @@ mod tests {
         let dump = format!(
             "{}\n{}",
             interface_line("wg0", PK_A, 51820),
-            format!(
-                "wg0\tPK_B\t{preshared}\t192.0.2.1:51820\t10.88.0.0/24\t1786100000\t1\t2\toff"
-            ),
+            format!("wg0\tPK_B\t{preshared}\t192.0.2.1:51820\t10.88.0.0/24\t1786100000\t1\t2\toff"),
         );
         let interfaces = parse_wg_dump(&dump);
         let serialized = serde_json::to_value(&interfaces).unwrap();
@@ -1522,10 +1592,8 @@ mod tests {
         // running per its link UP flag.
         let dump = interface_line("wg0", PK_A, 51820);
         let mut interfaces = parse_wg_dump(&dump);
-        interfaces[0].running = parse_link_up(&link_line(
-            "POINTOPOINT,NOARP,UP,LOWER_UP",
-            "UNKNOWN",
-        ));
+        interfaces[0].running =
+            parse_link_up(&link_line("POINTOPOINT,NOARP,UP,LOWER_UP", "UNKNOWN"));
         let status = WireGuardStatus {
             supported: true,
             wg_tool_available: true,
@@ -1592,10 +1660,8 @@ mod tests {
     fn interface_up_means_running_even_with_state_unknown() {
         let dump = interface_line("wg0", PK_A, 51820);
         let mut interfaces = parse_wg_dump(&dump);
-        interfaces[0].running = parse_link_up(&link_line(
-            "POINTOPOINT,NOARP,UP,LOWER_UP",
-            "UNKNOWN",
-        ));
+        interfaces[0].running =
+            parse_link_up(&link_line("POINTOPOINT,NOARP,UP,LOWER_UP", "UNKNOWN"));
         assert!(interfaces[0].running);
         let status = WireGuardStatus {
             supported: true,
@@ -1708,5 +1774,3 @@ firewall.cfg02.target='ACCEPT'
         assert!(!parse_uci_firewall_has_wg_inbound_rule(raw, 40000));
     }
 }
-
-

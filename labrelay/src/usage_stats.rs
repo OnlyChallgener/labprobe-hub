@@ -208,7 +208,6 @@ pub fn refresh_app_map() -> AppIdMap {
     }
 }
 
-
 /// Stations the firmware currently treats as child devices.
 ///
 /// `/proc/net/sniffer_info` is the authoritative list: it is the same child
@@ -271,8 +270,9 @@ fn restore_configured_rdpi() -> bool {
         .filter(|output| output.status.success())
         .and_then(|output| serde_json::from_slice::<serde_json::Value>(&output.stdout).ok());
     match status {
-        Some(value) if rdpi_recovery_required(configured, &value) =>
-            ubus_call("sniffer", "enable", &json!({"mod": "rdpi"}).to_string()),
+        Some(value) if rdpi_recovery_required(configured, &value) => {
+            ubus_call("sniffer", "enable", &json!({"mod": "rdpi"}).to_string())
+        }
         Some(value) => value.get("RDPI").and_then(|value| value.as_u64()).is_some(),
         None => false,
     }
@@ -306,13 +306,9 @@ pub fn prepare_sniffer() -> bool {
     if macs.is_empty() {
         return false;
     }
-    let identifiers = macs.iter().all(|mac| {
-        ubus_call(
-            "sniffer.idyc",
-            "add",
-            &json!({ "mac": [mac] }).to_string(),
-        )
-    });
+    let identifiers = macs
+        .iter()
+        .all(|mac| ubus_call("sniffer.idyc", "add", &json!({ "mac": [mac] }).to_string()));
     let full_mode = ubus_call(
         "sniffer",
         "enable",
@@ -365,9 +361,18 @@ mod watchdog_tests {
 
     #[test]
     fn sniffer_restart_with_stale_enabled_uci_requires_rdpi_restore() {
-        assert!(rdpi_recovery_required(true, &serde_json::json!({"RDPI": 0, "FULL_MODE": 1})));
-        assert!(!rdpi_recovery_required(true, &serde_json::json!({"RDPI": 6})));
-        assert!(!rdpi_recovery_required(false, &serde_json::json!({"RDPI": 0})));
+        assert!(rdpi_recovery_required(
+            true,
+            &serde_json::json!({"RDPI": 0, "FULL_MODE": 1})
+        ));
+        assert!(!rdpi_recovery_required(
+            true,
+            &serde_json::json!({"RDPI": 6})
+        ));
+        assert!(!rdpi_recovery_required(
+            false,
+            &serde_json::json!({"RDPI": 0})
+        ));
         assert!(!rdpi_recovery_required(true, &serde_json::json!({})));
     }
 
@@ -380,8 +385,14 @@ mod watchdog_tests {
     fn restarts_are_spaced_out_so_we_do_not_thrash() {
         let started = 1_000_000;
         assert!(!sniffer_restart_allowed(started + 60, started));
-        assert!(!sniffer_restart_allowed(started + SNIFFER_RESTART_COOLDOWN_SECS - 1, started));
-        assert!(sniffer_restart_allowed(started + SNIFFER_RESTART_COOLDOWN_SECS, started));
+        assert!(!sniffer_restart_allowed(
+            started + SNIFFER_RESTART_COOLDOWN_SECS - 1,
+            started
+        ));
+        assert!(sniffer_restart_allowed(
+            started + SNIFFER_RESTART_COOLDOWN_SECS,
+            started
+        ));
     }
 
     #[test]

@@ -66,7 +66,10 @@ pub fn changed_snapshot(now_epoch: u64) -> Result<Option<Value>> {
         return Ok(None);
     }
     let db: Value = serde_json::from_str(&text)?;
-    let apps = db.get("apps").cloned().unwrap_or_else(|| json_empty_array());
+    let apps = db
+        .get("apps")
+        .cloned()
+        .unwrap_or_else(|| json_empty_array());
     // `dbText` 是文件的原文。Hub 只拿 `apps` 合并再序列化会丢掉顶层的 `version`，
     // 所以写入要基于这一份；`apps` 留给卡片算数字，也兼容还没带 `dbText` 的中继。
     Ok(Some(json!({
@@ -146,7 +149,8 @@ fn write_db(payload: &Value) -> Result<Value> {
         }
     }
 
-    let current = std::fs::read_to_string(ROUTER_DB_PATH).with_context(|| format!("read {ROUTER_DB_PATH}"))?;
+    let current = std::fs::read_to_string(ROUTER_DB_PATH)
+        .with_context(|| format!("read {ROUTER_DB_PATH}"))?;
     let current_mark = fingerprint(&current);
     if write_is_stale(expected, current_mark) {
         // 星耀家 APP 也在往同一个文件里写自定义特征。拿旧副本合并会把对方的新条目
@@ -190,12 +194,14 @@ fn write_db(payload: &Value) -> Result<Value> {
         Err(error) => Some(anyhow!("回读 {ROUTER_DB_PATH} 失败: {error}")),
     };
     if let Some(failure) = mismatch {
-        restore().map_err(|rollback_error| anyhow!("{failure:#}; 回滚也失败: {rollback_error:#}"))?;
+        restore()
+            .map_err(|rollback_error| anyhow!("{failure:#}; 回滚也失败: {rollback_error:#}"))?;
         return Err(failure);
     }
     if let Err(error) = shell("ubus -t 3 send rdpi_reinit") {
         let failure = anyhow!("RDPI 热重载失败: {error:#}");
-        restore().map_err(|rollback_error| anyhow!("{failure:#}; 回滚也失败: {rollback_error:#}"))?;
+        restore()
+            .map_err(|rollback_error| anyhow!("{failure:#}; 回滚也失败: {rollback_error:#}"))?;
         return Err(failure);
     }
     let _ = shell(&format!("rm -f {TEMP_PATH} {ROLLBACK_PATH}"));
@@ -219,7 +225,7 @@ fn validate_entry_count(count: usize) -> Result<()> {
 
 #[cfg(test)]
 mod tests {
-    use super::{fingerprint, should_push, write_is_stale, validate_entry_count};
+    use super::{fingerprint, should_push, validate_entry_count, write_is_stale};
 
     #[test]
     fn entry_limit_is_enforced_before_any_file_write() {

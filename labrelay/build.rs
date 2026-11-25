@@ -18,7 +18,9 @@ fn main() {
     println!("cargo:rerun-if-changed=src/agent.rs");
     println!("cargo:rerun-if-changed=src/main.rs");
     println!("cargo:rerun-if-changed=src/runtime.rs");
-    if env::var_os("LABRELAY_LEGACY_SOURCE_PATCH").is_none() { return; }
+    if env::var_os("LABRELAY_LEGACY_SOURCE_PATCH").is_none() {
+        return;
+    }
     println!("cargo:rerun-if-changed=build.rs");
     println!("cargo:rerun-if-changed=src/runtime.rs");
     let manifest = PathBuf::from(env::var("CARGO_MANIFEST_DIR").expect("CARGO_MANIFEST_DIR"));

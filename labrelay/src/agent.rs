@@ -202,7 +202,13 @@ fn log_line(config: &AgentConfig, level: &str, message: &str) {
     }
 }
 
-fn log_limited(config: &AgentConfig, state: &mut AgentState, level: &str, key: &str, message: &str) {
+fn log_limited(
+    config: &AgentConfig,
+    state: &mut AgentState,
+    level: &str,
+    key: &str,
+    message: &str,
+) {
     let now = now_epoch();
     if state
         .last_logged_errors
@@ -213,7 +219,9 @@ fn log_limited(config: &AgentConfig, state: &mut AgentState, level: &str, key: &
         return;
     }
     state.last_logged_errors.insert(key.to_string(), now);
-    state.last_logged_errors.retain(|_, last| now.saturating_sub(*last) < 86_400);
+    state
+        .last_logged_errors
+        .retain(|_, last| now.saturating_sub(*last) < 86_400);
     log_line(config, level, message);
 }
 
@@ -523,7 +531,11 @@ fn cleanup_agent_files() -> Result<Value> {
     }))
 }
 
-async fn sync_agent_update(client: &Client, config: &AgentConfig, state: &mut AgentState) -> Result<bool> {
+async fn sync_agent_update(
+    client: &Client,
+    config: &AgentConfig,
+    state: &mut AgentState,
+) -> Result<bool> {
     let router = url_encode(&config.router_name);
     let root = get_json(
         client,
@@ -598,11 +610,25 @@ async fn sync_agent_update(client: &Client, config: &AgentConfig, state: &mut Ag
         let installer_response = match client.get(installer_url).send().await {
             Ok(response) if response.status().is_success() => response,
             Ok(response) => {
-                acknowledge_agent_command(client, config, id, "failed", &format!("安装脚本 HTTP {}", response.status())).await;
+                acknowledge_agent_command(
+                    client,
+                    config,
+                    id,
+                    "failed",
+                    &format!("安装脚本 HTTP {}", response.status()),
+                )
+                .await;
                 continue;
             }
             Err(error) => {
-                acknowledge_agent_command(client, config, id, "failed", &format!("下载安装脚本失败：{}", error)).await;
+                acknowledge_agent_command(
+                    client,
+                    config,
+                    id,
+                    "failed",
+                    &format!("下载安装脚本失败：{}", error),
+                )
+                .await;
                 continue;
             }
         };
@@ -617,10 +643,18 @@ async fn sync_agent_update(client: &Client, config: &AgentConfig, state: &mut Ag
         if let Err(error) = fs::write(installer_path, &installer_bytes)
             .and_then(|_| fs::set_permissions(installer_path, fs::Permissions::from_mode(0o700)))
         {
-            acknowledge_agent_command(client, config, id, "failed", &format!("保存安装脚本失败：{}", error)).await;
+            acknowledge_agent_command(
+                client,
+                config,
+                id,
+                "failed",
+                &format!("保存安装脚本失败：{}", error),
+            )
+            .await;
             continue;
         }
-        acknowledge_agent_command(client, config, id, "accepted", "路由器已领取指令，准备升级").await;
+        acknowledge_agent_command(client, config, id, "accepted", "路由器已领取指令，准备升级")
+            .await;
         let spawned = Command::new("sh")
             .arg("-c")
             .arg("sleep 2; sh /tmp/labprobe-install.sh upgrade >>/tmp/labprobe/agent-update.log 2>&1")
@@ -640,7 +674,14 @@ async fn sync_agent_update(client: &Client, config: &AgentConfig, state: &mut Ag
                 return Ok(true);
             }
             Err(error) => {
-                acknowledge_agent_command(client, config, id, "failed", &format!("启动升级失败：{}", error)).await;
+                acknowledge_agent_command(
+                    client,
+                    config,
+                    id,
+                    "failed",
+                    &format!("启动升级失败：{}", error),
+                )
+                .await;
             }
         }
     }
@@ -662,7 +703,6 @@ fn command_output(program: &str, args: &[&str]) -> Result<String> {
     Ok(String::from_utf8_lossy(&output.stdout).to_string())
 }
 
-
 fn command_json(program: &str, args: &[&str]) -> Result<Value> {
     let raw = command_output(program, args)?;
     parse_command_json(program, &raw)
@@ -672,8 +712,8 @@ fn parse_command_json(program: &str, raw: &str) -> Result<Value> {
     if raw.trim().is_empty() {
         bail!("{} returned empty JSON", program);
     }
-    let root: Value = serde_json::from_str(raw.trim())
-        .with_context(|| format!("parse {} JSON", program))?;
+    let root: Value =
+        serde_json::from_str(raw.trim()).with_context(|| format!("parse {} JSON", program))?;
     if let Some(code) = root.get("rcode").and_then(Value::as_str) {
         if code != "00000000" {
             bail!("{} returned rcode {}", program, code);
@@ -701,12 +741,12 @@ async fn bounded_command_json(program: &str, args: &[String], deadline: Duration
 }
 
 fn numeric_metric(value: Option<&Value>) -> Option<f64> {
-        let value = match value? {
-            Value::Number(value) => value.as_f64(),
-            Value::String(value) => value.trim().trim_end_matches('%').parse().ok(),
-            _ => None,
-        }?;
-        value.is_finite().then_some(value)
+    let value = match value? {
+        Value::Number(value) => value.as_f64(),
+        Value::String(value) => value.trim().trim_end_matches('%').parse().ok(),
+        _ => None,
+    }?;
+    value.is_finite().then_some(value)
 }
 
 fn validate_fast_telemetry(fast: &Value) -> Result<()> {
@@ -726,29 +766,54 @@ fn validate_fast_telemetry(fast: &Value) -> Result<()> {
 }
 
 fn has_numeric_metric(value: &Value, keys: &[&str]) -> bool {
-    keys.iter().any(|key| numeric_metric(value.get(*key)).is_some_and(|value| value >= 0.0))
+    keys.iter()
+        .any(|key| numeric_metric(value.get(*key)).is_some_and(|value| value >= 0.0))
 }
 
-fn fast_telemetry_with_local_fallback(config: &AgentConfig, state: &mut AgentState, fast: &Value, metadata: FastDashboardMetadata) -> Value {
-    let mut telemetry = telemetry_from_fast(fast, metadata.online_devices, metadata.storage_percent);
+fn fast_telemetry_with_local_fallback(
+    config: &AgentConfig,
+    state: &mut AgentState,
+    fast: &Value,
+    metadata: FastDashboardMetadata,
+) -> Value {
+    let mut telemetry =
+        telemetry_from_fast(fast, metadata.online_devices, metadata.storage_percent);
     let wan = object_path(fast, &["wan_stat", "wans"])
         .or_else(|| object_path(fast, &["wan_stat", "wan"]))
         .unwrap_or(&Value::Null);
     let missing_upload = !has_numeric_metric(wan, &["tx_rate_bps", "tx_rate", "up"]);
     let missing_download = !has_numeric_metric(wan, &["rx_rate_bps", "rx_rate", "down"]);
-    let missing_ipv4 = !has_numeric_metric(wan, &["ipv4_connection_count", "ipv4_session_count", "ipv4_connections", "ipv4_sessions", "v4_connection_count", "v4_session_count", "connection_ipv4", "session_ipv4"]);
+    let missing_ipv4 = !has_numeric_metric(
+        wan,
+        &[
+            "ipv4_connection_count",
+            "ipv4_session_count",
+            "ipv4_connections",
+            "ipv4_sessions",
+            "v4_connection_count",
+            "v4_session_count",
+            "connection_ipv4",
+            "session_ipv4",
+        ],
+    );
     if missing_upload || missing_download || missing_ipv4 {
         let local = local_telemetry_payload(config, state);
         let fallback = &local["telemetry"];
         if missing_upload {
             telemetry["wan"]["uploadBps"] = fallback["wan"]["uploadBps"].clone();
             telemetry["wan"]["totalUploadBytes"] = fallback["wan"]["totalUploadBytes"].clone();
-            telemetry["wan"].as_object_mut().unwrap().remove("uploadRaw");
+            telemetry["wan"]
+                .as_object_mut()
+                .unwrap()
+                .remove("uploadRaw");
         }
         if missing_download {
             telemetry["wan"]["downloadBps"] = fallback["wan"]["downloadBps"].clone();
             telemetry["wan"]["totalDownloadBytes"] = fallback["wan"]["totalDownloadBytes"].clone();
-            telemetry["wan"].as_object_mut().unwrap().remove("downloadRaw");
+            telemetry["wan"]
+                .as_object_mut()
+                .unwrap()
+                .remove("downloadRaw");
         }
         if missing_ipv4 {
             telemetry["connections"]["ipv4"] = fallback["connections"]["ipv4"].clone();
@@ -766,7 +831,10 @@ async fn collect_fast_dashboard_payload(
     state.storage_percent = metadata.storage_percent;
     let fast = bounded_command_json(&command.0, &command.1, FAST_COMMAND_TIMEOUT)
         .await
-        .and_then(|fast| { validate_fast_telemetry(&fast)?; Ok(fast) });
+        .and_then(|fast| {
+            validate_fast_telemetry(&fast)?;
+            Ok(fast)
+        });
     let mut payload = match fast {
         Ok(fast) => {
             // Stamp the sample after acquisition, before any HTTP publication.
@@ -779,7 +847,16 @@ async fn collect_fast_dashboard_payload(
             })
         }
         Err(error) => {
-            log_limited(config, state, "WARN", "router-fast-local", &format!("eWeb fast unavailable, using local procfs telemetry: {:#}", error));
+            log_limited(
+                config,
+                state,
+                "WARN",
+                "router-fast-local",
+                &format!(
+                    "eWeb fast unavailable, using local procfs telemetry: {:#}",
+                    error
+                ),
+            );
             local_telemetry_payload(config, state)
         }
     };
@@ -802,7 +879,10 @@ async fn publish_fast_dashboard(
     // A failed publication is replaced by the next newly acquired sample. Do
     // not retry an old frame through the control plane's 12-second retry loop.
     let response = client
-        .post(format!("{}/api/router/dashboard/push", config.hub_url.trim_end_matches('/')))
+        .post(format!(
+            "{}/api/router/dashboard/push",
+            config.hub_url.trim_end_matches('/')
+        ))
         .header("X-LabProbe-Token", &config.hook_token)
         .json(payload)
         .send()
@@ -820,7 +900,9 @@ async fn fast_dashboard_loop(
     command: (String, Vec<String>),
 ) {
     let mut state = AgentState::default();
-    let mut ticker = tokio::time::interval(Duration::from_secs(config.dashboard_interval_seconds.clamp(2, 30)));
+    let mut ticker = tokio::time::interval(Duration::from_secs(
+        config.dashboard_interval_seconds.clamp(2, 30),
+    ));
     ticker.set_missed_tick_behavior(MissedTickBehavior::Skip);
     loop {
         ticker.tick().await;
@@ -828,13 +910,23 @@ async fn fast_dashboard_loop(
             break;
         }
         let current = *metadata.borrow();
-        let result = match collect_fast_dashboard_payload(&config, &mut state, current, &command).await {
-            Ok(payload) => publish_fast_dashboard(&client, &config, &payload).await,
-            Err(error) => Err(error),
-        };
+        let result =
+            match collect_fast_dashboard_payload(&config, &mut state, current, &command).await {
+                Ok(payload) => publish_fast_dashboard(&client, &config, &payload).await,
+                Err(error) => Err(error),
+            };
         if let Err(error) = result {
-            let message = redact(&format!("router fast dashboard: {:#}", error), &config.hook_token);
-            log_limited(&config, &mut state, "WARN", "router-dashboard-fast", &message);
+            let message = redact(
+                &format!("router fast dashboard: {:#}", error),
+                &config.hook_token,
+            );
+            log_limited(
+                &config,
+                &mut state,
+                "WARN",
+                "router-dashboard-fast",
+                &message,
+            );
         }
     }
 }
@@ -843,10 +935,17 @@ fn start_fast_dashboard(
     config: &AgentConfig,
     metadata: tokio::sync::watch::Receiver<FastDashboardMetadata>,
 ) -> Result<std::thread::JoinHandle<()>> {
-    start_fast_dashboard_with_command(config, metadata, (
-        "dev_sta".into(),
-        ["get", "-m", "ws_sysinfo", r#"{"get":"fast"}"#].into_iter().map(str::to_string).collect(),
-    ))
+    start_fast_dashboard_with_command(
+        config,
+        metadata,
+        (
+            "dev_sta".into(),
+            ["get", "-m", "ws_sysinfo", r#"{"get":"fast"}"#]
+                .into_iter()
+                .map(str::to_string)
+                .collect(),
+        ),
+    )
 }
 
 fn start_fast_dashboard_with_command(
@@ -862,13 +961,21 @@ fn start_fast_dashboard_with_command(
     let config = config.clone();
     // Vendor shell commands in the control loop are synchronous. A dedicated
     // runtime thread keeps them from occupying the fast worker's executor.
-    Ok(std::thread::Builder::new().name("router-fast".into()).spawn(move || {
-        let runtime = tokio::runtime::Builder::new_current_thread().enable_all().build();
-        match runtime {
-            Ok(runtime) => runtime.block_on(fast_dashboard_loop(client, config, metadata, command)),
-            Err(error) => log_line(&config, "ERROR", &format!("router fast runtime: {}", error)),
-        }
-    })?)
+    Ok(std::thread::Builder::new()
+        .name("router-fast".into())
+        .spawn(move || {
+            let runtime = tokio::runtime::Builder::new_current_thread()
+                .enable_all()
+                .build();
+            match runtime {
+                Ok(runtime) => {
+                    runtime.block_on(fast_dashboard_loop(client, config, metadata, command))
+                }
+                Err(error) => {
+                    log_line(&config, "ERROR", &format!("router fast runtime: {}", error))
+                }
+            }
+        })?)
 }
 
 fn number(value: Option<&Value>) -> f64 {
@@ -893,9 +1000,19 @@ fn sanitize_config_value(value: &Value) -> Value {
             let mut clean = Map::new();
             for (key, child) in map {
                 let lower = key.to_ascii_lowercase();
-                if ["password", "passwd", "pwd", "secret", "token", "privatekey", "private_key", "username", "account"]
-                    .iter()
-                    .any(|needle| lower.contains(needle))
+                if [
+                    "password",
+                    "passwd",
+                    "pwd",
+                    "secret",
+                    "token",
+                    "privatekey",
+                    "private_key",
+                    "username",
+                    "account",
+                ]
+                .iter()
+                .any(|needle| lower.contains(needle))
                 {
                     continue;
                 }
@@ -921,7 +1038,11 @@ fn router_model() -> String {
     }
     command_json("ubus", &["call", "system", "board"])
         .ok()
-        .and_then(|root| root.get("model").and_then(Value::as_str).map(str::to_string))
+        .and_then(|root| {
+            root.get("model")
+                .and_then(Value::as_str)
+                .map(str::to_string)
+        })
         .unwrap_or_default()
 }
 
@@ -935,9 +1056,12 @@ fn first_optional_number_by_keys(root: &Value, keys: &[&str]) -> Option<f64> {
                     }
                 }
             }
-            map.values().find_map(|child| first_optional_number_by_keys(child, keys))
+            map.values()
+                .find_map(|child| first_optional_number_by_keys(child, keys))
         }
-        Value::Array(items) => items.iter().find_map(|child| first_optional_number_by_keys(child, keys)),
+        Value::Array(items) => items
+            .iter()
+            .find_map(|child| first_optional_number_by_keys(child, keys)),
         _ => None,
     }
 }
@@ -1040,8 +1164,8 @@ fn parse_storage_percent_from_df(raw: &str) -> Option<f64> {
 }
 
 fn storage_percent_from_df() -> Result<f64> {
-    let raw = command_output("df", &["-h", "/overlay"])
-        .or_else(|_| command_output("df", &["-h"]))?;
+    let raw =
+        command_output("df", &["-h", "/overlay"]).or_else(|_| command_output("df", &["-h"]))?;
     parse_storage_percent_from_df(&raw)
         .ok_or_else(|| anyhow!("df returned no writable overlay usage"))
 }
@@ -1054,7 +1178,9 @@ fn parse_local_cpu_percent(raw: &str, prev_busy: u64, prev_total: u64) -> Option
     if fields.next()? != "cpu" {
         return None;
     }
-    let cells: Vec<u64> = fields.map(|cell| cell.parse::<u64>().unwrap_or(0)).collect();
+    let cells: Vec<u64> = fields
+        .map(|cell| cell.parse::<u64>().unwrap_or(0))
+        .collect();
     if cells.len() < 4 {
         return None;
     }
@@ -1075,9 +1201,15 @@ fn parse_local_memory_percent(raw: &str) -> Option<f64> {
     let mut available = None;
     for line in raw.lines() {
         if let Some(rest) = line.strip_prefix("MemTotal:") {
-            total = rest.split_whitespace().next().and_then(|value| value.parse::<f64>().ok());
+            total = rest
+                .split_whitespace()
+                .next()
+                .and_then(|value| value.parse::<f64>().ok());
         } else if let Some(rest) = line.strip_prefix("MemAvailable:") {
-            available = rest.split_whitespace().next().and_then(|value| value.parse::<f64>().ok());
+            available = rest
+                .split_whitespace()
+                .next()
+                .and_then(|value| value.parse::<f64>().ok());
         }
     }
     let total = total.filter(|value| *value > 0.0)?;
@@ -1099,7 +1231,9 @@ fn parse_local_temperature_c(raw: &str) -> Option<f64> {
 fn parse_wan_counters(raw: &str) -> Option<(&'static str, u64, u64)> {
     for candidate in ["br-wan", "pppoe-wan", "eth5", "eth0"] {
         for line in raw.lines() {
-            let Some((name, rest)) = line.split_once(':') else { continue };
+            let Some((name, rest)) = line.split_once(':') else {
+                continue;
+            };
             if name.trim() != candidate {
                 continue;
             }
@@ -1135,7 +1269,10 @@ fn parse_local_connection_counts(raw: &str) -> (u64, u64) {
 }
 
 fn wan_rate_bps(current_bytes: u64, previous_bytes: u64, elapsed_seconds: u64) -> u64 {
-    current_bytes.saturating_sub(previous_bytes).saturating_mul(8) / elapsed_seconds.max(1)
+    current_bytes
+        .saturating_sub(previous_bytes)
+        .saturating_mul(8)
+        / elapsed_seconds.max(1)
 }
 
 fn local_telemetry_payload(config: &AgentConfig, state: &mut AgentState) -> Value {
@@ -1207,7 +1344,11 @@ fn local_telemetry_payload(config: &AgentConfig, state: &mut AgentState) -> Valu
     })
 }
 
-fn telemetry_from_fast(fast: &Value, online_devices: usize, cached_storage_percent: Option<f64>) -> Value {
+fn telemetry_from_fast(
+    fast: &Value,
+    online_devices: usize,
+    cached_storage_percent: Option<f64>,
+) -> Value {
     let wan_primary = object_path(fast, &["wan_stat", "wan"]).unwrap_or(&Value::Null);
     let wan = object_path(fast, &["wan_stat", "wans"])
         .or_else(|| object_path(fast, &["wan_stat", "wan"]))
@@ -1218,8 +1359,12 @@ fn telemetry_from_fast(fast: &Value, online_devices: usize, cached_storage_perce
     let download_raw = number(wan.get("rx_rate_bps"))
         .max(number(wan.get("rx_rate")))
         .max(number(wan.get("down")));
-    let total_upload_primary = first_number_by_keys(wan_primary, &["total_up", "total_upload", "totalTxBytes"]);
-    let total_download_primary = first_number_by_keys(wan_primary, &["total_down", "total_download", "totalRxBytes"]);
+    let total_upload_primary =
+        first_number_by_keys(wan_primary, &["total_up", "total_upload", "totalTxBytes"]);
+    let total_download_primary = first_number_by_keys(
+        wan_primary,
+        &["total_down", "total_download", "totalRxBytes"],
+    );
     let total_upload = if total_upload_primary > 0.0 {
         total_upload_primary
     } else {
@@ -1297,7 +1442,10 @@ fn csv_values(value: Option<&Value>) -> Value {
 }
 
 fn first_array_object<'a>(root: &'a Value, key: &str) -> Option<&'a Value> {
-    root.get(key)?.as_array()?.iter().find(|item| item.is_object())
+    root.get(key)?
+        .as_array()?
+        .iter()
+        .find(|item| item.is_object())
 }
 
 fn meaningful(value: &Value) -> bool {
@@ -1348,7 +1496,11 @@ fn first_text_by_keys(root: &Value, keys: &[&str]) -> String {
             .iter()
             .find_map(|child| {
                 let text = first_text_by_keys(child, keys);
-                if text.is_empty() { None } else { Some(text) }
+                if text.is_empty() {
+                    None
+                } else {
+                    Some(text)
+                }
             })
             .unwrap_or_default(),
         _ => String::new(),
@@ -1398,15 +1550,25 @@ fn wan_interface_display(network: &Value) -> String {
     let mut names = Vec::<String>::new();
     if let Some(items) = network.get("wan").and_then(Value::as_array) {
         for item in items {
-            let raw = value_text(item.get("name").or_else(|| item.get("intf_name")).or_else(|| item.get("ifname")));
+            let raw = value_text(
+                item.get("name")
+                    .or_else(|| item.get("intf_name"))
+                    .or_else(|| item.get("ifname")),
+            );
             let name = normalized_interface_name(&raw);
             if name.is_empty() {
                 continue;
             }
-            let status = value_text(item.get("enable").or_else(|| item.get("enabled")).or_else(|| item.get("status"))).to_ascii_lowercase();
+            let status = value_text(
+                item.get("enable")
+                    .or_else(|| item.get("enabled"))
+                    .or_else(|| item.get("status")),
+            )
+            .to_ascii_lowercase();
             let configured = name == "WAN"
                 || matches!(status.as_str(), "1" | "true" | "on" | "up" | "connected")
-                || !first_text_by_keys(item, &["username", "account", "ipaddr", "ip", "gateway"]).is_empty();
+                || !first_text_by_keys(item, &["username", "account", "ipaddr", "ip", "gateway"])
+                    .is_empty();
             if configured && !names.contains(&name) {
                 names.push(name);
             }
@@ -1434,7 +1596,10 @@ fn details_from_sources(
         details.insert("ports".into(), value.clone());
     }
 
-    if let Some(wireless) = slow.and_then(|root| root.get("wireless")).filter(|value| meaningful(value)) {
+    if let Some(wireless) = slow
+        .and_then(|root| root.get("wireless"))
+        .filter(|value| meaningful(value))
+    {
         details.insert("wireless".into(), wireless.clone());
     }
     if let Some(network) = network {
@@ -1449,7 +1614,11 @@ fn details_from_sources(
     let lan_ip_from_port = ports
         .as_ref()
         .and_then(Value::as_array)
-        .and_then(|items| items.iter().find(|item| item.get("name").and_then(Value::as_str) == Some("LAN")))
+        .and_then(|items| {
+            items
+                .iter()
+                .find(|item| item.get("name").and_then(Value::as_str) == Some("LAN"))
+        })
         .and_then(|item| item.get("ipaddr"))
         .and_then(Value::as_str)
         .unwrap_or("");
@@ -1465,23 +1634,36 @@ fn details_from_sources(
         if let Some(item) = network_lan {
             let lan_mac = first_text_by_keys(item, &["mac", "macaddr", "macAddress", "hwaddr"]);
             insert_meaningful(&mut lan, "mac", Value::String(lan_mac));
-            insert_meaningful(&mut lan, "netmask", item.get("netmask").cloned().unwrap_or(Value::Null));
+            insert_meaningful(
+                &mut lan,
+                "netmask",
+                item.get("netmask").cloned().unwrap_or(Value::Null),
+            );
             insert_meaningful(
                 &mut lan,
                 "vlanId",
-                item.get("vlanid").or_else(|| item.get("vlanId")).cloned().unwrap_or(Value::Null),
+                item.get("vlanid")
+                    .or_else(|| item.get("vlanId"))
+                    .cloned()
+                    .unwrap_or(Value::Null),
             );
             insert_meaningful(
                 &mut lan,
                 "dhcpLease",
-                item.get("leasetime").or_else(|| item.get("leaseTime")).cloned().unwrap_or(Value::Null),
+                item.get("leasetime")
+                    .or_else(|| item.get("leaseTime"))
+                    .cloned()
+                    .unwrap_or(Value::Null),
             );
         }
         if let Some(item) = network_wan {
             insert_meaningful(
                 &mut lan,
                 "uplink",
-                item.get("name").or_else(|| item.get("intf_name")).cloned().unwrap_or(Value::Null),
+                item.get("name")
+                    .or_else(|| item.get("intf_name"))
+                    .cloned()
+                    .unwrap_or(Value::Null),
             );
             let broadband_remark = first_text_by_keys(item, &["service", "serviceName"]);
             insert_meaningful(&mut lan, "broadbandRemark", Value::String(broadband_remark));
@@ -1498,18 +1680,45 @@ fn details_from_sources(
             .and_then(|item| item.get("ip"))
             .and_then(Value::as_str)
             .filter(|value| !value.trim().is_empty())
-            .or_else(|| slow.and_then(|root| root.get("wan_ip")).and_then(Value::as_str))
+            .or_else(|| {
+                slow.and_then(|root| root.get("wan_ip"))
+                    .and_then(Value::as_str)
+            })
             .unwrap_or("");
         insert_meaningful(&mut wan, "ipv4", Value::String(wan_ipv4.to_string()));
         if let Some(item) = wan_info {
-            insert_meaningful(&mut wan, "gateway", item.get("gateway").cloned().unwrap_or(Value::Null));
-            insert_meaningful(&mut wan, "netmask", item.get("mask").cloned().unwrap_or(Value::Null));
-            insert_meaningful(&mut wan, "proto", item.get("proto").cloned().unwrap_or(Value::Null));
-            insert_meaningful(&mut wan, "mtu", item.get("mtu").cloned().unwrap_or(Value::Null));
+            insert_meaningful(
+                &mut wan,
+                "gateway",
+                item.get("gateway").cloned().unwrap_or(Value::Null),
+            );
+            insert_meaningful(
+                &mut wan,
+                "netmask",
+                item.get("mask").cloned().unwrap_or(Value::Null),
+            );
+            insert_meaningful(
+                &mut wan,
+                "proto",
+                item.get("proto").cloned().unwrap_or(Value::Null),
+            );
+            insert_meaningful(
+                &mut wan,
+                "mtu",
+                item.get("mtu").cloned().unwrap_or(Value::Null),
+            );
             insert_meaningful(&mut wan, "dnsServers", csv_values(item.get("dnsList")));
         } else if let Some(item) = network_wan {
-            insert_meaningful(&mut wan, "proto", item.get("proto").cloned().unwrap_or(Value::Null));
-            insert_meaningful(&mut wan, "mtu", item.get("mtu").cloned().unwrap_or(Value::Null));
+            insert_meaningful(
+                &mut wan,
+                "proto",
+                item.get("proto").cloned().unwrap_or(Value::Null),
+            );
+            insert_meaningful(
+                &mut wan,
+                "mtu",
+                item.get("mtu").cloned().unwrap_or(Value::Null),
+            );
         }
         if let Some(network_root) = network {
             insert_meaningful(
@@ -1519,7 +1728,14 @@ fn details_from_sources(
             );
             let operator = first_text_by_keys(
                 network_root,
-                &["operator", "isp", "ispName", "serviceName", "carrier", "provider"],
+                &[
+                    "operator",
+                    "isp",
+                    "ispName",
+                    "serviceName",
+                    "carrier",
+                    "provider",
+                ],
             );
             insert_meaningful(&mut wan, "operator", Value::String(operator));
         }
@@ -1534,24 +1750,71 @@ fn details_from_sources(
     let ap = ap_list.and_then(|root| first_array_object(root, "list"));
     if let Some(item) = ap {
         let mut ap_out = Map::new();
-        insert_meaningful(&mut ap_out, "networkName", item.get("networkName").cloned().unwrap_or(Value::Null));
-        insert_meaningful(&mut ap_out, "hostName", item.get("hostName").cloned().unwrap_or(Value::Null));
+        insert_meaningful(
+            &mut ap_out,
+            "networkName",
+            item.get("networkName").cloned().unwrap_or(Value::Null),
+        );
+        insert_meaningful(
+            &mut ap_out,
+            "hostName",
+            item.get("hostName").cloned().unwrap_or(Value::Null),
+        );
         insert_meaningful(
             &mut ap_out,
             "model",
-            item.get("devModel").or_else(|| item.get("deviceType")).cloned().unwrap_or(Value::Null),
+            item.get("devModel")
+                .or_else(|| item.get("deviceType"))
+                .cloned()
+                .unwrap_or(Value::Null),
         );
-        insert_meaningful(&mut ap_out, "managementIp", item.get("ip").cloned().unwrap_or(Value::Null));
-        insert_meaningful(&mut ap_out, "status", item.get("status").cloned().unwrap_or(Value::Null));
-        insert_meaningful(&mut ap_out, "workMode", item.get("forwardMode").cloned().unwrap_or(Value::Null));
-        insert_meaningful(&mut ap_out, "relayMode", item.get("relayMode").cloned().unwrap_or(Value::Null));
+        insert_meaningful(
+            &mut ap_out,
+            "managementIp",
+            item.get("ip").cloned().unwrap_or(Value::Null),
+        );
+        insert_meaningful(
+            &mut ap_out,
+            "status",
+            item.get("status").cloned().unwrap_or(Value::Null),
+        );
+        insert_meaningful(
+            &mut ap_out,
+            "workMode",
+            item.get("forwardMode").cloned().unwrap_or(Value::Null),
+        );
+        insert_meaningful(
+            &mut ap_out,
+            "relayMode",
+            item.get("relayMode").cloned().unwrap_or(Value::Null),
+        );
         insert_meaningful(&mut ap_out, "bands", csv_values(item.get("band")));
         insert_meaningful(&mut ap_out, "channels", csv_values(item.get("channel")));
-        insert_meaningful(&mut ap_out, "channelUtilization", csv_values(item.get("chutil")));
-        insert_meaningful(&mut ap_out, "stationCount", item.get("staNum").cloned().unwrap_or(Value::Null));
-        insert_meaningful(&mut ap_out, "software", item.get("software").cloned().unwrap_or(Value::Null));
-        insert_meaningful(&mut ap_out, "serialNumber", item.get("serialNumber").cloned().unwrap_or(Value::Null));
-        insert_meaningful(&mut ap_out, "mac", item.get("mac").cloned().unwrap_or(Value::Null));
+        insert_meaningful(
+            &mut ap_out,
+            "channelUtilization",
+            csv_values(item.get("chutil")),
+        );
+        insert_meaningful(
+            &mut ap_out,
+            "stationCount",
+            item.get("staNum").cloned().unwrap_or(Value::Null),
+        );
+        insert_meaningful(
+            &mut ap_out,
+            "software",
+            item.get("software").cloned().unwrap_or(Value::Null),
+        );
+        insert_meaningful(
+            &mut ap_out,
+            "serialNumber",
+            item.get("serialNumber").cloned().unwrap_or(Value::Null),
+        );
+        insert_meaningful(
+            &mut ap_out,
+            "mac",
+            item.get("mac").cloned().unwrap_or(Value::Null),
+        );
         if !ap_out.is_empty() {
             details.insert("ap".into(), Value::Object(ap_out));
         }
@@ -1561,7 +1824,10 @@ fn details_from_sources(
         .and_then(|item| item.get("hostName"))
         .and_then(Value::as_str)
         .filter(|value| !value.trim().is_empty())
-        .or_else(|| slow.and_then(|root| root.get("hostname")).and_then(Value::as_str));
+        .or_else(|| {
+            slow.and_then(|root| root.get("hostname"))
+                .and_then(Value::as_str)
+        });
     let ap_model = ap
         .and_then(|item| item.get("devModel").or_else(|| item.get("deviceType")))
         .and_then(Value::as_str)
@@ -1569,7 +1835,11 @@ fn details_from_sources(
     if ap_hostname.is_some() || ap_model.is_some() || slow.is_some() {
         let mut identity = Map::new();
         if let Some(hostname) = ap_hostname {
-            insert_meaningful(&mut identity, "hostname", Value::String(hostname.to_string()));
+            insert_meaningful(
+                &mut identity,
+                "hostname",
+                Value::String(hostname.to_string()),
+            );
         }
         let model = ap_model.map(str::to_string).unwrap_or_else(router_model);
         insert_meaningful(&mut identity, "model", Value::String(model));
@@ -1607,7 +1877,8 @@ async fn collect_dashboard_payload(
 
     let mut payload = json!({"router": config.router_name});
     if include_telemetry {
-        let fast = match command_json("dev_sta", &["get", "-m", "ws_sysinfo", r#"{"get":"fast"}"#]) {
+        let fast = match command_json("dev_sta", &["get", "-m", "ws_sysinfo", r#"{"get":"fast"}"#])
+        {
             Ok(value) => value,
             Err(error) => {
                 // Firmware without ws_sysinfo uses its local procfs sample.
@@ -1616,7 +1887,10 @@ async fn collect_dashboard_payload(
                     state,
                     "WARN",
                     "router-fast-local",
-                    &format!("eWeb fast unavailable, using local procfs telemetry: {:#}", error),
+                    &format!(
+                        "eWeb fast unavailable, using local procfs telemetry: {:#}",
+                        error
+                    ),
                 );
                 return Ok(local_telemetry_payload(config, state));
             }
@@ -1647,15 +1921,33 @@ async fn collect_dashboard_payload(
     if details_due {
         match command_json("dev_sta", &["get", "-m", "ws_sysinfo", r#"{"get":"slow"}"#]) {
             Ok(value) => slow_value = Some(value),
-            Err(error) => log_limited(config, state, "WARN", "router-slow", &format!("router slow telemetry skipped: {:#}", error)),
+            Err(error) => log_limited(
+                config,
+                state,
+                "WARN",
+                "router-slow",
+                &format!("router slow telemetry skipped: {:#}", error),
+            ),
         }
         match command_json("dev_sta", &["get", "-m", "ipinfo", "{}"]) {
             Ok(value) => ipinfo_value = Some(value),
-            Err(error) => log_limited(config, state, "WARN", "router-ipinfo", &format!("router ipinfo skipped: {:#}", error)),
+            Err(error) => log_limited(
+                config,
+                state,
+                "WARN",
+                "router-ipinfo",
+                &format!("router ipinfo skipped: {:#}", error),
+            ),
         }
         match command_json("dev_sta", &["get", "-m", "ap_list", "{}"]) {
             Ok(value) => ap_list_value = Some(value),
-            Err(error) => log_limited(config, state, "WARN", "router-ap-list", &format!("router ap_list skipped: {:#}", error)),
+            Err(error) => log_limited(
+                config,
+                state,
+                "WARN",
+                "router-ap-list",
+                &format!("router ap_list skipped: {:#}", error),
+            ),
         }
         if slow_value.is_some() || ipinfo_value.is_some() || ap_list_value.is_some() {
             state.last_dashboard_details_at = now;
@@ -1663,12 +1955,18 @@ async fn collect_dashboard_payload(
     }
     let mut network_value = None;
     if network_due {
-        match command_json("dev_config", &["get", "-m", "network", "{}"] ) {
+        match command_json("dev_config", &["get", "-m", "network", "{}"]) {
             Ok(value) => {
                 state.last_dashboard_network_at = now;
                 network_value = Some(value);
             }
-            Err(error) => log_limited(config, state, "WARN", "router-network", &format!("router network config skipped: {:#}", error)),
+            Err(error) => log_limited(
+                config,
+                state,
+                "WARN",
+                "router-network",
+                &format!("router network config skipped: {:#}", error),
+            ),
         }
     }
     // WireGuard status is read-only and low-frequency (~30s). Detection is
@@ -1686,7 +1984,11 @@ async fn collect_dashboard_payload(
         state.last_wireguard_at = now;
     }
     payload["wireguard"] = state.wireguard_status.clone().unwrap_or(Value::Null);
-    if slow_value.is_some() || network_value.is_some() || ipinfo_value.is_some() || ap_list_value.is_some() {
+    if slow_value.is_some()
+        || network_value.is_some()
+        || ipinfo_value.is_some()
+        || ap_list_value.is_some()
+    {
         payload["details"] = details_from_sources(
             slow_value.as_ref(),
             network_value.as_ref(),
@@ -1787,15 +2089,40 @@ async fn sync_router_credentials(
     refresh_nonce: u64,
 ) -> Result<()> {
     let payload = collect_router_credentials(config, refresh_nonce)?;
-    post_json(client, config, "/api/router/dashboard/credentials/push", &payload).await?;
+    post_json(
+        client,
+        config,
+        "/api/router/dashboard/credentials/push",
+        &payload,
+    )
+    .await?;
     state.last_credentials_refresh_nonce = refresh_nonce;
     Ok(())
 }
 
-async fn sync_router_dashboard(client: &Client, config: &AgentConfig, state: &mut AgentState, force: bool) -> Result<()> {
-    let payload = collect_dashboard_payload(config, state, force, if force { state.last_dashboard_refresh_nonce } else { 0 }, force).await?;
+async fn sync_router_dashboard(
+    client: &Client,
+    config: &AgentConfig,
+    state: &mut AgentState,
+    force: bool,
+) -> Result<()> {
+    let payload = collect_dashboard_payload(
+        config,
+        state,
+        force,
+        if force {
+            state.last_dashboard_refresh_nonce
+        } else {
+            0
+        },
+        force,
+    )
+    .await?;
     let response = post_json(client, config, "/api/router/dashboard/push", &payload).await?;
-    let requested = response.get("refreshNonce").and_then(Value::as_u64).unwrap_or(0);
+    let requested = response
+        .get("refreshNonce")
+        .and_then(Value::as_u64)
+        .unwrap_or(0);
     if requested > state.last_dashboard_refresh_nonce {
         let full = collect_dashboard_payload(config, state, true, requested, force).await?;
         post_json(client, config, "/api/router/dashboard/push", &full).await?;
@@ -1944,14 +2271,20 @@ async fn flush_device_events(client: &Client, config: &AgentConfig, state: &mut 
     let mut retry = Vec::new();
     for body in pending {
         if let Err(error) = post_json(client, config, "/api/router/push", &body).await {
-            let event = body.get("event").and_then(Value::as_str).unwrap_or("device");
+            let event = body
+                .get("event")
+                .and_then(Value::as_str)
+                .unwrap_or("device");
             let mac = body.get("mac").and_then(Value::as_str).unwrap_or("");
             log_limited(
                 config,
                 state,
                 "WARN",
                 "event-retry",
-                &format!("{} event queued for retry mac={} error={:#}", event, mac, error),
+                &format!(
+                    "{} event queued for retry mac={} error={:#}",
+                    event, mac, error
+                ),
             );
             retry.push(body);
         }
@@ -1986,14 +2319,24 @@ async fn sync_child_guard(client: &Client, config: &AgentConfig) -> Result<()> {
         return Ok(());
     }
     for command in commands {
-        let id = command.get("id").and_then(Value::as_str).unwrap_or("").to_string();
-        let action = command.get("action").and_then(Value::as_str).unwrap_or("").to_string();
+        let id = command
+            .get("id")
+            .and_then(Value::as_str)
+            .unwrap_or("")
+            .to_string();
+        let action = command
+            .get("action")
+            .and_then(Value::as_str)
+            .unwrap_or("")
+            .to_string();
         let payload = command.get("payload").cloned().unwrap_or_else(|| json!({}));
         let result = tokio::task::spawn_blocking(move || {
             crate::child_guard::execute(&action, &payload)
         })
         .await
-        .unwrap_or_else(|error| json!({"ok": false, "errorCode": "adapter_panic", "error": error.to_string()}));
+        .unwrap_or_else(
+            |error| json!({"ok": false, "errorCode": "adapter_panic", "error": error.to_string()}),
+        );
         // Return each result before taking another command. A slow report must
         // not hide an already-completed manual change behind a batch response.
         post_json(client, config, &format!("/api/router/child-guard/ack?router={}", router),
@@ -2028,8 +2371,14 @@ async fn sync_rdpi(client: &Client, config: &AgentConfig) -> Result<()> {
         // 文件没变，什么都不用发。
         None => return Ok(()),
     };
-    let apps = snapshot.get("apps").cloned().unwrap_or_else(|| Value::Array(Vec::new()));
-    let mark = snapshot.get("fingerprint").and_then(Value::as_u64).unwrap_or(0);
+    let apps = snapshot
+        .get("apps")
+        .cloned()
+        .unwrap_or_else(|| Value::Array(Vec::new()));
+    let mark = snapshot
+        .get("fingerprint")
+        .and_then(Value::as_u64)
+        .unwrap_or(0);
     let count = apps.as_array().map(Vec::len).unwrap_or(0);
     let body = serde_json::json!({
         "router": config.router_name,
@@ -2045,7 +2394,11 @@ async fn sync_rdpi(client: &Client, config: &AgentConfig) -> Result<()> {
 }
 
 /// Hub 下发的特征库写入。和读一样走出站通道，Hub 不再反向 SSH 进路由器。
-async fn sync_rdpi_commands(client: &Client, config: &AgentConfig, state: &mut AgentState) -> Result<()> {
+async fn sync_rdpi_commands(
+    client: &Client,
+    config: &AgentConfig,
+    state: &mut AgentState,
+) -> Result<()> {
     let router = url_encode(&config.router_name);
     let root = get_json(
         client,
@@ -2063,13 +2416,25 @@ async fn sync_rdpi_commands(client: &Client, config: &AgentConfig, state: &mut A
     }
     let mut acknowledgements = Vec::new();
     for command in commands {
-        let id = command.get("id").and_then(Value::as_str).unwrap_or("").to_string();
-        let action = command.get("action").and_then(Value::as_str).unwrap_or("").to_string();
+        let id = command
+            .get("id")
+            .and_then(Value::as_str)
+            .unwrap_or("")
+            .to_string();
+        let action = command
+            .get("action")
+            .and_then(Value::as_str)
+            .unwrap_or("")
+            .to_string();
         let payload = command.get("payload").cloned().unwrap_or_else(|| json!({}));
         let action_for_worker = action.clone();
-        let result = tokio::task::spawn_blocking(move || crate::rdpi::execute(&action_for_worker, &payload))
-            .await
-            .unwrap_or_else(|error| json!({"ok": false, "errorCode": "adapter_panic", "error": error.to_string()}));
+        let result = tokio::task::spawn_blocking(move || {
+            crate::rdpi::execute(&action_for_worker, &payload)
+        })
+        .await
+        .unwrap_or_else(
+            |error| json!({"ok": false, "errorCode": "adapter_panic", "error": error.to_string()}),
+        );
         let text = redact(&result.to_string(), &config.hook_token);
         log_line(config, "INFO", &format!("rdpi command {action}: {text}"));
         acknowledgements.push(json!({
@@ -2119,9 +2484,10 @@ async fn sync_usage_stats(client: &Client, config: &AgentConfig) -> Result<()> {
                 // 不把异步执行线程占住。
                 // 重启 sniffer 不再以「有守护设备」为前提。那个条件本来是防止误清守护用户，
                 // 但名单为空时重启本来就是免费的，而短路它会让用量永远停在原地只留一句 WARN。
-                let restarted = tokio::task::spawn_blocking(move || minute_stats::restart_sniffer(now))
-                    .await
-                    .unwrap_or(false);
+                let restarted =
+                    tokio::task::spawn_blocking(move || minute_stats::restart_sniffer(now))
+                        .await
+                        .unwrap_or(false);
                 if restarted {
                     if minute_stats::has_guarded_devices() {
                         // 重启会清掉已经推进 sniffer 的守护用户，让 child_guard 再推一次。
@@ -2148,7 +2514,11 @@ async fn sync_usage_stats(client: &Client, config: &AgentConfig) -> Result<()> {
                 // from the router alone: it separates an empty firmware table
                 // from buckets that stopped advancing.
                 if minute_stats::log_due(now) {
-                    log_line(&config, "INFO", &format!("usage sample: {}", report.summary()));
+                    log_line(
+                        &config,
+                        "INFO",
+                        &format!("usage sample: {}", report.summary()),
+                    );
                 }
             }
             Ok(Err(problem)) => problems.push(problem),
@@ -2274,11 +2644,7 @@ async fn sync_portmaps(
     Ok(())
 }
 
-async fn sync_stun(
-    client: &Client,
-    config: &AgentConfig,
-    state: &mut AgentState,
-) -> Result<()> {
+async fn sync_stun(client: &Client, config: &AgentConfig, state: &mut AgentState) -> Result<()> {
     let router = url_encode(&config.router_name);
     let root = get_json(
         client,
@@ -2373,7 +2739,8 @@ async fn sync_wireguard(
             let result: Result<Value> = if endpoint_action {
                 (|| -> Result<Value> {
                     let update: crate::wireguard::WireGuardEndpointUpdate =
-                        serde_json::from_value(payload.clone()).context("invalid WireGuard endpoint update")?;
+                        serde_json::from_value(payload.clone())
+                            .context("invalid WireGuard endpoint update")?;
                     let updated = crate::wireguard::apply_endpoint_update(
                         &mut state.wireguard_endpoint_profiles,
                         &update,
@@ -2391,45 +2758,71 @@ async fn sync_wireguard(
             } else if revision < state.wireguard_revision {
                 Err(anyhow!("stale WireGuard revision"))
             } else if revision == state.wireguard_revision && revision > 0 {
-                Ok(state.wireguard_apply_result.clone().unwrap_or_else(|| json!({
-                    "ok": true,
-                    "idempotent": true,
-                    "revision": revision,
-                    "interfaceName": state.wireguard_interface,
-                })))
+                Ok(state.wireguard_apply_result.clone().unwrap_or_else(|| {
+                    json!({
+                        "ok": true,
+                        "idempotent": true,
+                        "revision": revision,
+                        "interfaceName": state.wireguard_interface,
+                    })
+                }))
             } else {
-                (|| -> Result<Value> { match action {
-                    "apply" => {
-                        let desired_value = payload.get("server").cloned().unwrap_or(Value::Null);
-                        let mut desired: crate::wireguard::WireGuardServerDesired =
-                            serde_json::from_value(desired_value).context("invalid WireGuard server document")?;
-                        desired.revision = revision;
-                        let applied = crate::wireguard::apply_server(&desired)?;
-                        let value = serde_json::to_value(&applied)?;
-                        state.wireguard_interface = applied.interface_name.clone();
-                        state.wireguard_endpoint_profiles = desired.endpoint_profiles.clone();
-                        Ok(value)
+                (|| -> Result<Value> {
+                    match action {
+                        "apply" => {
+                            let desired_value =
+                                payload.get("server").cloned().unwrap_or(Value::Null);
+                            let mut desired: crate::wireguard::WireGuardServerDesired =
+                                serde_json::from_value(desired_value)
+                                    .context("invalid WireGuard server document")?;
+                            desired.revision = revision;
+                            let applied = crate::wireguard::apply_server(&desired)?;
+                            let value = serde_json::to_value(&applied)?;
+                            state.wireguard_interface = applied.interface_name.clone();
+                            state.wireguard_endpoint_profiles = desired.endpoint_profiles.clone();
+                            Ok(value)
+                        }
+                        "stop" => {
+                            let interface = payload
+                                .get("interfaceName")
+                                .and_then(Value::as_str)
+                                .filter(|value| !value.is_empty())
+                                .map(str::to_string)
+                                .unwrap_or_else(|| {
+                                    if state.wireguard_interface.is_empty() {
+                                        "labwg0".into()
+                                    } else {
+                                        state.wireguard_interface.clone()
+                                    }
+                                });
+                            crate::wireguard::stop_server(&interface)?;
+                            state.wireguard_interface = interface.clone();
+                            Ok(
+                                json!({"ok":true,"interfaceName":interface,"enabled":false,"revision":revision,"controlBackend":"kernel-netlink"}),
+                            )
+                        }
+                        "delete" => {
+                            let interface = payload
+                                .get("interfaceName")
+                                .and_then(Value::as_str)
+                                .filter(|value| !value.is_empty())
+                                .map(str::to_string)
+                                .unwrap_or_else(|| {
+                                    if state.wireguard_interface.is_empty() {
+                                        "labwg0".into()
+                                    } else {
+                                        state.wireguard_interface.clone()
+                                    }
+                                });
+                            crate::wireguard::delete_server(&interface)?;
+                            state.wireguard_interface = interface.clone();
+                            Ok(
+                                json!({"ok":true,"interfaceName":interface,"deleted":true,"revision":revision,"controlBackend":"kernel-netlink"}),
+                            )
+                        }
+                        _ => Err(anyhow!("unsupported WireGuard action")),
                     }
-                    "stop" => {
-                        let interface = payload.get("interfaceName").and_then(Value::as_str)
-                            .filter(|value| !value.is_empty())
-                            .map(str::to_string)
-                            .unwrap_or_else(|| if state.wireguard_interface.is_empty() { "labwg0".into() } else { state.wireguard_interface.clone() });
-                        crate::wireguard::stop_server(&interface)?;
-                        state.wireguard_interface = interface.clone();
-                        Ok(json!({"ok":true,"interfaceName":interface,"enabled":false,"revision":revision,"controlBackend":"kernel-netlink"}))
-                    }
-                    "delete" => {
-                        let interface = payload.get("interfaceName").and_then(Value::as_str)
-                            .filter(|value| !value.is_empty())
-                            .map(str::to_string)
-                            .unwrap_or_else(|| if state.wireguard_interface.is_empty() { "labwg0".into() } else { state.wireguard_interface.clone() });
-                        crate::wireguard::delete_server(&interface)?;
-                        state.wireguard_interface = interface.clone();
-                        Ok(json!({"ok":true,"interfaceName":interface,"deleted":true,"revision":revision,"controlBackend":"kernel-netlink"}))
-                    }
-                    _ => Err(anyhow!("unsupported WireGuard action")),
-                }})()
+                })()
             };
             match result {
                 Ok(value) => {
@@ -2491,7 +2884,10 @@ async fn sync_tcp_session_test(client: &Client, config: &AgentConfig) -> Result<
     let root = get_json(
         client,
         config,
-        &format!("/api/router/tcp-session-test/commands?router={}&limit=5", router),
+        &format!(
+            "/api/router/tcp-session-test/commands?router={}&limit=5",
+            router
+        ),
     )
     .await?;
     let commands = root
@@ -2557,15 +2953,23 @@ async fn sync_tcp_session_test(client: &Client, config: &AgentConfig) -> Result<
 // Reading status never launches a measurement; only an explicit start command does.
 async fn sync_speedtest(client: &Client, config: &AgentConfig) -> Result<()> {
     let router = url_encode(&config.router_name);
-    let root = get_json(client, config,
-        &format!("/api/router/speedtest/commands?router={}&limit=5", router)).await?;
+    let root = get_json(
+        client,
+        config,
+        &format!("/api/router/speedtest/commands?router={}&limit=5", router),
+    )
+    .await?;
     let mut acks = Vec::new();
     if let Some(commands) = root.get("commands").and_then(Value::as_array) {
         for command in commands.iter().take(5) {
             let payload = command.get("payload").cloned().unwrap_or_else(|| json!({}));
             let local = match command.get("action").and_then(Value::as_str).unwrap_or("") {
-                "start" => json!({"action":"speedtest_start", "taskId":payload.get("taskId"), "config":payload.get("config")}),
-                "cancel" | "stop" => json!({"action":"speedtest_cancel", "taskId":payload.get("taskId")}),
+                "start" => {
+                    json!({"action":"speedtest_start", "taskId":payload.get("taskId"), "config":payload.get("config")})
+                }
+                "cancel" | "stop" => {
+                    json!({"action":"speedtest_cancel", "taskId":payload.get("taskId")})
+                }
                 _ => json!({"action":"invalid"}),
             };
             let result = tcp_session_ctl(config, local).await;
@@ -2573,12 +2977,24 @@ async fn sync_speedtest(client: &Client, config: &AgentConfig) -> Result<()> {
         }
     }
     if !acks.is_empty() {
-        post_json(client, config, "/api/router/speedtest/ack", &json!({"acks":acks})).await?;
+        post_json(
+            client,
+            config,
+            "/api/router/speedtest/ack",
+            &json!({"acks":acks}),
+        )
+        .await?;
     }
     if Path::new(&config.relay_socket).exists() {
         let capability = tcp_session_ctl(config, json!({"action":"speedtest_capability"})).await;
         let status = tcp_session_ctl(config, json!({"action":"speedtest_status"})).await;
-        post_json(client, config, "/api/router/speedtest/status", &json!({"capability":capability,"status":status})).await?;
+        post_json(
+            client,
+            config,
+            "/api/router/speedtest/status",
+            &json!({"capability":capability,"status":status}),
+        )
+        .await?;
     }
     Ok(())
 }
@@ -2606,11 +3022,17 @@ pub async fn run(args: &[String], once: bool) -> Result<()> {
         online_devices: state.devices.len(),
         storage_percent: state.storage_percent,
     });
-    let _fast_dashboard = if once { None } else { Some(start_fast_dashboard(&config, fast_metadata_rx)?) };
+    let _fast_dashboard = if once {
+        None
+    } else {
+        Some(start_fast_dashboard(&config, fast_metadata_rx)?)
+    };
     let mut last_agent_cycle_at = 0u64;
     let mut last_status_at = 0u64;
     log_line(&config, "INFO", "Rust agent started");
-    let _speedtest_sync = if once { None } else {
+    let _speedtest_sync = if once {
+        None
+    } else {
         let speed_client = client.clone();
         let speed_config = config.clone();
         Some(tokio::spawn(async move {
@@ -2619,7 +3041,10 @@ pub async fn run(args: &[String], once: bool) -> Result<()> {
                 if let Err(error) = sync_speedtest(&speed_client, &speed_config).await {
                     let now = now_epoch();
                     if now.saturating_sub(last_error_log) >= 60 {
-                        let message = redact(&format!("speedtest sync: {error:#}"), &speed_config.hook_token);
+                        let message = redact(
+                            &format!("speedtest sync: {error:#}"),
+                            &speed_config.hook_token,
+                        );
                         log_line(&speed_config, "WARN", &message);
                         last_error_log = now;
                     }
@@ -2653,7 +3078,9 @@ pub async fn run(args: &[String], once: bool) -> Result<()> {
     };
     // Child control is sequential within its own lane, independent of slow
     // inventory, STUN, WireGuard, and RDPI work in the housekeeping cycle.
-    let _child_control = if once { None } else {
+    let _child_control = if once {
+        None
+    } else {
         let child_client = client.clone();
         let child_config = config.clone();
         Some(tokio::spawn(async move {
@@ -2662,7 +3089,10 @@ pub async fn run(args: &[String], once: bool) -> Result<()> {
                 if let Err(error) = sync_child_guard(&child_client, &child_config).await {
                     let now = now_epoch();
                     if now.saturating_sub(last_error_log) >= 30 {
-                        let text = redact(&format!("child guard command: {:#}", error), &child_config.hook_token);
+                        let text = redact(
+                            &format!("child guard command: {:#}", error),
+                            &child_config.hook_token,
+                        );
                         log_line(&child_config, "WARN", &text);
                         last_error_log = now;
                     }
@@ -2671,7 +3101,9 @@ pub async fn run(args: &[String], once: bool) -> Result<()> {
             }
         }))
     };
-    let _child_statistics = if once { None } else {
+    let _child_statistics = if once {
+        None
+    } else {
         let usage_client = client.clone();
         let usage_config = config.clone();
         Some(tokio::spawn(async move {
@@ -2680,7 +3112,10 @@ pub async fn run(args: &[String], once: bool) -> Result<()> {
                 if let Err(error) = sync_usage_stats(&usage_client, &usage_config).await {
                     let now = now_epoch();
                     if now.saturating_sub(last_error_log) >= 30 {
-                        let text = redact(&format!("usage stats: {:#}", error), &usage_config.hook_token);
+                        let text = redact(
+                            &format!("usage stats: {:#}", error),
+                            &usage_config.hook_token,
+                        );
                         log_line(&usage_config, "WARN", &text);
                         last_error_log = now;
                     }
@@ -2697,21 +3132,38 @@ pub async fn run(args: &[String], once: bool) -> Result<()> {
         let mut errors = Vec::new();
         // Presence, command delivery and daemon runtime are independent of the
         // slower full inventory cycle, so APP update/cleanup responds in 3–5 s.
-        let status_due = once || last_status_at == 0 || now.saturating_sub(last_status_at) >= config.status_interval_seconds.clamp(3, 5);
+        let status_due = once
+            || last_status_at == 0
+            || now.saturating_sub(last_status_at) >= config.status_interval_seconds.clamp(3, 5);
         if status_due {
             if once {
                 if let Err(error) = sync_speedtest(&client, &config).await {
-                    log_limited(&config, &mut state, "WARN", "speedtest", &format!("speedtest sync: {error:#}"));
+                    log_limited(
+                        &config,
+                        &mut state,
+                        "WARN",
+                        "speedtest",
+                        &format!("speedtest sync: {error:#}"),
+                    );
                 }
                 if let Err(error) = sync_tcp_session_test(&client, &config).await {
-                    let text = redact(&format!("TCP 峰值连接数测试同步：{:#}", error), &config.hook_token);
+                    let text = redact(
+                        &format!("TCP 峰值连接数测试同步：{:#}", error),
+                        &config.hook_token,
+                    );
                     log_limited(&config, &mut state, "WARN", "tcp-session-test", &text);
                     errors.push(text);
                 }
             }
             match sync_agent_update(&client, &config, &mut state).await {
                 Ok(_) => {}
-                Err(error) => log_limited(&config, &mut state, "WARN", "agent-command-check", &format!("agent command check skipped: {:#}", error)),
+                Err(error) => log_limited(
+                    &config,
+                    &mut state,
+                    "WARN",
+                    "agent-command-check",
+                    &format!("agent command check skipped: {:#}", error),
+                ),
             }
             if let Err(error) = report_agent_status(&client, &config, &mut state).await {
                 let text = redact(&format!("agent status: {:#}", error), &config.hook_token);
@@ -2729,12 +3181,22 @@ pub async fn run(args: &[String], once: bool) -> Result<()> {
                 errors.push(text);
             }
             if let Err(error) = sync_wireguard(&client, &config, &mut state).await {
-                let text = redact(&format!("wireguard status: {:#}", error), &config.hook_token);
+                let text = redact(
+                    &format!("wireguard status: {:#}", error),
+                    &config.hook_token,
+                );
                 log_limited(&config, &mut state, "WARN", "wireguard-status", &text);
                 errors.push(text);
             }
-            if let Err(error) = if once { sync_child_guard(&client, &config).await } else { Ok(()) } {
-                let text = redact(&format!("child guard command: {:#}", error), &config.hook_token);
+            if let Err(error) = if once {
+                sync_child_guard(&client, &config).await
+            } else {
+                Ok(())
+            } {
+                let text = redact(
+                    &format!("child guard command: {:#}", error),
+                    &config.hook_token,
+                );
                 log_limited(&config, &mut state, "WARN", "child-guard-command", &text);
                 errors.push(text);
             }
@@ -2749,7 +3211,10 @@ pub async fn run(args: &[String], once: bool) -> Result<()> {
             }
             last_status_at = now;
         }
-        if once || last_agent_cycle_at == 0 || now.saturating_sub(last_agent_cycle_at) >= config.interval_seconds.clamp(5, 300) {
+        if once
+            || last_agent_cycle_at == 0
+            || now.saturating_sub(last_agent_cycle_at) >= config.interval_seconds.clamp(5, 300)
+        {
             if let Err(error) = agent_cycle(&client, &config, &mut state).await {
                 let text = redact(&format!("{:#}", error), &config.hook_token);
                 log_limited(&config, &mut state, "ERROR", "agent-cycle", &text);
@@ -2763,7 +3228,10 @@ pub async fn run(args: &[String], once: bool) -> Result<()> {
                 >= config.dashboard_interval_seconds.clamp(2, 30);
         if dashboard_due {
             if let Err(error) = sync_router_dashboard(&client, &config, &mut state, once).await {
-                let text = redact(&format!("router dashboard: {:#}", error), &config.hook_token);
+                let text = redact(
+                    &format!("router dashboard: {:#}", error),
+                    &config.hook_token,
+                );
                 log_limited(&config, &mut state, "WARN", "router-dashboard", &text);
                 errors.push(text);
             }
@@ -2794,7 +3262,11 @@ pub async fn run(args: &[String], once: bool) -> Result<()> {
         });
         save_json(&state_path, &state)?;
         if once {
-            return if state.last_error.is_empty() { Ok(()) } else { Err(anyhow!(state.last_error)) };
+            return if state.last_error.is_empty() {
+                Ok(())
+            } else {
+                Err(anyhow!(state.last_error))
+            };
         }
         sleep(Duration::from_secs(1)).await;
     }
@@ -2805,8 +3277,8 @@ pub fn configure(args: &[String]) -> Result<()> {
         .ok_or_else(|| anyhow!("missing --hub"))?
         .trim_end_matches('/')
         .to_string();
-    let hook_token = arg_value(args, "--hook-token")
-        .ok_or_else(|| anyhow!("missing --hook-token"))?;
+    let hook_token =
+        arg_value(args, "--hook-token").ok_or_else(|| anyhow!("missing --hook-token"))?;
     if hook_token.trim().is_empty() {
         bail!("HOOK_TOKEN is empty");
     }
@@ -2895,7 +3367,6 @@ mod local_telemetry_tests {
         );
     }
 
-
     #[test]
     fn router_credentials_keep_each_wan_scoped() {
         let payload = router_credentials_from_network(
@@ -2915,25 +3386,46 @@ mod local_telemetry_tests {
         assert_eq!(payload["refreshNonce"], 7);
     }
 
-
     #[test]
     fn fast_schema_accepts_real_zero_but_rejects_missing_metrics() {
         assert!(validate_fast_telemetry(&json!({"cpu_usage":0,"memutil":0,"runtime":0})).is_ok());
-        assert!(validate_fast_telemetry(&json!({"cpuutil":"12.5%","memutil":"68","runtime":"123"})).is_ok());
-        for payload in [Value::Null, json!({}), json!({"cpu_usage":12,"runtime":123}), json!({"cpu_usage":"NaN","memutil":68,"runtime":123})] {
+        assert!(validate_fast_telemetry(
+            &json!({"cpuutil":"12.5%","memutil":"68","runtime":"123"})
+        )
+        .is_ok());
+        for payload in [
+            Value::Null,
+            json!({}),
+            json!({"cpu_usage":12,"runtime":123}),
+            json!({"cpu_usage":"NaN","memutil":68,"runtime":123}),
+        ] {
             assert!(validate_fast_telemetry(&payload).is_err());
         }
     }
 
     #[tokio::test]
     async fn empty_success_and_empty_object_use_real_procfs_metrics() {
-        let config = AgentConfig { router_name:"BE50".into(), ..AgentConfig::default() };
-        let metadata = FastDashboardMetadata { online_devices:7, storage_percent:Some(27.0) };
+        let config = AgentConfig {
+            router_name: "BE50".into(),
+            ..AgentConfig::default()
+        };
+        let metadata = FastDashboardMetadata {
+            online_devices: 7,
+            storage_percent: Some(27.0),
+        };
         for body in [r#"{"message":"success","data":null}"#, "{}"] {
             let mut state = AgentState::default();
-            let command = ("/bin/sh".into(), vec!["-c".into(), format!("printf '%s' '{}'",body)]);
-            let payload = collect_fast_dashboard_payload(&config, &mut state, metadata, &command).await.unwrap();
-            assert!(state.local_cpu_total > 0, "invalid vendor payload must read procfs");
+            let command = (
+                "/bin/sh".into(),
+                vec!["-c".into(), format!("printf '%s' '{}'", body)],
+            );
+            let payload = collect_fast_dashboard_payload(&config, &mut state, metadata, &command)
+                .await
+                .unwrap();
+            assert!(
+                state.local_cpu_total > 0,
+                "invalid vendor payload must read procfs"
+            );
             assert!(payload["telemetry"]["memoryPercent"].as_f64().unwrap() > 0.0);
             assert!(payload["telemetry"]["uptimeSeconds"].as_u64().unwrap() > 0);
             assert_eq!(payload["telemetry"]["onlineDeviceCount"], 7);
@@ -2942,16 +3434,26 @@ mod local_telemetry_tests {
 
     #[test]
     fn partial_vendor_wan_keeps_valid_rates_and_falls_back_per_field() {
-        let config = AgentConfig { router_name:"BE50".into(), ..AgentConfig::default() };
-        let metadata = FastDashboardMetadata { online_devices:7, storage_percent:Some(27.0) };
+        let config = AgentConfig {
+            router_name: "BE50".into(),
+            ..AgentConfig::default()
+        };
+        let metadata = FastDashboardMetadata {
+            online_devices: 7,
+            storage_percent: Some(27.0),
+        };
         let mut state = AgentState::default();
-        let fast = json!({"cpu_usage":23,"memutil":68,"runtime":1234,"wan_stat":{"wans":{"tx_rate":12}}});
+        let fast =
+            json!({"cpu_usage":23,"memutil":68,"runtime":1234,"wan_stat":{"wans":{"tx_rate":12}}});
         let value = fast_telemetry_with_local_fallback(&config, &mut state, &fast, metadata);
         assert_eq!(value["cpuPercent"], 23.0);
         // eWeb 的速率字段本身就是 bit/s，不做二次 ×8。
         assert_eq!(value["wan"]["uploadBps"], 12);
         assert!(value["wan"].get("downloadRaw").is_none());
-        assert!(state.local_cpu_total > 0, "missing fields must read actual procfs rather than fabricate zero");
+        assert!(
+            state.local_cpu_total > 0,
+            "missing fields must read actual procfs rather than fabricate zero"
+        );
     }
 
     #[test]
@@ -2987,20 +3489,40 @@ mod local_telemetry_tests {
 
     #[tokio::test]
     async fn be50_fast_payload_never_advertises_ipv6_connection_counts() {
-        let config = AgentConfig { router_name:"BE50".into(), ..AgentConfig::default() };
-        let metadata = FastDashboardMetadata { online_devices:7, storage_percent:Some(27.0) };
+        let config = AgentConfig {
+            router_name: "BE50".into(),
+            ..AgentConfig::default()
+        };
+        let metadata = FastDashboardMetadata {
+            online_devices: 7,
+            storage_percent: Some(27.0),
+        };
         let mut state = AgentState::default();
-        let command = ("/bin/sh".into(), vec!["-c".into(), "printf '%s' '{\"cpu_usage\":23,\"memutil\":68,\"runtime\":1234}'".into()]);
-        let payload = collect_fast_dashboard_payload(&config, &mut state, metadata, &command).await.unwrap();
+        let command = (
+            "/bin/sh".into(),
+            vec![
+                "-c".into(),
+                "printf '%s' '{\"cpu_usage\":23,\"memutil\":68,\"runtime\":1234}'".into(),
+            ],
+        );
+        let payload = collect_fast_dashboard_payload(&config, &mut state, metadata, &command)
+            .await
+            .unwrap();
         assert!(payload["telemetry"]["connections"].get("ipv6").is_none());
-        assert!(payload["telemetry"]["connections"].get("ipv6Half").is_none());
+        assert!(payload["telemetry"]["connections"]
+            .get("ipv6Half")
+            .is_none());
     }
 
     #[tokio::test]
     async fn vendor_fast_command_has_a_deadline() {
         let started = std::time::Instant::now();
         let args = vec!["-c".to_string(), "exec sleep 2".to_string()];
-        assert!(bounded_command_json("/bin/sh", &args, Duration::from_millis(50)).await.is_err());
+        assert!(
+            bounded_command_json("/bin/sh", &args, Duration::from_millis(50))
+                .await
+                .is_err()
+        );
         assert!(started.elapsed() < Duration::from_millis(500));
     }
 
@@ -3024,7 +3546,9 @@ mod local_telemetry_tests {
                     }
                     Err(error) => panic!("fake Hub accept: {}", error),
                 };
-                stream.set_read_timeout(Some(Duration::from_secs(2))).unwrap();
+                stream
+                    .set_read_timeout(Some(Duration::from_secs(2)))
+                    .unwrap();
                 let mut headers = Vec::new();
                 while !headers.ends_with(b"\r\n\r\n") {
                     let mut byte = [0u8];
@@ -3033,20 +3557,40 @@ mod local_telemetry_tests {
                     assert!(headers.len() < 8192);
                 }
                 let headers = String::from_utf8(headers).unwrap();
-                let length: usize = headers.lines().find_map(|line| {
-                    let (key, value) = line.split_once(':')?;
-                    key.eq_ignore_ascii_case("content-length").then(|| value.trim().parse().unwrap())
-                }).unwrap();
+                let length: usize = headers
+                    .lines()
+                    .find_map(|line| {
+                        let (key, value) = line.split_once(':')?;
+                        key.eq_ignore_ascii_case("content-length")
+                            .then(|| value.trim().parse().unwrap())
+                    })
+                    .unwrap();
                 let mut body = vec![0u8; length];
                 stream.read_exact(&mut body).unwrap();
-                received.push((std::time::Instant::now(), serde_json::from_slice::<Value>(&body).unwrap()));
+                received.push((
+                    std::time::Instant::now(),
+                    serde_json::from_slice::<Value>(&body).unwrap(),
+                ));
                 stream.write_all(b"HTTP/1.1 200 OK\r\nContent-Length: 11\r\nConnection: close\r\n\r\n{\"ok\":true}").unwrap();
             }
             received
         });
-        let config = AgentConfig { hub_url: format!("http://{}", address), router_name: "BE50".into(), ..AgentConfig::default() };
-        let (metadata, receiver) = tokio::sync::watch::channel(FastDashboardMetadata { online_devices: 7, storage_percent: Some(27.0) });
-        let command = ("/bin/sh".into(), vec!["-c".into(), "printf '%s' '{\"cpu_usage\":23,\"memutil\":68,\"runtime\":1234}'".into()]);
+        let config = AgentConfig {
+            hub_url: format!("http://{}", address),
+            router_name: "BE50".into(),
+            ..AgentConfig::default()
+        };
+        let (metadata, receiver) = tokio::sync::watch::channel(FastDashboardMetadata {
+            online_devices: 7,
+            storage_percent: Some(27.0),
+        });
+        let command = (
+            "/bin/sh".into(),
+            vec![
+                "-c".into(),
+                "printf '%s' '{\"cpu_usage\":23,\"memutil\":68,\"runtime\":1234}'".into(),
+            ],
+        );
         let worker = start_fast_dashboard_with_command(&config, receiver, command).unwrap();
         // This is the actual blocking behavior of vendor commands in the main
         // control task; no async yield is available to rescue that executor.
@@ -3054,10 +3598,17 @@ mod local_telemetry_tests {
         drop(metadata);
         worker.join().unwrap();
         let received = server.join().unwrap();
-        assert_eq!(received.len(), 3, "fresh pushes must occur during slow control work");
+        assert_eq!(
+            received.len(),
+            3,
+            "fresh pushes must occur during slow control work"
+        );
         for pair in received.windows(2) {
             assert!(pair[1].0.duration_since(pair[0].0) < Duration::from_millis(2500));
-            assert!(pair[1].1["telemetryEpoch"].as_u64().unwrap() > pair[0].1["telemetryEpoch"].as_u64().unwrap());
+            assert!(
+                pair[1].1["telemetryEpoch"].as_u64().unwrap()
+                    > pair[0].1["telemetryEpoch"].as_u64().unwrap()
+            );
         }
         for (_, payload) in received {
             assert_eq!(payload["router"], "BE50");
@@ -3080,7 +3631,10 @@ mod local_telemetry_tests {
         let first = parse_local_cpu_percent(STAT_A, 0, 0).expect("first sample");
         assert_eq!(first.0, 0.0);
         let second = parse_local_cpu_percent(STAT_B, first.1, first.2).expect("second sample");
-        assert!((second.0 - 50.0).abs() < 0.01, "delta busy 500 / delta total 1000 = 50%");
+        assert!(
+            (second.0 - 50.0).abs() < 0.01,
+            "delta busy 500 / delta total 1000 = 50%"
+        );
     }
 
     #[test]
@@ -3091,7 +3645,10 @@ mod local_telemetry_tests {
 
     #[test]
     fn uptime_and_temperature_parse_real_shapes() {
-        assert_eq!(parse_local_uptime_seconds("1308261.73 2374364.70\n"), Some(1308261));
+        assert_eq!(
+            parse_local_uptime_seconds("1308261.73 2374364.70\n"),
+            Some(1308261)
+        );
         assert!((parse_local_temperature_c("71800\n").expect("temp") - 71.8).abs() < 0.001);
     }
 

@@ -367,10 +367,10 @@ impl MinuteStore {
             }
         }
         let evidence = {
-            let slot = self
-                .pending_app
-                .entry(key.clone())
-                .or_insert(Pending { minute, evidence: MinuteEvidence::default() });
+            let slot = self.pending_app.entry(key.clone()).or_insert(Pending {
+                minute,
+                evidence: MinuteEvidence::default(),
+            });
             slot.minute = minute;
             slot.evidence.add_window(up, down, new_flow);
             slot.evidence.clone()
@@ -390,10 +390,10 @@ impl MinuteStore {
             }
         }
         let evidence = {
-            let slot = self
-                .pending_device
-                .entry(key.clone())
-                .or_insert(Pending { minute, evidence: MinuteEvidence::default() });
+            let slot = self.pending_device.entry(key.clone()).or_insert(Pending {
+                minute,
+                evidence: MinuteEvidence::default(),
+            });
             slot.minute = minute;
             slot.evidence.add_window(up, down, false);
             slot.evidence.clone()
@@ -467,12 +467,18 @@ impl MinuteStore {
         let Some(cutoff) = shift_date(today, -(keep_days as i32)) else {
             return;
         };
-        self.device_minutes.retain(|(_, date), _| date.as_str() >= cutoff.as_str());
-        self.app_minutes.retain(|(_, date, _), _| date.as_str() >= cutoff.as_str());
-        self.traffic.retain(|(_, date), _| date.as_str() >= cutoff.as_str());
-        self.pushed_device.retain(|(_, date), _| date.as_str() >= cutoff.as_str());
-        self.pushed_app.retain(|(_, date, _), _| date.as_str() >= cutoff.as_str());
-        self.pushed_traffic.retain(|(_, date), _| date.as_str() >= cutoff.as_str());
+        self.device_minutes
+            .retain(|(_, date), _| date.as_str() >= cutoff.as_str());
+        self.app_minutes
+            .retain(|(_, date, _), _| date.as_str() >= cutoff.as_str());
+        self.traffic
+            .retain(|(_, date), _| date.as_str() >= cutoff.as_str());
+        self.pushed_device
+            .retain(|(_, date), _| date.as_str() >= cutoff.as_str());
+        self.pushed_app
+            .retain(|(_, date, _), _| date.as_str() >= cutoff.as_str());
+        self.pushed_traffic
+            .retain(|(_, date), _| date.as_str() >= cutoff.as_str());
         let floor = self.last_sample.saturating_sub(FLOW_BASELINE_TTL_SECS);
         self.seen_flows.retain(|_, seen| seen.epoch >= floor);
     }
@@ -587,11 +593,7 @@ impl MinuteStore {
         }
         if let Some(rows) = payload.get("appMinutes").and_then(Value::as_array) {
             for row in rows {
-                let key = (
-                    field(row, "mac"),
-                    field(row, "date"),
-                    field(row, "app"),
-                );
+                let key = (field(row, "mac"), field(row, "date"), field(row, "app"));
                 let top = max_minute(row);
                 let entry = self.pushed_app.entry(key).or_insert(0);
                 *entry = (*entry).max(top);
@@ -721,14 +723,17 @@ impl MinuteStore {
         }
         for row in rows(value, "pushedDevice") {
             if let Some(top) = row.get("top").and_then(Value::as_u64) {
-                store.pushed_device.insert((field(row, "mac"), field(row, "date")), top);
+                store
+                    .pushed_device
+                    .insert((field(row, "mac"), field(row, "date")), top);
             }
         }
         for row in rows(value, "pushedApp") {
             if let Some(top) = row.get("top").and_then(Value::as_u64) {
-                store
-                    .pushed_app
-                    .insert((field(row, "mac"), field(row, "date"), field(row, "app")), top);
+                store.pushed_app.insert(
+                    (field(row, "mac"), field(row, "date"), field(row, "app")),
+                    top,
+                );
             }
         }
         for row in rows(value, "pushedTraffic") {
@@ -921,14 +926,20 @@ pub fn apply_sample(store: &mut MinuteStore, input: &SampleInput) -> MinuteRepor
             Some(_) | None => (
                 // 冷启动首次见到的 flow 已经带着整条连接的累计字节，不能记账。
                 if baselining { 0 } else { row.counters.bytes_up },
-                if baselining { 0 } else { row.counters.bytes_down },
+                if baselining {
+                    0
+                } else {
+                    row.counters.bytes_down
+                },
                 !baselining,
             ),
         };
         if up_delta == 0 && down_delta == 0 {
             continue;
         }
-        let slot = app_window.entry((row.mac.clone(), app)).or_insert((0, 0, false));
+        let slot = app_window
+            .entry((row.mac.clone(), app))
+            .or_insert((0, 0, false));
         slot.0 = slot.0.saturating_add(up_delta);
         slot.1 = slot.1.saturating_add(down_delta);
         slot.2 |= is_new;
@@ -990,7 +1001,11 @@ pub fn apply_sample(store: &mut MinuteStore, input: &SampleInput) -> MinuteRepor
         .values()
         .map(|minutes| minutes.len())
         .sum();
-    report.app_minutes = store.app_minutes.values().map(|minutes| minutes.len()).sum();
+    report.app_minutes = store
+        .app_minutes
+        .values()
+        .map(|minutes| minutes.len())
+        .sum();
     report
 }
 
@@ -1182,8 +1197,7 @@ pub struct MinuteSampler {
 
 impl MinuteSampler {
     pub fn sample_due(&self, now: u64) -> bool {
-        self.last_sample_at == 0
-            || now.saturating_sub(self.last_sample_at) >= SAMPLE_INTERVAL_SECS
+        self.last_sample_at == 0 || now.saturating_sub(self.last_sample_at) >= SAMPLE_INTERVAL_SECS
     }
 
     pub fn push_due(&self, now: u64) -> bool {
@@ -1205,7 +1219,8 @@ impl MinuteSampler {
 
     /// 这一轮的采样计数器该不该写日志。
     pub fn log_due(&mut self, now: u64) -> bool {
-        if self.last_log_at != 0 && now.saturating_sub(self.last_log_at) < SAMPLE_LOG_INTERVAL_SECS {
+        if self.last_log_at != 0 && now.saturating_sub(self.last_log_at) < SAMPLE_LOG_INTERVAL_SECS
+        {
             return false;
         }
         self.last_log_at = now;
@@ -1338,7 +1353,8 @@ mod tests {
             .collect()
     }
 
-    fn counters(total_up: u64, total_down: u64) -> IpCounters {        IpCounters {
+    fn counters(total_up: u64, total_down: u64) -> IpCounters {
+        IpCounters {
             total_up,
             total_down,
             daily_up: total_up / 2,
@@ -1364,14 +1380,13 @@ mod tests {
     #[test]
     fn five_seconds_of_traffic_is_one_minute() {
         let mut store = MinuteStore::default();
-        let sample = input(
-            T0,
-            vec![flow("7-1-2-0", 4000, 9000, 47218)],
-            counters(0, 0),
-        );
+        let sample = input(T0, vec![flow("7-1-2-0", 4000, 9000, 47218)], counters(0, 0));
         // 冷启动只建基线，一条字节都不记。
         apply_sample(&mut store, &sample);
-        assert_eq!(store.app_minutes.values().map(|m| m.len()).sum::<usize>(), 0);
+        assert_eq!(
+            store.app_minutes.values().map(|m| m.len()).sum::<usize>(),
+            0
+        );
 
         let next = input(
             T0 + 5,
@@ -1382,10 +1397,17 @@ mod tests {
         store.advance_to(T0 + 60);
         let minutes = store
             .app_minutes
-            .get(&(MAC.to_string(), "2026-09-20".to_string(), "微信".to_string()))
+            .get(&(
+                MAC.to_string(),
+                "2026-09-20".to_string(),
+                "微信".to_string(),
+            ))
             .cloned()
             .unwrap_or_default();
-        assert_eq!(minutes.keys().copied().collect::<Vec<_>>(), vec![minute_start(T0)]);
+        assert_eq!(
+            minutes.keys().copied().collect::<Vec<_>>(),
+            vec![minute_start(T0)]
+        );
         // 5 秒和 55 秒一样，只有一分钟。
         assert_eq!(
             store
@@ -1409,9 +1431,16 @@ mod tests {
                 counters(1_000_000, 8_000_000),
             ),
         );
-        let key = (MAC.to_string(), "2026-09-20".to_string(), "微信".to_string());
+        let key = (
+            MAC.to_string(),
+            "2026-09-20".to_string(),
+            "微信".to_string(),
+        );
         let credited = store.app_minutes.get(&key).cloned().unwrap_or_default();
-        assert_eq!(credited.keys().copied().collect::<Vec<_>>(), vec![minute_start(T0)]);
+        assert_eq!(
+            credited.keys().copied().collect::<Vec<_>>(),
+            vec![minute_start(T0)]
+        );
 
         // 同一分钟再命中 20 次也只能是 1 分钟，且分钟起点这个键不会漂。
         for i in 0..20 {
@@ -1440,10 +1469,7 @@ mod tests {
     #[test]
     fn app_family_merges_sub_appids_into_one_name() {
         let mut store = MinuteStore::default();
-        apply_sample(
-            &mut store,
-            &input(T0, vec![], counters(0, 0)),
-        );
+        apply_sample(&mut store, &input(T0, vec![], counters(0, 0)));
         let sample = input(
             T0 + 5,
             vec![
@@ -1495,7 +1521,11 @@ mod tests {
         assert_eq!(
             store
                 .app_minutes
-                .get(&(MAC.to_string(), "2026-09-20".to_string(), "微信".to_string()))
+                .get(&(
+                    MAC.to_string(),
+                    "2026-09-20".to_string(),
+                    "微信".to_string()
+                ))
                 .map(|m| m.len()),
             Some(1)
         );
@@ -1523,7 +1553,9 @@ mod tests {
         );
         // 设备总流量来自固件计数，与 RDPI 无关。
         assert_eq!(
-            store.traffic.get(&(MAC.to_string(), "2026-09-20".to_string())),
+            store
+                .traffic
+                .get(&(MAC.to_string(), "2026-09-20".to_string())),
             Some(&TrafficCounters {
                 tx_bytes: 100_000,
                 rx_bytes: 100_000
@@ -1544,7 +1576,10 @@ mod tests {
         sample.child_macs = BTreeSet::new();
         apply_sample(&mut store, &sample);
         store.advance_to(T0 + 60);
-        assert!(store.device_minutes.is_empty(), "没有守护设备就没有该记的对象");
+        assert!(
+            store.device_minutes.is_empty(),
+            "没有守护设备就没有该记的对象"
+        );
         assert!(store.app_minutes.is_empty());
         assert!(store.traffic.is_empty());
     }
@@ -1623,7 +1658,11 @@ mod tests {
         apply_sample(&mut store, &input(T0, vec![], counters(0, 0)));
         apply_sample(
             &mut store,
-            &input(T0 + 5, vec![flow("7-1-2-0", 9_000, 9_000, 47218)], counters(9_000, 9_000)),
+            &input(
+                T0 + 5,
+                vec![flow("7-1-2-0", 9_000, 9_000, 47218)],
+                counters(9_000, 9_000),
+            ),
         );
         // 固件把同一条五元组复用给新连接：计数器倒退必须重新起算，否则这条
         // flow 之后每个窗口的差值都是 0，时长就永远停在这里。
@@ -1639,7 +1678,11 @@ mod tests {
         assert_eq!(
             store
                 .app_minutes
-                .get(&(MAC.to_string(), "2026-09-20".to_string(), "微信".to_string()))
+                .get(&(
+                    MAC.to_string(),
+                    "2026-09-20".to_string(),
+                    "微信".to_string()
+                ))
                 .map(|minutes| minutes.len()),
             Some(1)
         );
@@ -1656,7 +1699,13 @@ mod tests {
             credited(&[(T0, 100, 900), (T0 + 60, 200, 800)]),
         );
         let body = store.ingest_payload(DEFAULT_KEEP_DAYS);
-        assert_eq!(body["deviceMinutes"][0]["minutes"].as_array().unwrap().len(), 2);
+        assert_eq!(
+            body["deviceMinutes"][0]["minutes"]
+                .as_array()
+                .unwrap()
+                .len(),
+            2
+        );
         // 证据数组和分钟数组必须等长且同序，Hub 是按同一个下标读的。
         assert_eq!(body["deviceMinutes"][0]["up"].as_array().unwrap().len(), 2);
         assert_eq!(body["deviceMinutes"][0]["up"][0], json!(100));
@@ -1670,7 +1719,13 @@ mod tests {
             .insert(T0 + 120, MinuteEvidence::default());
         let body = store.ingest_payload(DEFAULT_KEEP_DAYS);
         // 只重发新增的那一分钟，不整天重传。
-        assert_eq!(body["deviceMinutes"][0]["minutes"].as_array().unwrap().len(), 1);
+        assert_eq!(
+            body["deviceMinutes"][0]["minutes"]
+                .as_array()
+                .unwrap()
+                .len(),
+            1
+        );
         assert_eq!(body["deviceMinutes"][0]["minutes"][0], json!(T0 + 120));
     }
 
@@ -1692,16 +1747,24 @@ mod tests {
     #[test]
     fn store_round_trips_through_json() {
         let mut store = MinuteStore::default();
-        store
-            .device_minutes
-            .insert((MAC.to_string(), "2026-09-20".to_string()), credited(&[(T0, 7, 11)]));
+        store.device_minutes.insert(
+            (MAC.to_string(), "2026-09-20".to_string()),
+            credited(&[(T0, 7, 11)]),
+        );
         store.app_minutes.insert(
-            (MAC.to_string(), "2026-09-20".to_string(), "微信".to_string()),
+            (
+                MAC.to_string(),
+                "2026-09-20".to_string(),
+                "微信".to_string(),
+            ),
             credited(&[(T0, 1, 2), (T0 + 60, 3, 4)]),
         );
         store.traffic.insert(
             (MAC.to_string(), "2026-09-20".to_string()),
-            TrafficCounters { tx_bytes: 11, rx_bytes: 22 },
+            TrafficCounters {
+                tx_bytes: 11,
+                rx_bytes: 22,
+            },
         );
         let restored = MinuteStore::from_json(&store.to_json());
         assert_eq!(restored.device_minutes, store.device_minutes);
@@ -1733,7 +1796,12 @@ mod tests {
         let parsed = parse_flow_audit_ips(text);
         assert_eq!(
             parsed.get("192.168.5.132"),
-            Some(&IpCounters { total_up: 123, total_down: 456, daily_up: 12, daily_down: 45 })
+            Some(&IpCounters {
+                total_up: 123,
+                total_down: 456,
+                daily_up: 12,
+                daily_down: 45
+            })
         );
     }
 

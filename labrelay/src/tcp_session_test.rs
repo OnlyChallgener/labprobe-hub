@@ -287,39 +287,147 @@ impl ExtremeNoTrackGuard {
     fn activate(target: SocketAddr) -> Self {
         let ip = target.ip().to_string();
         let port = target.port().to_string();
-        let cmd = if target.is_ipv6() { "ip6tables" } else { "iptables" };
+        let cmd = if target.is_ipv6() {
+            "ip6tables"
+        } else {
+            "iptables"
+        };
 
         let _ = std::process::Command::new(cmd)
-            .args(["-t", "raw", "-D", "OUTPUT", "-p", "tcp", "-d", &ip, "--dport", &port, "-j", "NOTRACK", "-m", "comment", "--comment", "labprobe-peak"])
+            .args([
+                "-t",
+                "raw",
+                "-D",
+                "OUTPUT",
+                "-p",
+                "tcp",
+                "-d",
+                &ip,
+                "--dport",
+                &port,
+                "-j",
+                "NOTRACK",
+                "-m",
+                "comment",
+                "--comment",
+                "labprobe-peak",
+            ])
             .output();
         let _ = std::process::Command::new(cmd)
-            .args(["-t", "raw", "-D", "PREROUTING", "-p", "tcp", "-s", &ip, "--sport", &port, "-j", "NOTRACK", "-m", "comment", "--comment", "labprobe-peak"])
+            .args([
+                "-t",
+                "raw",
+                "-D",
+                "PREROUTING",
+                "-p",
+                "tcp",
+                "-s",
+                &ip,
+                "--sport",
+                &port,
+                "-j",
+                "NOTRACK",
+                "-m",
+                "comment",
+                "--comment",
+                "labprobe-peak",
+            ])
             .output();
         let _ = std::process::Command::new(cmd)
-            .args(["-t", "raw", "-D", "OUTPUT", "-p", "tcp", "-d", &ip, "--dport", &port, "-j", "NOTRACK"])
+            .args([
+                "-t", "raw", "-D", "OUTPUT", "-p", "tcp", "-d", &ip, "--dport", &port, "-j",
+                "NOTRACK",
+            ])
             .output();
         let _ = std::process::Command::new(cmd)
-            .args(["-t", "raw", "-D", "PREROUTING", "-p", "tcp", "-s", &ip, "--sport", &port, "-j", "NOTRACK"])
+            .args([
+                "-t",
+                "raw",
+                "-D",
+                "PREROUTING",
+                "-p",
+                "tcp",
+                "-s",
+                &ip,
+                "--sport",
+                &port,
+                "-j",
+                "NOTRACK",
+            ])
             .output();
 
         let out_res = std::process::Command::new(cmd)
-            .args(["-t", "raw", "-I", "OUTPUT", "-p", "tcp", "-d", &ip, "--dport", &port, "-j", "NOTRACK", "-m", "comment", "--comment", "labprobe-peak"])
+            .args([
+                "-t",
+                "raw",
+                "-I",
+                "OUTPUT",
+                "-p",
+                "tcp",
+                "-d",
+                &ip,
+                "--dport",
+                &port,
+                "-j",
+                "NOTRACK",
+                "-m",
+                "comment",
+                "--comment",
+                "labprobe-peak",
+            ])
             .output();
         let pre_res = std::process::Command::new(cmd)
-            .args(["-t", "raw", "-I", "PREROUTING", "-p", "tcp", "-s", &ip, "--sport", &port, "-j", "NOTRACK", "-m", "comment", "--comment", "labprobe-peak"])
+            .args([
+                "-t",
+                "raw",
+                "-I",
+                "PREROUTING",
+                "-p",
+                "tcp",
+                "-s",
+                &ip,
+                "--sport",
+                &port,
+                "-j",
+                "NOTRACK",
+                "-m",
+                "comment",
+                "--comment",
+                "labprobe-peak",
+            ])
             .output();
 
         if let (Ok(o), Ok(p)) = (out_res, pre_res) {
             if o.status.success() && p.status.success() {
-                return Self { target, active: true, used_comment: true };
+                return Self {
+                    target,
+                    active: true,
+                    used_comment: true,
+                };
             }
         }
 
         let out_res2 = std::process::Command::new(cmd)
-            .args(["-t", "raw", "-I", "OUTPUT", "-p", "tcp", "-d", &ip, "--dport", &port, "-j", "NOTRACK"])
+            .args([
+                "-t", "raw", "-I", "OUTPUT", "-p", "tcp", "-d", &ip, "--dport", &port, "-j",
+                "NOTRACK",
+            ])
             .output();
         let pre_res2 = std::process::Command::new(cmd)
-            .args(["-t", "raw", "-I", "PREROUTING", "-p", "tcp", "-s", &ip, "--sport", &port, "-j", "NOTRACK"])
+            .args([
+                "-t",
+                "raw",
+                "-I",
+                "PREROUTING",
+                "-p",
+                "tcp",
+                "-s",
+                &ip,
+                "--sport",
+                &port,
+                "-j",
+                "NOTRACK",
+            ])
             .output();
 
         let active = match (out_res2, pre_res2) {
@@ -327,7 +435,11 @@ impl ExtremeNoTrackGuard {
             _ => false,
         };
 
-        Self { target, active, used_comment: false }
+        Self {
+            target,
+            active,
+            used_comment: false,
+        }
     }
 
     fn restore(&mut self) {
@@ -336,20 +448,74 @@ impl ExtremeNoTrackGuard {
         }
         let ip = self.target.ip().to_string();
         let port = self.target.port().to_string();
-        let cmd = if self.target.is_ipv6() { "ip6tables" } else { "iptables" };
+        let cmd = if self.target.is_ipv6() {
+            "ip6tables"
+        } else {
+            "iptables"
+        };
         if self.used_comment {
             let _ = std::process::Command::new(cmd)
-                .args(["-t", "raw", "-D", "OUTPUT", "-p", "tcp", "-d", &ip, "--dport", &port, "-j", "NOTRACK", "-m", "comment", "--comment", "labprobe-peak"])
+                .args([
+                    "-t",
+                    "raw",
+                    "-D",
+                    "OUTPUT",
+                    "-p",
+                    "tcp",
+                    "-d",
+                    &ip,
+                    "--dport",
+                    &port,
+                    "-j",
+                    "NOTRACK",
+                    "-m",
+                    "comment",
+                    "--comment",
+                    "labprobe-peak",
+                ])
                 .output();
             let _ = std::process::Command::new(cmd)
-                .args(["-t", "raw", "-D", "PREROUTING", "-p", "tcp", "-s", &ip, "--sport", &port, "-j", "NOTRACK", "-m", "comment", "--comment", "labprobe-peak"])
+                .args([
+                    "-t",
+                    "raw",
+                    "-D",
+                    "PREROUTING",
+                    "-p",
+                    "tcp",
+                    "-s",
+                    &ip,
+                    "--sport",
+                    &port,
+                    "-j",
+                    "NOTRACK",
+                    "-m",
+                    "comment",
+                    "--comment",
+                    "labprobe-peak",
+                ])
                 .output();
         } else {
             let _ = std::process::Command::new(cmd)
-                .args(["-t", "raw", "-D", "OUTPUT", "-p", "tcp", "-d", &ip, "--dport", &port, "-j", "NOTRACK"])
+                .args([
+                    "-t", "raw", "-D", "OUTPUT", "-p", "tcp", "-d", &ip, "--dport", &port, "-j",
+                    "NOTRACK",
+                ])
                 .output();
             let _ = std::process::Command::new(cmd)
-                .args(["-t", "raw", "-D", "PREROUTING", "-p", "tcp", "-s", &ip, "--sport", &port, "-j", "NOTRACK"])
+                .args([
+                    "-t",
+                    "raw",
+                    "-D",
+                    "PREROUTING",
+                    "-p",
+                    "tcp",
+                    "-s",
+                    &ip,
+                    "--sport",
+                    &port,
+                    "-j",
+                    "NOTRACK",
+                ])
                 .output();
         }
         self.active = false;
@@ -361,7 +527,6 @@ impl Drop for ExtremeNoTrackGuard {
         self.restore();
     }
 }
-
 
 #[derive(Debug, Clone, Serialize)]
 #[serde(rename_all = "camelCase")]
@@ -753,7 +918,11 @@ impl TcpSessionTestManager {
         } else {
             Vec::new()
         };
-        let plan = resource_plan(config.target_connections, config.extreme_mode, targets.len());
+        let plan = resource_plan(
+            config.target_connections,
+            config.extreme_mode,
+            targets.len(),
+        );
         let safe_target = plan.safe_target;
         let pending_limit = pending_connect_limit(config.cps, safe_target, config.extreme_mode);
         self.update(&control.task_id, |snapshot| {
@@ -922,7 +1091,9 @@ impl TcpSessionTestManager {
             }
             // A delayed reactor tick must not turn its missed time into a burst
             // of thousands of connects. Keep at most two ticks of launch credit.
-            let tick_seconds = now.duration_since(last_tick).as_secs_f64()
+            let tick_seconds = now
+                .duration_since(last_tick)
+                .as_secs_f64()
                 .min(LOOP_INTERVAL.as_secs_f64() * 2.0);
             last_tick = now;
             let load = (held.len() + pending.len()) as f64 / safe_target.max(1) as f64;
@@ -1523,9 +1694,7 @@ fn resource_plan(requested: usize, extreme_mode: bool, target_count: usize) -> R
     } else {
         single_capacity.saturating_mul(90) / 100
     };
-    let single_budget = single_ceiling
-        .saturating_sub(baseline_source_ports)
-        .max(1);
+    let single_budget = single_ceiling.saturating_sub(baseline_source_ports).max(1);
     let source_port_ceiling = single_ceiling.saturating_mul(target_multiplier);
     let source_port_budget = single_budget.saturating_mul(target_multiplier);
 
@@ -1868,10 +2037,16 @@ mod tests {
     fn available_source_ports_preserves_system_reserved_ranges() {
         let ports = available_source_ports(1024, 65535);
         if let Some(first) = ports.front() {
-            assert!(*first >= 1500, "first port should be >= 1500 to preserve system daemons");
+            assert!(
+                *first >= 1500,
+                "first port should be >= 1500 to preserve system daemons"
+            );
         }
         if let Some(last) = ports.back() {
-            assert!(*last <= 64999, "last port should be <= 64999 to preserve high ephemeral range");
+            assert!(
+                *last <= 64999,
+                "last port should be <= 64999 to preserve high ephemeral range"
+            );
         }
     }
 
@@ -1882,4 +2057,3 @@ mod tests {
         assert!(double.safe_target >= single.safe_target);
     }
 }
-

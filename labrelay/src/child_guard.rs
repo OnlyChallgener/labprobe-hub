@@ -365,7 +365,9 @@ fn usage_report(payload: &Value) -> Result<Value> {
         .and_then(Value::as_str)
         .ok_or_else(|| anyhow!("missing uid"))?;
     let snapshot = load_snapshot()?;
-    let user = snapshot.user(uid).ok_or_else(|| anyhow!("device not found"))?;
+    let user = snapshot
+        .user(uid)
+        .ok_or_else(|| anyhow!("device not found"))?;
     let macs: Vec<String> = user
         .lists
         .get("mac")
@@ -497,7 +499,10 @@ fn usage_stats_report(payload: &Value) -> Result<Value> {
     let mut report = crate::minute_stats::with_store(|store| store.report_json(&macs, &date));
     if let Some(object) = report.as_object_mut() {
         object.insert("ok".into(), json!(true));
-        object.insert("uid".into(), payload.get("uid").cloned().unwrap_or(Value::Null));
+        object.insert(
+            "uid".into(),
+            payload.get("uid").cloned().unwrap_or(Value::Null),
+        );
         object.insert("macs".into(), json!(macs));
         object.insert("source".into(), json!("relay"));
         object.insert(
@@ -1081,13 +1086,19 @@ fn policy_with_enabled(policy: &UciSection, snapshot: &Snapshot, enabled: bool) 
 }
 
 fn master_revision(snapshot: &Snapshot) -> u64 {
-    snapshot.named("config").and_then(|s| s.options.get("labprobe_master_revision"))
-        .and_then(|value| value.parse().ok()).unwrap_or(0)
+    snapshot
+        .named("config")
+        .and_then(|s| s.options.get("labprobe_master_revision"))
+        .and_then(|value| value.parse().ok())
+        .unwrap_or(0)
 }
 
 fn master_enabled(snapshot: &Snapshot) -> bool {
-    snapshot.named("config").and_then(|s| s.options.get("labprobe_master_enabled"))
-        .map(|value| value != "0").unwrap_or(true)
+    snapshot
+        .named("config")
+        .and_then(|s| s.options.get("labprobe_master_enabled"))
+        .map(|value| value != "0")
+        .unwrap_or(true)
 }
 
 fn payload_policy(policy: &UciSection, snapshot: &Snapshot) -> UciSection {
@@ -1095,9 +1106,11 @@ fn payload_policy(policy: &UciSection, snapshot: &Snapshot) -> UciSection {
     // Preserve desired ranges before replacing effective ranges, including policies
     // originally created by the firmware rather than LabProbe.
     let desired = desired_times(policy, snapshot);
-    copy.options.entry("labprobe_time".into())
+    copy.options
+        .entry("labprobe_time".into())
         .or_insert_with(|| times_json(&desired).to_string());
-    copy.options.entry("labprobe_enabled".into())
+    copy.options
+        .entry("labprobe_enabled".into())
         .or_insert_with(|| if desired.is_empty() { "0" } else { "1" }.into());
     let times = copy.lists.remove("_times").unwrap_or_else(|| {
         let enabled = copy
@@ -1117,7 +1130,11 @@ fn payload_policy(policy: &UciSection, snapshot: &Snapshot) -> UciSection {
             })
             .collect()
     });
-    let times = if master_enabled(snapshot) { times } else { Vec::new() };
+    let times = if master_enabled(snapshot) {
+        times
+    } else {
+        Vec::new()
+    };
     let tr_name = copy.options.get("tr").cloned().unwrap_or_default();
     copy.options.insert(
         "_payload_times".into(),
@@ -1178,22 +1195,77 @@ fn sync_child_guard_ip6_block_router() {
         .args(&["create", "child_guard_ip6_block", "hash:mac", "-exist"])
         .status();
     let _ = Command::new("ip6tables")
-        .args(&["-C", "FORWARD", "!", "-o", "br-lan", "-m", "set", "--match-set", "child_guard_ip6_block", "src", "-j", "REJECT", "--reject-with", "icmp6-adm-prohibited"])
+        .args(&[
+            "-C",
+            "FORWARD",
+            "!",
+            "-o",
+            "br-lan",
+            "-m",
+            "set",
+            "--match-set",
+            "child_guard_ip6_block",
+            "src",
+            "-j",
+            "REJECT",
+            "--reject-with",
+            "icmp6-adm-prohibited",
+        ])
         .status()
         .map(|status| {
             if !status.success() {
                 let _ = Command::new("ip6tables")
-                    .args(&["-I", "FORWARD", "1", "!", "-o", "br-lan", "-m", "set", "--match-set", "child_guard_ip6_block", "src", "-j", "REJECT", "--reject-with", "icmp6-adm-prohibited"])
+                    .args(&[
+                        "-I",
+                        "FORWARD",
+                        "1",
+                        "!",
+                        "-o",
+                        "br-lan",
+                        "-m",
+                        "set",
+                        "--match-set",
+                        "child_guard_ip6_block",
+                        "src",
+                        "-j",
+                        "REJECT",
+                        "--reject-with",
+                        "icmp6-adm-prohibited",
+                    ])
                     .status();
             }
         });
     // Remove the legacy blanket rules.  They also rejected LAN-local IPv6 and
     // return traffic; only outbound WAN forwarding needs to fall back to IPv4.
     let _ = Command::new("ip6tables")
-        .args(&["-D", "FORWARD", "-m", "set", "--match-set", "child_guard_ip6_block", "dst", "-j", "REJECT", "--reject-with", "icmp6-adm-prohibited"])
+        .args(&[
+            "-D",
+            "FORWARD",
+            "-m",
+            "set",
+            "--match-set",
+            "child_guard_ip6_block",
+            "dst",
+            "-j",
+            "REJECT",
+            "--reject-with",
+            "icmp6-adm-prohibited",
+        ])
         .status();
     let _ = Command::new("ip6tables")
-        .args(&["-D", "FORWARD", "-m", "set", "--match-set", "child_guard_ip6_block", "src", "-j", "REJECT", "--reject-with", "icmp6-adm-prohibited"])
+        .args(&[
+            "-D",
+            "FORWARD",
+            "-m",
+            "set",
+            "--match-set",
+            "child_guard_ip6_block",
+            "src",
+            "-j",
+            "REJECT",
+            "--reject-with",
+            "icmp6-adm-prohibited",
+        ])
         .status();
 
     if let Ok(snapshot) = load_snapshot() {
@@ -1272,7 +1344,10 @@ pub fn trigger_reload() {
             // 留足余量，只用来兜住「reload 自己卡死」这一种情况。
             let _ = command_output(
                 "sh",
-                &["-c", "timeout -t 240 /etc/init.d/child_guard reload >/dev/null 2>&1"],
+                &[
+                    "-c",
+                    "timeout -t 240 /etc/init.d/child_guard reload >/dev/null 2>&1",
+                ],
             );
             sync_child_guard_ip6_block_router();
             if !RELOAD_AGAIN.load(Ordering::SeqCst) {
@@ -1289,7 +1364,12 @@ pub fn trigger_reload() {
 fn drop_runtime_policy(pid: &str) {
     let _ = command_output(
         "ubus",
-        &["call", "sniffer.policy", "del", &format!("{{\"pid\":\"{}\"}}", pid)],
+        &[
+            "call",
+            "sniffer.policy",
+            "del",
+            &format!("{{\"pid\":\"{}\"}}", pid),
+        ],
     );
 }
 
@@ -1305,7 +1385,10 @@ fn write_user(
 }
 
 fn write_user_config(
-    snapshot: &Snapshot, uid: &str, policies: &[UciSection], fallback: Option<&Value>
+    snapshot: &Snapshot,
+    uid: &str,
+    policies: &[UciSection],
+    fallback: Option<&Value>,
 ) -> Result<()> {
     let policies = policies
         .iter()
@@ -1410,7 +1493,6 @@ fn policy_config_matches(actual: &UciSection, expected: &UciSection) -> bool {
         .all(|key| actual.options.get(*key) == expected.options.get(*key))
         && actual.lists.get("app") == expected.lists.get("app")
 }
-
 
 fn transactional_write<S, W, V, R>(
     snapshot: &S,
@@ -1538,58 +1620,94 @@ fn runtime_mapping(uid: &str, user_show: &Value, policy_show: &Value) -> Value {
 // Router-scoped plan pause: never overwrite individual plan-enabled flags,
 // per-device manual blocks, membership or statistics.
 fn set_master_enabled(payload: &Value) -> Result<Value> {
-    let enabled = payload.get("enabled").and_then(Value::as_bool)
+    let enabled = payload
+        .get("enabled")
+        .and_then(Value::as_bool)
         .ok_or_else(|| anyhow!("missing enabled"))?;
     let before = load_snapshot()?;
     let next_revision = master_revision(&before).saturating_add(1);
     let mut target = before.clone();
-    let config = target.sections.iter_mut().find(|s| s.name == "config")
+    let config = target
+        .sections
+        .iter_mut()
+        .find(|s| s.name == "config")
         .ok_or_else(|| anyhow!("child_guard config not found"))?;
-    config.options.insert("labprobe_master_enabled".into(), if enabled { "1" } else { "0" }.into());
-    config.options.insert("labprobe_master_revision".into(), next_revision.to_string());
-    let users = before.sections_of("user").map(|u| u.name.clone()).collect::<Vec<_>>();
+    config.options.insert(
+        "labprobe_master_enabled".into(),
+        if enabled { "1" } else { "0" }.into(),
+    );
+    config
+        .options
+        .insert("labprobe_master_revision".into(), next_revision.to_string());
+    let users = before
+        .sections_of("user")
+        .map(|u| u.name.clone())
+        .collect::<Vec<_>>();
     let apply = |snapshot: &Snapshot| -> Result<()> {
         for uid in &users {
             write_user_config(snapshot, uid, &policies_for(snapshot, uid), None)?;
         }
-        let assignment = format!("{}.config.labprobe_master_enabled={}", CONFIG,
-            if master_enabled(snapshot) { "1" } else { "0" });
+        let assignment = format!(
+            "{}.config.labprobe_master_enabled={}",
+            CONFIG,
+            if master_enabled(snapshot) { "1" } else { "0" }
+        );
         command_output("uci", &["-q", "set", &assignment])?;
-        let revision = format!("{}.config.labprobe_master_revision={}", CONFIG, master_revision(snapshot));
+        let revision = format!(
+            "{}.config.labprobe_master_revision={}",
+            CONFIG,
+            master_revision(snapshot)
+        );
         command_output("uci", &["-q", "set", &revision])?;
         command_output("uci", &["-q", "commit", CONFIG])?;
         Ok(())
     };
-    transactional_write(&before, || apply(&target), || {
-        let current = load_snapshot()?;
-        if master_enabled(&current) != enabled { bail!("master state verification failed"); }
-        for uid in &users {
-            for original in policies_for(&target, uid) {
-                let actual = current.named(&original.name)
-                    .ok_or_else(|| anyhow!("plan missing after master write"))?;
-                if plan_value(actual, &current) != plan_value(&original, &target) {
-                    // Firmware-origin plans gain metadata but keep their public content.
-                    let mut actual_value = plan_value(actual, &current);
-                    let mut expected_value = plan_value(&original, &target);
-                    actual_value.as_object_mut().unwrap().remove("source");
-                    expected_value.as_object_mut().unwrap().remove("source");
-                    if actual_value != expected_value { bail!("plan changed during master write"); }
-                }
-                let expected = payload_policy(&original, &target);
-                let actual_times = actual.options.get("tr").and_then(|name| current.named(name))
-                    .map(parse_times).unwrap_or_default();
-                let actual_times = times_json(&actual_times);
-                let prepared = user_payload_with_times(&target, uid, &[expected], None)?;
-                if prepared["policies"][0]["tr"] != actual_times {
-                    bail!("effective plan ranges verification failed");
+    transactional_write(
+        &before,
+        || apply(&target),
+        || {
+            let current = load_snapshot()?;
+            if master_enabled(&current) != enabled {
+                bail!("master state verification failed");
+            }
+            for uid in &users {
+                for original in policies_for(&target, uid) {
+                    let actual = current
+                        .named(&original.name)
+                        .ok_or_else(|| anyhow!("plan missing after master write"))?;
+                    if plan_value(actual, &current) != plan_value(&original, &target) {
+                        // Firmware-origin plans gain metadata but keep their public content.
+                        let mut actual_value = plan_value(actual, &current);
+                        let mut expected_value = plan_value(&original, &target);
+                        actual_value.as_object_mut().unwrap().remove("source");
+                        expected_value.as_object_mut().unwrap().remove("source");
+                        if actual_value != expected_value {
+                            bail!("plan changed during master write");
+                        }
+                    }
+                    let expected = payload_policy(&original, &target);
+                    let actual_times = actual
+                        .options
+                        .get("tr")
+                        .and_then(|name| current.named(name))
+                        .map(parse_times)
+                        .unwrap_or_default();
+                    let actual_times = times_json(&actual_times);
+                    let prepared = user_payload_with_times(&target, uid, &[expected], None)?;
+                    if prepared["policies"][0]["tr"] != actual_times {
+                        bail!("effective plan ranges verification failed");
+                    }
                 }
             }
-        }
-        Ok(())
-    }, |snapshot| apply(snapshot))?;
+            Ok(())
+        },
+        |snapshot| apply(snapshot),
+    )?;
     trigger_reload();
-    Ok(json!({"ok": true, "masterEnabled": enabled, "masterSupported": true,
-        "masterRevision": next_revision, "changed": users.len(), "runtimePending": true}))
+    Ok(
+        json!({"ok": true, "masterEnabled": enabled, "masterSupported": true,
+        "masterRevision": next_revision, "changed": users.len(), "runtimePending": true}),
+    )
 }
 
 fn set_all_plans_enabled(payload: &Value) -> Result<Value> {
@@ -1808,7 +1926,10 @@ fn device_pass(payload: &Value) -> Result<Value> {
         .get("uid")
         .and_then(Value::as_str)
         .ok_or_else(|| anyhow!("missing uid"))?;
-    let endtime = payload.get("untilEpoch").and_then(Value::as_u64).unwrap_or(0);
+    let endtime = payload
+        .get("untilEpoch")
+        .and_then(Value::as_u64)
+        .unwrap_or(0);
     let snapshot = load_snapshot()?;
     let section = snapshot
         .user(uid)
@@ -1825,7 +1946,10 @@ fn device_pass(payload: &Value) -> Result<Value> {
 }
 
 fn set_device_pause(section: &str, endtime: u64) -> Result<()> {
-    command_output("uci", &["-q", "set", &format!("{CONFIG}.{section}.pause={endtime}")])?;
+    command_output(
+        "uci",
+        &["-q", "set", &format!("{CONFIG}.{section}.pause={endtime}")],
+    )?;
     command_output("uci", &["-q", "commit", CONFIG])?;
     Ok(())
 }
@@ -1923,7 +2047,12 @@ fn ensure_runtime_user_macs(uid: &str, macs: &[String]) -> Result<()> {
     }
     let policy = current
         .as_ref()
-        .and_then(|object| object.get("policy").or_else(|| object.get("policies")).cloned())
+        .and_then(|object| {
+            object
+                .get("policy")
+                .or_else(|| object.get("policies"))
+                .cloned()
+        })
         .map(|value| json_strings(Some(&value)))
         .unwrap_or_default();
     let effect = current
@@ -1975,33 +2104,66 @@ fn verify_user_presence(uid: &str, should_exist: bool, macs: &[String]) -> Resul
 }
 
 fn membership_uid(snapshot: &Snapshot, requested: &str, macs: &[String]) -> Result<Option<String>> {
-    let matching = |user: &UciSection| user.lists.get("mac").map(|values|
-        values.iter().any(|mac| macs.contains(&normalize_mac(mac)))).unwrap_or(false);
+    let matching = |user: &UciSection| {
+        user.lists
+            .get("mac")
+            .map(|values| values.iter().any(|mac| macs.contains(&normalize_mac(mac))))
+            .unwrap_or(false)
+    };
     if let Some(user) = snapshot.user(requested) {
-        if !macs.is_empty() && !matching(user) { bail!("守护设备标识已变化，请刷新名单后重试"); }
+        if !macs.is_empty() && !matching(user) {
+            bail!("守护设备标识已变化，请刷新名单后重试");
+        }
         return Ok(Some(user.name.clone()));
     }
-    if macs.is_empty() { return Ok(None); }
-    let matches: Vec<_> = snapshot.sections_of("user").filter(|user| matching(user)).collect();
-    if matches.len() > 1 { bail!("设备对应多个守护编号，请刷新名单后重试"); }
+    if macs.is_empty() {
+        return Ok(None);
+    }
+    let matches: Vec<_> = snapshot
+        .sections_of("user")
+        .filter(|user| matching(user))
+        .collect();
+    if matches.len() > 1 {
+        bail!("设备对应多个守护编号，请刷新名单后重试");
+    }
     Ok(matches.first().map(|user| user.name.clone()))
 }
 
-fn membership_add_uid(snapshot: &Snapshot, macs: &[String], official: Option<&str>) -> Result<Option<String>> {
-    let matches: Vec<_> = snapshot.sections_of("user").filter(|user| {
-        user.lists.get("mac").map(|list| list.iter().any(|mac| macs.contains(&normalize_mac(mac)))).unwrap_or(false)
-    }).collect();
+fn membership_add_uid(
+    snapshot: &Snapshot,
+    macs: &[String],
+    official: Option<&str>,
+) -> Result<Option<String>> {
+    let matches: Vec<_> = snapshot
+        .sections_of("user")
+        .filter(|user| {
+            user.lists
+                .get("mac")
+                .map(|list| list.iter().any(|mac| macs.contains(&normalize_mac(mac))))
+                .unwrap_or(false)
+        })
+        .collect();
     if let Some(uid) = official {
         if uid.len() != 32 || !uid.bytes().all(|b| b.is_ascii_hexdigit()) {
             bail!("invalid official guard uid");
         }
         if let Some(section) = snapshot.named(uid) {
-            if section.kind != "user" || !macs.iter().all(|mac| section.lists.get("mac")
-                .map(|list| list.iter().any(|m| normalize_mac(m) == *mac)).unwrap_or(false)) {
+            if section.kind != "user"
+                || !macs.iter().all(|mac| {
+                    section
+                        .lists
+                        .get("mac")
+                        .map(|list| list.iter().any(|m| normalize_mac(m) == *mac))
+                        .unwrap_or(false)
+                })
+            {
                 bail!("official uid belongs to another device");
             }
         }
-        if matches.iter().any(|user| !user.name.eq_ignore_ascii_case(uid)) {
+        if matches
+            .iter()
+            .any(|user| !user.name.eq_ignore_ascii_case(uid))
+        {
             bail!("legacy guard uid must be reconciled before official add");
         }
         return Ok(snapshot.user(uid).map(|user| user.name.clone()));
@@ -2021,9 +2183,16 @@ fn mutate_membership(action: &str, payload: &Value) -> Result<Value> {
                 bail!("at least one valid mac is required");
             }
             let snapshot = load_snapshot()?;
-            let official_uid = payload.get("officialUid").and_then(Value::as_str).map(str::to_uppercase);
-            if let Some(existing_uid) = membership_add_uid(&snapshot, &macs, official_uid.as_deref())? {
-                let user = snapshot.user(&existing_uid).ok_or_else(|| anyhow!("missing guard user"))?;
+            let official_uid = payload
+                .get("officialUid")
+                .and_then(Value::as_str)
+                .map(str::to_uppercase);
+            if let Some(existing_uid) =
+                membership_add_uid(&snapshot, &macs, official_uid.as_deref())?
+            {
+                let user = snapshot
+                    .user(&existing_uid)
+                    .ok_or_else(|| anyhow!("missing guard user"))?;
                 let uid = user.name.clone();
                 let existing_macs = user.lists.get("mac").cloned().unwrap_or_default();
                 // A previous add may have landed in UCI but lost the runtime mac
@@ -2071,14 +2240,21 @@ fn mutate_membership(action: &str, payload: &Value) -> Result<Value> {
             Ok(json!({"ok": true, "uid": uid, "macs": macs, "created": true}))
         }
         "remove_device" => {
-            let requested_uid = payload.get("uid").and_then(Value::as_str)
+            let requested_uid = payload
+                .get("uid")
+                .and_then(Value::as_str)
                 .ok_or_else(|| anyhow!("missing uid"))?;
-            let macs: Vec<_> = json_strings(payload.get("macs")).iter().map(|mac| normalize_mac(mac)).collect();
+            let macs: Vec<_> = json_strings(payload.get("macs"))
+                .iter()
+                .map(|mac| normalize_mac(mac))
+                .collect();
             let snapshot = load_snapshot()?;
             let resolved = membership_uid(&snapshot, requested_uid, &macs)?;
             let Some(resolved_uid) = resolved else {
-                return Ok(json!({"ok": true, "uid": requested_uid, "alreadyAbsent": true,
-                    "removedPlans": 0, "rollback": "not_needed"}));
+                return Ok(
+                    json!({"ok": true, "uid": requested_uid, "alreadyAbsent": true,
+                    "removedPlans": 0, "rollback": "not_needed"}),
+                );
             };
             let uid = resolved_uid.as_str();
             let plans = policies_for(&snapshot, uid);
@@ -2101,7 +2277,9 @@ fn mutate_membership(action: &str, payload: &Value) -> Result<Value> {
             }
             trigger_reload();
             verify_user_presence(uid, false, &[])?;
-            Ok(json!({"ok": true, "uid": uid, "removedUids": [requested_uid, uid], "removedPlans": removed_plans}))
+            Ok(
+                json!({"ok": true, "uid": uid, "removedUids": [requested_uid, uid], "removedPlans": removed_plans}),
+            )
         }
         _ => bail!("unsupported membership action"),
     }
@@ -2162,7 +2340,10 @@ fn list_lan_devices() -> Result<Value> {
     devices.sort_by(|a, b| {
         let key = |value: &Value| {
             (
-                !value.get("guarded").and_then(Value::as_bool).unwrap_or(false),
+                !value
+                    .get("guarded")
+                    .and_then(Value::as_bool)
+                    .unwrap_or(false),
                 value
                     .get("ip")
                     .and_then(Value::as_str)
@@ -2172,7 +2353,9 @@ fn list_lan_devices() -> Result<Value> {
         };
         key(a).cmp(&key(b))
     });
-    Ok(json!({"ok": true, "devices": devices, "masterEnabled": master_enabled(&snapshot), "masterRevision": master_revision(&snapshot), "masterSupported": true}))
+    Ok(
+        json!({"ok": true, "devices": devices, "masterEnabled": master_enabled(&snapshot), "masterRevision": master_revision(&snapshot), "masterSupported": true}),
+    )
 }
 
 /// MACs named by the guard configuration, whether or not enforcement is on right now.
@@ -2202,7 +2385,9 @@ pub fn execute(action: &str, payload: &Value) -> Value {
     let result: Result<Value> = (|| match action {
         "get_master_state" => {
             let snapshot = load_snapshot()?;
-            Ok(json!({"ok": true, "masterEnabled": master_enabled(&snapshot), "masterRevision": master_revision(&snapshot), "masterSupported": true}))
+            Ok(
+                json!({"ok": true, "masterEnabled": master_enabled(&snapshot), "masterRevision": master_revision(&snapshot), "masterSupported": true}),
+            )
         }
         "set_master_enabled" => set_master_enabled(payload),
         "get_capabilities" => Ok(capabilities()),
@@ -2330,8 +2515,13 @@ config timerange 'child_tr_abc1234'
         let uid = "aabbccddeeff";
         let policy = paused.sections_of("policy").next().unwrap().clone();
         let original = plan_value(&policy, &paused);
-        paused.sections.iter_mut().find(|s| s.name == "config").unwrap()
-            .options.insert("labprobe_master_enabled".into(), "0".into());
+        paused
+            .sections
+            .iter_mut()
+            .find(|s| s.name == "config")
+            .unwrap()
+            .options
+            .insert("labprobe_master_enabled".into(), "0".into());
         let prepared = payload_policy(&policy, &paused);
         assert_eq!(prepared.options["_payload_times"], "[]");
         assert_eq!(prepared.options["labprobe_enabled"], "1");
@@ -2339,12 +2529,21 @@ config timerange 'child_tr_abc1234'
         // Simulate firmware persistence with empty effective timerange.
         let mut saved = paused.clone();
         for section in &mut saved.sections {
-            if section.name == policy.name { *section = prepared.clone(); }
-            if section.kind == "timerange" { section.lists.remove("time"); }
+            if section.name == policy.name {
+                *section = prepared.clone();
+            }
+            if section.kind == "timerange" {
+                section.lists.remove("time");
+            }
         }
         let restored_policy = saved.named(&policy.name).unwrap().clone();
-        saved.sections.iter_mut().find(|s| s.name == "config").unwrap()
-            .options.insert("labprobe_master_enabled".into(), "1".into());
+        saved
+            .sections
+            .iter_mut()
+            .find(|s| s.name == "config")
+            .unwrap()
+            .options
+            .insert("labprobe_master_enabled".into(), "1".into());
         let restored = payload_policy(&restored_policy, &saved);
         assert_ne!(restored.options["_payload_times"], "[]");
         assert_eq!(plan_value(&restored, &saved), original);
@@ -2366,7 +2565,9 @@ config timerange 'child_tr_abc1234'
     fn a_global_state_exists_even_without_any_plans() {
         let mut snapshot = parse_uci_export("config config 'config'\n option version '1'\n");
         assert!(master_enabled(&snapshot));
-        snapshot.sections[0].options.insert("labprobe_master_enabled".into(), "0".into());
+        snapshot.sections[0]
+            .options
+            .insert("labprobe_master_enabled".into(), "0".into());
         assert!(!master_enabled(&snapshot));
         assert_eq!(snapshot.sections_of("policy").count(), 0);
     }
@@ -2374,22 +2575,40 @@ config timerange 'child_tr_abc1234'
     #[test]
     fn removal_resolves_changed_uid_by_mac_but_not_by_device_name() {
         let snapshot = parse_uci_export("config user 'new'\n list mac 'aa:bb:cc:dd:ee:01'\n option name 'Mate60'\nconfig user 'other'\n list mac 'aa:bb:cc:dd:ee:02'\n option name 'Mate60'\n");
-        assert_eq!(membership_uid(&snapshot, "old", &["aa:bb:cc:dd:ee:01".into()]).unwrap(), Some("new".into()));
+        assert_eq!(
+            membership_uid(&snapshot, "old", &["aa:bb:cc:dd:ee:01".into()]).unwrap(),
+            Some("new".into())
+        );
         assert_eq!(membership_uid(&snapshot, "old", &[]).unwrap(), None);
         assert!(membership_uid(&snapshot, "other", &["aa:bb:cc:dd:ee:01".into()]).is_err());
-        assert!(membership_uid(&snapshot, "old", &["aa:bb:cc:dd:ee:01".into(), "aa:bb:cc:dd:ee:02".into()]).is_err());
+        assert!(membership_uid(
+            &snapshot,
+            "old",
+            &["aa:bb:cc:dd:ee:01".into(), "aa:bb:cc:dd:ee:02".into()]
+        )
+        .is_err());
     }
 
     #[test]
     fn official_add_requires_the_cloud_uid_and_rejects_legacy_or_foreign_identity() {
         let uid = "ABCDEF0123456789ABCDEF0123456789";
         let macs = vec!["aa:bb:cc:dd:ee:01".into()];
-        assert_eq!(membership_add_uid(&Snapshot::default(), &macs, Some(uid)).unwrap(), None);
-        let canonical = parse_uci_export(&format!("config user '{uid}'\n list mac 'aa:bb:cc:dd:ee:01'\n"));
-        assert_eq!(membership_add_uid(&canonical, &macs, Some(uid)).unwrap(), Some(uid.into()));
+        assert_eq!(
+            membership_add_uid(&Snapshot::default(), &macs, Some(uid)).unwrap(),
+            None
+        );
+        let canonical = parse_uci_export(&format!(
+            "config user '{uid}'\n list mac 'aa:bb:cc:dd:ee:01'\n"
+        ));
+        assert_eq!(
+            membership_add_uid(&canonical, &macs, Some(uid)).unwrap(),
+            Some(uid.into())
+        );
         let legacy = parse_uci_export("config user 'old'\n list mac 'aa:bb:cc:dd:ee:01'\n");
         assert!(membership_add_uid(&legacy, &macs, Some(uid)).is_err());
-        let foreign = parse_uci_export(&format!("config user '{uid}'\n list mac 'aa:bb:cc:dd:ee:02'\n"));
+        let foreign = parse_uci_export(&format!(
+            "config user '{uid}'\n list mac 'aa:bb:cc:dd:ee:02'\n"
+        ));
         assert!(membership_add_uid(&foreign, &macs, Some(uid)).is_err());
         assert!(membership_add_uid(&canonical, &macs, Some("bad")).is_err());
     }
@@ -2609,7 +2828,10 @@ config user 'router_uid'
         let text = "set name child_guard_ip6_block\nType hash:mac\nMembers:\n\tAA:BB:CC:DD:EE:FF,\n\t11:22:33:44:55:66\n\n";
         assert_eq!(
             parse_ipset_members(text),
-            vec!["11:22:33:44:55:66".to_string(), "aa:bb:cc:dd:ee:ff".to_string()]
+            vec![
+                "11:22:33:44:55:66".to_string(),
+                "aa:bb:cc:dd:ee:ff".to_string()
+            ]
         );
         // ipset 不存在时输出没有 Members 段，等于「没在用 IPv6 降级」，不是错误。
         assert!(parse_ipset_members("ipset v6: No such set").is_empty());
