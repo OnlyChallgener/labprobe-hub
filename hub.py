@@ -26,7 +26,7 @@ import paho.mqtt.client as mqtt
 from flask import Flask, request, jsonify, g
 from labprobe_storage import SQLiteStore
 from child_guard_schedule import clean_pass_until
-from official_child_guard import OfficialGuardCoordinator, OfficialGuardError
+from official_child_guard import OfficialGuardCoordinator, OfficialGuardError, normalize_serial
 from child_guard_service import (
     RouterCommandStore,
     ChildGuardValidationError,
@@ -3546,22 +3546,43 @@ def _child_guard_on_command_result(command: Dict[str, Any]) -> None:
 CHILD_GUARD_COMMANDS.add_result_observer(_child_guard_on_command_result)
 
 
+def _official_child_guard_live_serial() -> str:
+    """Read this worker's serial from a fresh, bounded eWeb login.
+
+    Dashboard data is pushed through a HOOK credential and its durable copy is
+    intentionally untrusted. Official-account authorization therefore never
+    falls back to either source. ReyeeSessionManager performs a real login and
+    validates the session with getDeviceInfo; (2, 4) network timeouts bound the
+    key lookup, login and validation requests.
+    """
+    try:
+        from router_core.driver.reyee_session import ReyeeSessionManager
+        from router_rpc import EncryptedRouterConfigStore
+
+        config = EncryptedRouterConfigStore(CONFIG_DIR).load()
+        if not config.get("address") or not config.get("password"):
+            return ""
+        manager = ReyeeSessionManager(
+            address=config["address"], password=config["password"],
+            username=config.get("username") or "admin",
+            verify_tls=bool(config.get("verifyTls")),
+            session_seconds=config.get("sessionSeconds") or 3600,
+            http_timeout=(2, 4),
+        )
+        session = manager.get_session(force=True)
+        return normalize_serial(getattr(session, "serial_number", ""))
+    except Exception as exc:
+        LOGGER.warning("official child guard live router identity failed (%s)", type(exc).__name__)
+        return ""
+
+
 def _official_child_guard_identity(router: str) -> str:
     # Each deployed Hub serves one router. Never borrow another router's serial
-    # or use an APP-supplied serial to select an official network.
+    # or use an APP/HOOK/persisted serial to select an official network.
     key = child_guard_router_alias(router)
     if not key or key != child_guard_router_alias(primary_router_name()):
         return ""
-    with ROUTER_DASHBOARD_LOCK:
-        dashboard = copy.deepcopy(ROUTER_DASHBOARD_CACHE)
-    dashboard_key = child_guard_router_alias(dashboard.get("router"))
-    # eWeb reports its generic hostname "Ruijie" on BE50. It is not a model
-    # identity; the independently verified serial remains the binding boundary.
-    if dashboard_key and dashboard_key not in {key, "ruijie", "router", "primary", "default"}:
-        return ""
-    details = dashboard.get("details") or {}
-    ap = details.get("ap") or {}
-    return str(ap.get("serialNumber") or "").strip()
+    return _official_child_guard_live_serial()
 
 
 OFFICIAL_CHILD_GUARD = OfficialGuardCoordinator(
@@ -3581,21 +3602,98 @@ def _child_guard_official_membership(action: str, payload: Dict[str, Any]):
     return jsonify(result), 202 if result.get("pending") else 200
 
 
-@app.route("/api/router/child-guard/official/auth", methods=["GET", "POST"])
+def _official_account_management_auth() -> bool:
+    accepted = [get_app_token(), str(os.environ.get("APP_TOKEN_PREVIOUS") or "").strip()]
+    return any(_token_matches(candidate, expected)
+               for candidate in _auth_tokens_from_request() for expected in accepted if expected)
+
+
+def _official_account_global_response(router: str, details: Dict[str, Any]) -> Dict[str, Any]:
+    serial = str(details.get("serial") or "").strip().upper()
+    authorized = bool(details.get("authorized") and serial)
+    matched = bool(authorized and details.get("cloudVerified") and details.get("routerVerified")
+                   and details.get("projectId"))
+    code = str(details.get("errorCode") or "")
+    if details.get("remoteRevocation") == "confirmed" and details.get("localCleared") is True:
+        sync_state = "unauthorized"
+    elif authorized and matched:
+        sync_state = "synced"
+    elif code in {"official_connection_pending", "official_unavailable"}:
+        sync_state = "checking"
+    elif code or authorized:
+        sync_state = "failed"
+    else:
+        sync_state = "unauthorized"
+    row = {
+        "routerId": workspace_router_id(), "name": primary_router_name(), "site": "", "model": "",
+        "serialNumber": serial, "online": bool(serial), "authorized": authorized, "matched": matched,
+        "projectId": str(details.get("projectId") or ""),
+        "projectName": str(details.get("projectName") or ""), "syncState": sync_state,
+    }
+    if code:
+        row["errorCode"] = code
+        row["error"] = str(details.get("error") or code)
+    if details.get("localCleared") is not None:
+        row.update(localCleared=details.get("localCleared"),
+                   remoteRevocation=details.get("remoteRevocation", "unknown"),
+                   operationState=details.get("operationState", "unknown"),
+                   retrySafe=bool(details.get("retrySafe")))
+    result = {
+        "ok": bool(details.get("ok", True)),
+        "account": str(details.get("account") or ""),
+        "authorized": authorized,
+        "state": "authorized" if matched else "partial" if authorized else "checking" if sync_state == "checking" else "unauthorized",
+        "projectCount": 1 if matched else 0,
+        "matchedRouterCount": 1 if matched else 0,
+        "hubAuthorization": "synced" if matched else "partial" if authorized else "failed" if sync_state == "failed" else "offline" if not serial else "unauthorized",
+        "routers": [row],
+    }
+    expiry = details.get("expireTime")
+    if isinstance(expiry, int) and expiry > 0:
+        result["expireTime"] = expiry
+    for key in ("localCleared", "remoteRevocation", "operationState", "retrySafe", "errorCode", "error",
+                "cloudVerified", "routerVerified", "serial", "projectId", "projectName", "verifiedAt"):
+        if key in details:
+            result[key] = details[key]
+    return result
+
+
+@app.route("/api/router/child-guard/official/auth", methods=["GET", "POST", "DELETE"])
+@app.route("/api/official-account", methods=["GET", "POST", "DELETE"])
 def api_child_guard_official_auth():
-    if not (check_app_token() if request.method == "POST" else check_read_token()):
+    if not (check_read_token() if request.method == "GET" else _official_account_management_auth()):
         return jsonify({"ok": False, "error": "unauthorized"}), 401
     body = request.get_json(silent=True) or {} if request.method == "POST" else {}
     router = clean_saved_value(body.get("router") or request.args.get("router") or primary_router_name())
-    if request.method == "GET":
-        return jsonify(OFFICIAL_CHILD_GUARD.authorization_status(router))
-    account, password = str(body.get("account") or ""), str(body.get("password") or "")
-    if not account or not password or len(account) > 128 or len(password) > 256:
-        return jsonify({"ok": False, "errorCode": "invalid_request", "error": "请填写官方账号和密码"}), 400
     try:
-        return jsonify(OFFICIAL_CHILD_GUARD.connect(router, account, password))
+        if request.method == "GET":
+            return jsonify(_official_account_global_response(router, OFFICIAL_CHILD_GUARD.authorization_status(
+                router, verify=request.args.get("verify") == "1")))
+        if request.method == "DELETE":
+            details = {**OFFICIAL_CHILD_GUARD.logout(router), "localCleared": True,
+                       "operationState": "complete", "retrySafe": True}
+            return jsonify(_official_account_global_response(router, details))
+        if body.get("action") == "refresh":
+            return jsonify(_official_account_global_response(router, OFFICIAL_CHILD_GUARD.refresh(router)))
+        account, password = str(body.get("account") or ""), str(body.get("password") or "")
+        if not account.strip() or not password or len(account) > 128 or len(password) > 256:
+            return jsonify({"ok": False, "errorCode": "invalid_request", "error": "请填写官方账号和密码"}), 400
+        return jsonify(_official_account_global_response(router, OFFICIAL_CHILD_GUARD.connect(router, account, password)))
     except OfficialGuardError as error:
-        return jsonify({"ok": False, "errorCode": error.code, "error": str(error)}), 409
+        code = error.code
+        try:
+            details = OFFICIAL_CHILD_GUARD.authorization_status(router)
+        except Exception:
+            details = {}
+        if request.method == "DELETE":
+            pending = error.code in {"official_logout_pending", "official_connection_pending", "official_unavailable"}
+            code = "official_logout_pending" if pending else "official_logout_failed"
+            details.update(ok=False, authorized=False, localCleared=True,
+                remoteRevocation="unknown" if pending else "failed",
+                operationState="pending_unknown" if pending else "failed", retrySafe=False)
+        response = _official_account_global_response(router, details)
+        response.update(ok=False, authorized=False, errorCode=code, error=str(error))
+        return jsonify(response), 400 if error.code == "invalid_request" else 409
 
 
 def _child_guard_directory(router: Optional[str] = None) -> List[Dict[str, Any]]:
@@ -4287,6 +4385,18 @@ def _deep_merge_dict(current: Dict[str, Any], update: Dict[str, Any]) -> Dict[st
     return result
 
 
+def _dashboard_details_from_hook(details: Dict[str, Any]) -> Dict[str, Any]:
+    """Keep display details but never cache a HOOK-supplied identity serial."""
+    result = copy.deepcopy(details)
+    result.pop("serialNumber", None)
+    for section in ("ap", "identity"):
+        value = result.get(section)
+        if isinstance(value, dict):
+            for key in ("serialNumber", "serialNumberUpper", "serial", "sn"):
+                value.pop(key, None)
+    return result
+
+
 def _operator_for_dashboard_ip(ip: str) -> str:
     addr = normalize_ip(ip)
     if not ip or not addr or not addr.is_global:
@@ -4459,7 +4569,8 @@ def api_router_dashboard_push():
         details = payload.get("details")
         if isinstance(details, dict):
             existing_details = ROUTER_DASHBOARD_CACHE.get("details") if isinstance(ROUTER_DASHBOARD_CACHE.get("details"), dict) else {}
-            ROUTER_DASHBOARD_CACHE["details"] = _deep_merge_dict(existing_details, details)
+            ROUTER_DASHBOARD_CACHE["details"] = _deep_merge_dict(
+                _dashboard_details_from_hook(existing_details), _dashboard_details_from_hook(details))
             merged_details = ROUTER_DASHBOARD_CACHE.get("details") if isinstance(ROUTER_DASHBOARD_CACHE.get("details"), dict) else {}
             merged_wan = merged_details.get("wan") if isinstance(merged_details.get("wan"), dict) else {}
             if hub_exit_ipv4:

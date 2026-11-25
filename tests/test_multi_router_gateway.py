@@ -556,3 +556,251 @@ def test_route_auth_names_the_hook_owner_and_never_an_owner_key(tmp_path):
     finally:
         server.shutdown()
         server.server_close()
+
+
+def test_nginx_has_exact_global_official_account_location_before_generic_api(tmp_path):
+    config = gateway.load_gateway_config(_config(tmp_path)[0], SECRETS)
+    rendered = gateway.render_nginx_config(config, Path("/tmp/nginx.pid"))
+    exact = f"location = {gateway.OFFICIAL_ACCOUNT_PATH} {{ proxy_pass http://127.0.0.1:{config['registryPort']}{gateway.OFFICIAL_ACCOUNT_PATH}; }}"
+    generic = "location ^~ /api/ {"
+    assert exact in rendered
+    assert rendered.index(exact) < rendered.index(generic)
+
+
+def test_gateway_fans_out_to_workers_concurrently(tmp_path, monkeypatch):
+    config = gateway.load_gateway_config(_config(tmp_path)[0], SECRETS)
+    barrier = threading.Barrier(2)
+
+    def reply(router, method, body=None):
+        barrier.wait(timeout=2)
+        return _official_reply(router, serial=router["routerId"].upper(), project=router["routerId"])
+
+    monkeypatch.setattr(gateway, "_worker_official_call", reply)
+    result = gateway.aggregate_official_account(config, "GET")
+    assert result["state"] == "authorized" and result["matchedRouterCount"] == 2
+
+
+def _official_reply(router, *, serial="SN1", project="p1", authorized=True, matched=True,
+                    account="o***@example.com", fingerprint="fp1", expire=1893456000000):
+    return True, {"ok": True, "authorized": authorized, "serial": serial, "projectId": project,
+        "projectName": "Home", "cloudVerified": matched, "routerVerified": matched,
+        "account": account, "accountFingerprint": fingerprint, "expireTime": expire}
+
+
+def test_gateway_partial_offline_counts_only_unique_verified_projects_and_serials(tmp_path, monkeypatch):
+    config = gateway.load_gateway_config(_config(tmp_path)[0], SECRETS)
+
+    def reply(router, method, body=None):
+        if router["routerId"] == "office":
+            return False, {"ok": False, "errorCode": "worker_offline"}
+        return _official_reply(router)
+
+    monkeypatch.setattr(gateway, "_worker_official_call", reply)
+    result = gateway.aggregate_official_account(config, "POST", {
+        "account": "owner@example.com", "password": "partial-login-password",
+    })
+    assert result["ok"] and result["state"] == "partial" and result["hubAuthorization"] == "partial"
+    assert result["authorized"] and result["projectCount"] == result["matchedRouterCount"] == 1
+    assert result["account"] == "o***@example.com" and result["expireTime"] == 1893456000000
+    assert result["routers"][0]["matched"] and result["routers"][0]["syncState"] == "synced"
+    assert result["routers"][1]["online"] is False and result["routers"][1]["syncState"] == "offline"
+    assert not result["routers"][1]["matched"] and "error" in result["routers"][1]
+    assert "password" not in json.dumps(result) and "token" not in json.dumps(result)
+
+
+def test_gateway_logout_reports_local_clear_and_remote_partial_failure(tmp_path, monkeypatch):
+    config = gateway.load_gateway_config(_config(tmp_path)[0], SECRETS)
+
+    def reply(router, method, body=None):
+        if router["routerId"] == "home":
+            return True, {"ok": True, "authorized": False, "serial": "SN1", "localCleared": True}
+        return True, {"ok": False, "authorized": False, "serial": "SN2", "localCleared": True,
+                      "errorCode": "official_logout_failed", "error": "cloud logout failed"}
+
+    monkeypatch.setattr(gateway, "_worker_official_call", reply)
+    result = gateway.aggregate_official_account(config, "DELETE")
+    assert result["ok"] is False and result["state"] == "partial"
+    assert result["localCleared"] is True and result["authorized"] is False
+    assert result["remoteRevocation"] == "partial" and result["operationState"] == "partial_failure"
+    assert result["retrySafe"] is False
+    assert result["routers"][0]["remoteRevocation"] == "confirmed"
+    assert result["routers"][1]["remoteRevocation"] == "failed"
+    assert result["routers"][1]["localCleared"] is True
+    assert result["errors"] == [{"routerId": "office", "errorCode": "official_logout_failed",
+        "error": gateway._official_error_text("official_logout_failed"),
+        "operationState": "failed", "retrySafe": False}]
+
+
+def test_gateway_codeless_logout_failure_is_not_confirmed(tmp_path, monkeypatch):
+    config = gateway.load_gateway_config(_config(tmp_path)[0], SECRETS)
+
+    def reply(router, method, body=None):
+        return True, {"ok": False, "authorized": False, "serial": "SN1", "localCleared": True}
+
+    monkeypatch.setattr(gateway, "_worker_official_call", reply)
+    result = gateway.aggregate_official_account(config, "DELETE")
+    assert result["ok"] is False and result["state"] == "failed"
+    assert result["remoteRevocation"] == "failed" and result["retrySafe"] is False
+    assert result["routers"][0]["remoteRevocation"] == "failed"
+    assert result["routers"][0]["errorCode"] == "official_logout_failed"
+
+
+def test_gateway_timeout_is_pending_unknown_and_not_safe_to_retry(tmp_path, monkeypatch):
+    config = gateway.load_gateway_config(_config(tmp_path)[0], SECRETS)
+
+    def timeout(*_args, **_kwargs):
+        raise TimeoutError("worker still mutating")
+
+    monkeypatch.setattr(gateway, "urlopen", timeout)
+    online, reply = gateway._worker_official_call(config["routers"][0], "DELETE")
+    assert online and reply["errorCode"] == "worker_timeout"
+    assert reply["operationState"] == "pending_unknown" and reply["retrySafe"] is False
+
+    def mixed(router, method, body=None):
+        if router["routerId"] == "home":
+            return True, {"ok": True, "authorized": False, "serial": "SN1"}
+        return online, reply
+
+    monkeypatch.setattr(gateway, "_worker_official_call", mixed)
+    result = gateway.aggregate_official_account(config, "DELETE")
+    assert result["ok"] is False and result["state"] == "partial"
+    assert result["localCleared"] is None  # The timed-out worker's local state is unknown.
+    assert result["remoteRevocation"] == "unknown" and result["operationState"] == "pending_unknown"
+    assert result["retrySafe"] is False
+    assert result["routers"][1]["operationState"] == "pending_unknown"
+    assert result["routers"][1]["errorCode"] == "worker_timeout"
+
+
+def test_gateway_unknown_serial_is_pending_and_sn_mismatch_is_not_matched(tmp_path, monkeypatch):
+    config = gateway.load_gateway_config(_config(tmp_path)[0], SECRETS)
+
+    def reply(router, method, body=None):
+        if router["routerId"] == "home":
+            return _official_reply(router, serial="", authorized=True, matched=True)
+        return _official_reply(router, serial="DIFFERENT", project="p2", authorized=False, matched=False)
+
+    monkeypatch.setattr(gateway, "_worker_official_call", reply)
+    result = gateway.aggregate_official_account(config, "GET")
+    assert result["state"] == "checking" and result["matchedRouterCount"] == result["projectCount"] == 0
+    assert result["routers"][0]["syncState"] == "offline"
+    assert result["routers"][1]["serialNumber"] == "DIFFERENT"
+    assert result["routers"][1]["syncState"] == "failed" and not result["routers"][1]["matched"]
+
+
+def test_gateway_conflicting_accounts_are_reported_and_counts_are_unique(tmp_path, monkeypatch):
+    config = gateway.load_gateway_config(_config(tmp_path)[0], SECRETS)
+
+    def reply(router, method, body=None):
+        if router["routerId"] == "home":
+            return _official_reply(router, serial="SN1", project="p1", fingerprint="fp1")
+        return _official_reply(router, serial="SN1", project="p1", account="a***@example.com", fingerprint="fp2")
+
+    monkeypatch.setattr(gateway, "_worker_official_call", reply)
+    result = gateway.aggregate_official_account(config, "GET")
+    assert result["state"] == "conflict" and result["hubAuthorization"] == "partial"
+    assert result["projectCount"] == result["matchedRouterCount"] == 1
+
+
+def test_gateway_fanout_uses_each_worker_token_and_keeps_password_only_in_loopback_body(tmp_path, monkeypatch):
+    config = gateway.load_gateway_config(_config(tmp_path)[0], SECRETS)
+    seen = []
+
+    class Reply:
+        def __enter__(self):
+            return self
+
+        def __exit__(self, *_args):
+            pass
+
+        def read(self, _amt=None):
+            router_id = "home" if ":58501/" in self.url else "office"
+            return json.dumps(_official_reply({"routerId": router_id})[1]).encode("utf-8")
+
+    def fake_urlopen(request, timeout=None):
+        seen.append((request.full_url, request.get_method(), request.get_header("Authorization"),
+                     request.data, timeout))
+        reply = Reply()
+        reply.url = request.full_url
+        return reply
+
+    monkeypatch.setattr(gateway, "urlopen", fake_urlopen)
+    password = "loopback-only-password"
+    gateway.aggregate_official_account(config, "POST", {"account": "owner@example.com", "password": password})
+    gateway.aggregate_official_account(config, "POST", {"action": "refresh"})
+    gateway.aggregate_official_account(config, "GET")
+    gateway.aggregate_official_account(config, "DELETE")
+    assert len(seen) == 8
+    for router in config["routers"]:
+        calls = [row for row in seen if row[2] == f"Bearer {router['appToken']}"]
+        assert len(calls) == 4
+        assert all(row[4] == gateway.OFFICIAL_WORKER_TIMEOUT_SEC for row in calls)
+        assert all(str(router["workerPort"]) in row[0] and row[0].startswith("http://127.0.0.1:") for row in calls)
+    assert sum(password.encode() in (row[3] or b"") for row in seen) == 2
+    assert all(b"password" not in (row[3] or b"") for row in seen if password.encode() not in (row[3] or b""))
+    assert all(row[0].endswith("/api/official-account?verify=1") for row in seen if row[1] == "GET")
+    assert all(row[3] is None for row in seen if row[1] == "DELETE")
+    assert all(password.encode() not in path.read_bytes() for path in tmp_path.rglob("*") if path.is_file())
+
+
+def test_logout_registry_returns_multistatus_for_remote_failure(tmp_path, monkeypatch):
+    config = gateway.load_gateway_config(_config(tmp_path)[0], SECRETS)
+    monkeypatch.setattr(gateway, "aggregate_official_account", lambda *_args, **_kwargs: {
+        "ok": False, "localCleared": True, "remoteRevocation": "failed", "routers": [],
+    })
+    server = ThreadingHTTPServer(("127.0.0.1", 0), gateway.make_registry_handler(config))
+    thread = threading.Thread(target=server.serve_forever, daemon=True)
+    thread.start()
+    request = Request(f"http://127.0.0.1:{server.server_port}{gateway.OFFICIAL_ACCOUNT_PATH}",
+        headers={"Authorization": f"Bearer {SECRETS['HOME_APP']}"}, method="DELETE")
+    try:
+        with urlopen(request, timeout=2) as response:
+            assert response.status == 207
+            body = json.load(response)
+        assert body["ok"] is False and body["localCleared"] is True
+        assert body["remoteRevocation"] == "failed"
+    finally:
+        server.shutdown()
+        server.server_close()
+
+
+def test_official_account_registry_accepts_any_app_and_rejects_hooks_for_every_method(tmp_path, monkeypatch):
+    config = gateway.load_gateway_config(_config(tmp_path)[0], SECRETS)
+    calls = []
+
+    def aggregate(_config, method, body=None):
+        calls.append((method, body))
+        return {"ok": True, "account": "o***@example.com", "authorized": False, "state": "unauthorized",
+                "projectCount": 0, "matchedRouterCount": 0, "hubAuthorization": "unauthorized", "routers": []}
+
+    monkeypatch.setattr(gateway, "aggregate_official_account", aggregate)
+    server = ThreadingHTTPServer(("127.0.0.1", 0), gateway.make_registry_handler(config))
+    thread = threading.Thread(target=server.serve_forever, daemon=True)
+    thread.start()
+    url = f"http://127.0.0.1:{server.server_port}{gateway.OFFICIAL_ACCOUNT_PATH}"
+
+    def send(method, token, body=None):
+        data = None if body is None else json.dumps(body).encode("utf-8")
+        headers = {"Authorization": f"Bearer {token}"}
+        if data is not None:
+            headers["Content-Type"] = "application/json"
+        return urlopen(Request(url, data=data, headers=headers, method=method), timeout=2)
+
+    try:
+        for method in ("GET", "POST", "DELETE"):
+            for token in ("", SECRETS["HOME_HOOK"], SECRETS["OFFICE_HOOK"]):
+                with pytest.raises(HTTPError) as denied:
+                    send(method, token, {"action": "refresh"} if method == "POST" else None)
+                assert denied.value.code == 401
+        assert calls == []
+        for method in ("GET", "POST", "DELETE"):
+            body = {"account": "owner@example.com", "password": "registry-memory-only"} if method == "POST" else None
+            with send(method, SECRETS["OFFICE_APP"], body) as response:
+                payload = response.read().decode("utf-8")
+                assert response.status == 200 and response.headers["Cache-Control"] == "no-store"
+                assert "registry-memory-only" not in payload and all(token not in payload for token in SECRETS.values())
+        assert calls[0] == ("GET", None)
+        assert calls[1][0] == "POST" and calls[1][1]["password"] == "registry-memory-only"
+        assert calls[2] == ("DELETE", None)
+    finally:
+        server.shutdown()
+        server.server_close()

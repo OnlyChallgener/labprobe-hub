@@ -20,7 +20,7 @@ import threading
 import time
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
-from urllib.error import URLError
+from urllib.error import HTTPError, URLError
 from urllib.request import Request, urlopen
 from urllib.parse import parse_qs, urlsplit
 
@@ -39,6 +39,8 @@ PLACEHOLDERS = {"", "change-app-token", "change-hook-token", "replace-me", "chan
 # correctly reported as offline, not something a longer timeout can fix.
 PROBE_HTTP_TIMEOUT_SEC = 2.5
 PROBE_TCP_TIMEOUT_SEC = 0.35
+OFFICIAL_ACCOUNT_PATH = "/api/official-account"
+OFFICIAL_WORKER_TIMEOUT_SEC = 45
 
 # The front door renders each worker's APP secret into the nginx configuration.
 # A secret that could carry a quote, a backslash, a variable marker or whitespace
@@ -291,6 +293,7 @@ def render_nginx_config(config: dict, pid_path: Path) -> str:
         "    proxy_request_buffering off;",
         f"    location = /api/routers {{ proxy_pass http://127.0.0.1:{config['registryPort']}/api/routers; }}",
         f"    location = /api/routers/default {{ proxy_pass http://127.0.0.1:{config['registryPort']}/api/routers/default; }}",
+        f"    location = {OFFICIAL_ACCOUNT_PATH} {{ proxy_pass http://127.0.0.1:{config['registryPort']}{OFFICIAL_ACCOUNT_PATH}; }}",
         "    location ^~ /_gateauth/ {",
         "      internal;",
         f"      proxy_pass http://127.0.0.1:{config['registryPort']};",
@@ -501,6 +504,226 @@ class DefaultRouterController:
             return router_id
 
 
+def _mask_official_account(value: object) -> str:
+    account = str(value or "").strip()
+    if not account:
+        return ""
+    if "@" in account:
+        local, domain = account.rsplit("@", 1)
+        return (local[:1] or "*") + "***@" + domain
+    if len(account) >= 7:
+        return account[:3] + "****" + account[-4:]
+    return account[:1] + "***"
+
+
+def _official_error_text(code: object) -> str:
+    return {
+        "worker_offline": "HUB 工作节点离线",
+        "router_serial_unknown": "尚未确认路由器真实序列号",
+        "official_auth_required": "官方账号授权已失效",
+        "official_token_expired": "官方账号授权已过期，请刷新",
+        "official_router_mismatch": "官方网络未唯一匹配当前路由器",
+        "official_logout_failed": "本地授权已清除，但官方退出未确认",
+        "official_logout_pending": "本地授权已清除，但退出操作仍待确认",
+        "worker_timeout": "工作节点响应超时，退出操作可能仍在执行",
+        "official_connection_pending": "官方服务结果尚待确认",
+        "official_unavailable": "官方服务暂时不可用",
+        "official_request_rejected": "官方服务未接受此次操作",
+        "official_response_invalid": "官方服务响应异常",
+        "official_sync_failed": "同步失败，请重新核对",
+    }.get(str(code or ""), "官方账号同步未完成")
+
+
+def _worker_official_call(router: dict, method: str, body: dict | None = None) -> tuple[bool, dict]:
+    """Call one loopback worker; return reachability and a non-secret payload."""
+    url = f"http://127.0.0.1:{router['workerPort']}{OFFICIAL_ACCOUNT_PATH}"
+    if method == "GET":
+        url += "?verify=1"
+    data = None if body is None else json.dumps(body, ensure_ascii=False).encode("utf-8")
+    headers = {"Authorization": f"Bearer {router['appToken']}", "Accept": "application/json"}
+    if data is not None:
+        headers["Content-Type"] = "application/json"
+    request = Request(url, data=data, headers=headers, method=method)
+    try:
+        with urlopen(request, timeout=OFFICIAL_WORKER_TIMEOUT_SEC) as response:
+            raw = response.read(65536)
+    except HTTPError as error:
+        try:
+            value = json.loads(error.read(65536))
+        except Exception:
+            value = {}
+        return True, value if isinstance(value, dict) else {"ok": False, "errorCode": "official_request_rejected"}
+    except (TimeoutError, socket.timeout):
+        # A timed-out DELETE may still be revoking cloud auth or waiting for an
+        # already-delivered native command. Never describe it as stopped.
+        return True, {"ok": False, "errorCode": "worker_timeout",
+                      "operationState": "pending_unknown", "retrySafe": False}
+    except URLError as error:
+        if isinstance(error.reason, (TimeoutError, socket.timeout)):
+            return True, {"ok": False, "errorCode": "worker_timeout",
+                          "operationState": "pending_unknown", "retrySafe": False}
+        return False, {"ok": False, "errorCode": "worker_offline"}
+    except (OSError, ValueError):
+        return False, {"ok": False, "errorCode": "worker_offline"}
+    try:
+        value = json.loads(raw)
+    except (ValueError, UnicodeDecodeError):
+        return True, {"ok": False, "errorCode": "official_response_invalid"}
+    return True, value if isinstance(value, dict) else {"ok": False, "errorCode": "official_response_invalid"}
+
+
+def aggregate_official_account(config: dict, method: str, body: dict | None = None) -> dict:
+    """Fan out concurrently and expose only the stable global status contract."""
+    body = body or None
+    with ThreadPoolExecutor(max_workers=max(1, len(config["routers"])),
+                            thread_name_prefix="official-account") as pool:
+        replies = list(pool.map(lambda router: _worker_official_call(router, method, body), config["routers"]))
+
+    rows = []
+    accounts = []
+    fingerprints = set()
+    for router, (online, value) in zip(config["routers"], replies):
+        serial = str(value.get("serial") or "").strip().upper()
+        account = str(value.get("account") or "")
+        fingerprint = str(value.get("accountFingerprint") or account or "")
+        if account:
+            accounts.append(account)
+        if fingerprint:
+            fingerprints.add(fingerprint)
+        authorized = bool(online and value.get("authorized") and serial)
+        matched = bool(authorized and value.get("cloudVerified") and value.get("routerVerified")
+                       and value.get("projectId"))
+        code = str(value.get("errorCode") or "")
+        logout_fields = {}
+        if method == "DELETE":
+            local_cleared = (bool(value.get("localCleared"))
+                             if online and "localCleared" in value else
+                             not bool(value.get("authorized"))
+                             if online and value.get("ok") is True and "authorized" in value else None)
+            if not online:
+                remote, operation = "unknown", "pending_unknown" if code == "worker_timeout" else "unknown"
+                sync_state, error_code = ("failed" if code == "worker_timeout" else "offline"), code or "worker_offline"
+            elif value.get("ok") is False:
+                pending = code in {"worker_timeout", "official_logout_pending",
+                                   "official_connection_pending", "official_unavailable"}
+                remote, operation = ("unknown" if pending else "failed"), ("pending_unknown" if pending else "failed")
+                sync_state, error_code = ("checking" if pending else "failed"), code or "official_logout_failed"
+            elif local_cleared is False:
+                remote, operation = "failed", "failed"
+                sync_state, error_code = "failed", code or "official_logout_failed"
+            elif code:
+                pending = code in {"worker_timeout", "official_logout_pending",
+                                   "official_connection_pending", "official_unavailable"}
+                remote, operation = ("unknown" if pending else "failed"), ("pending_unknown" if pending else "failed")
+                sync_state, error_code = ("checking" if pending else "failed"), code
+            elif local_cleared is True:
+                remote, operation = "confirmed", "complete"
+                sync_state, error_code = "unauthorized", ""
+            else:
+                remote, operation = "unknown", "unknown"
+                sync_state, error_code = "failed", "official_logout_failed"
+            logout_fields = {"localCleared": local_cleared, "remoteRevocation": remote,
+                             "operationState": operation, "retrySafe": remote == "confirmed"}
+        elif not online:
+            sync_state, error_code = "offline", "worker_offline"
+        elif not serial:
+            sync_state, error_code = "offline", "router_serial_unknown"
+        elif value.get("ok") is False or not authorized:
+            if code in {"official_auth_required", "official_token_expired"}:
+                sync_state = "unauthorized"
+            elif code in {"official_connection_pending", "official_unavailable"}:
+                sync_state = "checking"
+            else:
+                sync_state = "failed"
+            error_code = code or "official_sync_failed"
+        elif not value.get("cloudVerified"):
+            sync_state, error_code = "checking", code or "official_connection_pending"
+        elif not value.get("routerVerified") or not value.get("projectId"):
+            sync_state, error_code = "failed", code or "official_router_mismatch"
+        else:
+            sync_state, error_code = "synced", ""
+        row = {"routerId": router["routerId"], "name": router["name"], "site": router["site"],
+               "model": router["model"], "serialNumber": serial, "online": bool(online and serial),
+               "authorized": authorized, "matched": matched,
+               "projectId": str(value.get("projectId") or ""),
+               "projectName": str(value.get("projectName") or ""), "syncState": sync_state,
+               **logout_fields}
+        if error_code:
+            row["errorCode"] = error_code
+            row["error"] = _official_error_text(error_code)
+        rows.append(row)
+
+    project_ids = {row["projectId"] for row in rows if row["matched"] and row["projectId"]}
+    serials = {row["serialNumber"] for row in rows if row["matched"] and row["serialNumber"]}
+    expiries = []
+    for row, (_, value) in zip(rows, replies):
+        if row["matched"] and isinstance(value.get("expireTime"), int):
+            expiries.append(value["expireTime"])
+    all_synced = bool(rows) and all(row["syncState"] == "synced" for row in rows)
+    conflict = len(fingerprints) > 1
+    if conflict:
+        state = "conflict"
+    elif serials:
+        state = "authorized" if all_synced else "partial"
+    elif any(row["syncState"] in {"offline", "checking", "failed"} for row in rows):
+        state = "checking"
+    else:
+        state = "unauthorized"
+
+    if conflict:
+        hub_authorization = "partial"
+    elif all_synced:
+        hub_authorization = "synced"
+    elif serials:
+        hub_authorization = "partial"
+    elif any(row["syncState"] == "offline" for row in rows):
+        hub_authorization = "offline"
+    elif any(row["syncState"] in {"failed", "checking"} for row in rows):
+        hub_authorization = "failed"
+    else:
+        hub_authorization = "unauthorized"
+
+    if method == "DELETE":
+        confirmed = sum(row["remoteRevocation"] == "confirmed" for row in rows)
+        unknown = any(row["remoteRevocation"] == "unknown" for row in rows)
+        failed = any(row["remoteRevocation"] == "failed" for row in rows)
+        all_confirmed = bool(rows) and confirmed == len(rows)
+        local_values = [row["localCleared"] for row in rows]
+        local_cleared = (False if any(value is False for value in local_values)
+                         else True if all(value is True for value in local_values) else None)
+        if all_confirmed:
+            logout_state, operation_state, hub_authorization = "unauthorized", "complete", "unauthorized"
+        elif unknown:
+            logout_state = "partial" if confirmed else "pending_unknown"
+            operation_state, hub_authorization = "pending_unknown", "partial" if confirmed else "failed"
+        elif confirmed:
+            logout_state, operation_state, hub_authorization = "partial", "partial_failure", "partial"
+        else:
+            logout_state, operation_state, hub_authorization = "failed", "failed", "failed"
+        remote = ("confirmed" if all_confirmed else "unknown" if unknown
+                  else "partial" if confirmed and failed else "failed")
+        return {"ok": all_confirmed,
+                "account": accounts[0] if accounts else "",
+                "authorized": (True if any(value is False for value in local_values)
+                               else False if local_cleared is True else None),
+                "localCleared": local_cleared, "remoteRevocation": remote,
+                "operationState": operation_state, "retrySafe": all_confirmed,
+                "state": logout_state, "projectCount": 0, "matchedRouterCount": 0,
+                "hubAuthorization": hub_authorization, "routers": rows,
+                "errors": [{"routerId": row["routerId"], "errorCode": row.get("errorCode", "official_logout_failed"),
+                            "error": row.get("error", _official_error_text("official_logout_failed")),
+                            "operationState": row["operationState"], "retrySafe": row["retrySafe"]}
+                           for row in rows if row.get("errorCode")]}
+
+    result = {"ok": True, "account": accounts[0] if accounts else _mask_official_account((body or {}).get("account")),
+              "authorized": bool(serials), "state": state, "projectCount": len(project_ids),
+              "matchedRouterCount": len(serials), "hubAuthorization": hub_authorization,
+              "routers": rows}
+    if expiries:
+        result["expireTime"] = min(expiries)
+    return result
+
+
 def make_registry_handler(config: dict, controller: DefaultRouterController | None = None) -> type[BaseHTTPRequestHandler]:
     # Every worker's APP secret is an owner-level management credential. One front door only
     # delivers "log in once" if a key the user already holds for any of their routers also
@@ -589,6 +812,12 @@ def make_registry_handler(config: dict, controller: DefaultRouterController | No
         def do_GET(self) -> None:
             if self.answer_route_auth():
                 return
+            if urlsplit(self.path).path == OFFICIAL_ACCOUNT_PATH:
+                if not self.authorized():
+                    self.send_error(401)
+                    return
+                self.respond(aggregate_official_account(config, "GET"))
+                return
             if urlsplit(self.path).path.startswith("/_gateauth/"):
                 router_id = urlsplit(self.path).path[len("/_gateauth/"):]
                 router = next((item for item in config["routers"]
@@ -620,6 +849,33 @@ def make_registry_handler(config: dict, controller: DefaultRouterController | No
         def do_POST(self) -> None:
             if self.answer_route_auth():
                 return
+            if urlsplit(self.path).path == OFFICIAL_ACCOUNT_PATH:
+                if not self.authorized():
+                    self.send_error(401)
+                    return
+                try:
+                    size = int(self.headers.get("Content-Length", "0"))
+                    if not 0 < size <= 4096:
+                        raise ValueError("invalid request size")
+                    body = json.loads(self.rfile.read(size))
+                    if not isinstance(body, dict):
+                        raise ValueError("invalid request body")
+                    action = body.get("action")
+                    if action == "refresh":
+                        worker_body = {"action": "refresh"}
+                    elif action in (None, "", "login"):
+                        account = str(body.get("account") or "")
+                        password = str(body.get("password") or "")
+                        if not account.strip() or not password or len(account) > 128 or len(password) > 256:
+                            raise ValueError("account and password are required")
+                        worker_body = {"account": account, "password": password}
+                    else:
+                        raise ValueError("unsupported action")
+                except (ValueError, TypeError, json.JSONDecodeError):
+                    self.respond({"ok": False, "errorCode": "invalid_request", "error": "invalid request"}, 400)
+                    return
+                self.respond(aggregate_official_account(config, "POST", worker_body))
+                return
             if self.path != "/api/routers/default":
                 self.send_error(404)
                 return
@@ -644,14 +900,25 @@ def make_registry_handler(config: dict, controller: DefaultRouterController | No
                 return
             self.respond({"ok": True, "defaultRouterId": selected})
 
+        def do_DELETE(self) -> None:
+            if self.answer_route_auth():
+                return
+            if urlsplit(self.path).path != OFFICIAL_ACCOUNT_PATH:
+                self.send_error(501)
+                return
+            if not self.authorized():
+                self.send_error(401)
+                return
+            result = aggregate_official_account(config, "DELETE")
+            self.respond(result, 200 if result.get("ok") else 207)
+
         def _unsupported_method(self) -> None:
-            # nginx auth_request replays the original method, so PUT/DELETE/PATCH must be
+            # nginx auth_request replays the original method, so PUT/PATCH must be
             # answerable for /_routeauth; anything else keeps its 501.
             if not self.answer_route_auth():
                 self.send_error(501)
 
         do_PUT = _unsupported_method
-        do_DELETE = _unsupported_method
         do_PATCH = _unsupported_method
 
         def log_message(self, format: str, *args: object) -> None:
