@@ -360,12 +360,12 @@ class RouterRpcCompatibilitySync:
         temperature5g = _number(_first(fast, "temp_5g", "temperature5gC"), _number(_first(slow, "temp_5g", "temperature5gC")))
         uptime = _integer(_first(fast, "runtime", "uptime", "uptimeSeconds"), _integer(_first(slow, "runtime", "uptime", "uptimeSeconds")))
 
-        upload = _integer(aggregate.get("up") if isinstance(aggregate, dict) else 0)
-        download = _integer(aggregate.get("down") if isinstance(aggregate, dict) else 0)
-        total_upload = _integer(aggregate.get("total_up") if isinstance(aggregate, dict) else 0)
-        total_download = _integer(aggregate.get("total_down") if isinstance(aggregate, dict) else 0)
-        ipv4_connections = _integer(aggregate.get("ipv4_connection_count") if isinstance(aggregate, dict) else 0)
-        ipv6_connections = _integer(aggregate.get("ipv6_connection_count") if isinstance(aggregate, dict) else 0)
+        upload = _integer(aggregate.get("uploadBps"))
+        download = _integer(aggregate.get("downloadBps"))
+        total_upload = _integer(aggregate.get("totalUploadBytes"))
+        total_download = _integer(aggregate.get("totalDownloadBytes"))
+        ipv4_connections = _integer(aggregate.get("ipv4Connections"))
+        ipv6_connections = _integer(aggregate.get("ipv6Connections"))
 
         dns = _split(wan_info.get("dnsList") or wan_info.get("dns") or network_wan.get("dns"))
         for key in ("dns1", "dns2", "primaryDns", "secondaryDns"):
@@ -452,17 +452,17 @@ class RouterRpcCompatibilitySync:
                     "downloadBps": download,
                     "totalUploadBytes": total_upload,
                     "totalDownloadBytes": total_download,
-                    "dailyUploadBytes": _integer(aggregate.get("daily_up") if isinstance(aggregate, dict) else 0),
-                    "dailyDownloadBytes": _integer(aggregate.get("daily_down") if isinstance(aggregate, dict) else 0),
+                    "dailyUploadBytes": _integer(aggregate.get("dailyUploadBytes")),
+                    "dailyDownloadBytes": _integer(aggregate.get("dailyDownloadBytes")),
                 },
                 "connections": {
                     "ipv4": ipv4_connections,
                     "ipv6": ipv6_connections,
-                    "ipv4Half": _integer(aggregate.get("ipv4_half_connection_count") if isinstance(aggregate, dict) else 0),
-                    "ipv6Half": _integer(aggregate.get("ipv6_half_connection_count") if isinstance(aggregate, dict) else 0),
-                    "ipv4Local": _integer(aggregate.get("ipv4_local_connection_count") if isinstance(aggregate, dict) else 0),
-                    "ipv6Local": _integer(aggregate.get("ipv6_local_connection_count") if isinstance(aggregate, dict) else 0),
-                    "flowCount": _integer(aggregate.get("flow_cnt") if isinstance(aggregate, dict) else 0),
+                    "ipv4Half": _integer(aggregate.get("ipv4HalfConnections")),
+                    "ipv6Half": _integer(aggregate.get("ipv6HalfConnections")),
+                    "ipv4Local": _integer(aggregate.get("ipv4LocalConnections")),
+                    "ipv6Local": _integer(aggregate.get("ipv6LocalConnections")),
+                    "flowCount": _integer(aggregate.get("flowCount")),
                     "cps": _integer(aggregate.get("cps") if isinstance(aggregate, dict) else 0),
                     "max": _integer(_first(fast, "conntrack_max", "maxConnections")),
                 },
