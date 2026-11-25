@@ -824,7 +824,7 @@ def test_global_root_alias_supports_login_verify_refresh_and_logout(monkeypatch,
     assert logged_in.get_json()["routers"][0]["routerId"]
     verified = client.get("/api/official-account?verify=1")
     assert verified.status_code == 200 and verified.get_json()["cloudVerified"] and cloud.verifications == 1
-    refreshed = client.post("/api/router/child-guard/official/auth", json={"action": "refresh"})
+    refreshed = client.post("/api/official-account", json={"action": "refresh"})
     assert refreshed.status_code == 200 and refreshed.get_json()["authorized"] and cloud.refreshes == 1
     logged_out = client.delete("/api/official-account")
     assert logged_out.status_code == 200 and not logged_out.get_json()["authorized"] and cloud.logouts == 1
