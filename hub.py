@@ -183,12 +183,22 @@ LOGGER = configure_logging()
 MIGRATION_RESULT = STORE.initialize()
 
 
+def _scrub_dashboard_secrets(value: Any) -> Any:
+    """Defense in depth for cached/hook-supplied dashboard details."""
+    from router_compat import scrub_password_keys
+
+    if isinstance(value, dict) and isinstance(value.get("details"), dict):
+        value["details"] = scrub_password_keys(value["details"])
+    return value
+
+
 def _load_router_dashboard_cache() -> Dict[str, Any]:
     try:
         if ROUTER_DASHBOARD_FILE.exists():
             value = json.loads(ROUTER_DASHBOARD_FILE.read_text(encoding="utf-8"))
             if not isinstance(value, dict):
                 return {}
+            value = _scrub_dashboard_secrets(value)
             # Fast telemetry is runtime-only and must not survive restarts.
             for key in ["telemetry", "telemetryAt", "telemetryEpoch", "receivedAt", "receivedEpoch"]:
                 value.pop(key, None)
@@ -4388,6 +4398,7 @@ def _deep_merge_dict(current: Dict[str, Any], update: Dict[str, Any]) -> Dict[st
 def _dashboard_details_from_hook(details: Dict[str, Any]) -> Dict[str, Any]:
     """Keep display details but never cache a HOOK-supplied identity serial."""
     result = copy.deepcopy(details)
+    result = _scrub_dashboard_secrets({"details": result})["details"]
     result.pop("serialNumber", None)
     for section in ("ap", "identity"):
         value = result.get(section)
@@ -4477,6 +4488,7 @@ def _schedule_dashboard_operator_probe() -> None:
 def _router_dashboard_public() -> Dict[str, Any]:
     with ROUTER_DASHBOARD_LOCK:
         result = json.loads(json.dumps(ROUTER_DASHBOARD_CACHE, ensure_ascii=False)) if ROUTER_DASHBOARD_CACHE else {}
+        result = _scrub_dashboard_secrets(result)
         refresh_nonce = ROUTER_DASHBOARD_REFRESH_NONCE
     now = time.time()
     telemetry_at = _dashboard_epoch(result.get("telemetryEpoch"))
@@ -4503,7 +4515,7 @@ def _persist_router_dashboard_if_due(force: bool = False) -> None:
         # online counts and received timestamps are rebuilt by LabRelay after restart.
         payload = {
             "router": ROUTER_DASHBOARD_CACHE.get("router", ""),
-            "details": ROUTER_DASHBOARD_CACHE.get("details", {}),
+            "details": _scrub_dashboard_secrets({"details": ROUTER_DASHBOARD_CACHE.get("details", {})})["details"],
             "detailsAt": ROUTER_DASHBOARD_CACHE.get("detailsAt", ""),
             "detailsEpoch": ROUTER_DASHBOARD_CACHE.get("detailsEpoch", 0),
         }
@@ -4657,12 +4669,24 @@ def api_router_credentials_push():
     payload = request.get_json(silent=True) or {}
     if not isinstance(payload, dict):
         return jsonify({"ok": False, "error": "invalid payload"}), 400
+    from router_relay_credentials_patch import _credential_rows_from_payload, _default_credential_projection, _no_store
+
+    wans = _credential_rows_from_payload(payload)
+    projection = _default_credential_projection(wans)
     completed = int(_dashboard_number(payload.get("refreshNonce"), 0))
+    if not wans or not projection["username"] or not projection["password"] or completed <= 0 or not all(
+        row.get("username") and row.get("password") for row in wans
+    ):
+        response = jsonify({"ok": False, "error": "incomplete_credentials"})
+        response.status_code = 422
+        return _no_store(response)
     safe = {
         "router": clean_saved_value(payload.get("router")) or primary_router_name() or "router",
         "lanMac": clean_saved_value(payload.get("lanMac")),
-        "username": clean_saved_value(payload.get("username")),
-        "password": clean_saved_value(payload.get("password")),
+        "username": projection["username"],
+        "password": projection["password"],
+        "passwordConfigured": projection["passwordConfigured"],
+        "wans": [dict(row) for row in wans],
         "refreshCompletedNonce": completed,
         "receivedAt": now_str(),
         "receivedEpoch": time.time(),
@@ -4671,15 +4695,17 @@ def api_router_credentials_push():
         ROUTER_CREDENTIALS_CACHE.clear()
         ROUTER_CREDENTIALS_CACHE.update(safe)
     # Deliberately no save_json(), backup or MQTT publish here.
-    return jsonify({"ok": True, "time": now_str(), "refreshNonce": ROUTER_CREDENTIALS_REFRESH_NONCE})
+    return _no_store(jsonify({"ok": True, "time": now_str(), "refreshNonce": ROUTER_CREDENTIALS_REFRESH_NONCE}))
 
 
 @app.route("/api/router/dashboard/credentials", methods=["GET"])
 def api_router_credentials():
     if not check_read_token():
         return jsonify({"ok": False, "error": "unauthorized"}), 401
+    from router_relay_credentials_patch import _no_store
+
     with ROUTER_CREDENTIALS_LOCK:
-        result = dict(ROUTER_CREDENTIALS_CACHE)
+        result = copy.deepcopy(ROUTER_CREDENTIALS_CACHE)
         requested = ROUTER_CREDENTIALS_REFRESH_NONCE
     received = _dashboard_epoch(result.get("receivedEpoch"))
     stale = not received or time.time() - received > ROUTER_CREDENTIALS_TTL_SEC
@@ -4689,10 +4715,14 @@ def api_router_credentials():
             "lanMac": "",
             "username": "",
             "password": "",
+            "passwordConfigured": None,
+            "wans": [],
             "refreshCompletedNonce": int(_dashboard_number(result.get("refreshCompletedNonce"), 0)),
         }
+    result.setdefault("passwordConfigured", None)
+    result.setdefault("wans", [])
     result.update({"ok": True, "stale": stale, "refreshNonce": requested, "serverTime": now_str()})
-    return jsonify(result)
+    return _no_store(jsonify(result))
 
 
 @app.route("/.well-known/labprobe", methods=["GET"])

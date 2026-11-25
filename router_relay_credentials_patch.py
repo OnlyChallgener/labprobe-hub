@@ -19,7 +19,7 @@ import json
 import re
 import threading
 import time
-from typing import Any, Dict, Iterable, Tuple
+from typing import Any, Dict, Iterable, Mapping, Tuple
 
 from flask import jsonify, request
 
@@ -60,6 +60,19 @@ def _safe_int(value: Any, default: int = 0) -> int:
         return int(str(value).strip())
     except (TypeError, ValueError):
         return default
+
+
+def _flag(value: Any) -> bool | None:
+    if isinstance(value, bool):
+        return value
+    if isinstance(value, (int, float)):
+        return value != 0
+    text = _clean_value(value).lower()
+    if text in {"1", "true", "yes", "on"}:
+        return True
+    if text in {"0", "false", "no", "off"}:
+        return False
+    return None
 
 
 def _decode_payload(value: Any) -> Any:
@@ -111,67 +124,178 @@ def _candidate_score(row: Dict[str, Any]) -> int:
     return score
 
 
-def _extract_router_credentials(value: Any) -> Dict[str, str]:
-    """Extract the highest-scoring same-object WAN/PPPoE credential pair."""
-    root = _decode_payload(value)
-    rows: list[Dict[str, Any]] = []
+def _row_wan_id(row: Mapping[str, Any]) -> str:
+    for key in ("wanId", "wan_id", "wan", "ifname", "interface", "name", "id"):
+        value = _normalized_key(row.get(key))
+        if re.fullmatch(r"wan[0-9]*", value):
+            return value
+    return ""
 
-    def collect(node: Any) -> None:
-        node = _decode_payload(node)
-        if isinstance(node, dict):
-            rows.append(node)
-            for child in node.values():
-                collect(child)
-        elif isinstance(node, list):
-            for child in node:
-                collect(child)
 
-    collect(root)
-    rows.sort(key=_candidate_score, reverse=True)
-
+def _credential_row(row: Mapping[str, Any], wan_id: str) -> Dict[str, Any] | None:
+    """Read one credential object; never borrow a missing field from another."""
     username = ""
     password = ""
-    lan_mac = ""
-    pair_selected = False
-    for row in rows:
-        local_user = ""
-        local_password = ""
-        for key, child in row.items():
-            normalized = _normalized_key(key)
-            if not local_user and normalized in _USERNAME_KEYS:
-                local_user = _clean_value(child)
-            if not local_password and normalized in _PASSWORD_KEYS:
-                local_password = _clean_value(child, secret=True)
-            if not lan_mac and normalized in _MAC_KEYS:
-                candidate = _clean_value(child).lower().replace("-", ":")
-                if re.fullmatch(r"[0-9a-f]{2}(?::[0-9a-f]{2}){5}", candidate):
-                    lan_mac = candidate
-        # Rows are score-sorted; retain the first complete pair but continue
-        # scanning so a LAN MAC in a separate object is not lost.
-        if local_user and local_password and not pair_selected:
-            username, password = local_user, local_password
-            pair_selected = True
-        elif not pair_selected:
-            if local_user and not username:
-                username = local_user
-            if local_password and not password:
-                password = local_password
-
-    if not username or not password:
-        for key, child, _parent in _walk(root):
-            normalized = _normalized_key(key)
-            if not username and normalized in _USERNAME_KEYS:
-                username = _clean_value(child)
-            elif not password and normalized in _PASSWORD_KEYS:
+    password_present = False
+    password_indicated = False
+    configured: bool | None = None
+    for key, child in row.items():
+        normalized = _normalized_key(key)
+        if not username and normalized in _USERNAME_KEYS:
+            username = _clean_value(child)
+        if normalized in _PASSWORD_KEYS:
+            password_present = True
+            password_indicated = password_indicated or bool(_clean_value(child))
+            if not password:
                 password = _clean_value(child, secret=True)
-            if username and password:
+        if normalized in {"passwordconfigured", "pppoepasswordconfigured", "credentialset"}:
+            configured = _flag(child)
+    if password or password_indicated:
+        configured = True
+    elif password_present and configured is None:
+        # A present but empty password is explicitly not configured. An absent
+        # password key remains unknown instead of becoming false.
+        configured = False
+    if not username and not password and configured is None:
+        return None
+    return {
+        "wanId": wan_id,
+        "username": username,
+        "password": password,
+        "passwordConfigured": configured,
+    }
+
+
+def _select_credential_rows(rows: Iterable[Dict[str, Any]]) -> List[Dict[str, Any]]:
+    selected: Dict[str, Dict[str, Any]] = {}
+    scores: Dict[str, Tuple[int, int, int, int]] = {}
+    for row in rows:
+        if not isinstance(row, Mapping):
+            continue
+        wan_id = _row_wan_id(row)
+        if wan_id and set(row).issubset({"wanId", "username", "password", "passwordConfigured"}):
+            # Re-projecting an already canonical row must not reinterpret its
+            # empty placeholder password as an explicitly empty firmware field.
+            password = _clean_value(row.get("password"), secret=True)
+            clean = {
+                "wanId": wan_id,
+                "username": _clean_value(row.get("username")),
+                "password": password,
+                "passwordConfigured": True if password else _flag(row.get("passwordConfigured")),
+            }
+        else:
+            clean = _credential_row(row, wan_id)
+        if not wan_id or clean is None:
+            continue
+        score = (
+            1 if clean["username"] and clean["password"] else 0,
+            1 if clean["username"] else 0,
+            1 if clean["password"] else 0,
+            _candidate_score(dict(row)),
+        )
+        if wan_id not in selected or score > scores[wan_id]:
+            selected[wan_id] = clean
+            scores[wan_id] = score
+    return [selected[key] for key in ("wan", "wan1") if key in selected] + [
+        selected[key] for key in selected if key not in {"wan", "wan1"}
+    ]
+
+
+def _default_credential_projection(wans: List[Dict[str, Any]]) -> Dict[str, Any]:
+    default = next((row for row in wans if row.get("wanId") == "wan"), {})
+    return {
+        "username": str(default.get("username") or ""),
+        "password": str(default.get("password") or ""),
+        "passwordConfigured": default.get("passwordConfigured"),
+    }
+
+
+def _credentials_result(wans: List[Dict[str, Any]], lan_mac: str = "") -> Dict[str, Any]:
+    rows = _select_credential_rows(wans)
+    return {**_default_credential_projection(rows), "lanMac": lan_mac, "wans": rows}
+
+
+def _credential_rows_from_payload(payload: Any) -> List[Dict[str, Any]]:
+    """Accept WAN-aware pushes, or the legacy top-level default-WAN pair."""
+    root = _decode_payload(payload)
+    if not isinstance(root, Mapping):
+        return []
+    raw_wans = root.get("wans")
+    if isinstance(raw_wans, list):
+        return _select_credential_rows(raw_wans)
+    if isinstance(raw_wans, Mapping):
+        rows = []
+        for wan_id, row in raw_wans.items():
+            if isinstance(row, Mapping):
+                rows.append({**dict(row), "wanId": str(wan_id)})
+        return _select_credential_rows(rows)
+    if any(_normalized_key(key) in (_USERNAME_KEYS | _PASSWORD_KEYS | {"passwordconfigured"}) for key in root):
+        row = dict(root)
+        row.setdefault("wanId", "wan")
+        return _select_credential_rows([row])
+    return []
+
+
+def _extract_router_credentials(value: Any) -> Dict[str, Any]:
+    """Extract independent, explicitly WAN-scoped credential objects."""
+    root = _decode_payload(value)
+    rows: List[Dict[str, Any]] = []
+    stack: List[Tuple[Any, str]] = [(root, "")]
+    while stack:
+        node, inherited_id = stack.pop(0)
+        if isinstance(node, list):
+            stack.extend((item, inherited_id) for item in node)
+            continue
+        if not isinstance(node, Mapping):
+            continue
+        wan_id = _row_wan_id(node) or inherited_id
+        if wan_id:
+            row = _credential_row(node, wan_id)
+            if row is not None:
+                rows.append(row)
+        for key, child in node.items():
+            normalized_key = _normalized_key(key)
+            child_id = normalized_key if re.fullmatch(r"wan[0-9]*", normalized_key) else ""
+            stack.append((child, child_id or wan_id))
+
+    # Legacy firmware may return a bare PPPoE object with no WAN wrapper.
+    if not rows and isinstance(root, Mapping):
+        marker = " ".join(_clean_value(root.get(key)).lower() for key in ("proto", "protocol", "type"))
+        if "pppoe" in marker:
+            row = _credential_row(root, "wan")
+            if row is not None:
+                rows.append(row)
+
+    lan_mac = ""
+    for key, child, _parent in _walk(root):
+        normalized = _normalized_key(key)
+        if normalized in _MAC_KEYS:
+            candidate = _clean_value(child).lower().replace("-", ":")
+            if re.fullmatch(r"[0-9a-f]{2}(?::[0-9a-f]{2}){5}", candidate):
+                lan_mac = candidate
                 break
+    return _credentials_result(rows, lan_mac)
 
-    return {"username": username, "password": password, "lanMac": lan_mac}
+
+def _coerce_found_credentials(found: Mapping[str, Any]) -> Dict[str, Any]:
+    raw_wans = found.get("wans")
+    if isinstance(raw_wans, list):
+        rows = _select_credential_rows(raw_wans)
+    elif found.get("username") or found.get("password") or found.get("passwordConfigured") is not None:
+        rows = _select_credential_rows([{
+            "wanId": "wan",
+            "username": found.get("username", ""),
+            "password": found.get("password", ""),
+            "passwordConfigured": found.get("passwordConfigured"),
+        }])
+    else:
+        rows = []
+    return _credentials_result(rows, _clean_value(found.get("lanMac")))
 
 
-def _read_direct_credentials(client: Any) -> Dict[str, str]:
-    merged = {"username": "", "password": "", "lanMac": ""}
+def _read_direct_credentials(client: Any) -> Dict[str, Any]:
+    merged_wans: Dict[str, Dict[str, Any]] = {}
+    lan_mac = ""
     loaders = (
         lambda: client.rpc("devConfig.get", "network", no_parse=True),
         lambda: client.rpc("devConfig.get", "network"),
@@ -180,17 +304,25 @@ def _read_direct_credentials(client: Any) -> Dict[str, str]:
     last_error: Exception | None = None
     for loader in loaders:
         try:
-            found = _extract_router_credentials(loader())
-            for key in merged:
-                if not merged[key] and found.get(key):
-                    merged[key] = found[key]
-            if merged["username"] and merged["password"]:
-                return merged
+            found = _coerce_found_credentials(_extract_router_credentials(loader()))
+            if found.get("lanMac") and not lan_mac:
+                lan_mac = found["lanMac"]
+            for row in found.get("wans", []):
+                wan_id = row["wanId"]
+                current = merged_wans.get(wan_id)
+                # Replace the whole row; username/password are never merged
+                # across router responses or WAN objects.
+                merged_wans[wan_id] = _select_credential_rows([current, row])[0] if current else dict(row)
+            projection = _default_credential_projection(list(merged_wans.values()))
+            if projection["username"] and projection["password"] and all(
+                row.get("username") and row.get("password") for row in merged_wans.values()
+            ):
+                return _credentials_result(list(merged_wans.values()), lan_mac)
         except Exception as exc:  # keep trying alternative router wire forms
             last_error = exc
-    if not any(merged.values()) and last_error is not None:
+    if not merged_wans and not lan_mac and last_error is not None:
         raise last_error
-    return merged
+    return _credentials_result(list(merged_wans.values()), lan_mac)
 
 
 def _relay_dashboard_ack(self: Any):
@@ -249,6 +381,11 @@ def _relay_dashboard_ack(self: Any):
     })
 
 
+def _no_store(response: Any):
+    response.headers["Cache-Control"] = "no-store"
+    return response
+
+
 def _direct_credentials_refresh_view(self: Any):
     if not self.hub.check_app_token():
         return jsonify({"ok": False, "error": "unauthorized"}), 401
@@ -265,9 +402,17 @@ def _direct_credentials_refresh_view(self: Any):
         self.logger.warning("router credential direct refresh failed type=%s", type(exc).__name__)
         found = {"username": "", "password": "", "lanMac": ""}
 
-    found_username = str(found.get("username") or "")
-    found_password = str(found.get("password") or "")
-    direct_complete = bool(found_username and found_password)
+    found = _coerce_found_credentials(found)
+    wans = found.get("wans", [])
+    projection = _default_credential_projection(wans)
+    found_username = projection["username"]
+    found_password = projection["password"]
+    direct_complete = bool(
+        wans
+        and found_username
+        and found_password
+        and all(row.get("username") and row.get("password") for row in wans)
+    )
 
     # Do not mark a partial eWeb response complete. Leaving the new nonce
     # outstanding makes the router-local Relay fallback fetch both fields.
@@ -277,6 +422,8 @@ def _direct_credentials_refresh_view(self: Any):
             "lanMac": str(found.get("lanMac") or previous.get("lanMac") or ""),
             "username": found_username,
             "password": found_password,
+            "passwordConfigured": projection["passwordConfigured"],
+            "wans": [dict(row) for row in wans],
             "refreshCompletedNonce": nonce,
             "receivedAt": self.hub.now_str(),
             "receivedEpoch": time.time(),
@@ -292,7 +439,7 @@ def _direct_credentials_refresh_view(self: Any):
     with _AGENT_COMMAND_CONDITION:
         _AGENT_COMMAND_CONDITION.notify_all()
 
-    return jsonify({
+    return _no_store(jsonify({
         "ok": True,
         "refreshNonce": nonce,
         "refreshCompletedNonce": nonce if direct_complete else 0,
@@ -300,7 +447,7 @@ def _direct_credentials_refresh_view(self: Any):
         "relayFallbackPending": not direct_complete,
         "message": "credentials refreshed from router" if direct_complete else "waiting for router-local credential fallback",
         "time": self.hub.now_str(),
-    })
+    }))
 
 
 def _relay_credentials_push_view(self: Any):
@@ -311,26 +458,32 @@ def _relay_credentials_push_view(self: Any):
     if not isinstance(payload, dict):
         return jsonify({"ok": False, "error": "invalid payload"}), 400
 
-    username = _clean_value(payload.get("username"))
-    password = _clean_value(payload.get("password"), secret=True)
+    wans = _credential_rows_from_payload(payload)
+    projection = _default_credential_projection(wans)
     completed = _safe_int(payload.get("refreshNonce"), 0)
-    if not username or not password or completed <= 0:
+    if not wans or not projection["username"] or not projection["password"] or completed <= 0 or not all(
+        row.get("username") and row.get("password") for row in wans
+    ):
         # Never overwrite a prior valid memory snapshot with an empty/masked
         # router response, and never acknowledge the nonce so Relay retries.
         with self.hub.ROUTER_CREDENTIALS_LOCK:
             requested = self.hub.ROUTER_CREDENTIALS_REFRESH_NONCE
-        return jsonify({
+        response = jsonify({
             "ok": False,
             "error": "incomplete_credentials",
-            "message": "router did not expose a complete broadband credential pair",
+            "message": "router did not expose complete broadband credentials for every WAN",
             "refreshNonce": requested,
-        }), 422
+        })
+        response.status_code = 422
+        return _no_store(response), 422
 
     safe = {
         "router": _clean_value(payload.get("router")) or self.hub.primary_router_name() or "router",
         "lanMac": _clean_value(payload.get("lanMac")),
-        "username": username,
-        "password": password,
+        "username": projection["username"],
+        "password": projection["password"],
+        "passwordConfigured": projection["passwordConfigured"],
+        "wans": [dict(row) for row in wans],
         "refreshCompletedNonce": completed,
         "receivedAt": self.hub.now_str(),
         "receivedEpoch": time.time(),
@@ -340,7 +493,7 @@ def _relay_credentials_push_view(self: Any):
         self.hub.ROUTER_CREDENTIALS_CACHE.clear()
         self.hub.ROUTER_CREDENTIALS_CACHE.update(safe)
         requested = self.hub.ROUTER_CREDENTIALS_REFRESH_NONCE
-    return jsonify({"ok": True, "time": self.hub.now_str(), "refreshNonce": requested})
+    return _no_store(jsonify({"ok": True, "time": self.hub.now_str(), "refreshNonce": requested}))
 
 
 def _matches_router(hub: Any, cmd_router: str, target_router: str) -> bool:

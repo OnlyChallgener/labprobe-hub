@@ -21,7 +21,7 @@ import websocket
 import router_compat
 import router_rpc_v010
 from router_capabilities import firmware_features
-from router_core.wan_telemetry import normalize_wan_telemetry
+from router_core.wan_telemetry import canonical_wan_rows, normalize_wan_telemetry
 
 
 WS_MESSAGE_TYPES = {"static", "slow", "fast", "recent_wan", "daily_wan", "ping"}
@@ -169,6 +169,32 @@ def _aggregate_wan(value: Any) -> Dict[str, Any]:
     return normalize_wan_telemetry(value)["aggregate"]
 
 
+def _observed_epoch_seconds(value: Any) -> int | None:
+    if not isinstance(value, dict):
+        return None
+    for key in ("trafficObservedAt", "observedAt", "observed_at", "timestamp", "time", "sampleEpochMs"):
+        number = _number(value.get(key))
+        if number is _MISSING or number <= 0:
+            continue
+        if number >= 100_000_000_000:
+            number /= 1000.0
+        return int(number)
+    return None
+
+
+def _fast_wan_rows(wan_stat: Dict[str, Any], root: Any) -> list[Dict[str, Any]]:
+    value: Any = None
+    if isinstance(wan_stat.get("wans"), (dict, list)):
+        value = wan_stat.get("wans")
+    elif isinstance(wan_stat.get("wan"), (dict, list)):
+        value = wan_stat.get("wan")
+    return canonical_wan_rows(
+        value,
+        source="router_eweb_ws_fast",
+        observed_at=_observed_epoch_seconds(wan_stat) or _observed_epoch_seconds(root),
+    )
+
+
 def normalize_fast_message(message: Dict[str, Any]) -> Dict[str, Any]:
     """Extract the compact numeric APP realtime payload from one eWeb fast frame."""
     if not isinstance(message, dict):
@@ -184,6 +210,10 @@ def normalize_fast_message(message: Dict[str, Any]) -> Dict[str, Any]:
     )
 
     sample: Dict[str, Any] = {}
+    if wan_stat:
+        # Replace the whole canonical list on every fast sample. Aggregate-only
+        # wan_stat payloads intentionally publish [] rather than a fake WAN row.
+        sample["wans"] = _fast_wan_rows(wan_stat, root)
     for target, keys in _FAST_WAN_INT_FIELDS.items():
         value = aggregate.get(target) if target in aggregate else _lookup_recursive(aggregate, keys)
         if value is _MISSING and target in {"ipv4Connections", "ipv6Connections", "ipv4HalfConnections", "ipv6HalfConnections", "cps"}:
@@ -417,6 +447,9 @@ class RouterWebSocketMonitor:
         if message_type == "fast":
             epoch_ms = int(time.time() * 1000)
             sample = normalize_fast_message(message)
+            for row in sample.get("wans", []):
+                if isinstance(row, dict):
+                    row.setdefault("trafficObservedAt", epoch_ms // 1000)
             self._store_fast(message, sample, epoch_ms)
             if sample:
                 with self._fast_handler_lock:
@@ -811,6 +844,9 @@ def _normalize_dashboard(self: Any, raw: Dict[str, Any]) -> Dict[str, Any]:
     wan_ip = _first_text(slow, "wan_ip", "wanIp")
     if wan_ip:
         wan["ipv4"] = wan_ip
+    fast_sample = normalize_fast_message(raw.get("fast")) if isinstance(raw.get("fast"), dict) else {}
+    if "wans" in fast_sample:
+        telemetry["wans"] = fast_sample["wans"]
     if "diskutil" in slow:
         try:
             telemetry["storagePercent"] = float(str(slow.get("diskutil")).strip().rstrip("%"))

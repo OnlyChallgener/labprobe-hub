@@ -136,6 +136,43 @@ def test_other_router_sources_keep_three_second_freshness(monkeypatch, firmware,
     assert engine.get_router_calibration_snapshot()["stale"] is True
 
 
+def test_agent_telemetry_flatten_preserves_per_wan_rows():
+    sample = RouterRealtimeEngine.flatten_agent_telemetry({
+        "wans": [{"wanId": "wan", "uploadBps": 10}, {"wanId": "wan1", "uploadBps": 20}],
+        "wan": {"uploadBps": 30},
+    })
+    assert sample["wans"] == [
+        {"wanId": "wan", "uploadBps": 10},
+        {"wanId": "wan1", "uploadBps": 20},
+    ]
+    assert sample["uploadBps"] == 30
+
+
+def test_realtime_wans_are_replaced_atomically_not_merged_or_summed():
+    engine = RouterRealtimeEngine()
+    engine.accept_router_fast({"wans": [
+        {"wanId": "wan", "uploadBps": 10},
+        {"wanId": "wan1", "uploadBps": 20},
+    ]}, 1_000_000)
+    engine.accept_router_fast({"wans": [{"wanId": "wan", "uploadBps": 30}]}, 2_000_000)
+    frame = engine.router_payload()
+    assert frame["wans"] == [{"wanId": "wan", "uploadBps": 30, "trafficObservedAt": 2000}]
+
+
+def test_slow_sample_without_wans_preserves_current_rows():
+    engine = RouterRealtimeEngine()
+    engine.accept_router_fast({"wans": [{"wanId": "wan", "uploadBps": 10}]}, 1_000_000)
+    engine.accept_router_slow({"storagePercent": 12.5}, 2_000_000)
+    assert engine.router_payload()["wans"][0]["uploadBps"] == 10
+
+
+def test_agent_sample_without_wans_does_not_keep_stale_eweb_rows():
+    engine = RouterRealtimeEngine()
+    engine.accept_router_fast({"wans": [{"wanId": "wan", "uploadBps": 10}]}, 1_000_000)
+    engine.accept_agent_telemetry({"cpuPercent": 7.0}, 2_000_000)
+    assert "wans" not in engine.router_payload()
+
+
 @pytest.mark.parametrize("age_ms, connected", [(9000, True), (10001, False)])
 def test_be50_status_confirms_only_agent_samples_within_freshness_window(monkeypatch, age_ms, connected):
     monkeypatch.setenv("PRIMARY_ROUTER_NAME", "BE50")

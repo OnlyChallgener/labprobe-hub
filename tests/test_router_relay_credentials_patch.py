@@ -151,6 +151,7 @@ def test_extract_router_credentials_rejects_masked_password():
 
     assert result["username"] == "user-3"
     assert result["password"] == ""
+    assert result["passwordConfigured"] is True
 
 
 def _refresh_fixture():
@@ -262,6 +263,75 @@ def test_complete_relay_push_updates_memory_cache_and_nonce():
     assert sync.hub.ROUTER_CREDENTIALS_CACHE["password"] == "local-pass"
     assert sync.hub.ROUTER_CREDENTIALS_CACHE["refreshCompletedNonce"] == 101
     assert sync.hub.ROUTER_CREDENTIALS_CACHE["source"] == "router_local_agent"
+
+
+def test_extract_router_credentials_keeps_dual_wan_credentials_isolated():
+    payload = {"wans": [
+        {"wanId": "wan1", "username": "user-1", "password": "pass-1"},
+        {"wanId": "wan", "username": "user-0", "password": "pass-0"},
+    ]}
+    result = _extract_router_credentials(payload)
+    assert result["username"] == "user-0" and result["password"] == "pass-0"
+    assert result["wans"] == [
+        {"wanId": "wan", "username": "user-0", "password": "pass-0", "passwordConfigured": True},
+        {"wanId": "wan1", "username": "user-1", "password": "pass-1", "passwordConfigured": True},
+    ]
+
+
+def test_extract_router_credentials_never_combines_split_objects():
+    result = _extract_router_credentials({"wans": [
+        {"wanId": "wan", "username": "user-only"},
+        {"wanId": "wan", "password": "password-only"},
+    ]})
+    assert result["username"] == "user-only"
+    assert result["password"] == ""
+    assert result["passwordConfigured"] is None
+    assert len(result["wans"]) == 1
+
+
+def test_extract_router_credentials_wan1_only_does_not_become_default_wan():
+    result = _extract_router_credentials({"wans": [
+        {"wanId": "wan1", "username": "user-1", "password": "pass-1"},
+    ]})
+    assert result["username"] == result["password"] == ""
+    assert result["wans"][0]["wanId"] == "wan1"
+
+
+def test_complete_dual_wan_relay_push_projects_only_wan_to_legacy_fields():
+    app = Flask(__name__)
+    sync = _refresh_fixture()
+    sync.hub.ROUTER_CREDENTIALS_REFRESH_NONCE = 101
+    with app.test_request_context(
+        "/api/router/dashboard/credentials/push", method="POST",
+        json={"router": "router", "refreshNonce": 101, "wans": [
+            {"wanId": "wan", "username": "user-0", "password": "pass-0"},
+            {"wanId": "wan1", "username": "user-1", "password": "pass-1"},
+        ]},
+    ):
+        response = _relay_credentials_push_view(sync)
+        assert response.status_code == 200
+        assert response.headers["Cache-Control"] == "no-store"
+    cache = sync.hub.ROUTER_CREDENTIALS_CACHE
+    assert cache["username"] == "user-0" and cache["password"] == "pass-0"
+    assert [row["wanId"] for row in cache["wans"]] == ["wan", "wan1"]
+    assert cache["wans"][1]["username"] == "user-1"
+
+
+def test_relay_push_rejects_incomplete_second_wan_without_overwriting_cache():
+    app = Flask(__name__)
+    sync = _refresh_fixture()
+    sync.hub.ROUTER_CREDENTIALS_CACHE.update({"username": "old", "password": "old-pass"})
+    with app.test_request_context(
+        "/api/router/dashboard/credentials/push", method="POST",
+        json={"refreshNonce": 101, "wans": [
+            {"wanId": "wan", "username": "new", "password": "new-pass"},
+            {"wanId": "wan1", "username": "partial"},
+        ]},
+    ):
+        response, status = _relay_credentials_push_view(sync)
+        assert response.headers["Cache-Control"] == "no-store"
+        assert status == 422
+    assert sync.hub.ROUTER_CREDENTIALS_CACHE["password"] == "old-pass"
 
 
 def _command_fixture(requested=100, completed=100):

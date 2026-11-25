@@ -77,3 +77,24 @@ def test_be72pro_real_fast_frame_wan_rates_are_bits_per_second():
     assert sample.get("downloadBps") == 19361
     assert sample.get("totalUploadBytes") == 3672912896
     assert sample.get("totalDownloadBytes") == 13989216196
+
+
+def test_fast_frame_preserves_canonical_per_wan_rows():
+    frame = {"type": "fast", "data": {"timestamp": 1000, "wan_stat": {"wans": [
+        {"wanId": "wan", "tx_rate": 100, "rx_rate": 200},
+        {"wanId": "wan1", "tx_rate": 300, "rx_rate": 400},
+    ]}}}
+    rows = normalize_fast_message(frame)["wans"]
+    assert [row["wanId"] for row in rows] == ["wan", "wan1"]
+    assert rows[0]["uploadBps"] == 100 and rows[1]["downloadBps"] == 400
+    assert all(row["trafficObservedAt"] == 1000 for row in rows)
+
+
+def test_fast_frame_aggregate_wans_does_not_create_a_per_wan_row():
+    frame = {"type": "fast", "data": {"wan_stat": {"wans": {
+        "up": 100, "down": 200, "total_up": 300, "total_down": 400,
+    }}}}
+    sample = normalize_fast_message(frame)
+    assert sample["wans"] == []
+    assert sample["uploadBps"] == 100
+    assert sample["totalUploadBytes"] == 300

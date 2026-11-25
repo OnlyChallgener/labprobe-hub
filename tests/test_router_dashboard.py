@@ -281,5 +281,77 @@ class RouterDashboardApiTests(unittest.TestCase):
         self.assertEqual(response.status_code, 401)
 
 
+class WanCredentialAndSecretContractTests(unittest.TestCase):
+    def setUp(self):
+        self.client = hub.app.test_client()
+        with hub.ROUTER_CREDENTIALS_LOCK:
+            hub.ROUTER_CREDENTIALS_CACHE.clear()
+            hub.ROUTER_CREDENTIALS_REFRESH_NONCE = 1000
+        with hub.ROUTER_DASHBOARD_LOCK:
+            hub.ROUTER_DASHBOARD_CACHE.clear()
+
+    def test_credentials_get_returns_wan_rows_with_no_store(self):
+        import time
+        with hub.ROUTER_CREDENTIALS_LOCK:
+            hub.ROUTER_CREDENTIALS_CACHE.update({
+                "username": "user-0", "password": "pass-0", "passwordConfigured": True,
+                "wans": [
+                    {"wanId": "wan", "username": "user-0", "password": "pass-0", "passwordConfigured": True},
+                    {"wanId": "wan1", "username": "user-1", "password": "pass-1", "passwordConfigured": True},
+                ],
+                "receivedEpoch": time.time(),
+            })
+        response = self.client.get(
+            "/api/router/dashboard/credentials",
+            headers={"Authorization": "Bearer test-app-token"},
+        )
+        self.assertEqual(response.status_code, 200)
+        self.assertEqual(response.headers["Cache-Control"], "no-store")
+        body = response.get_json()
+        self.assertEqual(body["username"], "user-0")
+        self.assertEqual([row["wanId"] for row in body["wans"]], ["wan", "wan1"])
+
+    def test_stale_credentials_get_clears_every_wan_secret(self):
+        with hub.ROUTER_CREDENTIALS_LOCK:
+            hub.ROUTER_CREDENTIALS_CACHE.update({
+                "username": "user-0", "password": "pass-0",
+                "wans": [{"wanId": "wan1", "username": "user-1", "password": "pass-1"}],
+                "receivedEpoch": 1,
+            })
+        body = self.client.get(
+            "/api/router/dashboard/credentials",
+            headers={"Authorization": "Bearer test-app-token"},
+        ).get_json()
+        self.assertTrue(body["stale"])
+        self.assertEqual(body["wans"], [])
+        self.assertEqual(body["username"], "")
+        self.assertEqual(body["password"], "")
+
+    def test_public_dashboard_scrubs_cached_nested_secrets(self):
+        with hub.ROUTER_DASHBOARD_LOCK:
+            hub.ROUTER_DASHBOARD_CACHE.update({"details": {
+                "network": {"nested": [{"pppoe_password": "must-not-leak", "passwordConfigured": True}]},
+            }})
+        body = hub._router_dashboard_public()
+        encoded = json.dumps(body)
+        self.assertNotIn("must-not-leak", encoded)
+        self.assertTrue(body["details"]["network"]["nested"][0]["passwordConfigured"])
+
+    def test_dashboard_persistence_scrubs_nested_secrets(self):
+        from pathlib import Path
+        import tempfile
+        with tempfile.TemporaryDirectory() as directory:
+            target = Path(directory) / "router-dashboard.json"
+            with mock.patch.object(hub, "ROUTER_DASHBOARD_FILE", target), \
+                 hub.ROUTER_DASHBOARD_LOCK:
+                hub.ROUTER_DASHBOARD_CACHE.update({"details": {
+                    "network": {"password": "must-not-persist", "wifi": {"wpaPassphrase": "wifi-secret"}},
+                }})
+                hub._persist_router_dashboard_if_due(force=True)
+            encoded = target.read_text(encoding="utf-8")
+            self.assertNotIn("must-not-persist", encoded)
+            self.assertNotIn("wifi-secret", encoded)
+
+
 if __name__ == "__main__":
     unittest.main()

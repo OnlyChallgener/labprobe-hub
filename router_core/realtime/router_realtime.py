@@ -24,6 +24,7 @@ import time
 from typing import Any, Callable, Dict, List, Optional, Set
 
 from router_capabilities import is_be50_firmware
+from router_core.wan_telemetry import canonical_wan_rows
 
 
 ROUTER_STALE_MS = 3_000
@@ -72,6 +73,14 @@ def _sample_epoch_ms(value: Any = 0) -> int:
     if sample_ms <= 0 or sample_ms > now_ms + 10_000:
         return now_ms
     return sample_ms
+
+
+def _copy_wan_rows(value: Any) -> List[Dict[str, Any]]:
+    if isinstance(value, list):
+        return [json.loads(json.dumps(dict(row), ensure_ascii=False)) for row in value if isinstance(row, dict)]
+    if isinstance(value, dict):
+        return canonical_wan_rows(value)
+    return []
 
 
 class RealtimeFrame:
@@ -290,6 +299,8 @@ class RouterRealtimeEngine:
             value = source.get(key) if key in source else None
             if value is not None:
                 sample[target] = value
+        if isinstance(telemetry.get("wans"), (list, dict)):
+            sample["wans"] = _copy_wan_rows(telemetry.get("wans"))
         return sample
 
     def accept_agent_telemetry(self, telemetry: Any, sample_epoch_ms: int = 0) -> None:
@@ -331,17 +342,26 @@ class RouterRealtimeEngine:
         for key in _ROUTER_NUMBER_FIELDS:
             if key in sample:
                 normalized[key] = _number(sample.get(key))
+        epoch_ms = _sample_epoch_ms(sample_epoch_ms)
+        if "wans" in sample:
+            rows = _copy_wan_rows(sample.get("wans"))
+            for row in rows:
+                row.setdefault("trafficObservedAt", epoch_ms // 1000)
+            normalized["wans"] = rows
         if not normalized:
             return
 
-        epoch_ms = _sample_epoch_ms(sample_epoch_ms)
         with self._lock:
             previous = dict((self._latest_router_frame or {}).get("data") or {})
             merged = {
                 key: value
                 for key, value in previous.items()
-                if key in _ROUTER_INTEGER_FIELDS or key in _ROUTER_NUMBER_FIELDS
+                if key in _ROUTER_INTEGER_FIELDS or key in _ROUTER_NUMBER_FIELDS or key == "wans"
             }
+            previous_source = str(previous.get("source") or "")
+            if "wans" not in normalized and previous_source and source and \
+                    previous_source.startswith("router_eweb_ws") != source.startswith("router_eweb_ws"):
+                merged.pop("wans", None)
             merged.update(normalized)
             self._router_sequence += 1
             sequence = self._router_sequence

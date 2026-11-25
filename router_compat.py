@@ -11,6 +11,7 @@ from __future__ import annotations
 
 import json
 import os
+import re
 import threading
 import time
 from typing import Any, Dict, Iterable, List, Optional, Tuple
@@ -18,7 +19,51 @@ from typing import Any, Dict, Iterable, List, Optional, Tuple
 from flask import jsonify, request
 
 from router_rpc import RuijieRouterClient, RouterRpcError
+from router_core.wan import build_wan_inventory
 from router_core.wan_telemetry import normalize_wan_telemetry
+
+
+def _password_like_key(key: Any) -> bool:
+    normalized = re.sub(r"[^a-z0-9]", "", str(key or "").lower())
+    if "configured" in normalized:
+        return False
+    return (
+        normalized in {"password", "passwd", "pwd"}
+        or "password" in normalized
+        or "passwd" in normalized
+        or "passphrase" in normalized
+    )
+
+
+def scrub_password_keys(value: Any) -> Any:
+    """Return a deep copy with plaintext password-like fields removed."""
+    if isinstance(value, dict):
+        return {
+            key: scrub_password_keys(child)
+            for key, child in value.items()
+            if not _password_like_key(key)
+        }
+    if isinstance(value, list):
+        return [scrub_password_keys(child) for child in value]
+    return value
+
+
+def _traffic_rows(wans: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
+    rows: List[Dict[str, Any]] = []
+    metric_keys = (
+        "uploadBps", "downloadBps", "totalUploadBytes", "totalDownloadBytes",
+        "dailyUploadBytes", "dailyDownloadBytes",
+    )
+    for wan in wans:
+        if not wan.get("trafficSource") and not any(wan.get(key) is not None for key in metric_keys):
+            continue
+        row = {"wanId": wan.get("wanId", "")}
+        row.update({key: wan.get(key) for key in metric_keys})
+        row["trafficSource"] = wan.get("trafficSource", "")
+        row["trafficObservedAt"] = wan.get("trafficObservedAt")
+        row["trafficComplete"] = wan.get("trafficComplete")
+        rows.append(row)
+    return rows
 
 
 def _clean(value: Any) -> str:
@@ -323,16 +368,16 @@ class RouterRpcCompatibilitySync:
         wan_stat = _dict(fast, "wan_stat", "wanStat") or _dict(network_connect, "wan_stat", "wanStat")
         wan_value = wan_stat.get("wans") or wan_stat.get("wan") or wan_stat
         aggregate = normalize_wan_telemetry(wan_value)["aggregate"]
-        wan_info = (
-            _dict(ipinfo, "wan", "WAN")
-            or (_list(ipinfo, "list") or [{}])[0]
-            or _dict(network_connect, "wan", "WAN")
-            or (network_connect if isinstance(network_connect, dict) else {})
-        )
-        if not isinstance(wan_info, dict):
-            wan_info = {}
+        inventory_raw = dict(raw)
+        for key in ("network", "ipinfo", "ipinfo6", "networkConnect", "portStatus", "fast", "flowAudit", "telemetry", "rcgame"):
+            if key in inventory_raw:
+                inventory_raw[key] = _unwrap(inventory_raw.get(key))
+        inventory = build_wan_inventory(inventory_raw)
+        wans = inventory.get("wans") if isinstance(inventory.get("wans"), list) else []
+        # The singular legacy view is the logical WAN only. It must not fall
+        # back to the first runtime row, which may belong to WAN1.
+        legacy_wan = next((row for row in wans if isinstance(row, dict) and row.get("wanId") == "wan"), {})
         network_lan = _select_network_row(network, "lan") or _select_network_row(network_group, "lan")
-        network_wan = _select_network_row(network, "wan") or _select_network_row(network_group, "wan")
 
         ap_rows = _list(ap_raw, "list", "apList", "aps")
         ap = next((row for row in ap_rows if isinstance(row, dict)), ap_raw if isinstance(ap_raw, dict) else {})
@@ -367,11 +412,7 @@ class RouterRpcCompatibilitySync:
         ipv4_connections = _integer(aggregate.get("ipv4Connections"))
         ipv6_connections = _integer(aggregate.get("ipv6Connections"))
 
-        dns = _split(wan_info.get("dnsList") or wan_info.get("dns") or network_wan.get("dns"))
-        for key in ("dns1", "dns2", "primaryDns", "secondaryDns"):
-            value = _clean(wan_info.get(key) or network_wan.get(key))
-            if value and value not in dns:
-                dns.append(value)
+        dns = list(legacy_wan.get("dns") or [])
 
         channel_values = _split(ap.get("channel") or ap.get("channels"))
         channel_util = _split(ap.get("chutil") or ap.get("channelUtilization"))
@@ -387,14 +428,21 @@ class RouterRpcCompatibilitySync:
         previous_wireless = previous_details.get("wireless") if isinstance(previous_details.get("wireless"), dict) else {}
 
         wan = {
-            "ipv4": _clean(wan_info.get("ip") or wan_info.get("ipv4") or network_wan.get("ipaddr")),
-            "gateway": _clean(wan_info.get("gateway") or network_wan.get("gateway")),
-            "netmask": _clean(wan_info.get("mask") or wan_info.get("netmask") or network_wan.get("netmask")),
-            "proto": _clean(wan_info.get("proto") or network_wan.get("proto")),
-            "mtu": _clean(wan_info.get("mtu") or network_wan.get("mtu")),
+            "ipv4": _clean(legacy_wan.get("ipv4")),
+            "gateway": _clean(legacy_wan.get("gateway")),
+            "netmask": _clean(legacy_wan.get("netmask")),
+            "proto": _clean(legacy_wan.get("proto")),
+            "mtu": legacy_wan.get("mtu"),
             "dnsServers": dns[:3],
-            "interfaceDisplay": _clean(wan_info.get("interfaceDisplay") or wan_info.get("ifname") or "WAN").upper(),
-            "operator": _clean(previous_wan.get("operator")),
+            "interfaceDisplay": _clean(legacy_wan.get("ifname") or "WAN").upper(),
+            "ifname": _clean(legacy_wan.get("ifname")),
+            "vlanId": legacy_wan.get("vlanId"),
+            "mac": _clean(legacy_wan.get("mac")),
+            "remark": _clean(legacy_wan.get("remark")),
+            "dhcpLease": legacy_wan.get("dhcpLease"),
+            "operator": _clean(legacy_wan.get("operator")),
+            "pppoeUsername": _clean(legacy_wan.get("pppoeUsername")),
+            "pppoePasswordConfigured": legacy_wan.get("pppoePasswordConfigured"),
             "publicIpv4": _clean(previous_wan.get("publicIpv4")),
             "operatorCheckedIp": _clean(previous_wan.get("operatorCheckedIp")),
             "operatorCheckedEpoch": previous_wan.get("operatorCheckedEpoch", 0),
@@ -403,11 +451,11 @@ class RouterRpcCompatibilitySync:
         lan = {
             "ipv4": _clean(network_lan.get("ipaddr") or network_lan.get("ip") or _first(network, "lanIp", "lan_ip")),
             "mac": _clean(network_lan.get("macaddr") or network_lan.get("mac") or ap.get("mac")),
-            "broadbandRemark": _clean(network_wan.get("service") or network_wan.get("serviceName")),
+            "broadbandRemark": _clean(legacy_wan.get("remark")),
             "netmask": _clean(network_lan.get("netmask") or network_lan.get("mask")),
             "vlanId": _clean(network_lan.get("vlanid") or network_lan.get("vlanId") or network_lan.get("vid")),
             "dhcpLease": _clean(network_lan.get("leasetime") or network_lan.get("leaseTime")),
-            "uplink": _clean(network_wan.get("ifname") or network_wan.get("interface") or "wan"),
+            "uplink": _clean(legacy_wan.get("ifname") or "wan"),
         }
         ap_details = {
             "model": model,
@@ -438,6 +486,7 @@ class RouterRpcCompatibilitySync:
             "detailsAt": now,
             "detailsEpoch": now_epoch,
             "source": "router_rpc",
+            "wans": wans,
             "telemetry": {
                 "temperatureC": temperature,
                 "temperature2gC": temperature2g,
@@ -455,6 +504,7 @@ class RouterRpcCompatibilitySync:
                     "dailyUploadBytes": _integer(aggregate.get("dailyUploadBytes")),
                     "dailyDownloadBytes": _integer(aggregate.get("dailyDownloadBytes")),
                 },
+                "wans": _traffic_rows(wans),
                 "connections": {
                     "ipv4": ipv4_connections,
                     "ipv6": ipv6_connections,
@@ -473,11 +523,11 @@ class RouterRpcCompatibilitySync:
                 "lan": lan,
                 "ap": ap_details,
                 "wireless": previous_wireless,
-                "network": network,
-                "networkGroup": network_group,
-                "networkConnect": network_connect,
-                "wirelessConfig": wireless_config,
-                "rcgame": rcgame,
+                "network": scrub_password_keys(network),
+                "networkGroup": scrub_password_keys(network_group),
+                "networkConnect": scrub_password_keys(network_connect),
+                "wirelessConfig": scrub_password_keys(wireless_config),
+                "rcgame": scrub_password_keys(rcgame),
                 "ports": port_rows,
             },
         }

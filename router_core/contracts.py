@@ -59,6 +59,27 @@ class WanInfo:
     linkSpeedMbps: int = 0
     capabilities: Dict[str, bool] = field(default_factory=dict)
     source: str = "firmware"
+    # Additive per-WAN detail/telemetry fields. Unknown numeric values stay
+    # None so the wire contract can render "--" instead of a fabricated zero.
+    ifname: str = ""
+    netmask: str = ""
+    mtu: Optional[int] = None
+    vlanId: Optional[int] = None
+    mac: str = ""
+    remark: str = ""
+    operator: str = ""
+    pppoeUsername: str = ""
+    pppoePasswordConfigured: Optional[bool] = None
+    dhcpLease: Optional[str] = None
+    uploadBps: Optional[int] = None
+    downloadBps: Optional[int] = None
+    totalUploadBytes: Optional[int] = None
+    totalDownloadBytes: Optional[int] = None
+    dailyUploadBytes: Optional[int] = None
+    dailyDownloadBytes: Optional[int] = None
+    trafficSource: str = ""
+    trafficObservedAt: Optional[int] = None
+    trafficComplete: Optional[bool] = None
 
     def to_dict(self) -> Dict[str, Any]:
         return {
@@ -84,6 +105,25 @@ class WanInfo:
             "linkSpeedMbps": self.linkSpeedMbps,
             "capabilities": dict(self.capabilities),
             "source": self.source,
+            "ifname": self.ifname,
+            "netmask": self.netmask,
+            "mtu": self.mtu,
+            "vlanId": self.vlanId,
+            "mac": self.mac,
+            "remark": self.remark,
+            "operator": self.operator,
+            "pppoeUsername": self.pppoeUsername,
+            "pppoePasswordConfigured": self.pppoePasswordConfigured,
+            "dhcpLease": self.dhcpLease,
+            "uploadBps": self.uploadBps,
+            "downloadBps": self.downloadBps,
+            "totalUploadBytes": self.totalUploadBytes,
+            "totalDownloadBytes": self.totalDownloadBytes,
+            "dailyUploadBytes": self.dailyUploadBytes,
+            "dailyDownloadBytes": self.dailyDownloadBytes,
+            "trafficSource": self.trafficSource,
+            "trafficObservedAt": self.trafficObservedAt,
+            "trafficComplete": self.trafficComplete,
         }
 
 
