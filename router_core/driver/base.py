@@ -26,6 +26,11 @@ class RouterDriver(ABC):
         ...
 
     @abstractmethod
+    def get_wans(self, force: bool = False) -> Dict[str, Any]:
+        """Returns the unified WAN inventory and per-module capabilities."""
+        ...
+
+    @abstractmethod
     def get_devices(self, force: bool = False) -> List[Dict[str, Any]]:
         """Returns list of connected terminal devices."""
         ...

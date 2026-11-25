@@ -116,6 +116,13 @@ class RouterService:
         except Exception as exc:
             raise from_legacy_error(exc) from exc
 
+    def get_wans(self, force: bool = False) -> Dict[str, Any]:
+        try:
+            res = self._driver.get_wans(force=force)
+            return self._ensure_data_wrapper(res)
+        except Exception as exc:
+            raise from_legacy_error(exc) from exc
+
     def get_connection_config(self) -> Dict[str, Any]:
         if self._config_loader is None:
             return {"ok": False, "error": "router_config_unavailable"}

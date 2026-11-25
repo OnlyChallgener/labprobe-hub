@@ -62,6 +62,11 @@ def create_router_blueprint_v1(
     def refresh_dashboard():
         return jsonify(service.refresh_dashboard())
 
+    @bp.get("/wans")
+    def get_wans():
+        force = request.args.get("force", "").lower() in ("1", "true")
+        return jsonify(service.get_wans(force=force))
+
     @bp.get("/devices")
     def get_devices():
         force = request.args.get("force", "").lower() in ("1", "true")

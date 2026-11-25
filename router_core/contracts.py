@@ -36,6 +36,78 @@ class RouterCapabilities:
 
 
 @dataclass
+class WanInfo:
+    wanId: str = ""
+    logicalInterface: str = ""
+    displayName: str = ""
+    physicalPortId: int = 0
+    physicalPortName: str = ""
+    role: str = ""
+    supported: bool = False
+    configured: bool = False
+    enabled: bool = False
+    online: bool = False
+    defaultEgress: bool = False
+    families: List[str] = field(default_factory=list)
+    proto: str = ""
+    ipv4: str = ""
+    ipv6: str = ""
+    gateway: str = ""
+    gateway6: str = ""
+    dns: List[str] = field(default_factory=list)
+    uptimeSeconds: int = 0
+    linkSpeedMbps: int = 0
+    capabilities: Dict[str, bool] = field(default_factory=dict)
+    source: str = "firmware"
+
+    def to_dict(self) -> Dict[str, Any]:
+        return {
+            "wanId": self.wanId,
+            "logicalInterface": self.logicalInterface,
+            "displayName": self.displayName,
+            "physicalPortId": self.physicalPortId,
+            "physicalPortName": self.physicalPortName,
+            "role": self.role,
+            "supported": self.supported,
+            "configured": self.configured,
+            "enabled": self.enabled,
+            "online": self.online,
+            "defaultEgress": self.defaultEgress,
+            "families": list(self.families),
+            "proto": self.proto,
+            "ipv4": self.ipv4,
+            "ipv6": self.ipv6,
+            "gateway": self.gateway,
+            "gateway6": self.gateway6,
+            "dns": list(self.dns),
+            "uptimeSeconds": self.uptimeSeconds,
+            "linkSpeedMbps": self.linkSpeedMbps,
+            "capabilities": dict(self.capabilities),
+            "source": self.source,
+        }
+
+
+@dataclass
+class WanInventory:
+    wans: List[WanInfo] = field(default_factory=list)
+    supported: bool = False
+    configuredCount: int = 0
+    onlineCount: int = 0
+    multiWanMode: str = ""
+    updatedAt: int = 0
+
+    def to_dict(self) -> Dict[str, Any]:
+        return {
+            "wans": [wan.to_dict() for wan in self.wans],
+            "supported": self.supported,
+            "configuredCount": self.configuredCount,
+            "onlineCount": self.onlineCount,
+            "multiWanMode": self.multiWanMode,
+            "updatedAt": self.updatedAt,
+        }
+
+
+@dataclass
 class RouterStatus:
     state: str = "checking"
     connected: bool = False

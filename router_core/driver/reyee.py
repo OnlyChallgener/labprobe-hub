@@ -13,6 +13,7 @@ from .base import RouterDriver
 from router_core.driver.reyee_rpc import ReyeeRpcClient
 from router_core.driver.reyee_session import ReyeeSessionManager
 from router_core.errors import RouterRpcExecutionError, RouterValidationError, from_legacy_error
+from router_core.wan import build_wan_inventory
 from router_capabilities import firmware_features
 
 
@@ -203,7 +204,11 @@ class ReyeeEWebDriver(RouterDriver):
     def get_dashboard(self, force: bool = False) -> Dict[str, Any]:
         if self._legacy_client and hasattr(self._legacy_client, "dashboard"):
             try:
-                return self._legacy_client.dashboard(force=force)
+                dashboard = self._legacy_client.dashboard(force=force)
+                if isinstance(dashboard, dict):
+                    inventory = build_wan_inventory(dashboard)
+                    return {**dashboard, "wanInventory": inventory, "wans": inventory["wans"]}
+                return dashboard
             except Exception:
                 pass
         if not self._rpc_client:
@@ -267,9 +272,18 @@ class ReyeeEWebDriver(RouterDriver):
                                 result[key] = snapshot[key]
                 except Exception:
                     pass
+            inventory = build_wan_inventory(result)
+            result["wanInventory"] = inventory
+            result["wans"] = inventory["wans"]
             return result
 
         return self._cached("dashboard", 3.0, load, force)
+
+    def get_wans(self, force: bool = False) -> Dict[str, Any]:
+        try:
+            return self._cached("wans", 10.0, lambda: build_wan_inventory(self.get_dashboard(force=force)), force)
+        except Exception as exc:
+            raise from_legacy_error(exc) from exc
 
     def get_devices(self, force: bool = False) -> List[Dict[str, Any]]:
         try:

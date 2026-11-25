@@ -42,6 +42,7 @@ def mock_driver():
         "lastSuccessAt": 1700000000000,
     }
     driver.get_dashboard.return_value = {"hardware": {"cpu": 15.0}}
+    driver.get_wans.return_value = {"wans": [], "supported": False, "configuredCount": 0, "onlineCount": 0}
     driver.get_devices.return_value = [{"mac": "AA:BB:CC:DD:EE:01"}]
     driver.get_port_mappings.return_value = {"rules": [{"name": "ssh", "extPort": 2222}]}
     driver.add_port_mapping.return_value = {"rules": [{"name": "web", "extPort": 80}]}
@@ -115,6 +116,13 @@ def test_dashboard_and_devices(test_app, mock_driver):
     r3 = test_app.get("/api/router/devices")
     assert r3.status_code == 200
     assert len(r3.get_json()) == 1
+
+
+def test_wans_endpoint_preserves_inventory_contract(test_app, mock_driver):
+    response = test_app.get("/api/router/wans?force=1")
+    assert response.status_code == 200
+    assert response.get_json()["data"]["configuredCount"] == 0
+    mock_driver.get_wans.assert_called_with(force=True)
 
 
 def test_port_mapping_endpoints(test_app, mock_driver):
