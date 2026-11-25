@@ -286,7 +286,9 @@ class ReyeeEWebDriver(RouterDriver):
 
     def get_wans(self, force: bool = False) -> Dict[str, Any]:
         try:
-            return self._cached("wans", 10.0, lambda: build_wan_inventory(self.get_dashboard(force=force)), force)
+            # WAN inventory is a configuration/capability snapshot, not the realtime feed.
+            # Dashboard/WSS telemetry retains its own independent refresh path.
+            return self._cached("wans", 120.0, lambda: build_wan_inventory(self.get_dashboard(force=force)), force)
         except Exception as exc:
             raise from_legacy_error(exc) from exc
 

@@ -242,3 +242,24 @@ def test_missing_wan1_traffic_is_not_filled_from_wan_or_aggregate():
     assert wan["uploadBps"] == 10
     assert wan1["uploadBps"] is None and wan1["downloadBps"] is None
     assert wan1["trafficSource"] == ""
+
+
+def test_driver_wan_inventory_reuses_low_frequency_snapshot_and_honors_force(monkeypatch):
+    from router_core.cache.router_cache import RouterCache
+    from router_core.driver.reyee import ReyeeEWebDriver
+
+    cache = RouterCache()
+    driver = ReyeeEWebDriver(cache=cache)
+    calls = []
+
+    def dashboard(force=False):
+        calls.append(force)
+        return {"network": {"wan": [{"proto": "dhcp"}], "wanNum": "1"}}
+
+    monkeypatch.setattr(driver, "get_dashboard", dashboard)
+    first = driver.get_wans()
+    assert driver.get_wans() == first
+    assert calls == [False]
+    assert cache._store["wans"].ttl == 120.0
+    driver.get_wans(force=True)
+    assert calls == [False, True]
