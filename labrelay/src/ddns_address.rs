@@ -46,6 +46,7 @@ pub struct DdnsAddressSnapshot {
 pub struct DdnsAddressReport {
     pub address: DdnsAddressSnapshot,
     pub wans: Vec<DdnsWanAddressSnapshot>,
+    pub wan_supported: bool,
 }
 
 #[derive(Debug, Clone, Serialize, PartialEq, Eq)]
@@ -246,6 +247,7 @@ impl InterfaceTopology {
 
 pub async fn detect() -> DdnsAddressReport {
     let discovered = wan::discover_snapshot_async().await.ok();
+    let wan_supported = discovered.is_some();
     let detected_at = now_epoch();
     let detections = match discovered.as_ref() {
         Some(snapshot) => detect_wans(snapshot, detected_at).await,
@@ -255,6 +257,7 @@ pub async fn detect() -> DdnsAddressReport {
     DdnsAddressReport {
         address,
         wans: detections.iter().map(WanDetection::snapshot).collect(),
+        wan_supported,
     }
 }
 
@@ -1477,8 +1480,10 @@ mod tests {
                 FamilyDetection::unavailable(),
             )
             .snapshot()],
+            wan_supported: true,
         };
         let value = serde_json::to_value(report).unwrap();
+        assert_eq!(value["wanSupported"], true);
         assert_eq!(value["address"]["detectedIpv4"], "192.0.2.10");
         assert_eq!(value["address"]["detectedAt"], 123);
         assert_eq!(value["wans"][0]["wanId"], "wan1");

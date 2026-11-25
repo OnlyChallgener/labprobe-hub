@@ -666,6 +666,7 @@ class LabDdnsStore:
 
     def public_snapshot(self) -> Dict[str, Any]:
         snapshot = self.snapshot()
+        snapshot["wanSupported"] = bool(snapshot.get("wanSupported"))
         for record in snapshot.get("records", []):
             record["credentialsConfigured"] = self.secrets.configured(record.get("id", ""))
         return snapshot
@@ -779,6 +780,10 @@ class LabDdnsStore:
         with self.lock:
             changed = False
             auto_ready = False
+            wan_supported = isinstance(value, dict) and bool(value.get("wanSupported"))
+            if bool(self.root.get("wanSupported")) != wan_supported:
+                self.root["wanSupported"] = wan_supported
+                changed = True
             for wan_id, address in samples:
                 addresses = self.root.get("addresses", {})
                 previous_address = self.root.get("address", {}) if not wan_id else addresses.get(wan_id, {})

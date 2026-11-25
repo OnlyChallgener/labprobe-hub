@@ -490,12 +490,14 @@ def test_relay_nested_default_and_wans_update_legacy_and_explicit_scopes(tmp_pat
 
     assert store.accept_address({
         "address": sample("wan2", "192.0.2.10", "2001:db8::10", 100),
+        "wanSupported": True,
         "wans": [
             sample("WAN1", "198.51.100.10", "2001:db8:1::10", 100),
             sample("wan2", "198.51.100.20", "2001:db8:2::20", 100),
         ],
     })
     snapshot = store.snapshot()
+    assert snapshot["wanSupported"] is True
     assert snapshot["address"]["detectedIpv4"] == "192.0.2.10"
     assert snapshot["address"]["detectedIpv6"] == "2001:db8::10"
     assert snapshot["addresses"]["wan1"]["detectedIpv4"] == "198.51.100.10"
@@ -510,6 +512,7 @@ def test_relay_nested_default_and_wans_update_legacy_and_explicit_scopes(tmp_pat
         "wans": "malformed",
     })
     snapshot = store.snapshot()
+    assert snapshot["wanSupported"] is False
     assert snapshot["address"]["detectedIpv4"] == "192.0.2.11"
     assert snapshot["addresses"]["wan1"]["detectedAt"] == 100
     assert snapshot["addresses"]["wan2"]["detectedAt"] == 100
