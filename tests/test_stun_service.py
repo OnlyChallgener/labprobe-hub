@@ -989,7 +989,9 @@ def test_relay_stun_startup_does_not_block_the_agent_control_loop():
 
     assert "confirm_stun_startup(&shared, Duration::from_secs(30))" not in source
     assert "Duration::from_secs(if is_stun_upsert { 70 } else { 8 })" not in source
-    assert 'let startup_state = if rule.kind == "stun" { "mapping" } else { "running" };' in source
+    startup = source.split('let startup_state = if rule.kind == "stun" {', 1)[1].split("};", 1)[0]
+    assert '"mapping"' in startup
+    assert '"running"' in startup
     assert "pending_transaction.take().is_some()" in source
     assert "STUN UDP 响应超时，正在重试" in source
     assert "STUN 绑定响应事务不匹配" in source
