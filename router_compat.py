@@ -18,6 +18,7 @@ from typing import Any, Dict, Iterable, List, Optional, Tuple
 from flask import jsonify, request
 
 from router_rpc import RuijieRouterClient, RouterRpcError
+from router_core.wan_telemetry import normalize_wan_telemetry
 
 
 def _clean(value: Any) -> str:
@@ -320,7 +321,8 @@ class RouterRpcCompatibilitySync:
         port_raw = _unwrap(raw.get("portStatus")) or {}
 
         wan_stat = _dict(fast, "wan_stat", "wanStat") or _dict(network_connect, "wan_stat", "wanStat")
-        aggregate = _dict(wan_stat, "wans") or _dict(wan_stat, "wan") or wan_stat
+        wan_value = wan_stat.get("wans") or wan_stat.get("wan") or wan_stat
+        aggregate = normalize_wan_telemetry(wan_value)["aggregate"]
         wan_info = (
             _dict(ipinfo, "wan", "WAN")
             or (_list(ipinfo, "list") or [{}])[0]

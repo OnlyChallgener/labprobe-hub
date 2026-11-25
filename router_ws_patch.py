@@ -21,6 +21,7 @@ import websocket
 import router_compat
 import router_rpc_v010
 from router_capabilities import firmware_features
+from router_core.wan_telemetry import normalize_wan_telemetry
 
 
 WS_MESSAGE_TYPES = {"static", "slow", "fast", "recent_wan", "daily_wan", "ping"}
@@ -165,33 +166,7 @@ def _message_payload(message: Dict[str, Any]) -> Any:
 
 
 def _aggregate_wan(value: Any) -> Dict[str, Any]:
-    if isinstance(value, dict):
-        if any(key in value for keys in _FAST_WAN_INT_FIELDS.values() for key in keys):
-            return value
-        child_rows = [child for child in value.values() if isinstance(child, dict)]
-        if child_rows:
-            return _sum_wan_rows(child_rows)
-        return value
-    if isinstance(value, list):
-        return _sum_wan_rows([child for child in value if isinstance(child, dict)])
-    return {}
-
-
-def _sum_wan_rows(rows: list[Dict[str, Any]]) -> Dict[str, Any]:
-    output: Dict[str, Any] = {}
-    for target, keys in _FAST_WAN_INT_FIELDS.items():
-        total = 0
-        found_any = False
-        for row in rows:
-            value = _lookup_recursive(row, keys)
-            number = _integer(value)
-            if number is _MISSING:
-                continue
-            total += number
-            found_any = True
-        if found_any:
-            output[target] = total
-    return output
+    return normalize_wan_telemetry(value)["aggregate"]
 
 
 def normalize_fast_message(message: Dict[str, Any]) -> Dict[str, Any]:
