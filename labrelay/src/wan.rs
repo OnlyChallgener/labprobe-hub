@@ -18,7 +18,7 @@ use std::net::{IpAddr, Ipv4Addr, Ipv6Addr, SocketAddr};
 use std::os::fd::AsRawFd;
 use std::process::Command;
 use std::str::FromStr;
-use std::time::{SystemTime, UNIX_EPOCH};
+use std::time::{Instant, SystemTime, UNIX_EPOCH};
 use tokio::net::{TcpSocket, TcpStream, UdpSocket};
 use tokio::time::{timeout, Duration};
 
@@ -323,7 +323,25 @@ pub fn discover_snapshot() -> Result<WanSnapshot> {
     )
 }
 
-/// Async wrapper for callers that must not block their runtime thread.
+// Shared within each process; concurrent STUN rules and passive telemetry
+// must not each fork a complete set of UCI/ip discovery commands.
+static WAN_DISCOVERY_CACHE: tokio::sync::Mutex<Option<(Instant, Result<WanSnapshot, String>)>> =
+    tokio::sync::Mutex::const_new(None);
+
+pub async fn discover_snapshot_cached_async(max_age: Duration) -> Result<WanSnapshot> {
+    let mut cache = WAN_DISCOVERY_CACHE.lock().await;
+    if let Some((observed, value)) = cache.as_ref() {
+        let ttl = if value.is_ok() { max_age } else { max_age.min(Duration::from_secs(15)) };
+        if observed.elapsed() < ttl {
+            return value.clone().map_err(anyhow::Error::msg);
+        }
+    }
+    let result = discover_snapshot_async().await.map_err(|error| format!("{error:#}"));
+    *cache = Some((Instant::now(), result.clone()));
+    result.map_err(anyhow::Error::msg)
+}
+
+/// Fresh, read-only discovery for explicit operations such as a new TCP test.
 pub async fn discover_snapshot_async() -> Result<WanSnapshot> {
     tokio::task::spawn_blocking(discover_snapshot)
         .await

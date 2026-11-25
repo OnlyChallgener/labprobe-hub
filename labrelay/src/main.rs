@@ -919,7 +919,7 @@ fn resolve_stun_wan_from_discovery(
 }
 
 async fn resolve_stun_wan(wan_id: &str) -> Result<wan::WanBinding> {
-    resolve_stun_wan_from_discovery(wan_id, wan::discover_snapshot_async().await)
+    resolve_stun_wan_from_discovery(wan_id, wan::discover_snapshot_cached_async(Duration::from_secs(60)).await)
 }
 
 fn same_binding_plan(left: &wan::WanBinding, right: &wan::WanBinding) -> bool {

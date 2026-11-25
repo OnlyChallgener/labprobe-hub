@@ -293,9 +293,9 @@ async fn report_agent_status(
     state: &mut AgentState,
 ) -> Result<()> {
     let now = now_epoch();
-    if state.last_wan_capability_at == 0 || now.saturating_sub(state.last_wan_capability_at) >= 30 {
+    if state.last_wan_capability_at == 0 || now.saturating_sub(state.last_wan_capability_at) >= 120 {
         state.wan_capability = Some(agent_wan_capability(
-            crate::wan::discover_snapshot_async().await,
+            crate::wan::discover_snapshot_cached_async(Duration::from_secs(120)).await,
         ));
         state.last_wan_capability_at = now;
     }

@@ -706,7 +706,7 @@ impl TcpSessionTestManager {
     }
 
     pub(crate) async fn capability(&self) -> Value {
-        let snapshot = wan::discover_snapshot_async().await;
+        let snapshot = wan::discover_snapshot_cached_async(Duration::from_secs(120)).await;
         match snapshot {
             Ok(snapshot) => {
                 let wan_ids: Vec<String> = snapshot

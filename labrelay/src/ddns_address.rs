@@ -246,7 +246,7 @@ impl InterfaceTopology {
 }
 
 pub async fn detect() -> DdnsAddressReport {
-    let discovered = wan::discover_snapshot_async().await.ok();
+    let discovered = wan::discover_snapshot_cached_async(Duration::from_secs(120)).await.ok();
     let wan_supported = discovered.is_some();
     let detected_at = now_epoch();
     let detections = match discovered.as_ref() {
@@ -310,17 +310,17 @@ async fn detect_external_bound(
         WanFamily::V4 => &IPV4_EGRESS_ENDPOINTS,
         WanFamily::V6 => &IPV6_EGRESS_ENDPOINTS,
     };
-    // Each endpoint verifies and pins its own resolved address. Cloning the
-    // binding keeps concurrent probes from overwriting each other's status.
-    let (primary, fallback) = tokio::join!(
-        query_external_bound(binding.clone(), family, endpoints[0]),
-        query_external_bound(binding, family, endpoints[1]),
-    );
-    if let Some((ip, source)) = primary.0.or(fallback.0) {
-        return (Some((ip, source)), WanVerification::Verified);
+    // The fallback is only necessary on failure; avoid duplicate external
+    // requests on every healthy line. Keep per-destination route verification.
+    let primary = query_external_bound(binding.clone(), family, endpoints[0]).await;
+    if primary.0.is_some() {
+        return primary;
     }
-    let verification = strongest_verification(primary.1, fallback.1);
-    (None, verification)
+    let fallback = query_external_bound(binding, family, endpoints[1]).await;
+    if fallback.0.is_some() {
+        return fallback;
+    }
+    (None, strongest_verification(primary.1, fallback.1))
 }
 
 async fn query_external_bound(
