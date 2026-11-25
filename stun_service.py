@@ -135,6 +135,21 @@ def _rule_fingerprint(row: Dict[str, Any]) -> str:
     return hashlib.sha256(json.dumps(data, ensure_ascii=False, sort_keys=True, separators=(",", ":"), default=str).encode()).hexdigest()
 
 
+def _runtime_wan_error(rule: Dict[str, Any], runtime: Dict[str, Any]) -> str:
+    expected = _wan_id(rule.get("wanId"))
+    reported = _text(runtime.get("wanId")).lower()
+    verification = _text(runtime.get("egressVerification")).lower()
+    if reported and reported != expected:
+        return "Relay 上报的 WAN 线路与规则不一致"
+    # Old single-WAN Relays did not report verification. Preserve that
+    # legacy path, but never accept it as evidence of a secondary WAN.
+    if expected != "wan" and (reported != expected or verification != "verified"):
+        return "所选 WAN 线路的实际出口尚未验证"
+    if verification and verification != "verified":
+        return "所选 WAN 线路的实际出口尚未验证"
+    return ""
+
+
 def _runtime_projection(rule: Dict[str, Any]) -> Dict[str, Any]:
     return {field: rule.get(field) for field in STUN_RUNTIME_FIELDS}
 
@@ -433,7 +448,7 @@ class StunService:
         else:
             rule_id = _text(rule.get("id"))
         endpoint = _text(runtime.get("publicEndpoint"))
-        if not endpoint:
+        if not endpoint or _runtime_wan_error(rule, runtime):
             return
         history = self._history()
         rows = [row for row in history.get(rule_id, []) if isinstance(row, dict)]
@@ -874,13 +889,12 @@ class StunService:
                 # reported separately and still withheld from mutations.
                 firewall_state = "ready"
             actual = _text(current.get("state"))
-            reported_wan = _text(current.get("wanId"))
-            wan_mismatch = bool(reported_wan and reported_wan != _wan_id(rule.get("wanId")))
+            wan_error = _runtime_wan_error(rule, current) if actual == "mapped" else ""
             if not _bool(rule.get("enabled")):
                 actual = "stopped"
-            elif wan_mismatch:
+            elif wan_error:
                 actual = "error"
-                current["lastError"] = "Relay 上报的 WAN 线路与规则不一致"
+                current["lastError"] = wan_error
             elif current and (not local_rule or not _same_runtime(local_rule, rule)):
                 actual = "error" if actual == "error" or _text(current.get("lastError")) else "mapping"
             elif self._is_native_forward(rule) and actual == "mapped" and native_state != "ready":
@@ -1208,7 +1222,7 @@ def create_stun_blueprint(hub: Any, service: StunService) -> Blueprint:
                         service.remove_firewall(rule["id"])
                     except Exception:
                         pass
-                elif _bool(rule.get("enabled")) and _text(current.get("state")) == "mapped":
+                elif _bool(rule.get("enabled")) and _text(current.get("state")) == "mapped" and not _runtime_wan_error(rule, current):
                     try:
                         result = service.ensure_firewall(rule)
                     except Exception as error:

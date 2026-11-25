@@ -113,6 +113,8 @@ def test_legacy_stun_rule_defaults_to_wan_and_history_keeps_line(tmp_path):
         "publicEndpoint": "203.0.113.9:12636",
         "mappingUpdatedAt": 123,
         "transportProtocol": "TCP",
+        "wanId": "wan1",
+        "egressVerification": "verified",
     })
 
     assert service._document()["rules"] == []
@@ -995,3 +997,23 @@ def test_relay_stun_startup_does_not_block_the_agent_control_loop():
     assert "pending_transaction.take().is_some()" in source
     assert "STUN UDP 响应超时，正在重试" in source
     assert "STUN 绑定响应事务不匹配" in source
+
+
+def test_secondary_wan_requires_verified_runtime_and_does_not_pollute_history(tmp_path):
+    hub, client, service, rule, _ = _running_rule(tmp_path, {
+        "serviceType": "SSH", "targetIpv4": "192.168.5.46", "targetPort": 22, "wanId": "wan1",
+    })
+    runtime = {"state": "mapped", "wanId": "wan1", "publicEndpoint": "203.0.113.9:12636",
+               "mappingUpdatedAt": int(time.time())}
+    for evidence in ({}, {"egressVerification": "unknown"}, {"wanId": "wan", "egressVerification": "verified"}):
+        current = {**runtime, **evidence}
+        hub.save_json(service.status_path, {"status": {"rules": [{"rule": rule, "runtime": current}]}})
+        assert service.rows()[0]["actualState"] == "error"
+        assert not service.rows()[0]["runtime"]["mappingFresh"]
+        service._remember_endpoint(rule, current)
+        assert not service._history().get(rule["id"])
+    current = {**runtime, "egressVerification": "verified"}
+    hub.save_json(service.status_path, {"status": {"rules": [{"rule": rule, "runtime": current}]}})
+    assert service.rows()[0]["actualState"] == "mapped"
+    service._remember_endpoint(rule, current)
+    assert service._history()[rule["id"]][0]["wanId"] == "wan1"
