@@ -14,6 +14,8 @@ use tokio::net::{lookup_host, TcpSocket};
 use tokio::sync::Mutex;
 use tokio::time::{sleep, timeout};
 
+use crate::wan;
+
 const ABSOLUTE_CONNECTION_LIMIT: usize = 131_072;
 const EXTREME_CONNECTION_TARGET: usize = 131_072;
 const EXTREME_FD_RESERVE: usize = 256;
@@ -51,6 +53,7 @@ struct TcpSessionConfig {
     connect_timeout_ms: u64,
     max_duration_seconds: u64,
     extreme_mode: bool,
+    wan_id: String,
 }
 
 impl Default for TcpSessionConfig {
@@ -64,6 +67,7 @@ impl Default for TcpSessionConfig {
             connect_timeout_ms: 1_500,
             max_duration_seconds: 180,
             extreme_mode: false,
+            wan_id: String::new(),
         }
     }
 }
@@ -92,6 +96,22 @@ impl TcpSessionConfig {
         self.cps = self.cps.clamp(1, 10_000);
         self.connect_timeout_ms = self.connect_timeout_ms.clamp(300, 10_000);
         self.max_duration_seconds = self.max_duration_seconds.clamp(10, 300);
+        self.wan_id = self.wan_id.trim().to_ascii_lowercase();
+        if self.wan_id.len() > 64
+            || (!self.wan_id.is_empty()
+                && !self
+                    .wan_id
+                    .chars()
+                    .next()
+                    .is_some_and(|ch| ch.is_ascii_alphanumeric()))
+            || (!self.wan_id.is_empty()
+                && !self
+                    .wan_id
+                    .chars()
+                    .all(|ch| ch.is_ascii_alphanumeric() || matches!(ch, '_' | '-' | '.')))
+        {
+            bail!("WAN 线路标识无效");
+        }
         if self.extreme_mode && fd_soft_limit().unwrap_or(0) < 65_536 {
             bail!("极限模式不可用：Relay FD 软上限低于 65536");
         }
@@ -389,6 +409,7 @@ struct TcpSessionSnapshot {
     started_epoch: u64,
     updated_epoch: u64,
     finished_epoch: u64,
+    wan_id: String,
 }
 
 impl Default for TcpSessionSnapshot {
@@ -409,6 +430,7 @@ impl Default for TcpSessionSnapshot {
             started_epoch: 0,
             updated_epoch: now_epoch(),
             finished_epoch: 0,
+            wan_id: String::new(),
         }
     }
 }
@@ -482,6 +504,7 @@ impl TcpSessionTestManager {
                 started_epoch: now,
                 updated_epoch: now,
                 finished_epoch: 0,
+                wan_id: config.wan_id.clone(),
             };
             inner.active = Some(control.clone());
         }
@@ -515,6 +538,32 @@ impl TcpSessionTestManager {
             row.insert("ok".into(), Value::Bool(true));
         }
         value
+    }
+
+    pub(crate) async fn capability(&self) -> Value {
+        let snapshot = wan::discover_snapshot_async().await;
+        match snapshot {
+            Ok(snapshot) => {
+                let wan_ids: Vec<String> = snapshot
+                    .wans
+                    .iter()
+                    .filter(|wan| wan.up)
+                    .map(|wan| wan.wan_id.clone())
+                    .collect();
+                json!({
+                    "available": true,
+                    "perWanTcpSession": !wan_ids.is_empty(),
+                    "wanIds": wan_ids,
+                    "source": snapshot.source,
+                })
+            }
+            Err(error) => json!({
+                "available": true,
+                "perWanTcpSession": false,
+                "wanIds": [],
+                "error": format!("{error:#}"),
+            }),
+        }
     }
 
     async fn run_task(&self, config: TcpSessionConfig, control: Arc<ActiveControl>) {
@@ -646,6 +695,42 @@ impl TcpSessionTestManager {
         })
         .await;
         let targets = resolve_targets(&config.host, config.port, ipv6).await?;
+        let mut binding = if config.wan_id.is_empty() {
+            None
+        } else {
+            let snapshot = wan::discover_snapshot_async().await?;
+            Some(wan::resolve_binding(
+                &snapshot,
+                &config.wan_id,
+                if ipv6 { wan::WanFamily::V6 } else { wan::WanFamily::V4 },
+            )?)
+        };
+        if let Some(binding) = binding.as_mut() {
+            for target in &targets {
+                let verification = wan::verify_route_get(binding, target.ip()).await;
+                if verification != wan::WanVerification::Verified {
+                    bail!(
+                        "WAN {} egress verification {} does not permit TCP session test to {}",
+                        binding.wan_id,
+                        verification.as_str(),
+                        target
+                    );
+                }
+            }
+            self.update(&control.task_id, |snapshot| {
+                push_log(
+                    snapshot,
+                    format!(
+                        "{} 已绑定 WAN {} 出口 {} ({})",
+                        label,
+                        binding.wan_id,
+                        binding.source_address,
+                        binding.device.as_deref().unwrap_or("未知设备")
+                    ),
+                );
+            })
+            .await;
+        }
         let _notrack_guards: Vec<ExtremeNoTrackGuard> = if config.extreme_mode {
             let guards: Vec<ExtremeNoTrackGuard> = targets
                 .iter()
@@ -887,7 +972,12 @@ impl TcpSessionTestManager {
                     (addr, None)
                 };
                 let timeout_duration = Duration::from_millis(config.connect_timeout_ms);
-                pending.push(connect_once(target_addr, timeout_duration, source_port));
+                pending.push(connect_once(
+                    target_addr,
+                    timeout_duration,
+                    source_port,
+                    binding.as_ref(),
+                ));
             }
 
             if now.duration_since(last_report) >= STATUS_INTERVAL {
@@ -1265,31 +1355,40 @@ async fn connect_once(
     address: SocketAddr,
     connect_timeout: Duration,
     source_port: Option<u16>,
+    binding: Option<&wan::WanBinding>,
 ) -> ConnectResult {
-    let socket = if address.is_ipv4() {
-        TcpSocket::new_v4()
+    let socket = if let Some(binding) = binding {
+        match wan::prepare_tcp_bound(binding, source_port.unwrap_or(0)) {
+            Ok(socket) => socket,
+            Err(_) => return ConnectResult::Failed(FailureKind::Other),
+        }
     } else {
-        TcpSocket::new_v6()
-    };
-    let socket = match socket {
-        Ok(value) => value,
-        Err(error) => return ConnectResult::Failed(classify_connect_error(&error)),
+        let socket = if address.is_ipv4() {
+            TcpSocket::new_v4()
+        } else {
+            TcpSocket::new_v6()
+        };
+        let socket = match socket {
+            Ok(value) => value,
+            Err(error) => return ConnectResult::Failed(classify_connect_error(&error)),
+        };
+        let _ = socket.set_reuseaddr(true);
+        #[cfg(unix)]
+        let _ = SockRef::from(&socket).set_reuse_port(true);
+        if let Some(port) = source_port {
+            let source = if address.is_ipv4() {
+                SocketAddr::from((Ipv4Addr::UNSPECIFIED, port))
+            } else {
+                SocketAddr::from((Ipv6Addr::UNSPECIFIED, port))
+            };
+            if let Err(error) = socket.bind(source) {
+                return ConnectResult::Failed(classify_connect_error(&error));
+            }
+        }
+        socket
     };
     let _ = socket.set_recv_buffer_size(2048);
     let _ = socket.set_send_buffer_size(2048);
-    let _ = socket.set_reuseaddr(true);
-    #[cfg(unix)]
-    let _ = SockRef::from(&socket).set_reuse_port(true);
-    if let Some(port) = source_port {
-        let source = if address.is_ipv4() {
-            SocketAddr::from((Ipv4Addr::UNSPECIFIED, port))
-        } else {
-            SocketAddr::from((Ipv6Addr::UNSPECIFIED, port))
-        };
-        if let Err(error) = socket.bind(source) {
-            return ConnectResult::Failed(classify_connect_error(&error));
-        }
-    }
     match timeout(connect_timeout, socket.connect(address)).await {
         Ok(Ok(stream)) => match stream.into_std() {
             Ok(stream) => {
@@ -1667,6 +1766,38 @@ fn now_epoch() -> u64 {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn tcp_session_config_and_status_preserve_wan_identity() {
+        let config = TcpSessionConfig {
+            host: "198.51.100.10".into(),
+            wan_id: " WAN1 ".into(),
+            ..TcpSessionConfig::default()
+        }
+        .validate()
+        .unwrap();
+        assert_eq!(config.wan_id, "wan1");
+
+        let snapshot = TcpSessionSnapshot {
+            wan_id: config.wan_id,
+            ..TcpSessionSnapshot::default()
+        };
+        let value = serde_json::to_value(snapshot).unwrap();
+        assert_eq!(value["wanId"], "wan1");
+        assert_eq!(serde_json::to_value(TcpSessionSnapshot::default()).unwrap()["wanId"], "");
+    }
+
+    #[test]
+    fn tcp_session_config_rejects_invalid_wan_identity() {
+        for wan_id in ["wan/1", ".wan"] {
+            let config = TcpSessionConfig {
+                host: "198.51.100.10".into(),
+                wan_id: wan_id.into(),
+                ..TcpSessionConfig::default()
+            };
+            assert!(config.validate().is_err());
+        }
+    }
 
     #[test]
     fn consecutive_failure_guard_stops_at_two_hundred() {

@@ -2225,12 +2225,18 @@ fn validate_rule(rule: &Rule, _port_min: u16, _port_max: u16) -> Result<()> {
     if rule.name.is_empty() || rule.name.len() > 64 {
         bail!("规则名称无效");
     }
-    if !rule
-        .wan_id
-        .strip_prefix("wan")
-        .is_some_and(|suffix| suffix.bytes().all(|byte| byte.is_ascii_digit()))
+    if rule.wan_id.len() > 64
+        || !rule
+            .wan_id
+            .chars()
+            .next()
+            .is_some_and(|ch| ch.is_ascii_alphanumeric())
+        || !rule
+            .wan_id
+            .chars()
+            .all(|ch| ch.is_ascii_alphanumeric() || matches!(ch, '_' | '-' | '.'))
     {
-        bail!("WAN ID 必须是 wan 或 wan 加数字");
+        bail!("WAN ID 无效");
     }
     if !matches!(
         rule.target_type.as_str(),
@@ -2406,6 +2412,7 @@ async fn handle_command_fixed(manager: Manager, raw: &str) -> Value {
                 .await
         }
         "tcp_session_status" => Ok(manager.tcp_session_tests.status().await),
+        "tcp_session_capability" => Ok(manager.tcp_session_tests.capability().await),
         "speedtest_start" => manager.speed_tests.start(&v).await,
         "speedtest_cancel" => {
             manager
@@ -2847,6 +2854,22 @@ mod tests {
             legacy_runtime.egress_verification,
             wan::WanVerification::Unknown
         );
+    }
+
+    #[test]
+    fn stable_arbitrary_wan_id_is_accepted_without_rewriting_identity() {
+        let mut rule = Rule {
+            id: "broadband".into(),
+            name: "Broadband".into(),
+            wan_id: "broadband_2".into(),
+            listen_port: 20001,
+            target_ipv4: "192.168.1.50".into(),
+            target_port: 443,
+            ..Rule::default()
+        };
+        normalize_rule(&mut rule);
+        validate_rule(&rule, 20000, 20020).unwrap();
+        assert_eq!(rule.wan_id, "broadband_2");
     }
 
     fn stun_wan_snapshot(up: bool, addresses: Value) -> wan::WanSnapshot {
