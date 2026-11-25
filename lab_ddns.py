@@ -375,14 +375,35 @@ def _normal_addresses(value: Any) -> Dict[str, Dict[str, Any]]:
 
 
 def _address_samples(value: Any) -> List[tuple[str, Dict[str, Any]]]:
-    """Normalize scalar, single-WAN and multi-WAN Relay payloads."""
+    """Normalize legacy scalar and Relay ``{address, wans}`` reports.
+
+    The nested address always belongs to the legacy ``wanId == ""`` scope,
+    even if a malformed payload puts a wanId inside it. Explicit WAN samples
+    are never used as a fallback for the default or for another WAN.
+    """
     if not isinstance(value, dict):
         return []
+    samples: List[tuple[str, Dict[str, Any]]] = []
+    nested_address = value.get("address")
+    if isinstance(nested_address, dict):
+        samples.append(("", _normal_address(nested_address)))
+    elif "wans" not in value or any(
+        key in value
+        for key in (
+            "detectedIpv4", "detectedIpv6", "ipv4State", "ipv6State",
+            "ipv4Source", "ipv6Source", "detectedAt",
+        )
+    ):
+        try:
+            wan_id = _normal_wan_id(value.get("wanId"))
+        except ValueError:
+            return []
+        samples.append((wan_id, _normal_address(value)))
+
     if "wans" in value:
         raw_wans = value.get("wans")
         if not isinstance(raw_wans, list):
-            return []
-        samples: List[tuple[str, Dict[str, Any]]] = []
+            return samples
         for raw_sample in raw_wans:
             if not isinstance(raw_sample, dict):
                 continue
@@ -392,12 +413,7 @@ def _address_samples(value: Any) -> List[tuple[str, Dict[str, Any]]]:
                 continue
             if wan_id:
                 samples.append((wan_id, _normal_address(raw_sample)))
-        return samples
-    try:
-        wan_id = _normal_wan_id(value.get("wanId"))
-    except ValueError:
-        return []
-    return [(wan_id, _normal_address(value))]
+    return samples
 
 
 def _normal_record(value: Any) -> Optional[Dict[str, Any]]:

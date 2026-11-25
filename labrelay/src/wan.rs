@@ -48,7 +48,7 @@ impl WanFamily {
         }
     }
 
-    fn matches(self, ip: IpAddr) -> bool {
+    pub(crate) fn matches(self, ip: IpAddr) -> bool {
         WanFamily::from_ip(ip) == self
     }
 }
@@ -600,6 +600,44 @@ pub async fn verify_udp_egress(peer: SocketAddr, binding: &mut WanBinding) -> Re
     require_verified_binding(binding, peer)
 }
 
+/// Verify the kernel route for an already-resolved destination IP using the
+/// selected WAN source. This is read-only: it only runs `ip route get` and
+/// never installs routes, rules, firewall state, or mwan3 marks.
+///
+/// Callers must use the returned status as a gate. `Unknown` includes command,
+/// parse, and address-family failures; only `Verified` proves both source and
+/// device match the selected binding.
+pub async fn verify_route_get(binding: &mut WanBinding, target: IpAddr) -> WanVerification {
+    binding.set_verification(WanVerification::Unknown);
+    if !binding.family.matches(target) || target.is_unspecified() {
+        return WanVerification::Unknown;
+    }
+    let source = match IpAddr::from_str(binding.source_address.trim()) {
+        Ok(source) if binding.family.matches(source) => source,
+        _ => return WanVerification::Unknown,
+    };
+    let family = if target.is_ipv4() { "-4" } else { "-6" };
+    let route_target = target.to_string();
+    let source = source.to_string();
+    let output = tokio::task::spawn_blocking(move || {
+        run_ip(&[
+            family,
+            "route",
+            "get",
+            route_target.as_str(),
+            "from",
+            source.as_str(),
+        ])
+    })
+    .await;
+    let verification = match output {
+        Ok(Ok(output)) => evaluate_route_get(binding, target, &output),
+        _ => WanVerification::Unknown,
+    };
+    binding.set_verification(verification);
+    verification
+}
+
 /// Require successful connected route verification before a WAN-bound STUN
 /// mapping may be reported.
 pub fn require_verified_binding(binding: &WanBinding, peer: SocketAddr) -> Result<()> {
@@ -755,23 +793,54 @@ fn evaluate_egress(
     connected_local: SocketAddr,
     route_get_output: &str,
 ) -> WanVerification {
-    let Some(route) = parse_route_get(route_get_output, binding.family) else {
+    let verification = evaluate_route_get(binding, peer.ip(), route_get_output);
+    if verification == WanVerification::Unknown {
         return WanVerification::Unknown;
-    };
+    }
     let Ok(source) = IpAddr::from_str(binding.source_address.trim()) else {
         return WanVerification::Unknown;
     };
     if !binding.family.matches(peer.ip())
         || !binding.family.matches(connected_local.ip())
         || connected_local.ip() != source
-        || route.source != source
     {
         return WanVerification::Mismatch;
     }
-    if let Some(expected_device) = binding.device.as_deref() {
-        if route.device != expected_device {
-            return WanVerification::Mismatch;
-        }
+    verification
+}
+
+/// Evaluate route output for a resolved target without requiring a connected
+/// socket. Parse failures are `unknown`; a different target, source, or device
+/// is a `mismatch`. Neither result permits publication.
+fn evaluate_route_get(
+    binding: &WanBinding,
+    target: IpAddr,
+    route_get_output: &str,
+) -> WanVerification {
+    let Some(route) = parse_route_get(route_get_output, binding.family) else {
+        return WanVerification::Unknown;
+    };
+    let Ok(source) = IpAddr::from_str(binding.source_address.trim()) else {
+        return WanVerification::Unknown;
+    };
+    if !binding.family.matches(target) || !binding.family.matches(source) {
+        return WanVerification::Unknown;
+    }
+    let Some(reported_target) = route_get_output
+        .lines()
+        .find_map(|line| line.split_whitespace().next())
+        .and_then(|value| value.parse::<IpAddr>().ok())
+    else {
+        return WanVerification::Unknown;
+    };
+    if reported_target != target
+        || route.source != source
+        || binding
+            .device
+            .as_deref()
+            .is_some_and(|expected_device| route.device != expected_device)
+    {
+        return WanVerification::Mismatch;
     }
     WanVerification::Verified
 }
@@ -2355,6 +2424,41 @@ default via fe80::2 dev pppoe-wan1 proto static table 101 metric 20 pref medium
 
     fn query_and_evaluate_verification_reset(binding: &mut WanBinding) {
         binding.set_verification(WanVerification::Unknown);
+    }
+
+    #[test]
+    fn resolved_target_route_requires_matching_target_source_and_device() {
+        let snapshot = snapshot_from_fixture(NETWORK, LINKS);
+        let binding = resolve_binding(&snapshot, "wan", WanFamily::V4).unwrap();
+        let target: IpAddr = "203.0.113.1".parse().unwrap();
+        assert_eq!(
+            evaluate_route_get(
+                &binding,
+                target,
+                "203.0.113.1 from 192.0.2.2 dev eth0.2 uid 0\n    cache\n",
+            ),
+            WanVerification::Verified
+        );
+        assert_eq!(
+            evaluate_route_get(
+                &binding,
+                target,
+                "203.0.113.1 from 192.0.2.2 dev pppoe-wan1 uid 0\n",
+            ),
+            WanVerification::Mismatch
+        );
+        assert_eq!(
+            evaluate_route_get(
+                &binding,
+                target,
+                "203.0.113.2 from 192.0.2.2 dev eth0.2 uid 0\n",
+            ),
+            WanVerification::Mismatch
+        );
+        assert_eq!(
+            evaluate_route_get(&binding, target, "RTNETLINK answers: Permission denied"),
+            WanVerification::Unknown
+        );
     }
 
     #[test]

@@ -480,3 +480,51 @@ def test_api_crud_automatically_carries_wan_id(tmp_path):
     assert blank.get_json()["record"]["wanId"] == ""
     assert client.delete(f"/api/ddns/{record_id}").status_code == 200
     assert store.snapshot()["records"] == []
+
+
+def test_relay_nested_default_and_wans_update_legacy_and_explicit_scopes(tmp_path):
+    store = new_store(tmp_path)
+    legacy = add_record(store, "", hostname="legacy.example.com")
+    first = add_record(store, "wan1")
+    second = add_record(store, "wan2", hostname="second.example.com")
+
+    assert store.accept_address({
+        "address": sample("wan2", "192.0.2.10", "2001:db8::10", 100),
+        "wans": [
+            sample("WAN1", "198.51.100.10", "2001:db8:1::10", 100),
+            sample("wan2", "198.51.100.20", "2001:db8:2::20", 100),
+        ],
+    })
+    snapshot = store.snapshot()
+    assert snapshot["address"]["detectedIpv4"] == "192.0.2.10"
+    assert snapshot["address"]["detectedIpv6"] == "2001:db8::10"
+    assert snapshot["addresses"]["wan1"]["detectedIpv4"] == "198.51.100.10"
+    assert snapshot["addresses"]["wan2"]["detectedIpv6"] == "2001:db8:2::20"
+    by_id = {record["id"]: record for record in snapshot["records"]}
+    assert by_id[legacy["id"]]["detectedIpv4"] == "192.0.2.10"
+    assert by_id[first["id"]]["detectedIpv4"] == "198.51.100.10"
+    assert by_id[second["id"]]["detectedIpv6"] == "2001:db8:2::20"
+
+    assert store.accept_address({
+        "address": sample("", "192.0.2.11", "", 101, ipv6_state="unavailable"),
+        "wans": "malformed",
+    })
+    snapshot = store.snapshot()
+    assert snapshot["address"]["detectedIpv4"] == "192.0.2.11"
+    assert snapshot["addresses"]["wan1"]["detectedAt"] == 100
+    assert snapshot["addresses"]["wan2"]["detectedAt"] == 100
+
+
+def test_legacy_scalar_payload_remains_compatible_with_nested_reports(tmp_path):
+    store = new_store(tmp_path)
+    legacy = add_record(store, "")
+    store.accept_address({"detectedIpv4": "192.0.2.10", "ipv4State": "public", "detectedAt": 100})
+    store.accept_address({
+        "address": sample("", "192.0.2.10", "", 101, ipv6_state="unavailable"),
+        "wans": [sample("wan1", "198.51.100.10", "", 101, ipv6_state="unavailable")],
+    })
+    store.accept_address({"detectedIpv4": "192.0.2.11", "ipv4State": "public", "detectedAt": 102})
+    record = next(item for item in store.snapshot()["records"] if item["id"] == legacy["id"])
+    assert record["detectedIpv4"] == "192.0.2.11"
+    assert record["stability"]["A"]["stableCount"] == 1
+    assert store.snapshot()["addresses"]["wan1"]["detectedIpv4"] == "198.51.100.10"

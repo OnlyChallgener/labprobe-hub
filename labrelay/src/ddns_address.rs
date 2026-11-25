@@ -4,7 +4,9 @@
 //! run on OpenWrt and other Linux routers. OpenWrt's ubus output is used only
 //! as a read-only topology hint; interface names never decide a role.
 
+use crate::wan::{self, WanBinding, WanFamily, WanLink, WanSnapshot, WanVerification};
 use anyhow::Result;
+use futures_util::future::join_all;
 use reqwest::Client;
 use serde::Serialize;
 use serde_json::Value;
@@ -13,6 +15,7 @@ use std::net::{IpAddr, Ipv4Addr, Ipv6Addr};
 use std::path::Path;
 use std::process::Command;
 use std::time::{SystemTime, UNIX_EPOCH};
+use tokio::net::lookup_host;
 use tokio::time::Duration;
 
 const IPV4_EGRESS_ENDPOINTS: [(&str, &str); 2] = [
@@ -34,6 +37,153 @@ pub struct DdnsAddressSnapshot {
     pub ipv4_source: String,
     pub ipv6_source: String,
     pub detected_at: u64,
+}
+
+/// Dashboard payload. The nested default address retains the legacy scalar
+/// shape for records with `wanId == ""`; `wans` carries isolated line samples.
+#[derive(Debug, Clone, Serialize, Default, PartialEq, Eq)]
+#[serde(rename_all = "camelCase")]
+pub struct DdnsAddressReport {
+    pub address: DdnsAddressSnapshot,
+    pub wans: Vec<DdnsWanAddressSnapshot>,
+}
+
+#[derive(Debug, Clone, Serialize, PartialEq, Eq)]
+#[serde(rename_all = "camelCase")]
+pub struct DdnsWanAddressSnapshot {
+    pub wan_id: String,
+    #[serde(flatten)]
+    pub address: DdnsAddressSnapshot,
+}
+
+#[derive(Debug, Clone)]
+struct FamilyDetection {
+    source: Option<IpAddr>,
+    detected: Option<(IpAddr, String)>,
+    verification: WanVerification,
+}
+
+impl FamilyDetection {
+    fn unavailable() -> Self {
+        Self {
+            source: None,
+            detected: None,
+            verification: WanVerification::Unknown,
+        }
+    }
+
+    fn verified_external(&self, family: WanFamily) -> Option<(IpAddr, String)> {
+        let source = self.source?;
+        if self.verification != WanVerification::Verified
+            || !family.matches(source)
+            || !family.matches(self.detected.as_ref()?.0)
+        {
+            return None;
+        }
+        let (ip, source_name) = self.detected.as_ref()?;
+        (public_address(*ip, family)).then(|| (*ip, source_name.clone()))
+    }
+
+    fn allows_local_fallback(&self) -> bool {
+        self.source.is_some() && self.verification == WanVerification::Verified
+    }
+
+    fn snapshot(&self, wan_id: &str, family: WanFamily, detected_at: u64) -> DdnsAddressSnapshot {
+        if let Some((ip, source)) = self.verified_external(family) {
+            let (detected_ipv4, detected_ipv6) = match family {
+                WanFamily::V4 => (ip.to_string(), String::new()),
+                WanFamily::V6 => (String::new(), ip.to_string()),
+            };
+            return DdnsAddressSnapshot {
+                detected_ipv4,
+                detected_ipv6,
+                ipv4_state: if family == WanFamily::V4 {
+                    "public"
+                } else {
+                    "unavailable"
+                }
+                .into(),
+                ipv6_state: if family == WanFamily::V6 {
+                    "public"
+                } else {
+                    "unavailable"
+                }
+                .into(),
+                ipv4_source: if family == WanFamily::V4 {
+                    source.clone()
+                } else {
+                    String::new()
+                },
+                ipv6_source: if family == WanFamily::V6 {
+                    source
+                } else {
+                    String::new()
+                },
+                detected_at,
+            };
+        }
+        let cgnat = family == WanFamily::V4
+            && self
+                .source
+                .is_some_and(|source| matches!(source, IpAddr::V4(ip) if ipv4_cgnat(ip)));
+        DdnsAddressSnapshot {
+            detected_ipv4: String::new(),
+            detected_ipv6: String::new(),
+            ipv4_state: if family == WanFamily::V4 {
+                if cgnat {
+                    "cgnat"
+                } else {
+                    "unavailable"
+                }
+            } else {
+                "unavailable"
+            }
+            .into(),
+            ipv6_state: "unavailable".into(),
+            ipv4_source: if family == WanFamily::V4 {
+                format!("wan:{wan_id}:unavailable")
+            } else {
+                String::new()
+            },
+            ipv6_source: if family == WanFamily::V6 {
+                format!("wan:{wan_id}:unavailable")
+            } else {
+                String::new()
+            },
+            detected_at,
+        }
+    }
+}
+
+#[derive(Debug, Clone)]
+struct WanDetection {
+    wan_id: String,
+    ipv4: FamilyDetection,
+    ipv6: FamilyDetection,
+    detected_at: u64,
+}
+
+impl WanDetection {
+    fn snapshot(&self) -> DdnsWanAddressSnapshot {
+        let ipv4 = self
+            .ipv4
+            .snapshot(&self.wan_id, WanFamily::V4, self.detected_at);
+        let ipv6 = self
+            .ipv6
+            .snapshot(&self.wan_id, WanFamily::V6, self.detected_at);
+        DdnsWanAddressSnapshot {
+            wan_id: self.wan_id.clone(),
+            address: DdnsAddressSnapshot {
+                detected_ipv4: ipv4.detected_ipv4,
+                detected_ipv6: ipv6.detected_ipv6,
+                ipv4_state: ipv4.ipv4_state,
+                ipv6_state: ipv6.ipv6_state,
+                ipv4_source: ipv4.ipv4_source,
+                ipv6_source: ipv6.ipv6_source,
+                detected_at: self.detected_at,
+            },
+        }
+    }
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -94,9 +244,217 @@ impl InterfaceTopology {
     }
 }
 
-pub async fn detect() -> DdnsAddressSnapshot {
-    let (external_ipv4, external_ipv6) =
-        tokio::join!(detect_external_ipv4(), detect_external_ipv6());
+pub async fn detect() -> DdnsAddressReport {
+    let discovered = wan::discover_snapshot_async().await.ok();
+    let detected_at = now_epoch();
+    let detections = match discovered.as_ref() {
+        Some(snapshot) => detect_wans(snapshot, detected_at).await,
+        None => Vec::new(),
+    };
+    let address = detect_default_address(discovered.as_ref(), &detections, detected_at);
+    DdnsAddressReport {
+        address,
+        wans: detections.iter().map(WanDetection::snapshot).collect(),
+    }
+}
+
+async fn detect_wans(snapshot: &WanSnapshot, detected_at: u64) -> Vec<WanDetection> {
+    join_all(
+        snapshot
+            .wans
+            .iter()
+            .map(|wan| detect_wan(wan, snapshot, detected_at)),
+    )
+    .await
+}
+
+async fn detect_wan(wan: &WanLink, snapshot: &WanSnapshot, detected_at: u64) -> WanDetection {
+    let (ipv4, ipv6) = tokio::join!(
+        detect_wan_family(snapshot, &wan.wan_id, WanFamily::V4),
+        detect_wan_family(snapshot, &wan.wan_id, WanFamily::V6),
+    );
+    WanDetection {
+        wan_id: wan.wan_id.clone(),
+        ipv4,
+        ipv6,
+        detected_at,
+    }
+}
+
+async fn detect_wan_family(
+    snapshot: &WanSnapshot,
+    wan_id: &str,
+    family: WanFamily,
+) -> FamilyDetection {
+    let binding = match wan::resolve_binding(snapshot, wan_id, family) {
+        Ok(binding) => binding,
+        Err(_) => return FamilyDetection::unavailable(),
+    };
+    let source = binding.source_address.parse::<IpAddr>().ok();
+    let (detected, verification) = detect_external_bound(binding, family).await;
+    FamilyDetection {
+        source,
+        detected,
+        verification,
+    }
+}
+
+async fn detect_external_bound(
+    binding: WanBinding,
+    family: WanFamily,
+) -> (Option<(IpAddr, String)>, WanVerification) {
+    let endpoints = match family {
+        WanFamily::V4 => &IPV4_EGRESS_ENDPOINTS,
+        WanFamily::V6 => &IPV6_EGRESS_ENDPOINTS,
+    };
+    // Each endpoint verifies and pins its own resolved address. Cloning the
+    // binding keeps concurrent probes from overwriting each other's status.
+    let (primary, fallback) = tokio::join!(
+        query_external_bound(binding.clone(), family, endpoints[0]),
+        query_external_bound(binding, family, endpoints[1]),
+    );
+    if let Some((ip, source)) = primary.0.or(fallback.0) {
+        return (Some((ip, source)), WanVerification::Verified);
+    }
+    let verification = strongest_verification(primary.1, fallback.1);
+    (None, verification)
+}
+
+async fn query_external_bound(
+    mut binding: WanBinding,
+    family: WanFamily,
+    endpoint: (&str, &str),
+) -> (Option<(IpAddr, String)>, WanVerification) {
+    let (name, url) = endpoint;
+    let addresses = match lookup_host((name, 443)).await {
+        Ok(addresses) => addresses,
+        Err(_) => return (None, WanVerification::Unknown),
+    };
+    let mut strongest = WanVerification::Unknown;
+    for address in addresses {
+        if address.port() != 443
+            || !family.matches(address.ip())
+            || !public_address(address.ip(), family)
+        {
+            continue;
+        }
+        let target = address.ip();
+        let verification = wan::verify_route_get(&mut binding, target).await;
+        strongest = strongest_verification(strongest, verification);
+        if verification != WanVerification::Verified {
+            continue;
+        }
+        let Ok(source) = binding.source_address.parse::<IpAddr>() else {
+            continue;
+        };
+        let client = match Client::builder()
+            .local_address(Some(source))
+            .resolve(name, address)
+            .redirect(reqwest::redirect::Policy::none())
+            .no_proxy()
+            .connect_timeout(Duration::from_secs(1))
+            .timeout(Duration::from_secs(2))
+            .user_agent(concat!("labrelay/", env!("CARGO_PKG_VERSION")))
+            .build()
+        {
+            Ok(client) => client,
+            Err(_) => continue,
+        };
+        let response = match client.get(url).send().await {
+            Ok(response) if response.status().is_success() => response,
+            _ => continue,
+        };
+        let Ok(text) = response.text().await else {
+            continue;
+        };
+        if let Some(ip) = parse_public_address(text.trim(), family) {
+            return (Some((ip, format!("egress-http:{name}"))), verification);
+        }
+    }
+    (None, strongest)
+}
+
+fn parse_public_address(text: &str, family: WanFamily) -> Option<IpAddr> {
+    let ip = text.parse::<IpAddr>().ok()?;
+    public_address(ip, family).then_some(ip)
+}
+
+fn public_address(ip: IpAddr, family: WanFamily) -> bool {
+    match (family, ip) {
+        (WanFamily::V4, IpAddr::V4(ip)) => ipv4_public(ip),
+        (WanFamily::V6, IpAddr::V6(ip)) => ipv6_public(ip),
+        _ => false,
+    }
+}
+
+fn strongest_verification(left: WanVerification, right: WanVerification) -> WanVerification {
+    use WanVerification::{Mismatch, Unknown, Verified};
+    match (left, right) {
+        (Verified, _) | (_, Verified) => Verified,
+        (Mismatch, _) | (_, Mismatch) => Mismatch,
+        (Unknown, Unknown) => Unknown,
+    }
+}
+
+#[derive(Debug)]
+struct DefaultFamilyDetection {
+    external: Option<(IpAddr, String)>,
+    allow_local_fallback: bool,
+    unavailable_source: String,
+}
+
+fn default_family_detection(
+    snapshot: Option<&WanSnapshot>,
+    detections: &[WanDetection],
+    family: WanFamily,
+) -> DefaultFamilyDetection {
+    let Some(snapshot) = snapshot else {
+        return DefaultFamilyDetection {
+            external: None,
+            allow_local_fallback: true,
+            unavailable_source: "generic".into(),
+        };
+    };
+    let default_id = match family {
+        WanFamily::V4 => snapshot.default_wan_id_v4.as_deref(),
+        WanFamily::V6 => snapshot.default_wan_id_v6.as_deref(),
+    };
+    let unavailable_source = default_id
+        .map(|wan_id| format!("default-wan:{wan_id}:unavailable"))
+        .unwrap_or_else(|| "default-wan:unavailable".into());
+    let Some(default_id) = default_id else {
+        return DefaultFamilyDetection {
+            external: None,
+            allow_local_fallback: false,
+            unavailable_source,
+        };
+    };
+    let Some(detection) = detections
+        .iter()
+        .find(|detection| detection.wan_id.eq_ignore_ascii_case(default_id))
+    else {
+        return DefaultFamilyDetection {
+            external: None,
+            allow_local_fallback: false,
+            unavailable_source,
+        };
+    };
+    let family_detection = match family {
+        WanFamily::V4 => &detection.ipv4,
+        WanFamily::V6 => &detection.ipv6,
+    };
+    DefaultFamilyDetection {
+        external: family_detection.verified_external(family),
+        allow_local_fallback: family_detection.allows_local_fallback(),
+        unavailable_source,
+    }
+}
+
+fn detect_default_address(
+    snapshot: Option<&WanSnapshot>,
+    detections: &[WanDetection],
+    detected_at: u64,
+) -> DdnsAddressSnapshot {
     let default4 = command_text("ip", &["-4", "route", "show", "default"])
         .ok()
         .and_then(|text| default_interface(&text));
@@ -109,17 +467,36 @@ pub async fn detect() -> DdnsAddressSnapshot {
     let candidates6 = command_text("ip", &["-6", "addr", "show", "scope", "global"])
         .map(|text| parse_ipv6(&text))
         .unwrap_or_default();
+    let external4 = default_family_detection(snapshot, detections, WanFamily::V4);
+    let external6 = default_family_detection(snapshot, detections, WanFamily::V6);
 
-    let (detected_ipv4, ipv4_state, ipv4_source) = external_ipv4
-        .map(|(ip, source)| (ip.to_string(), "public".into(), source))
-        .unwrap_or_else(|| choose_ipv4(&candidates4, default4.as_deref()));
-    let route6 = command_text("ip", &["-6", "route", "get", "2001:4860:4860::8888"])
-        .ok()
-        .and_then(|text| parse_ipv6_route_get(&text));
-    let topology = openwrt_topology(default6.as_deref());
-    let chosen_local_ipv6 = choose_ipv6(&candidates6, &topology);
-    let (detected_ipv6, ipv6_state, ipv6_source) =
-        select_ipv6(chosen_local_ipv6, route6, external_ipv6, &candidates6);
+    let (detected_ipv4, ipv4_state, ipv4_source) = if let Some((ip, source)) = external4.external {
+        (ip.to_string(), "public".into(), source)
+    } else if external4.allow_local_fallback {
+        choose_ipv4(&candidates4, default4.as_deref())
+    } else {
+        (
+            String::new(),
+            "unavailable".into(),
+            external4.unavailable_source,
+        )
+    };
+    let (detected_ipv6, ipv6_state, ipv6_source) = if let Some((ip, source)) = external6.external {
+        (ip.to_string(), "public".into(), source)
+    } else if external6.allow_local_fallback {
+        let route6 = command_text("ip", &["-6", "route", "get", "2001:4860:4860::8888"])
+            .ok()
+            .and_then(|text| parse_ipv6_route_get(&text));
+        let topology = openwrt_topology(default6.as_deref());
+        let chosen_local_ipv6 = choose_ipv6(&candidates6, &topology);
+        select_ipv6(chosen_local_ipv6, route6, None, &candidates6)
+    } else {
+        (
+            String::new(),
+            "unavailable".into(),
+            external6.unavailable_source,
+        )
+    };
 
     DdnsAddressSnapshot {
         detected_ipv4,
@@ -128,73 +505,8 @@ pub async fn detect() -> DdnsAddressSnapshot {
         ipv6_state,
         ipv4_source,
         ipv6_source,
-        detected_at: now_epoch(),
+        detected_at,
     }
-}
-
-async fn detect_external_ipv4() -> Option<(Ipv4Addr, String)> {
-    let client = Client::builder()
-        .local_address(Some(IpAddr::V4(Ipv4Addr::UNSPECIFIED)))
-        .connect_timeout(Duration::from_secs(1))
-        .timeout(Duration::from_secs(2))
-        .user_agent(concat!("labrelay/", env!("CARGO_PKG_VERSION")))
-        .build()
-        .ok()?;
-    // Probe both independent public services concurrently. The dashboard keeps
-    // its two-second cadence, so address discovery must not serially consume
-    // six seconds before local fallback can run.
-    let (primary, fallback) = tokio::join!(
-        query_external_ipv4(client.clone(), IPV4_EGRESS_ENDPOINTS[0]),
-        query_external_ipv4(client, IPV4_EGRESS_ENDPOINTS[1]),
-    );
-    primary.or(fallback)
-}
-
-async fn detect_external_ipv6() -> Option<(Ipv6Addr, String)> {
-    let client = Client::builder()
-        .local_address(Some(IpAddr::V6(Ipv6Addr::UNSPECIFIED)))
-        .connect_timeout(Duration::from_secs(1))
-        .timeout(Duration::from_secs(2))
-        .user_agent(concat!("labrelay/", env!("CARGO_PKG_VERSION")))
-        .build()
-        .ok()?;
-    let (primary, fallback) = tokio::join!(
-        query_external_ipv6(client.clone(), IPV6_EGRESS_ENDPOINTS[0]),
-        query_external_ipv6(client, IPV6_EGRESS_ENDPOINTS[1]),
-    );
-    primary.or(fallback)
-}
-
-async fn query_external_ipv4(client: Client, endpoint: (&str, &str)) -> Option<(Ipv4Addr, String)> {
-    let (name, url) = endpoint;
-    let response = client.get(url).send().await.ok()?;
-    if !response.status().is_success() {
-        return None;
-    }
-    let ip = response
-        .text()
-        .await
-        .ok()?
-        .trim()
-        .parse::<Ipv4Addr>()
-        .ok()?;
-    ipv4_public(ip).then(|| (ip, format!("egress-http:{name}")))
-}
-
-async fn query_external_ipv6(client: Client, endpoint: (&str, &str)) -> Option<(Ipv6Addr, String)> {
-    let (name, url) = endpoint;
-    let response = client.get(url).send().await.ok()?;
-    if !response.status().is_success() {
-        return None;
-    }
-    let ip = response
-        .text()
-        .await
-        .ok()?
-        .trim()
-        .parse::<Ipv6Addr>()
-        .ok()?;
-    ipv6_public(ip).then(|| (ip, format!("egress-http:{name}")))
 }
 
 fn command_text(program: &str, args: &[&str]) -> Result<String> {
@@ -1047,5 +1359,130 @@ mod tests {
             .1,
             "ambiguous"
         );
+    }
+
+    fn family_detection(
+        source: &str,
+        detected: &str,
+        verification: WanVerification,
+    ) -> FamilyDetection {
+        FamilyDetection {
+            source: Some(source.parse().unwrap()),
+            detected: Some((detected.parse().unwrap(), "egress-http:test".into())),
+            verification,
+        }
+    }
+
+    fn wan_detection(wan_id: &str, ipv4: FamilyDetection, ipv6: FamilyDetection) -> WanDetection {
+        WanDetection {
+            wan_id: wan_id.into(),
+            ipv4,
+            ipv6,
+            detected_at: 123,
+        }
+    }
+
+    #[test]
+    fn two_wans_keep_external_addresses_and_sources_separate() {
+        let detections = vec![
+            wan_detection(
+                "wan",
+                family_detection("192.0.2.2", "198.51.100.10", WanVerification::Verified),
+                family_detection("2001:db8::2", "2001:db8:1::10", WanVerification::Verified),
+            ),
+            wan_detection(
+                "wan1",
+                family_detection("198.51.100.2", "198.51.100.20", WanVerification::Verified),
+                family_detection("2001:db8:1::2", "2001:db8:2::20", WanVerification::Verified),
+            ),
+        ];
+        let first = detections[0].snapshot();
+        let second = detections[1].snapshot();
+        assert_eq!(first.wan_id, "wan");
+        assert_eq!(first.address.detected_ipv4, "198.51.100.10");
+        assert_eq!(first.address.detected_ipv6, "2001:db8:1::10");
+        assert_eq!(second.wan_id, "wan1");
+        assert_eq!(second.address.detected_ipv4, "198.51.100.20");
+        assert_eq!(second.address.detected_ipv6, "2001:db8:2::20");
+        assert_ne!(first.address.detected_ipv4, second.address.detected_ipv4);
+        assert_ne!(first.address.detected_ipv6, second.address.detected_ipv6);
+    }
+
+    #[test]
+    fn offline_wan_and_missing_families_are_unavailable_without_fallback() {
+        let offline = wan_detection(
+            "wan1",
+            FamilyDetection::unavailable(),
+            FamilyDetection::unavailable(),
+        )
+        .snapshot();
+        assert_eq!(offline.wan_id, "wan1");
+        assert_eq!(offline.address.detected_ipv4, "");
+        assert_eq!(offline.address.detected_ipv6, "");
+        assert_eq!(offline.address.ipv4_state, "unavailable");
+        assert_eq!(offline.address.ipv6_state, "unavailable");
+
+        let ipv4_only = wan_detection(
+            "wan",
+            family_detection("192.0.2.2", "198.51.100.10", WanVerification::Verified),
+            FamilyDetection::unavailable(),
+        )
+        .snapshot();
+        assert_eq!(ipv4_only.address.detected_ipv4, "198.51.100.10");
+        assert_eq!(ipv4_only.address.detected_ipv6, "");
+        assert_eq!(ipv4_only.address.ipv6_state, "unavailable");
+    }
+
+    #[test]
+    fn unverified_or_mismatched_routes_never_publish_external_or_default() {
+        for verification in [WanVerification::Unknown, WanVerification::Mismatch] {
+            let detection = wan_detection(
+                "wan1",
+                family_detection("198.51.100.2", "203.0.113.99", verification),
+                FamilyDetection::unavailable(),
+            );
+            let snapshot = detection.snapshot();
+            assert_eq!(snapshot.address.detected_ipv4, "");
+            assert_eq!(snapshot.address.ipv4_state, "unavailable");
+
+            let discovered = WanSnapshot {
+                wans: Vec::new(),
+                default_wan_id_v4: Some("wan1".into()),
+                default_wan_id_v6: None,
+                observed_at: 123,
+                source: "test".into(),
+            };
+            let default = default_family_detection(
+                Some(&discovered),
+                std::slice::from_ref(&detection),
+                WanFamily::V4,
+            );
+            assert!(default.external.is_none());
+            assert!(!default.allow_local_fallback);
+        }
+    }
+
+    #[test]
+    fn report_serializes_nested_legacy_address_and_wan_samples() {
+        let report = DdnsAddressReport {
+            address: DdnsAddressSnapshot {
+                detected_ipv4: "192.0.2.10".into(),
+                ipv4_state: "public".into(),
+                detected_at: 123,
+                ..DdnsAddressSnapshot::default()
+            },
+            wans: vec![wan_detection(
+                "wan1",
+                family_detection("198.51.100.2", "198.51.100.20", WanVerification::Verified),
+                FamilyDetection::unavailable(),
+            )
+            .snapshot()],
+        };
+        let value = serde_json::to_value(report).unwrap();
+        assert_eq!(value["address"]["detectedIpv4"], "192.0.2.10");
+        assert_eq!(value["address"]["detectedAt"], 123);
+        assert_eq!(value["wans"][0]["wanId"], "wan1");
+        assert_eq!(value["wans"][0]["detectedIpv4"], "198.51.100.20");
+        assert_eq!(value["wans"][0]["ipv6State"], "unavailable");
     }
 }
