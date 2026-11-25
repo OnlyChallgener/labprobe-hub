@@ -29,7 +29,18 @@ BE72_ENTRIES = [
      "enabled": True, "id": "ddns_6affba6f_4", "rcode": "0", "credential_set": True},
 ]
 
+DDNS_STATUS = [
+    {"id": "uX0abxr32S", "record_type": "A", "state": "success",
+     "content": "36.157.252.37", "detected_ip": "36.157.252.37", "last_success": 1795259667},
+    {"id": "fzSi9uAlyR", "record_type": "AAAA", "state": "success",
+     "content": "2409:8a50:2e04:3990:39f4:eec9:9df6:f878",
+     "detected_ip": "2409:8a50:2e04:3990:39f4:eec9:9df6:f878", "last_success": 1795259669},
+    {"id": "ddns_6affba6f_4", "record_type": "TXT", "state": "success",
+     "content": "36.157.252.37:6500", "detected_ip": "36.157.252.37", "last_success": 1795259670},
+]
+
 _DEFAULT_VIEW_RESPONSE = object()
+_DEFAULT_STATUS_RESPONSE = object()
 
 
 class FakeRpc:
@@ -44,6 +55,8 @@ class FakeRpc:
         self.malformed_view = False
         self.missing_settings = False
         self.view_response = _DEFAULT_VIEW_RESPONSE
+        self.status_response = _DEFAULT_STATUS_RESPONSE
+        self.fail_status = False
 
     def rpc(self, method, module="", data=None, **kwargs):
         with self.lock:
@@ -65,6 +78,12 @@ class FakeRpc:
                 return {"entries": [dict(e) for e in self.entries]}
             if method == "devSta.get" and module == "ddnsCfg":
                 return {"list": []} if self.view else {"list": [dict(e) for e in self.entries]}
+            if method == "devSta.get" and module == "ddns_status":
+                if self.fail_status:
+                    raise RouterUnreachableError("temporary status failure")
+                if self.status_response is not _DEFAULT_STATUS_RESPONSE:
+                    return self.status_response
+                return {"list": [dict(row) for row in DDNS_STATUS]} if self.view else {"list": []}
             if method == "devSta.set" and module == "ddns":
                 entries = [dict(e) for e in (data or {}).get("entries", [])]
                 for entry in entries:
@@ -121,6 +140,54 @@ def test_be72pro_ddns_view_returns_all_three_records():
     assert not any(m == "devSta.get" and mod == "ddnsCfg" for m, mod, _ in rpc.calls)
 
 
+def test_ddns_view_merges_status_content_and_last_success():
+    rpc = FakeRpc(view=True)
+    rows = driver(rpc).get_ddns(force=True)["list"]
+    assert rows[0]["status"] == "success"
+    assert rows[0]["ip"] == "36.157.252.37"
+    assert rows[0]["lastSuccessAt"] == 1795259667
+    assert rows[1]["ip"] == "2409:8a50:2e04:3990:39f4:eec9:9df6:f878"
+    assert rows[2]["ip"] == "36.157.252.37:6500"
+    assert rows[2]["detected_ip"] == "36.157.252.37"
+    assert rows[2]["lastUpdatedAt"] == 1795259670
+    assert any(module == "ddns_status" for _, module, _ in rpc.calls)
+
+
+def test_ddns_status_failure_keeps_configuration_rows():
+    rpc = FakeRpc(view=True)
+    rpc.fail_status = True
+    rows = driver(rpc).get_ddns(force=True)["list"]
+    assert len(rows) == 3
+    assert [row["serviceId"] for row in rows] == [entry["id"] for entry in BE72_ENTRIES]
+
+
+def test_malformed_ddns_status_is_ignored():
+    rpc = FakeRpc(view=True)
+    rpc.status_response = {"list": "invalid"}
+    rows = driver(rpc).get_ddns(force=True)["list"]
+    assert len(rows) == 3
+    assert all("lastSuccessAt" not in row for row in rows)
+
+
+def test_legacy_router_rpc_path_also_merges_ddns_status():
+    rpc = FakeRpc(view=True)
+    rows = FakeLegacyClient(rpc).ddns(force=True)["list"]
+    assert rows[2]["ip"] == "36.157.252.37:6500"
+    assert rows[2]["lastSuccessAt"] == 1795259670
+
+
+def test_ddns_status_accepts_id_keyed_record_map():
+    rpc = FakeRpc(view=True)
+    rpc.status_response = {"records": {
+        "uX0abxr32S": {"state": "success", "detected_ip": "36.157.252.37", "last_success": 1795259667},
+        "ddns_6affba6f_4": {"state": "success", "content": "36.157.252.37:6500", "last_success": 1795259670},
+    }}
+    rows = driver(rpc).get_ddns(force=True)["list"]
+    assert rows[0]["ip"] == "36.157.252.37"
+    assert rows[2]["ip"] == "36.157.252.37:6500"
+    assert rows[2]["lastSuccessAt"] == 1795259670
+
+
 def test_force_refresh_reprobes_protocol_after_firmware_change():
     rpc = FakeRpc(view=True)
     d = driver(rpc)
@@ -136,6 +203,7 @@ def test_legacy_firmware_still_uses_ddnscfg():
     result = driver(rpc).get_ddns(force=True)
     assert result["nativeProtocol"] == "ddnsCfg"
     assert any(m == "devSta.get" and mod == "ddnsCfg" for m, mod, _ in rpc.calls)
+    assert not any(m == "devSta.get" and mod == "ddns_status" for m, mod, _ in rpc.calls)
 
 
 @pytest.mark.parametrize("response", [{}, []])

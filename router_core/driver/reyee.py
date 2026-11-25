@@ -10,6 +10,7 @@ import threading
 import time
 from typing import Any, Callable, Dict, List, Optional, Tuple
 from .base import RouterDriver
+from router_core.ddns_status import merge_ddns_status
 from router_core.driver.reyee_rpc import ReyeeRpcClient
 from router_core.driver.reyee_session import ReyeeSessionManager
 from router_core.errors import RouterRpcExecutionError, RouterValidationError, from_legacy_error
@@ -747,6 +748,12 @@ class ReyeeEWebDriver(RouterDriver):
                 def load() -> Dict[str, Any]:
                     protocol = self._ddns_protocol(force=force)
                     rows = self._get_raw_ddns_rows(protocol)
+                    if protocol == self._DDNS_PROTOCOL_VIEW:
+                        try:
+                            status_raw = self._unwrap_json(self.rpc("devSta.get", "ddns_status"))
+                        except Exception:
+                            status_raw = None
+                        rows = merge_ddns_status(rows, status_raw)
                     clean_rows = []
                     for row in rows:
                         item = dict(row)
@@ -834,7 +841,11 @@ class ReyeeEWebDriver(RouterDriver):
         if password:
             entry["password"] = password
         # APP/HTTP 契约字段不能透传到固件 RPC；记录 ID 只允许来自原记录。
-        for key in ("enable", "serviceId", "service_id", "passwordConfigured", "nativeProtocol", "status", "ip", "wanId", "id"):
+        for key in (
+            "enable", "serviceId", "service_id", "passwordConfigured", "nativeProtocol",
+            "status", "ip", "content", "detected_ip", "last_success", "lastSuccessAt",
+            "lastUpdatedAt", "wanId", "id",
+        ):
             entry.pop(key, None)
         if old and old.get("id") is not None:
             entry["id"] = old["id"]

@@ -23,6 +23,7 @@ from Crypto.Cipher import AES
 from Crypto.Util.Padding import pad
 from flask import Blueprint, jsonify, request
 from router_capabilities import firmware_features
+from router_core.ddns_status import merge_ddns_status
 
 HUB_ROUTER_API_VERSION = "1.0"
 DEFAULT_ROUTER_URL = "http://192.168.5.1"
@@ -454,7 +455,11 @@ def _merge_ddns_view_entry(record: Dict[str, Any], password: str, old: Optional[
         entry["external_port"] = 0
     if password:
         entry["password"] = password
-    for key in ("enable", "serviceId", "service_id", "passwordConfigured", "nativeProtocol", "status", "ip", "id"):
+    for key in (
+        "enable", "serviceId", "service_id", "passwordConfigured", "nativeProtocol",
+        "status", "ip", "content", "detected_ip", "last_success", "lastSuccessAt",
+        "lastUpdatedAt", "id",
+    ):
         entry.pop(key, None)
     if old and old.get("id") is not None:
         entry["id"] = old["id"]
@@ -860,6 +865,12 @@ class RuijieRouterClient:
     def ddns(self, force: bool = False) -> Dict[str, Any]:
         def load() -> Dict[str, Any]:
             protocol, rows, settings = _read_ddns_snapshot(self)
+            if protocol == "ddns_view":
+                try:
+                    status_raw = self.rpc("devSta.get", "ddns_status")
+                except Exception:
+                    status_raw = None
+                rows = merge_ddns_status(rows, status_raw)
             clean = []
             for row in rows:
                 item = {**row}
