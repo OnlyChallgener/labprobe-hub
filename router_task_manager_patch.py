@@ -17,7 +17,14 @@ from typing import Any, Callable, Dict
 from flask import Blueprint, jsonify, request
 
 import router_rpc_v099 as v099
-from router_native_features_patch import normalize_nat_request, _normalize_nat_payload, _nat_terminal
+from router_native_features_patch import (
+    _nat_result_is_stale,
+    _nat_result_timestamp,
+    _nat_result_with_request,
+    _nat_terminal,
+    normalize_nat_request,
+)
+from router_rpc import RouterRpcError
 
 TERMINAL = {"succeeded", "failed", "timed_out", "cancelled"}
 NAT_MAX_SECONDS = max(180, int(os.environ.get("ROUTER_NAT_MAX_RUNTIME_SEC", "600")))
@@ -47,7 +54,7 @@ def _translate_beta_message(value: Any) -> str:
 
 
 def _task(kind: str) -> Dict[str, Any]:
-    return {
+    task = {
         "kind": kind,
         "taskId": "",
         "state": "idle",
@@ -61,6 +68,18 @@ def _task(kind: str) -> Dict[str, Any]:
         "log": [],
         "result": {},
     }
+    if kind == "nat":
+        task.update({
+            "request": {},
+            "requestId": "",
+            "requestStartedAt": 0,
+            "requestedInterface": "",
+            "detectedInterface": "",
+            "sourceIp": "",
+            "resultTimestamp": 0,
+            "firmwareResultTimestamp": 0,
+        })
+    return task
 
 
 class RouterTaskManager:
@@ -128,9 +147,11 @@ class RouterTaskManager:
             except Exception:
                 self.logger.debug("router task WSS publish deferred", exc_info=True)
 
-    def _update(self, kind: str, **changes: Any) -> Dict[str, Any]:
+    def _update(self, kind: str, *, task_id: str | None = None, **changes: Any) -> Dict[str, Any] | None:
         with self.lock:
             current = self.tasks[kind]
+            if task_id is not None and current.get("taskId") != task_id:
+                return None
             current.update(changes)
             current["updatedAt"] = _now()
             snapshot = self._snapshot_locked(kind)
@@ -138,20 +159,24 @@ class RouterTaskManager:
         self._publish(kind)
         return snapshot
 
-    def _append_log(self, kind: str, line: str) -> None:
+    def _append_log(self, kind: str, line: str, *, task_id: str | None = None) -> bool:
         text = str(line or "").strip()
         if not text:
-            return
+            return False
         with self.lock:
-            lines = list(self.tasks[kind].get("log") or [])
+            current = self.tasks[kind]
+            if task_id is not None and current.get("taskId") != task_id:
+                return False
+            lines = list(current.get("log") or [])
             if not lines or lines[-1] != text:
                 lines.append(text)
-                self.tasks[kind]["log"] = lines[-300:]
-                self.tasks[kind]["updatedAt"] = _now()
+                current["log"] = lines[-300:]
+                current["updatedAt"] = _now()
                 self._save()
         self._publish(kind)
+        return True
 
-    def _begin(self, kind: str, stage_text: str) -> tuple[str, Dict[str, Any], bool]:
+    def _begin(self, kind: str, stage_text: str, **metadata: Any) -> tuple[str, Dict[str, Any], bool]:
         with self.lock:
             active = self.tasks[kind]
             if active.get("state") in {"queued", "running"}:
@@ -159,6 +184,7 @@ class RouterTaskManager:
             task_id = f"{kind}-{uuid.uuid4().hex[:12]}"
             self.tasks[kind] = {
                 **_task(kind),
+                **metadata,
                 "taskId": task_id,
                 "state": "queued",
                 "stage": "queued",
@@ -173,76 +199,203 @@ class RouterTaskManager:
 
     def start_nat(self, payload: Dict[str, Any]) -> Dict[str, Any]:
         request_data = normalize_nat_request(payload)
-        task_id, snapshot, created = self._begin("nat", "检测任务已排队")
+        request_id = f"nat-request-{uuid.uuid4().hex[:12]}"
+        request_started_at = _now()
+        task_id, snapshot, created = self._begin(
+            "nat",
+            "检测任务已排队",
+            request=request_data,
+            requestId=request_id,
+            requestStartedAt=request_started_at,
+            requestedInterface=request_data["interface"],
+        )
         if not created:
-            return snapshot
+            # The firmware detector is a singleton. Reusing the active snapshot
+            # here would make a second caller poll and claim the first taskId.
+            raise RouterRpcError(
+                "路由器 NAT 检测正在运行，请等待当前检测完成",
+                "NAT_DIAGNOSTIC_BUSY",
+                409,
+            )
         threading.Thread(
             target=self._run_nat,
-            args=(task_id, request_data),
+            args=(task_id, request_data, request_id),
             name=f"router-task-nat-{task_id[-6:]}",
             daemon=True,
         ).start()
         return snapshot
 
-    def _run_nat(self, task_id: str, requested: Dict[str, Any]) -> None:
+    def _accept_nat_result(
+        self,
+        task_id: str,
+        requested: Dict[str, Any],
+        request_id: str,
+        value: Any,
+    ) -> tuple[Dict[str, Any], bool] | None:
+        if not isinstance(value, dict):
+            return None
+        kind = "nat"
+        with self.lock:
+            current = self.tasks[kind]
+            if current.get("taskId") != task_id:
+                return None
+            request_started_at = int(current.get("requestStartedAt") or current.get("startedAt") or 0)
+            last_firmware_timestamp = int(current.get("firmwareResultTimestamp") or 0)
+            previous_result = dict(current.get("result") or {}) if isinstance(current.get("result"), dict) else {}
+
+        firmware_timestamp = _nat_result_timestamp(value)
+        if _nat_result_is_stale(value, request_started_at, last_firmware_timestamp):
+            self.logger.debug(
+                "NAT task stale firmware result ignored taskId=%s timestamp=%s requestStartedAt=%s",
+                task_id,
+                firmware_timestamp,
+                request_started_at,
+            )
+            return None
+
+        observed_at = firmware_timestamp or _now()
+        normalized = _nat_result_with_request(
+            value,
+            requested,
+            request_id=request_id,
+            task_id=task_id,
+            request_started_at=request_started_at,
+            result_timestamp=observed_at,
+        )
+        if not isinstance(normalized, dict):
+            return None
+
+        source_ip = str(normalized.get("source_ip") or previous_result.get("source_ip") or "")
+        detected_interface = str(
+            normalized.get("detected_interface") or previous_result.get("detected_interface") or ""
+        )
+        if source_ip and not normalized.get("source_ip"):
+            normalized.update({
+                "source_ip": source_ip,
+                "source_ipv4": source_ip,
+                "sourceIp": source_ip,
+                "sourceIpv4": source_ip,
+                "sourceIPv4": source_ip,
+            })
+        if detected_interface and not normalized.get("detected_interface"):
+            normalized["detected_interface"] = detected_interface
+            normalized["detectedInterface"] = detected_interface
+            normalized["interface"] = detected_interface
+
+        if _nat_terminal(normalized):
+            status = str(normalized.get("status") or "").strip().lower()
+            if status not in {"failed", "error", "timeout", "cancelled", "canceled"}:
+                normalized["status"] = "completed"
+
+        raw_log = normalized.get("log")
+        if raw_log:
+            for line in str(raw_log).splitlines():
+                self._append_log(kind, line, task_id=task_id)
+
+        mapping = str(normalized.get("mapping_behavior") or "").strip()
+        filtering = str(normalized.get("filtering_behavior") or "").strip()
+        stage_text = "路由器正在执行 NAT 检测"
+        stage = "router_running"
+        if mapping and not filtering:
+            stage, stage_text = "mapping_done", "映射行为已返回，等待过滤行为"
+        elif filtering:
+            stage, stage_text = "filtering_done", "过滤行为已返回，正在整理结果"
+        snapshot = self._update(
+            kind,
+            task_id=task_id,
+            stage=stage,
+            stageText=stage_text,
+            lastRouterResponseAt=_now(),
+            sourceIp=source_ip,
+            detectedInterface=detected_interface,
+            requestedInterface=requested["interface"],
+            resultTimestamp=observed_at,
+            firmwareResultTimestamp=firmware_timestamp or last_firmware_timestamp,
+            result=normalized,
+        )
+        if snapshot is None:
+            return None
+        return normalized, _nat_terminal(normalized)
+
+    def _run_nat(self, task_id: str, requested: Dict[str, Any], request_id: str) -> None:
         kind = "nat"
         try:
-            self._update(kind, state="running", stage="command", stageText="正在向路由器发送检测指令", request=requested)
-            self._append_log(kind, "Hub 已接受 NAT 检测任务")
-            start = self.client.rpc("devSta.set", "nat_detector", requested)
-            self._update(kind, lastRouterResponseAt=_now(), stage="router_running", stageText="路由器正在执行 NAT 检测")
-            self._append_log(kind, "检测指令已发送到路由器")
+            if self._update(
+                kind,
+                task_id=task_id,
+                state="running",
+                stage="command",
+                stageText="正在向路由器发送检测指令",
+                request=requested,
+            ) is None:
+                return
+            if not self._append_log(kind, "Hub 已接受 NAT 检测任务", task_id=task_id):
+                return
+            latest = self.client.rpc("devSta.set", "nat_detector", requested)
+            if self._update(
+                kind,
+                task_id=task_id,
+                lastRouterResponseAt=_now(),
+                stage="router_running",
+                stageText="路由器正在执行 NAT 检测",
+            ) is None:
+                return
+            if not self._append_log(kind, "检测指令已发送到路由器", task_id=task_id):
+                return
             deadline = time.monotonic() + NAT_MAX_SECONDS
-            latest: Any = start
             while time.monotonic() < deadline:
                 with self.lock:
                     if self.tasks[kind].get("taskId") != task_id:
                         return
-                if isinstance(latest, dict):
-                    normalized = _normalize_nat_payload(latest)
-                    if isinstance(normalized, dict):
-                        normalized = dict(normalized)
-                        normalized["requested_host"] = requested.get("host", "")
-                        normalized["requested_port"] = int(requested.get("port") or 3478)
-                        normalized["requested_interface"] = requested.get("interface", "wan")
-                        normalized["requested_mode"] = requested.get("mode", "classic")
-                        normalized.setdefault("mode", requested.get("mode", "classic"))
-                        raw_log = normalized.get("log")
-                        if raw_log:
-                            for line in str(raw_log).splitlines():
-                                self._append_log(kind, line)
-                        mapping = str(normalized.get("mapping_behavior") or "").strip()
-                        filtering = str(normalized.get("filtering_behavior") or "").strip()
-                        stage_text = "路由器正在执行 NAT 检测"
-                        stage = "router_running"
-                        if mapping and not filtering:
-                            stage, stage_text = "mapping_done", "映射行为已返回，等待过滤行为"
-                        elif filtering:
-                            stage, stage_text = "filtering_done", "过滤行为已返回，正在整理结果"
-                        self._update(kind, stage=stage, stageText=stage_text, lastRouterResponseAt=_now(), result=normalized)
-                        if _nat_terminal(normalized):
-                            status = str(normalized.get("status") or "").lower()
-                            failed = status in {"failed", "error", "timeout", "cancelled", "canceled"}
-                            self._update(
-                                kind,
-                                state="failed" if failed else "succeeded",
-                                stage="finished",
-                                stageText="检测失败" if failed else "检测完成",
-                                message=str(normalized.get("message") or ("检测失败" if failed else "检测完成")),
-                                result=normalized,
-                            )
+                accepted = self._accept_nat_result(task_id, requested, request_id, latest)
+                if accepted is not None:
+                    normalized, terminal = accepted
+                    if terminal:
+                        status = str(normalized.get("status") or "").lower()
+                        failed = status in {"failed", "error", "timeout", "cancelled", "canceled"}
+                        if self._update(
+                            kind,
+                            task_id=task_id,
+                            state="failed" if failed else "succeeded",
+                            stage="finished",
+                            stageText="检测失败" if failed else "检测完成",
+                            message=str(normalized.get("message") or ("检测失败" if failed else "检测完成")),
+                            result=normalized,
+                        ) is None:
                             return
+                        return
                 time.sleep(POLL_SECONDS)
                 try:
                     latest = self.client.rpc("devSta.get", "nat_detector")
                 except Exception as exc:
                     self.logger.debug("NAT task poll deferred: %s", exc)
-                    self._update(kind, stage="router_running", stageText="路由器仍在检测，等待下一次状态响应")
-            self._update(kind, state="timed_out", stage="timeout", stageText="检测超时", message="路由器长时间未返回最终检测结果")
-            self._append_log(kind, f"已等待 {NAT_MAX_SECONDS} 秒，任务结束")
+                    if self._update(
+                        kind,
+                        task_id=task_id,
+                        stage="router_running",
+                        stageText="路由器仍在检测，等待下一次状态响应",
+                    ) is None:
+                        return
+            if self._update(
+                kind,
+                task_id=task_id,
+                state="timed_out",
+                stage="timeout",
+                stageText="检测超时",
+                message="路由器长时间未返回最终检测结果",
+            ) is None:
+                return
+            self._append_log(kind, f"已等待 {NAT_MAX_SECONDS} 秒，任务结束", task_id=task_id)
         except Exception as exc:
             self.logger.warning("NAT task failed: %s", exc)
-            self._update(kind, state="failed", stage="failed", stageText="检测失败", message=str(exc) or "NAT 检测失败")
+            self._update(
+                kind,
+                task_id=task_id,
+                state="failed",
+                stage="failed",
+                stageText="检测失败",
+                message=str(exc) or "NAT 检测失败",
+            )
 
     def start_diagnostic(self) -> Dict[str, Any]:
         task_id, snapshot, created = self._begin("diagnostic", "网络自检已排队")

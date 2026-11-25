@@ -6,10 +6,13 @@ job and polls the in-memory result while one Hub worker follows the router.
 """
 from __future__ import annotations
 
+import ipaddress
 import json
 import os
+import re
 import threading
 import time
+import uuid
 from typing import Any, Callable, Dict
 
 from flask import Blueprint, jsonify, request
@@ -115,17 +118,163 @@ def _normalize_nat_payload(value: Any) -> Any:
     return result
 
 
-def _nat_result_with_request(data: Any, requested: Dict[str, Any]) -> Any:
-    """Normalize result aliases and attach the requested parameters."""
+def _epoch_seconds(value: Any) -> int:
+    if value is None or isinstance(value, bool):
+        return 0
+    try:
+        number = float(str(value).strip())
+        if number <= 0:
+            return 0
+        if number >= 10_000_000_000:
+            number /= 1000.0
+        return int(number)
+    except (TypeError, ValueError, OverflowError):
+        return 0
+
+
+def _nat_result_timestamp(data: Any) -> int:
+    if not isinstance(data, dict):
+        return 0
+    for key in ("timestamp", "result_timestamp", "resultTimestamp"):
+        timestamp = _epoch_seconds(data.get(key))
+        if timestamp:
+            return timestamp
+    return 0
+
+
+def _nat_result_is_stale(
+    data: Any,
+    request_started_at: int,
+    last_firmware_timestamp: int = 0,
+) -> bool:
+    """Only timestamped firmware output can prove that a result is current."""
+    timestamp = _nat_result_timestamp(data)
+    if not timestamp:
+        # Older firmware did not always return a timestamp. Keep that payload
+        # compatible while still rejecting every stale result that can be dated.
+        return False
+    started_at = _epoch_seconds(request_started_at)
+    previous = _epoch_seconds(last_firmware_timestamp)
+    return bool((started_at and timestamp < started_at) or (previous and timestamp < previous))
+
+
+def _valid_ipv4(value: Any) -> str:
+    text = str(value or "").strip()
+    if not text:
+        return ""
+    try:
+        return str(ipaddress.IPv4Address(text))
+    except ipaddress.AddressValueError:
+        return ""
+
+
+def _nat_source_ipv4(data: Dict[str, Any]) -> str:
+    for key in (
+        "source_ipv4",
+        "sourceIPv4",
+        "sourceIpv4",
+        "source_ip",
+        "sourceIp",
+        "src_ipv4",
+        "srcIpv4",
+        "src_ip",
+        "srcIp",
+        "local_ipv4",
+        "localIpv4",
+        "local_ip",
+        "localIp",
+    ):
+        address = _valid_ipv4(data.get(key))
+        if address:
+            return address
+    raw_log = data.get("log")
+    if isinstance(raw_log, (list, tuple)):
+        raw_log = "\n".join(str(line) for line in raw_log)
+    match = re.search(r"(?im)^\s*(?:\[[^\]]+\]\s*)?Source\s*IP(?:v4)?\s*:\s*([^\s,;]+)", str(raw_log or ""))
+    return _valid_ipv4(match.group(1)) if match else ""
+
+
+def _nat_detected_interface(data: Dict[str, Any]) -> str:
+    for key in (
+        "detected_interface",
+        "detectedInterface",
+        "external_iface",
+        "externalIface",
+        "wan_id",
+        "wanId",
+        "interface",
+        "wan",
+        "line",
+    ):
+        value = _first_text(data, key).lower()
+        if value in ALLOWED_WAN_INTERFACES:
+            return value
+    raw_log = data.get("log")
+    if isinstance(raw_log, (list, tuple)):
+        raw_log = "\n".join(str(line) for line in raw_log)
+    match = re.search(r"(?im)^\s*(?:\[[^\]]+\]\s*)?Interface\s*:\s*(wan1|wan)\s*$", str(raw_log or ""))
+    return match.group(1).lower() if match else ""
+
+
+def _nat_result_with_request(
+    data: Any,
+    requested: Dict[str, Any],
+    *,
+    request_id: str = "",
+    task_id: str = "",
+    request_started_at: int = 0,
+    result_timestamp: int | None = None,
+) -> Any:
+    """Normalize firmware output and bind it to one accepted Hub request."""
     parsed = _normalize_nat_payload(data)
     if not isinstance(parsed, dict):
         return parsed
     result = dict(parsed)
-    result["requested_host"] = requested.get("host", DEFAULT_STUN_HOST)
-    result["requested_port"] = int(requested.get("port") or 3478)
-    result["requested_interface"] = requested.get("interface", "wan")
-    result["requested_mode"] = requested.get("mode", "classic")
-    result.setdefault("mode", requested.get("mode", "classic"))
+    requested_host = requested.get("host", DEFAULT_STUN_HOST)
+    requested_port = int(requested.get("port") or 3478)
+    requested_interface = str(requested.get("interface") or "wan").strip().lower()
+    requested_mode = str(requested.get("mode") or "classic").strip().lower()
+    result["requested_host"] = requested_host
+    result["requested_port"] = requested_port
+    result["requested_interface"] = requested_interface
+    result["requested_mode"] = requested_mode
+    result["requestedInterface"] = requested_interface
+    detected_interface = _nat_detected_interface(result)
+    result["wan_id"] = requested_interface
+    result["wanId"] = requested_interface
+    result.setdefault("mode", requested_mode)
+
+    if detected_interface:
+        result["detected_interface"] = detected_interface
+        result["detectedInterface"] = detected_interface
+    # ``interface`` was historically ambiguous. Keep it usable for old history
+    # readers, but never let firmware output replace the requested line.
+    result["interface"] = detected_interface or requested_interface
+
+    source_ipv4 = _nat_source_ipv4(result)
+    if source_ipv4:
+        result["source_ip"] = source_ipv4
+        result["source_ipv4"] = source_ipv4
+        result["sourceIp"] = source_ipv4
+        result["sourceIpv4"] = source_ipv4
+        result["sourceIPv4"] = source_ipv4
+
+    started_at = _epoch_seconds(request_started_at)
+    if started_at:
+        result["request_started_at"] = started_at
+        result["requestStartedAt"] = started_at
+    if request_id:
+        result["request_id"] = request_id
+        result["requestId"] = request_id
+    if task_id:
+        result["task_id"] = task_id
+        result["taskId"] = task_id
+
+    timestamp = _nat_result_timestamp(result) if result_timestamp is None else _epoch_seconds(result_timestamp)
+    if timestamp:
+        result["timestamp"] = timestamp
+        result["result_timestamp"] = timestamp
+        result["resultTimestamp"] = timestamp
     return result
 
 
@@ -198,6 +347,8 @@ def install_router_native_features_patch() -> None:
 
         nat_lock = threading.RLock()
         nat_generation = 0
+        nat_active = False
+        nat_last_firmware_timestamp = 0
         last_nat_request: Dict[str, Any] = {
             "host": DEFAULT_STUN_HOST,
             "port": 3478,
@@ -213,29 +364,62 @@ def install_router_native_features_patch() -> None:
         beta_result: Dict[str, Any] = {}
         beta_updated_at = 0.0
 
-        def store_nat_result(generation: int, value: Any, requested: Dict[str, Any]) -> bool:
-            nonlocal nat_result
-            normalized = _nat_result_with_request(value, requested)
-            if not isinstance(normalized, dict):
-                normalized = _nat_result_with_request(
-                    {"status": "running", "message": "检测进行中"},
-                    requested,
-                )
-            if _nat_terminal(normalized):
-                status = str(normalized.get("status") or "").strip().lower()
-                if status not in {"failed", "error", "timeout", "cancelled", "canceled"}:
-                    normalized["status"] = "completed"
-            normalized["updatedAt"] = int(time.time())
+        def store_nat_result(
+            generation: int,
+            value: Any,
+            requested: Dict[str, Any],
+            correlation: Dict[str, Any],
+        ) -> bool:
+            nonlocal nat_result, nat_active, nat_last_firmware_timestamp
             with nat_lock:
                 if generation != nat_generation:
                     return False
+                if _nat_result_is_stale(
+                    value,
+                    int(correlation.get("requestStartedAt") or 0),
+                    nat_last_firmware_timestamp,
+                ):
+                    logger.debug("router NAT stale firmware result ignored: %s", value)
+                    return False
+                firmware_timestamp = _nat_result_timestamp(value)
+                normalized = _nat_result_with_request(
+                    value,
+                    requested,
+                    request_id=str(correlation.get("requestId") or ""),
+                    task_id=str(correlation.get("taskId") or ""),
+                    request_started_at=int(correlation.get("requestStartedAt") or 0),
+                    result_timestamp=firmware_timestamp or int(time.time()),
+                )
+                if not isinstance(normalized, dict):
+                    normalized = _nat_result_with_request(
+                        {"status": "running", "message": "检测进行中"},
+                        requested,
+                        request_id=str(correlation.get("requestId") or ""),
+                        task_id=str(correlation.get("taskId") or ""),
+                        request_started_at=int(correlation.get("requestStartedAt") or 0),
+                        result_timestamp=int(time.time()),
+                    )
+                if _nat_terminal(normalized):
+                    status = str(normalized.get("status") or "").strip().lower()
+                    if status not in {"failed", "error", "timeout", "cancelled", "canceled"}:
+                        normalized["status"] = "completed"
+                normalized["updatedAt"] = int(time.time())
+                if firmware_timestamp:
+                    nat_last_firmware_timestamp = firmware_timestamp
+                terminal = _nat_terminal(normalized)
+                if terminal:
+                    nat_active = False
                 nat_result = dict(normalized)
-            return _nat_terminal(normalized)
+                return terminal
 
-        def run_nat_detection(generation: int, requested: Dict[str, Any]) -> None:
+        def run_nat_detection(
+            generation: int,
+            requested: Dict[str, Any],
+            correlation: Dict[str, Any],
+        ) -> None:
             try:
                 start_data = client.rpc("devSta.set", "nat_detector", requested)
-                if store_nat_result(generation, start_data, requested):
+                if store_nat_result(generation, start_data, requested, correlation):
                     return
                 deadline = time.monotonic() + NAT_MAX_RUNTIME_SECONDS
                 while time.monotonic() < deadline:
@@ -244,7 +428,7 @@ def install_router_native_features_patch() -> None:
                             return
                     try:
                         latest = client.rpc("devSta.get", "nat_detector")
-                        if store_nat_result(generation, latest, requested):
+                        if store_nat_result(generation, latest, requested, correlation):
                             return
                     except Exception as poll_error:
                         # A single control-RPC timeout must not become the final NAT
@@ -255,7 +439,7 @@ def install_router_native_features_patch() -> None:
                 # One final router read before declaring the Hub-side maximum runtime.
                 try:
                     latest = client.rpc("devSta.get", "nat_detector")
-                    if store_nat_result(generation, latest, requested):
+                    if store_nat_result(generation, latest, requested, correlation):
                         return
                 except Exception as poll_error:
                     logger.debug("router NAT final poll deferred: %s", poll_error)
@@ -269,6 +453,7 @@ def install_router_native_features_patch() -> None:
                         "timeoutSource": "hub_max_runtime",
                     },
                     requested,
+                    correlation,
                 )
             except Exception as exc:
                 message = _nat_error_message(exc)
@@ -277,6 +462,7 @@ def install_router_native_features_patch() -> None:
                     generation,
                     {"status": "error", "message": message, "log": message},
                     requested,
+                    correlation,
                 )
 
         @bp.get("/nat-diagnostic")
@@ -287,31 +473,55 @@ def install_router_native_features_patch() -> None:
 
         @bp.post("/nat-diagnostic")
         def nat_diagnostic_start():
-            nonlocal nat_generation, nat_result
+            nonlocal nat_generation, nat_active, nat_last_firmware_timestamp
             payload = normalize_nat_request(request.get_json(silent=True) or {})
             with nat_lock:
+                if nat_active:
+                    raise RouterRpcError(
+                        "路由器 NAT 检测正在运行，请等待当前检测完成",
+                        "NAT_DIAGNOSTIC_BUSY",
+                        409,
+                    )
                 nat_generation += 1
                 generation = nat_generation
+                request_started_at = int(time.time())
+                request_id = f"nat-request-{uuid.uuid4().hex[:12]}"
+                task_id = f"nat-{generation}-{uuid.uuid4().hex[:12]}"
+                correlation = {
+                    "requestId": request_id,
+                    "taskId": task_id,
+                    "requestStartedAt": request_started_at,
+                }
+                nat_active = True
+                nat_last_firmware_timestamp = 0
                 last_nat_request.clear()
                 last_nat_request.update(payload)
                 nat_result = _nat_result_with_request(
                     {
                         "status": "running",
                         "message": "检测已启动",
-                        "startedAt": int(time.time()),
+                        "startedAt": request_started_at,
                     },
                     payload,
+                    request_id=request_id,
+                    task_id=task_id,
+                    request_started_at=request_started_at,
+                    result_timestamp=request_started_at,
                 )
             threading.Thread(
                 target=run_nat_detection,
-                args=(generation, dict(payload)),
+                args=(generation, dict(payload), correlation),
                 name=f"router-nat-diagnostic-{generation}",
                 daemon=True,
             ).start()
             return jsonify({
                 "ok": True,
                 "message": "路由 NAT 诊断已在后台启动",
-                "startedAt": int(time.time()),
+                "taskId": task_id,
+                "requestId": request_id,
+                "startedAt": request_started_at,
+                "requestStartedAt": request_started_at,
+                "requestedInterface": payload["interface"],
                 "request": payload,
             }), 202
 
