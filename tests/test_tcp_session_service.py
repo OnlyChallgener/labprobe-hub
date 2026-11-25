@@ -243,7 +243,7 @@ def test_legacy_blank_wan_keeps_default_behavior_without_presence(tmp_path, wan_
 @pytest.mark.parametrize("capability", ["relay.perWanTcpSession", "relay.multiWan"])
 def test_explicit_wan1_is_accepted_with_advertised_capability(tmp_path, capability):
     client, service = build(tmp_path)
-    service.hub.presence = {"agentOnline": True, "agentCapabilities": [capability]}
+    service.hub.presence = {"agentOnline": True, "agentCapabilities": [capability], "agentWanIds": ["wan1"]}
     response = client.post("/api/tcp-session-test/start", json=start_payload(wanId=" WAN1 "))
     assert response.status_code == 200
     task = response.get_json()["task"]
@@ -264,6 +264,8 @@ def test_explicit_wan1_is_accepted_with_advertised_capability(tmp_path, capabili
     {"agentOnline": True, "agentCapabilities": ["relay.wanTelemetry"]},
     {"agentOnline": False, "agentCapabilities": ["relay.perWanTcpSession"]},
     {"agentOnline": True, "agentCapabilities": "relay.perWanTcpSession"},
+    {"agentOnline": True, "agentCapabilities": ["relay.perWanTcpSession"], "agentWanIds": []},
+    {"agentOnline": True, "agentCapabilities": ["relay.perWanTcpSession"], "agentWanIds": ["wan"]},
 ])
 def test_explicit_wan1_is_rejected_before_queueing_without_online_capability(tmp_path, presence):
     client, service = build(tmp_path)
@@ -278,7 +280,7 @@ def test_explicit_wan1_is_rejected_before_queueing_without_online_capability(tmp
 
 def test_explicit_wan_status_and_ack_mismatches_do_not_mutate_state(tmp_path):
     client, service = build(tmp_path)
-    service.hub.presence = {"agentOnline": True, "agentCapabilities": ["relay.perWanTcpSession"]}
+    service.hub.presence = {"agentOnline": True, "agentCapabilities": ["relay.perWanTcpSession"], "agentWanIds": ["wan1", "wan2"]}
     task = client.post("/api/tcp-session-test/start", json=start_payload(wanId="wan1")).get_json()["task"]
     command = client.get("/api/router/tcp-session-test/commands?router=Router").get_json()["commands"][0]
     before = service._state()
@@ -323,7 +325,7 @@ def test_explicit_wan_status_and_ack_mismatches_do_not_mutate_state(tmp_path):
 
 def test_active_tasks_are_scoped_by_router_and_wan_with_legacy_single_active(tmp_path):
     client, service = build(tmp_path)
-    service.hub.presence = {"agentOnline": True, "agentCapabilities": ["relay.perWanTcpSession"]}
+    service.hub.presence = {"agentOnline": True, "agentCapabilities": ["relay.perWanTcpSession"], "agentWanIds": ["wan1", "wan2"]}
     wan1 = client.post("/api/tcp-session-test/start", json=start_payload(wanId="wan1")).get_json()["task"]
     wan2 = client.post("/api/tcp-session-test/start", json=start_payload(wanId="wan2")).get_json()["task"]
     assert wan1["id"] != wan2["id"]
@@ -343,7 +345,7 @@ def test_active_tasks_are_scoped_by_router_and_wan_with_legacy_single_active(tmp
 
 def test_legacy_active_task_still_blocks_explicit_wan_start(tmp_path):
     client, service = build(tmp_path)
-    service.hub.presence = {"agentOnline": True, "agentCapabilities": ["relay.perWanTcpSession"]}
+    service.hub.presence = {"agentOnline": True, "agentCapabilities": ["relay.perWanTcpSession"], "agentWanIds": ["wan1", "wan2"]}
     assert client.post("/api/tcp-session-test/start", json=start_payload()).status_code == 200
     response = client.post("/api/tcp-session-test/start", json=start_payload(wanId="wan1"))
     assert response.status_code == 409
@@ -353,7 +355,7 @@ def test_legacy_active_task_still_blocks_explicit_wan_start(tmp_path):
 
 def test_per_wan_history_preserves_wan_identity_and_five_item_limit_after_restart(tmp_path):
     client, service = build(tmp_path)
-    service.hub.presence = {"agentOnline": True, "agentCapabilities": ["relay.perWanTcpSession"]}
+    service.hub.presence = {"agentOnline": True, "agentCapabilities": ["relay.perWanTcpSession"], "agentWanIds": ["wan1", "wan2"]}
     expected = []
     for index in range(7):
         wan_id = "wan1" if index % 2 == 0 else ""

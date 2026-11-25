@@ -347,7 +347,9 @@ class TcpSessionService:
         capabilities = presence.get("agentCapabilities", presence.get("capabilities", []))
         capabilities = {item for item in capabilities if isinstance(item, str)} if isinstance(capabilities, (list, tuple, set)) else set()
         online = presence.get("agentOnline", presence.get("online")) is True
-        if not online or not capabilities.intersection(PER_WAN_CAPABILITIES):
+        wan_ids = presence.get("agentWanIds", [])
+        available = {item.strip().lower() for item in wan_ids if isinstance(item, str)} if isinstance(wan_ids, list) else set()
+        if not online or not capabilities.intersection(PER_WAN_CAPABILITIES) or wan_id not in available:
             raise RelayMultiWanUnsupported()
 
     def start(self, payload: Dict[str, Any]) -> Dict[str, Any]:

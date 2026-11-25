@@ -342,6 +342,7 @@ fn agent_wan_capability(discovery: Result<crate::wan::WanSnapshot>) -> Value {
             "relay.wanTelemetry",
             "relay.perWanTcpSession",
             "relay.wanDdns",
+            "relay.wanStun",
         ]
     };
     json!({"capabilities": capabilities, "wanIds": wan_ids})
@@ -3361,7 +3362,8 @@ mod local_telemetry_tests {
                 "relay.multiWan",
                 "relay.wanTelemetry",
                 "relay.perWanTcpSession",
-                "relay.wanDdns"
+                "relay.wanDdns",
+                "relay.wanStun"
             ])
         );
         assert_eq!(

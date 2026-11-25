@@ -1017,3 +1017,18 @@ def test_secondary_wan_requires_verified_runtime_and_does_not_pollute_history(tm
     assert service.rows()[0]["actualState"] == "mapped"
     service._remember_endpoint(rule, current)
     assert service._history()[rule["id"]][0]["wanId"] == "wan1"
+
+
+def test_secondary_wan_requires_live_capability_before_mutation(tmp_path):
+    hub = _hub(tmp_path)
+    client = _Client()
+    service = StunService(hub, client)
+    hub.app.register_blueprint(create_stun_blueprint(hub, service))
+    api = hub.app.test_client()
+    payload = {"serviceType": "SSH", "targetIpv4": "192.0.2.2", "targetPort": 22, "wanId": "wan1"}
+    assert api.post("/api/stun", json=payload).status_code == 400
+    assert not client.rpc_calls
+    hub.agent_presence_snapshot = lambda router: {
+        "agentOnline": True, "agentCapabilities": ["relay.wanStun"], "agentWanIds": ["wan", "wan1"]}
+    assert api.get("/api/stun").json["availableWanIds"] == ["wan", "wan1"]
+    assert api.post("/api/stun", json=payload).status_code == 201

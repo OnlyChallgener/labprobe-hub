@@ -417,6 +417,27 @@ class StunService:
             self._save_commands(self._compact_commands(commands))
             return command
 
+    def available_wans(self) -> List[str]:
+        presence_fn = getattr(self.hub, "agent_presence_snapshot", None)
+        try:
+            presence = presence_fn(self._router_name()) if callable(presence_fn) else {}
+        except Exception:
+            presence = {}
+        if not isinstance(presence, dict) or presence.get("agentOnline") is not True:
+            return []
+        capabilities = presence.get("agentCapabilities")
+        wan_ids = presence.get("agentWanIds")
+        if not isinstance(capabilities, list) or "relay.wanStun" not in capabilities or not isinstance(wan_ids, list):
+            return []
+        return sorted({value.strip().lower() for value in wan_ids
+                       if isinstance(value, str) and re.fullmatch(r"wan[0-9]*", value.strip().lower())})
+
+    def require_wan(self, rule: Dict[str, Any]) -> None:
+        wan_id = _wan_id(rule.get("wanId"))
+        # The default line remains compatible with agents predating WAN binding.
+        if rule.get("enabled") and wan_id != "wan" and wan_id not in self.available_wans():
+            raise ValueError("所选 WAN 线路暂不可用或 Relay 尚不支持 STUN 线路绑定")
+
     def _status_record(self) -> Dict[str, Any]:
         raw = self.hub.load_json(self.status_path, {})
         return raw if isinstance(raw, dict) else {}
@@ -968,12 +989,13 @@ def create_stun_blueprint(hub: Any, service: StunService) -> Blueprint:
             with service.lock:
                 doc = service._document()
                 status = service._status_record()
-                return jsonify({"ok": True, "rules": service.rows(), "revision": doc["revision"], "rulesUpdatedAt": doc["updatedAt"], "portRange": {"min": 20000, "max": 20020}, "agentOnline": _now() - _int(status.get("receivedEpoch"), 0) <= 35, "agentLastSeenAt": _text(status.get("receivedAt"))})
+                return jsonify({"ok": True, "rules": service.rows(), "revision": doc["revision"], "rulesUpdatedAt": doc["updatedAt"], "portRange": {"min": 20000, "max": 20020}, "agentOnline": _now() - _int(status.get("receivedEpoch"), 0) <= 35, "agentLastSeenAt": _text(status.get("receivedAt")), "availableWanIds": service.available_wans()})
         if (denied := app_auth()) is not None:
             return denied
         try:
             with service.lock:
                 rule = service.clean_rule(request.get_json(silent=True) or {})
+                service.require_wan(rule)
                 def create_operation() -> None:
                     if rule["enabled"] and service._is_native_forward(rule):
                         mapping = service.ensure_native_mapping(rule)
@@ -1046,6 +1068,7 @@ def create_stun_blueprint(hub: Any, service: StunService) -> Blueprint:
                     service.mutate(rule_id, lambda: service._save_rules(replacement))
                     return jsonify({"ok": True, "rule": rule})
 
+                service.require_wan(rule)
                 native_changed = any(old.get(field) != rule.get(field) for field in STUN_NATIVE_MAPPING_FIELDS)
                 def update_operation() -> None:
                     if native_changed:
@@ -1120,6 +1143,7 @@ def create_stun_blueprint(hub: Any, service: StunService) -> Blueprint:
                 )
 
             try:
+                service.require_wan(next_rule)
                 service.mutate(
                     rule_id,
                     action_operation,
