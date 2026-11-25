@@ -1,4 +1,5 @@
 import base64
+import copy
 from pathlib import Path
 import threading
 from types import SimpleNamespace
@@ -40,14 +41,22 @@ def _hub(tmp_path):
             "forwardMode": "router_native",
             "targetIpv4": "192.168.5.1",
             "targetPort": 51820,
+            "wanId": "wan1",
+        }],
+    }
+    saved[Path(tmp_path) / "lab_ddns.json"] = {
+        "records": [{
+            "id": "ddns-record-primary",
+            "hostname": "wg.example.test",
+            "wanId": "wan2",
         }],
     }
 
     def load(path, default=None):
-        return saved.get(Path(path), default)
+        return copy.deepcopy(saved.get(Path(path), default))
 
     def save(path, value):
-        saved[Path(path)] = value
+        saved[Path(path)] = copy.deepcopy(value)
 
     return SimpleNamespace(
         DATA_DIR=tmp_path,
@@ -82,6 +91,7 @@ def _server():
             {
                 "id": "ddns-primary",
                 "endpointSource": "ddns",
+                "ddnsRecordId": "ddns-record-primary",
                 "hostname": "wg.example.test",
                 "port": 51820,
             },
@@ -132,10 +142,10 @@ def test_ddns_and_stun_have_independent_endpoint_revisions(tmp_path):
     }]
 
     ddns = service.update_endpoint(
-        "ddns-primary", "ddns", "ddns:ddns-primary", "wg.example.test", 0
+        "ddns-primary", "ddns", "ddns:ddns-primary", "wg.example.test", 0, "wan2"
     )
     stun = service.update_endpoint(
-        "stun-fallback", "stun", "stun:stun-wireguard", "203.0.113.8:24567", 0
+        "stun-fallback", "stun", "stun:stun-wireguard", "203.0.113.8:24567", 0, "wan1"
     )
     current = service.document()
     assert current["revision"] == 1
@@ -149,6 +159,294 @@ def test_ddns_and_stun_have_independent_endpoint_revisions(tmp_path):
         "endpoint:ddns-primary",
         "endpoint:stun-fallback",
     ]
+
+
+def test_endpoint_profiles_inherit_wan_from_bound_source(tmp_path):
+    hub = _hub(tmp_path)
+    service = WireGuardService(hub)
+    saved = service.put(_server(), 0)
+    profiles = {row["id"]: row for row in saved["server"]["endpointProfiles"]}
+
+    assert profiles["stun-fallback"]["wanId"] == "wan1"
+    assert profiles["ddns-primary"]["wanId"] == "wan2"
+    assert profiles["ddns-primary"]["ddnsRecordId"] == "ddns-record-primary"
+    assert profiles["ddns-primary"]["owner"] == "ddns:ddns-primary"
+    ddns_firewall = next(
+        row for row in hub._stun_lifecycle.ensure_calls
+        if row["id"] == "wireguard-ddns-ddns-primary"
+    )
+    assert ddns_firewall["wanId"] == "wan2"
+    # STUN admission remains owned by the bound STUN rule on the same WAN.
+    stun_rule = service._stun_rule("stun-wireguard")
+    assert stun_rule["wanId"] == profiles["stun-fallback"]["wanId"]
+
+
+@pytest.mark.parametrize(
+    "source, wan_id",
+    [("ddns", "wan1"), ("stun", "wan2")],
+)
+def test_endpoint_profile_rejects_supplied_wan_mismatch(tmp_path, source, wan_id):
+    service = WireGuardService(_hub(tmp_path))
+    payload = _server()
+    profile = next(row for row in payload["endpointProfiles"] if row["endpointSource"] == source)
+    profile["wanId"] = wan_id
+    with pytest.raises(ValueError, match="wanId.*不一致"):
+        service.put(payload, 0)
+    assert service.document()["revision"] == 0
+
+
+def test_manual_endpoint_wan_must_be_blank(tmp_path):
+    service = WireGuardService(_hub(tmp_path))
+    payload = _server()
+    payload["endpointProfiles"].append({
+        "id": "manual-office",
+        "endpointSource": "manual",
+        "resolvedEndpoint": "198.51.100.20:51820",
+        "port": 51820,
+        "wanId": "wan9",
+    })
+    with pytest.raises(ValueError, match="Manual Profile 不能绑定 WAN"):
+        service.put(payload, 0)
+
+
+def test_ddns_profile_requires_matching_explicit_record(tmp_path):
+    hub = _hub(tmp_path)
+    service = WireGuardService(hub)
+    payload = _server()
+    payload["endpointProfiles"][0].pop("ddnsRecordId")
+    with pytest.raises(ValueError, match="明确关联 DDNS 记录"):
+        service.put(payload, 0)
+
+    payload = _server()
+    payload["endpointProfiles"][0]["hostname"] = "other.example.test"
+    with pytest.raises(ValueError, match="域名必须与关联记录一致"):
+        service.put(payload, 0)
+
+    payload = _server()
+    payload["endpointProfiles"][0]["ddnsRecordId"] = "missing-record"
+    with pytest.raises(ValueError, match="关联记录不存在"):
+        service.put(payload, 0)
+
+
+def test_rebinding_source_wan_resets_only_endpoint_revision(tmp_path):
+    hub = _hub(tmp_path)
+    service = WireGuardService(hub)
+    saved = service.put(_server(), 0)
+    service.update_endpoint("ddns-primary", "ddns", "ddns:ddns-primary", "wg.example.test", 0, "wan2")
+    service.update_endpoint("stun-fallback", "stun", "stun:stun-wireguard", "203.0.113.8:24567", 0, "wan1")
+
+    unchanged = service.put(service.document()["server"], 1)
+    unchanged_profiles = {row["id"]: row for row in unchanged["server"]["endpointProfiles"]}
+    assert unchanged_profiles["ddns-primary"]["endpointRevision"] == 1
+    assert unchanged_profiles["stun-fallback"]["endpointRevision"] == 1
+
+    ddns_path = Path(tmp_path) / "lab_ddns.json"
+    hub._saved[ddns_path]["records"][0]["wanId"] = "wan3"
+    changed = unchanged["server"]
+    next(row for row in changed["endpointProfiles"] if row["id"] == "ddns-primary").pop("wanId")
+    rebound = service.put(changed, 2)
+    profiles = {row["id"]: row for row in rebound["server"]["endpointProfiles"]}
+    assert rebound["revision"] == 3
+    assert rebound["endpointRevision"] == 2
+    assert profiles["ddns-primary"]["id"] == "ddns-primary"
+    assert profiles["ddns-primary"]["owner"] == "ddns:ddns-primary"
+    assert profiles["ddns-primary"]["wanId"] == "wan3"
+    assert profiles["ddns-primary"]["endpointRevision"] == 0
+    assert profiles["ddns-primary"]["resolvedEndpoint"] == ""
+    assert profiles["stun-fallback"]["endpointRevision"] == 1
+
+    with pytest.raises(RuntimeError, match="endpoint revision conflict"):
+        service.update_endpoint("ddns-primary", "ddns", "ddns:ddns-primary", "wg.example.test", 1)
+    updated = service.update_endpoint(
+        "ddns-primary", "ddns", "ddns:ddns-primary", "wg.example.test", 0, "wan3"
+    )
+    assert updated["endpointRevision"] == 1
+    assert service.document()["endpointRevision"] == 3
+
+
+def test_omitted_wan_inherits_without_resetting_endpoint_revision(tmp_path):
+    service = WireGuardService(_hub(tmp_path))
+    service.put(_server(), 0)
+    service.update_endpoint("ddns-primary", "ddns", "ddns:ddns-primary", "wg.example.test", 0, "wan2")
+    payload = service.document()["server"]
+    for profile in payload["endpointProfiles"]:
+        profile.pop("wanId")
+    saved = service.put(payload, 1)
+    profiles = {row["id"]: row for row in saved["server"]["endpointProfiles"]}
+    assert profiles["ddns-primary"]["wanId"] == "wan2"
+    assert profiles["ddns-primary"]["endpointRevision"] == 1
+    assert profiles["stun-fallback"]["wanId"] == "wan1"
+    assert profiles["stun-fallback"]["endpointRevision"] == 0
+
+
+def test_changing_ddns_record_rebind_resets_revision_on_same_wan(tmp_path):
+    hub = _hub(tmp_path)
+    records = hub._saved[Path(tmp_path) / "lab_ddns.json"]["records"]
+    records.append({**records[0], "id": "ddns-record-secondary"})
+    service = WireGuardService(hub)
+    service.put(_server(), 0)
+    service.update_endpoint("ddns-primary", "ddns", "ddns:ddns-primary", "wg.example.test", 0, "wan2")
+    changed = service.document()["server"]
+    changed["endpointProfiles"][0]["ddnsRecordId"] = "ddns-record-secondary"
+    saved = service.put(changed, 1)
+    profile = saved["server"]["endpointProfiles"][0]
+    assert profile["owner"] == "ddns:ddns-primary"
+    assert profile["wanId"] == "wan2"
+    assert profile["endpointRevision"] == 0
+    assert profile["resolvedEndpoint"] == ""
+
+
+def test_changing_endpoint_source_rebind_resets_revision(tmp_path):
+    service = WireGuardService(_hub(tmp_path))
+    saved = service.put(_server(), 0)
+    service.update_endpoint("ddns-primary", "ddns", "ddns:ddns-primary", "wg.example.test", 0, "wan2")
+    changed = saved["server"]
+    changed["endpointProfiles"][0] = {
+        "id": "ddns-primary",
+        "endpointSource": "stun",
+        "stunRuleId": "stun-wireguard",
+        "endpointRevision": 1,
+        "resolvedEndpoint": "203.0.113.8:24567",
+    }
+    rebound = service.put(changed, 1)
+    profile = rebound["server"]["endpointProfiles"][0]
+    assert profile["id"] == "ddns-primary"
+    assert profile["owner"] == "stun:stun-wireguard"
+    assert profile["wanId"] == "wan1"
+    assert profile["endpointRevision"] == 0
+    assert profile["resolvedEndpoint"] == ""
+
+
+def test_legacy_blank_wan_defaults_firewall_to_wan_and_lan_is_unchanged(tmp_path):
+    hub = _hub(tmp_path)
+    hub._saved[Path(tmp_path) / "stun_rules.json"]["rules"][0].pop("wanId")
+    hub._saved[Path(tmp_path) / "lab_ddns.json"]["records"][0].pop("wanId")
+    service = WireGuardService(hub)
+    saved = service.put(_server(), 0)
+    profiles = {row["id"]: row for row in saved["server"]["endpointProfiles"]}
+    assert profiles["stun-fallback"]["wanId"] == "wan"
+    assert profiles["ddns-primary"]["wanId"] == "wan"
+
+    # A desired document written before wanId existed also defaults at admission.
+    profiles["ddns-primary"].pop("wanId")
+    service._sync_ddns_firewalls(None, saved["server"])
+    ddns_firewall = hub._stun_lifecycle.ensure_calls[-1]
+    lan_firewall = next(
+        row for row in hub._stun_lifecycle.ensure_calls
+        if row["id"] == "wireguard-lan-labwg0"
+    )
+    assert ddns_firewall["wanId"] == "wan"
+    assert "wanId" not in lan_firewall
+    assert lan_firewall["kind"] == "wireguard-lan-forward"
+    assert lan_firewall["tunnelNetwork"] == "10.77.0.0/24"
+
+
+def test_legacy_blank_profile_wan_accepts_omitted_updater_wan(tmp_path):
+    hub = _hub(tmp_path)
+    service = WireGuardService(hub)
+    service.put(_server(), 0)
+    document = service.document()
+    profile = next(
+        row for row in document["server"]["endpointProfiles"]
+        if row["id"] == "ddns-primary"
+    )
+    profile["wanId"] = ""
+    hub.save_json(service.document_path, document)
+
+    updated = service.update_endpoint(
+        "ddns-primary", "ddns", "ddns:ddns-primary", "wg.example.test", 0
+    )
+
+    assert updated["wanId"] == "wan"
+    assert updated["endpointRevision"] == 1
+    assert service.document()["endpointRevision"] == 1
+    assert service.commands()[-1]["payload"]["wanId"] == "wan"
+
+
+def test_endpoint_update_status_and_command_include_and_verify_wan(tmp_path):
+    hub = _hub(tmp_path)
+    service = install_wireguard_service(hub)
+    service.put(_server(), 0)
+    client = hub.app.test_client()
+
+    mismatch = client.patch(
+        "/api/wireguard/endpoints/ddns-primary",
+        json={
+            "endpointSource": "ddns",
+            "owner": "ddns:ddns-primary",
+            "wanId": "wan1",
+            "endpoint": "wg.example.test",
+            "expectedEndpointRevision": 0,
+        },
+    )
+    assert mismatch.status_code == 400
+    assert "wanId does not match" in mismatch.get_json()["error"]
+    assert service.document()["endpointRevision"] == 0
+
+    response = client.patch(
+        "/api/wireguard/endpoints/ddns-primary",
+        json={
+            "endpointSource": "ddns",
+            "owner": "ddns:ddns-primary",
+            "wanId": "wan2",
+            "endpoint": "wg.example.test",
+            "expectedEndpointRevision": 0,
+        },
+    )
+    assert response.status_code == 200
+    assert response.get_json()["profile"]["wanId"] == "wan2"
+    command = service.commands()[-1]
+    assert command["action"] == "endpoint"
+    assert command["payload"]["wanId"] == "wan2"
+
+
+@pytest.mark.parametrize(
+    "source, profile_id, owner, endpoint, target_wan, wrong_wan",
+    [
+        (
+            "ddns",
+            "ddns-primary",
+            "ddns:ddns-primary",
+            "wg.example.test",
+            "wan2",
+            "wan1",
+        ),
+        (
+            "stun",
+            "stun-fallback",
+            "stun:stun-wireguard",
+            "203.0.113.8:24567",
+            "wan1",
+            "wan2",
+        ),
+    ],
+)
+@pytest.mark.parametrize("omit_wan", [True, False], ids=["missing", "mismatch"])
+def test_endpoint_update_requires_matching_wan_without_side_effects(
+    tmp_path, source, profile_id, owner, endpoint, target_wan, wrong_wan, omit_wan
+):
+    hub = _hub(tmp_path)
+    service = WireGuardService(hub)
+    service.put(_server(), 0)
+    document_before = service.document()
+    commands_before = service.commands()
+    stored_before = copy.deepcopy(hub._saved)
+    profile_before = next(
+        row for row in document_before["server"]["endpointProfiles"]
+        if row["id"] == profile_id
+    )
+    assert profile_before["wanId"] == target_wan
+    assert profile_before["endpointRevision"] == 0
+    assert profile_before["resolvedEndpoint"] == ""
+    assert document_before["endpointRevision"] == 0
+
+    kwargs = {} if omit_wan else {"wan_id": wrong_wan}
+    with pytest.raises(ValueError, match="wanId does not match"):
+        service.update_endpoint(profile_id, source, owner, endpoint, 0, **kwargs)
+
+    assert service.document() == document_before
+    assert service.commands() == commands_before
+    assert hub._saved == stored_before
 
 
 def test_endpoint_updater_cannot_write_a_profile_owned_by_other_source(tmp_path):
@@ -239,6 +537,7 @@ def test_manual_endpoint_is_immutable_to_automatic_updaters(tmp_path):
     saved = service.put(payload, 0)
     manual = saved["server"]["endpointProfiles"][2]
     assert manual["owner"] == ""
+    assert manual["wanId"] == ""
     assert manual["resolvedEndpoint"] == "198.51.100.20:51820"
     with pytest.raises(ValueError, match="manual endpoint profile"):
         service.update_endpoint(
@@ -388,7 +687,7 @@ def test_listen_port_customization_and_ddns_endpoint_sync(tmp_path):
 
     # Updating DDNS endpoint formats with the customized listenPort 40000
     updated_ddns = service.update_endpoint(
-        "ddns-primary", "ddns", "ddns:ddns-primary", "wg.example.test", 0
+        "ddns-primary", "ddns", "ddns:ddns-primary", "wg.example.test", 0, "wan2"
     )
     assert updated_ddns["resolvedEndpoint"] == "wg.example.test:40000"
     assert updated_ddns["endpointRevision"] == 1

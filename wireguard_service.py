@@ -30,6 +30,27 @@ def _text(value: Any) -> str:
     return str(value or "").strip()
 
 
+def _wan_id(value: Any) -> str:
+    text = _text(value).lower()
+    if not text:
+        return "wan"
+    if not re.fullmatch(r"[a-z0-9_-]{1,64}", text):
+        raise ValueError("WAN 线路标识无效")
+    return text
+
+
+def _validate_profile_wan(source: str, supplied: Any, derived: Any) -> str:
+    supplied_wan = _text(supplied).lower()
+    derived_wan = _wan_id(derived)
+    if source == "manual":
+        if supplied_wan:
+            raise ValueError("Manual Profile 不能绑定 WAN")
+        return ""
+    if supplied_wan and _wan_id(supplied_wan) != derived_wan:
+        raise ValueError("Profile wanId 与关联来源不一致")
+    return derived_wan
+
+
 def _int(value: Any, default: int = 0) -> int:
     try:
         return int(value)
@@ -126,6 +147,25 @@ class WireGuardService:
             (dict(row) for row in rows if isinstance(row, dict) and _text(row.get("id")) == rule_id),
             None,
         )
+
+    def _ddns_record(self, record_id: str) -> Dict[str, Any]:
+        """Resolve the public DDNS record that owns an endpoint profile."""
+        store = getattr(self.hub, "LAB_DDNS", None)
+        snapshot = getattr(store, "snapshot", None)
+        if callable(snapshot):
+            raw = snapshot()
+        else:
+            raw = self.hub.load_json(Path(self.hub.DATA_DIR) / "lab_ddns.json", {})
+        rows = raw.get("records", []) if isinstance(raw, dict) else []
+        if isinstance(rows, dict):
+            rows = [{"id": key, **value} for key, value in rows.items() if isinstance(value, dict)]
+        record = next(
+            (dict(row) for row in rows if isinstance(row, dict) and _text(row.get("id")) == record_id),
+            None,
+        )
+        if record is None:
+            raise ValueError("DDNS Profile 关联记录不存在")
+        return record
 
     def _sync_stun_rule_target_port(self, rule_id: str, listen_port: int) -> None:
         rule_id = _text(rule_id)
@@ -364,6 +404,7 @@ class WireGuardService:
             "transportProtocol": "UDP",
             "targetPort": _int(server.get("listenPort")),
             "forwardMode": "router_native",
+            "wanId": _wan_id(profile.get("wanId")),
         }
 
     def _ensure_ddns_firewall(self, profile: Dict[str, Any], server: Dict[str, Any]) -> Dict[str, Any]:
@@ -497,6 +538,9 @@ class WireGuardService:
             if source not in {"manual", "ddns", "stun"}:
                 raise ValueError("Endpoint Source 只能是 manual、ddns 或 stun")
             old_profile = old_profiles.get(profile_id)
+            rebind = bool(old_profile and (
+                _text(old_profile.get("endpointSource")).lower() != source
+            ))
             profile = {
                 "id": profile_id,
                 "name": _text(raw.get("name"))[:64] or ({"manual": "手动地址", "ddns": "DDNS 直连", "stun": "STUN 穿透"}[source]),
@@ -513,9 +557,11 @@ class WireGuardService:
                 endpoint = _text(raw.get("resolvedEndpoint"))
                 if not endpoint:
                     raise ValueError("Manual Profile 需要固定 Endpoint")
+                profile["wanId"] = _validate_profile_wan(source, raw.get("wanId"), "")
                 profile.update({
                     "hostname": "",
                     "stunRuleId": "",
+                    "ddnsRecordId": "",
                     "bindingMode": "manual",
                     "owner": "",
                     "resolvedEndpoint": endpoint,
@@ -524,10 +570,23 @@ class WireGuardService:
                 hostname = _text(raw.get("hostname")).lower().rstrip(".")
                 if not hostname or len(hostname) > 253 or ":" in hostname:
                     raise ValueError("DDNS Profile 需要独立域名")
+                record_id = _text(raw.get("ddnsRecordId"))
+                if not re.fullmatch(r"[A-Za-z0-9_-]{1,64}", record_id):
+                    raise ValueError("DDNS Profile 需要明确关联 DDNS 记录")
+                record = self._ddns_record(record_id)
+                record_hostname = _text(record.get("hostname")).lower().rstrip(".")
+                if record_hostname != hostname:
+                    raise ValueError("DDNS Profile 域名必须与关联记录一致")
+                profile["wanId"] = _validate_profile_wan(source, raw.get("wanId"), record.get("wanId"))
+                rebind = rebind or bool(old_profile and (
+                    _wan_id(old_profile.get("wanId")) != profile["wanId"]
+                    or _text(old_profile.get("ddnsRecordId")) != record_id
+                ))
                 profile["port"] = listen_port
                 profile.update({
                     "hostname": hostname,
                     "stunRuleId": "",
+                    "ddnsRecordId": record_id,
                     "bindingMode": "fixed-port",
                     "owner": f"ddns:{profile_id}",
                     "resolvedEndpoint": _text(raw.get("resolvedEndpoint")),
@@ -541,23 +600,35 @@ class WireGuardService:
                 old_listen_port = _int(old.get("listenPort")) if old else 0
                 previous_listen_port = old_listen_port if old_listen_port and old_listen_port != listen_port else None
                 try:
-                    self._validate_stun_binding(stun_rule_id, listen_port, previous_listen_port)
+                    stun_rule = self._validate_stun_binding(stun_rule_id, listen_port, previous_listen_port)
                 except ValueError as error:
                     if str(error) == "STUN Profile 关联规则不存在" and old_profile is not None:
                         continue
                     raise
+                profile["wanId"] = _validate_profile_wan(source, raw.get("wanId"), stun_rule.get("wanId"))
+                rebind = rebind or bool(old_profile and (
+                    _wan_id(old_profile.get("wanId")) != profile["wanId"]
+                    or _text(old_profile.get("stunRuleId")) != stun_rule_id
+                ))
                 # STUN owns the public channel port; the router-native map
                 # forwards it to the Agent's fixed WireGuard listen port.
                 # WireGuard itself never binds the changing STUN port.
                 profile.update({
                     "hostname": "",
                     "stunRuleId": stun_rule_id,
+                    "ddnsRecordId": "",
                     "bindingMode": "router-native",
                     "forwardMode": "router_native",
                     "transportProtocol": "UDP",
                     "localTargetPort": listen_port,
                     "owner": f"stun:{stun_rule_id}",
                 })
+            if rebind:
+                # A source/record/rule/WAN change starts a new endpoint stream.
+                # Reusing the old revision would let a stale update overwrite
+                # the freshly bound profile with an endpoint from its old WAN.
+                profile["endpointRevision"] = 0
+                profile["resolvedEndpoint"] = ""
             profile_ids.add(profile_id)
             profiles.append(profile)
 
@@ -789,8 +860,10 @@ class WireGuardService:
             return saved
 
 
-    def update_endpoint(self, profile_id: str, source: str, owner: str, endpoint: str, expected_revision: Optional[int]) -> Dict[str, Any]:
+    def update_endpoint(self, profile_id: str, source: str, owner: str, endpoint: str, expected_revision: Optional[int], wan_id: Optional[str] = None) -> Dict[str, Any]:
         with self.lock:
+            profile_id = _text(profile_id)
+            source = _text(source).lower()
             document = self.document()
             server = dict(document.get("server") or {})
             profiles = [dict(row) for row in server.get("endpointProfiles", []) if isinstance(row, dict)]
@@ -808,6 +881,14 @@ class WireGuardService:
                 raise ValueError("expectedEndpointRevision is required")
             if expected_revision != current:
                 raise RuntimeError("endpoint revision conflict")
+            target_wan = _text(profile.get("wanId"))
+            supplied_wan = _text(wan_id)
+            desired_wan = _wan_id(target_wan)
+            if (target_wan and not supplied_wan) or (
+                supplied_wan and _wan_id(supplied_wan) != desired_wan
+            ):
+                raise ValueError("endpoint updater wanId does not match this profile")
+            profile["wanId"] = desired_wan
             if source == "stun":
                 try:
                     host, port = endpoint.rsplit(":", 1)
@@ -833,6 +914,7 @@ class WireGuardService:
                     "profileId": profile_id,
                     "endpointSource": source,
                     "owner": owner,
+                    "wanId": profile["wanId"],
                     "endpoint": endpoint,
                     "expectedEndpointRevision": current,
                     "endpointRevision": profile["endpointRevision"],
@@ -908,6 +990,7 @@ def create_wireguard_blueprint(hub: Any, service: WireGuardService) -> Blueprint
                 _text(payload.get("owner")),
                 _text(payload.get("endpoint")),
                 _int(expected) if expected is not None else None,
+                _text(payload.get("wanId")),
             )
             return jsonify({"ok": True, "profile": profile, "endpointRevision": service.document()["endpointRevision"]})
         except RuntimeError as error:
