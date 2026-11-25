@@ -1,5 +1,11 @@
 # LabProbe 变更记录
 
+## 0.14.7 / LabRelay 0.2.80（测试版）
+
+- 多 WAN 统一发现、逐线路遥测、原生功能与 DDNS/STUN/TCP 线路绑定。
+- STUN 出口校验、共享低频 WAN 发现、官方账号全局授权及并发修复。
+- WireGuard 继承来源线路，保留已确认的单 WAN 旧配置；双 WAN 入站与回程待真机验证。
+
 ## 0.14.6 / LabRelay 0.2.79
 
 - 原生 DDNS 强制刷新重新探测 `ddns_view` / `ddnsCfg` 协议，避免固件升级后仍沿用旧协议而显示空列表。

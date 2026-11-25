@@ -148,6 +148,20 @@ class WireGuardService:
             None,
         )
 
+    def _legacy_single_wan(self) -> bool:
+        """Permit an external/native DDNS hostname only on confirmed single WAN."""
+        service = getattr(self.hub, "ROUTER_SERVICE", None)
+        try:
+            result = service.get_wans(force=False)
+        except Exception:
+            return False
+        data = result.get("data", {}) if isinstance(result, dict) else {}
+        if not isinstance(data, dict) or data.get("supported") is not True:
+            return False
+        rows = data.get("wans", [])
+        configured = [row for row in rows if isinstance(row, dict) and row.get("configured") is True] if isinstance(rows, list) else []
+        return len(configured) == 1 and _text(configured[0].get("wanId")).lower() == "wan"
+
     def _ddns_record(self, record_id: str) -> Dict[str, Any]:
         """Resolve the public DDNS record that owns an endpoint profile."""
         store = getattr(self.hub, "LAB_DDNS", None)
@@ -571,13 +585,26 @@ class WireGuardService:
                 if not hostname or len(hostname) > 253 or ":" in hostname:
                     raise ValueError("DDNS Profile 需要独立域名")
                 record_id = _text(raw.get("ddnsRecordId"))
-                if not re.fullmatch(r"[A-Za-z0-9_-]{1,64}", record_id):
-                    raise ValueError("DDNS Profile 需要明确关联 DDNS 记录")
-                record = self._ddns_record(record_id)
-                record_hostname = _text(record.get("hostname")).lower().rstrip(".")
-                if record_hostname != hostname:
-                    raise ValueError("DDNS Profile 域名必须与关联记录一致")
-                profile["wanId"] = _validate_profile_wan(source, raw.get("wanId"), record.get("wanId"))
+                if record_id:
+                    if not re.fullmatch(r"[A-Za-z0-9_-]{1,64}", record_id):
+                        raise ValueError("DDNS Profile 需要明确关联 DDNS 记录")
+                    record = self._ddns_record(record_id)
+                    record_hostname = _text(record.get("hostname")).lower().rstrip(".")
+                    if record_hostname != hostname:
+                        raise ValueError("DDNS Profile 域名必须与关联记录一致")
+                    profile["wanId"] = _validate_profile_wan(source, raw.get("wanId"), record.get("wanId"))
+                else:
+                    # Existing unbound DDNS profiles historically used WAN.
+                    # Preserve that exact binding on unchanged metadata; new
+                    # unbound profiles need real single-WAN evidence.
+                    legacy_unchanged = bool(old_profile and
+                        _text(old_profile.get("endpointSource")) == "ddns" and
+                        not _text(old_profile.get("ddnsRecordId")) and
+                        _wan_id(old_profile.get("wanId")) == "wan" and
+                        _text(old_profile.get("hostname")).lower().rstrip(".") == hostname)
+                    if not legacy_unchanged and not self._legacy_single_wan():
+                        raise ValueError("DDNS Profile 需要明确关联 DDNS 记录")
+                    profile["wanId"] = _validate_profile_wan(source, raw.get("wanId"), "wan")
                 rebind = rebind or bool(old_profile and (
                     _wan_id(old_profile.get("wanId")) != profile["wanId"]
                     or _text(old_profile.get("ddnsRecordId")) != record_id

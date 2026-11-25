@@ -1076,3 +1076,22 @@ def test_peer_creation_time_survives_edits_and_backfills_from_history(tmp_path):
     service.hub.save_json(service.commands_path, {"commands": []})
     assert service.peers()[0]["createdAt"] == ""
 
+
+
+def test_external_ddns_legacy_single_wan_and_multi_wan_gate(tmp_path):
+    hub = _hub(tmp_path)
+    hub.ROUTER_SERVICE = SimpleNamespace(get_wans=lambda force=False: {"data": {
+        "supported": True, "wans": [{"wanId": "wan", "configured": True}]}})
+    service = WireGuardService(hub)
+    payload = _server()
+    profile = payload["endpointProfiles"][0]
+    profile.pop("ddnsRecordId")
+    profile["hostname"] = "external.example.test"
+    saved = service.put(payload, 0)
+    assert saved["server"]["endpointProfiles"][0]["wanId"] == "wan"
+    assert saved["server"]["endpointProfiles"][0]["ddnsRecordId"] == ""
+    hub.ROUTER_SERVICE = SimpleNamespace(get_wans=lambda force=False: {"data": {
+        "supported": True, "wans": [{"wanId": "wan", "configured": True}, {"wanId": "wan1", "configured": True}]}})
+    payload["endpointProfiles"][0]["hostname"] = "new.example.test"
+    with pytest.raises(ValueError, match="明确关联 DDNS 记录"):
+        service.put(payload, 1)
