@@ -48,6 +48,8 @@ pub struct WireGuardEndpointProfile {
     pub port: u16,
     #[serde(default)]
     pub endpoint_revision: u64,
+    #[serde(default)]
+    pub wan_id: String,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
@@ -59,6 +61,8 @@ pub struct WireGuardEndpointUpdate {
     pub endpoint: String,
     pub expected_endpoint_revision: u64,
     pub endpoint_revision: u64,
+    #[serde(default)]
+    pub wan_id: String,
 }
 
 /// Apply a public endpoint observation without changing the server/kernel
@@ -81,6 +85,11 @@ pub fn apply_endpoint_update(
     if profile.owner.is_empty() || profile.owner != update.owner {
         bail!("endpoint updater owner does not match profile");
     }
+    let profile_wan = profile.wan_id.trim().to_ascii_lowercase();
+    let update_wan = update.wan_id.trim().to_ascii_lowercase();
+    if profile_wan != update_wan {
+        bail!("endpoint updater wanId does not match profile");
+    }
     if profile.endpoint_revision == update.endpoint_revision
         && profile.resolved_endpoint == update.endpoint
     {
@@ -97,6 +106,7 @@ pub fn apply_endpoint_update(
     }
     profile.resolved_endpoint = update.endpoint.clone();
     profile.endpoint_revision = update.endpoint_revision;
+    profile.wan_id = profile_wan;
     Ok(profile.clone())
 }
 
@@ -1290,6 +1300,7 @@ mod tests {
             hostname: "wg.example.test".into(),
             binding_mode: "fixed-port".into(),
             port: 51820,
+            wan_id: "wan1".into(),
             ..WireGuardEndpointProfile::default()
         }];
         let update = WireGuardEndpointUpdate {
@@ -1299,6 +1310,7 @@ mod tests {
             endpoint: "wg.example.test:51820".into(),
             expected_endpoint_revision: 0,
             endpoint_revision: 1,
+            wan_id: "wan1".into(),
         };
         let first = apply_endpoint_update(&mut profiles, &update).unwrap();
         assert_eq!(first.endpoint_revision, 1);
@@ -1311,6 +1323,27 @@ mod tests {
         wrong_owner.endpoint_revision = 2;
         wrong_owner.owner = "ddns:someone-else".into();
         assert!(apply_endpoint_update(&mut profiles, &wrong_owner).is_err());
+
+        let mut wrong_wan = update.clone();
+        wrong_wan.wan_id = "wan2".into();
+        assert!(apply_endpoint_update(&mut profiles, &wrong_wan).is_err());
+        assert_eq!(profiles[0].resolved_endpoint, "wg.example.test:51820");
+        assert_eq!(profiles[0].endpoint_revision, 1);
+    }
+
+    #[test]
+    fn endpoint_update_deserializes_wan_identity() {
+        let update: WireGuardEndpointUpdate = serde_json::from_value(serde_json::json!({
+            "profileId": "wg-ddns",
+            "endpointSource": "ddns",
+            "owner": "ddns:wg-ddns",
+            "endpoint": "wg.example.test:51820",
+            "expectedEndpointRevision": 0,
+            "endpointRevision": 1,
+            "wanId": "wan1"
+        }))
+        .unwrap();
+        assert_eq!(update.wan_id, "wan1");
     }
 
     #[test]
@@ -1330,6 +1363,7 @@ mod tests {
             endpoint: "other.example.test:51820".into(),
             expected_endpoint_revision: 0,
             endpoint_revision: 1,
+            wan_id: String::new(),
         };
         assert!(apply_endpoint_update(&mut profiles, &update).is_err());
         assert_eq!(profiles[0].resolved_endpoint, "198.51.100.20:51820");

@@ -2290,6 +2290,7 @@ async fn sync_wireguard(
                         "profileId": updated.id,
                         "endpointSource": updated.endpoint_source,
                         "owner": updated.owner,
+                        "wanId": updated.wan_id,
                         "endpointRevision": updated.endpoint_revision,
                         "resolvedEndpoint": updated.resolved_endpoint,
                     }))
