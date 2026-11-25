@@ -15,6 +15,7 @@ class Ipv6ValidationError(ValueError):
 
 @dataclass(frozen=True)
 class Ipv6Status:
+    wanId: str = "wan"
     connected: bool = False
     proto: str = ""
     address: str = ""
@@ -24,6 +25,7 @@ class Ipv6Status:
 
     def to_dict(self) -> Dict[str, Any]:
         return {
+            "wanId": self.wanId,
             "connected": self.connected,
             "proto": self.proto,
             "address": self.address,
@@ -35,6 +37,7 @@ class Ipv6Status:
 
 @dataclass(frozen=True)
 class WanIpv6Config:
+    wanId: str = "wan"
     proto: str = "dhcpv6"
     ifname: str = "@wan"
     dns: List[str] = field(default_factory=list)
@@ -43,6 +46,7 @@ class WanIpv6Config:
 
     def to_dict(self) -> Dict[str, Any]:
         return {
+            "wanId": self.wanId,
             "proto": self.proto,
             "ifname": self.ifname,
             "dns": list(self.dns),
@@ -78,10 +82,15 @@ class LanIpv6Config:
 @dataclass(frozen=True)
 class Ipv6Config:
     wan: WanIpv6Config = field(default_factory=WanIpv6Config)
+    wans: List[WanIpv6Config] = field(default_factory=list)
     lan: LanIpv6Config = field(default_factory=LanIpv6Config)
 
     def to_dict(self) -> Dict[str, Any]:
-        return {"wan": self.wan.to_dict(), "lan": self.lan.to_dict()}
+        return {
+            "wan": self.wan.to_dict(),
+            "wans": [wan.to_dict() for wan in self.wans],
+            "lan": self.lan.to_dict(),
+        }
 
 
 @dataclass(frozen=True)

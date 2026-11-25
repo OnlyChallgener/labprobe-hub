@@ -1027,24 +1027,24 @@ class ReyeeEWebDriver(RouterDriver):
 
     # --- IPv6 ---
 
-    def get_ipv6_status(self) -> Dict[str, Any]:
+    def get_ipv6_status(self, wan_id: Optional[str] = None) -> Dict[str, Any]:
         try:
             if self._legacy_client and hasattr(self._legacy_client, "ipv6_status"):
                 return self._legacy_client.ipv6_status()
             if self._rpc_client:
                 from router.ipv6.mapper import map_status
-                return map_status(self.rpc("devSta.get", "ipinfo6")).to_dict()
+                return map_status(self.rpc("devSta.get", "ipinfo6"), wan_id).to_dict()
             raise NotImplementedError("ipv6_status not available")
         except Exception as exc:
             raise from_legacy_error(exc) from exc
 
-    def get_ipv6_config(self) -> Dict[str, Any]:
+    def get_ipv6_config(self, wan_id: Optional[str] = None) -> Dict[str, Any]:
         try:
             if self._legacy_client and hasattr(self._legacy_client, "ipv6_config"):
                 return self._legacy_client.ipv6_config()
             if self._rpc_client:
                 from router.ipv6.mapper import map_config
-                return map_config(self.rpc("devConfig.get", "network6")).to_dict()
+                return map_config(self.rpc("devConfig.get", "network6"), wan_id).to_dict()
             raise NotImplementedError("ipv6_config not available")
         except Exception as exc:
             raise from_legacy_error(exc) from exc
@@ -1074,10 +1074,11 @@ class ReyeeEWebDriver(RouterDriver):
                 from router.ipv6.mapper import map_config, merge_config
                 with self.write_lock:
                     current = self.rpc("devConfig.get", "network6")
-                    payload = merge_config(current, config)
+                    wan_id = str(config.get("wanId") or "") if isinstance(config, dict) else ""
+                    payload = merge_config(current, config, wan_id)
                     self.rpc("devConfig.set", "network6", payload)
                     verified = self.rpc("devConfig.get", "network6")
-                return map_config(verified).to_dict()
+                return map_config(verified, wan_id).to_dict()
             raise NotImplementedError("save_ipv6_config not available")
         except Exception as exc:
             raise from_legacy_error(exc) from exc

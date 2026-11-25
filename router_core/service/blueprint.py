@@ -168,11 +168,13 @@ def create_router_blueprint_v1(
 
     @bp.get("/ipv6/status")
     def get_ipv6_status():
-        return jsonify(service.get_ipv6_status())
+        wan_id = request.args.get("wanId")
+        return jsonify(service.get_ipv6_status(wan_id))
 
     @bp.get("/ipv6/config")
     def get_ipv6_config():
-        return jsonify(service.get_ipv6_config())
+        wan_id = request.args.get("wanId")
+        return jsonify(service.get_ipv6_config(wan_id))
 
     @bp.get("/ipv6/clients")
     def get_dhcpv6_clients():

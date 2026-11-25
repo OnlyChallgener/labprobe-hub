@@ -116,12 +116,12 @@ class RouterDriver(ABC):
         ...
 
     @abstractmethod
-    def get_ipv6_status(self) -> Dict[str, Any]:
+    def get_ipv6_status(self, wan_id: Optional[str] = None) -> Dict[str, Any]:
         """Returns IPv6 WAN/LAN address and prefix status."""
         ...
 
     @abstractmethod
-    def get_ipv6_config(self) -> Dict[str, Any]:
+    def get_ipv6_config(self, wan_id: Optional[str] = None) -> Dict[str, Any]:
         """Returns IPv6 configuration."""
         ...
 

@@ -38,11 +38,13 @@ def create_ipv6_blueprint(check_app_token: Callable[[], bool], logger: Any, clie
 
     @bp.get("/status")
     def get_status():
-        return jsonify({"ok": True, "data": service.status().to_dict(), "updatedAt": int(time.time())})
+        wan_id = request.args.get("wanId")
+        return jsonify({"ok": True, "data": service.status(wan_id).to_dict(), "updatedAt": int(time.time())})
 
     @bp.get("/config")
     def get_config():
-        return jsonify({"ok": True, "data": service.config().to_dict()})
+        wan_id = request.args.get("wanId")
+        return jsonify({"ok": True, "data": service.config(wan_id).to_dict()})
 
     @bp.get("/clients")
     def get_clients():

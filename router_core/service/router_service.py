@@ -305,16 +305,16 @@ class RouterService:
 
     # --- IPv6 ---
 
-    def get_ipv6_status(self) -> Dict[str, Any]:
+    def get_ipv6_status(self, wan_id: Optional[str] = None) -> Dict[str, Any]:
         try:
-            res = self._driver.get_ipv6_status()
+            res = self._driver.get_ipv6_status(wan_id)
             return self._ensure_data_wrapper(res)
         except Exception as exc:
             raise from_legacy_error(exc) from exc
 
-    def get_ipv6_config(self) -> Dict[str, Any]:
+    def get_ipv6_config(self, wan_id: Optional[str] = None) -> Dict[str, Any]:
         try:
-            res = self._driver.get_ipv6_config()
+            res = self._driver.get_ipv6_config(wan_id)
             return self._ensure_data_wrapper(res)
         except Exception as exc:
             raise from_legacy_error(exc) from exc

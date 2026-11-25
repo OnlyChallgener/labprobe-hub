@@ -44,7 +44,15 @@ class FakeRouterClient:
                     "masq6": "0",
                     "metric": "7",
                     "unknownWan": "keep-wan",
-                }
+                },
+                {
+                    "proto": "dhcpv6",
+                    "ifname": "@wan1",
+                    "dns": "",
+                    "dnsType": "auto",
+                    "relay": "0",
+                    "unknownWan1": "keep-wan1",
+                },
             ],
             "version": "1.0.0",
             "lanNum": "1",
@@ -65,7 +73,14 @@ class FakeRouterClient:
                     "prefix": "2409:8a50:10::/60",
                     "gateway6": "fe80::1",
                     "dns6List": "2400:3200::1,2400:3200:baba::1",
-                }
+                },
+                "wan1_v6": {
+                    "proto": "dhcpv6",
+                    "ip6": "2001:db8:1::20/64",
+                    "prefix": "2001:db8:1::/64",
+                    "gateway6": "fe80::2",
+                    "dns6List": "2001:4860:4860::8888",
+                },
             }
         if method == "devSta.get" and module == "dhcp_lease6":
             assert data == {"index": 1, "size": 100, "macaddr": ""}
@@ -95,6 +110,7 @@ def test_status_and_dhcpv6_clients_are_normalized():
     clients = [item.to_dict() for item in service.clients()]
 
     assert status == {
+        "wanId": "wan",
         "connected": True,
         "proto": "dhcpv6",
         "address": "2409:8a50::20/64",
@@ -159,6 +175,43 @@ def test_save_reads_merges_writes_full_config_and_verifies():
     assert written["lan"][0]["ra"] == "server"
     assert written["lan"][0]["leasetime6"] == "240"
     assert result["config"].wan.dns == ["2400:3200::1"]
+
+
+def test_status_and_config_select_wan1_and_keep_inventory():
+    service = Ipv6Service(FakeRouterClient())
+    status = service.status("wan1").to_dict()
+    config = service.config("wan1").to_dict()
+    assert status["wanId"] == "wan1"
+    assert status["address"] == "2001:db8:1::20/64"
+    assert config["wan"]["wanId"] == "wan1"
+    assert [wan["wanId"] for wan in config["wans"]] == ["wan", "wan1"]
+
+
+def test_save_wan1_preserves_wan_lan_and_unknown_fields():
+    client = FakeRouterClient()
+    service = Ipv6Service(client)
+    result = service.update_config(
+        {
+            "wanId": "wan1",
+            "wan": {"proto": "relay", "relay": True, "dnsType": "manual", "dns": ["2001:4860:4860::8888"]},
+            "lan": {"dhcpv6Server": True, "slaac": True, "ra": True, "ip6assign": 64, "leasetime6": 120},
+        }
+    )
+    written = client.calls[1][2]
+    assert written["wan6"][0]["proto"] == "dhcpv6"
+    assert written["wan6"][0]["unknownWan"] == "keep-wan"
+    assert written["wan6"][1]["proto"] == "relay"
+    assert written["wan6"][1]["unknownWan1"] == "keep-wan1"
+    assert written["lan"][0]["unknownLan"] == "keep-lan"
+    assert result["config"].wan.wanId == "wan1"
+
+
+def test_unknown_wan_is_rejected_before_write():
+    client = FakeRouterClient()
+    service = Ipv6Service(client)
+    with pytest.raises(Ipv6ValidationError, match="wan2"):
+        service.update_config({"wanId": "wan2", "wan": {"proto": "dhcpv6"}, "lan": {}})
+    assert all(method != "devConfig.set" for method, _, _ in client.calls)
 
 
 def test_invalid_manual_dns_is_rejected_before_write():

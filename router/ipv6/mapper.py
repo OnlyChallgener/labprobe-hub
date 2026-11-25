@@ -4,7 +4,7 @@ from __future__ import annotations
 import copy
 import ipaddress
 import re
-from typing import Any, Dict, Iterable, List, Mapping
+from typing import Any, Dict, Iterable, List, Mapping, Optional
 
 from .models import (
     Dhcpv6Client,
@@ -52,6 +52,45 @@ def _first_mapping(value: Any) -> Dict[str, Any]:
     return {}
 
 
+def _wan_id(row: Mapping[str, Any], index: int = 0) -> str:
+    explicit = _text(row.get("wanId"))
+    if explicit:
+        return explicit.lower()
+    ifname = _text(row.get("ifname")).lower()
+    if ifname.startswith("@"):
+        return ifname[1:]
+    return "wan" if index == 0 else f"wan{index}"
+
+
+def _wan_config_rows(root: Mapping[str, Any]) -> List[Dict[str, Any]]:
+    value = root.get("wan6")
+    if isinstance(value, list):
+        return [dict(item) for item in value if isinstance(item, Mapping)]
+    if isinstance(value, Mapping):
+        if any(key in value for key in ("proto", "ifname", "dnsType")):
+            return [dict(value)]
+        rows = []
+        for key, item in value.items():
+            if isinstance(item, Mapping):
+                row = dict(item)
+                row.setdefault("wanId", str(key))
+                rows.append(row)
+        return rows
+    return []
+
+
+def _select_wan(rows: List[Dict[str, Any]], wan_id: Optional[str]) -> tuple[Dict[str, Any], int]:
+    if not rows:
+        return {}, 0
+    target = _text(wan_id).lower()
+    if target:
+        for index, row in enumerate(rows):
+            if _wan_id(row, index) == target:
+                return row, index
+        raise Ipv6ValidationError(f"路由器未配置 {target} IPv6 接口")
+    return rows[0], 0
+
+
 def split_dns(value: Any) -> List[str]:
     if isinstance(value, list):
         candidates: Iterable[Any] = value
@@ -65,12 +104,19 @@ def split_dns(value: Any) -> List[str]:
     return result
 
 
-def map_status(raw: Any) -> Ipv6Status:
+def map_status(raw: Any, wan_id: Optional[str] = None) -> Ipv6Status:
     root = dict(raw) if isinstance(raw, Mapping) else {}
-    wan = _first_mapping(root.get("wan_v6") or root.get("wan6") or root)
+    target = _text(wan_id).lower()
+    if target:
+        wan = _first_mapping(root.get(f"{target}_v6") or root.get(target))
+        selected_id = target
+    else:
+        wan = _first_mapping(root.get("wan_v6") or root.get("wan6") or root)
+        selected_id = _wan_id(wan)
     proto = _text(wan.get("proto"))
     address = _text(wan.get("ip6"))
     return Ipv6Status(
+        wanId=selected_id or "wan",
         connected=bool(address and proto.lower() not in {"none", "disabled", "off"}),
         proto=proto,
         address=address,
@@ -80,20 +126,28 @@ def map_status(raw: Any) -> Ipv6Status:
     )
 
 
-def map_config(raw: Any) -> Ipv6Config:
+def _map_wan_config(row: Mapping[str, Any], index: int = 0) -> WanIpv6Config:
+    dns_type_raw = _text(row.get("dnsType")).lower()
+    return WanIpv6Config(
+        wanId=_wan_id(row, index),
+        proto=_text(row.get("proto")) or "dhcpv6",
+        ifname=_text(row.get("ifname")) or "@wan",
+        dns=split_dns(row.get("dns")),
+        dns_type="manual" if dns_type_raw in {"admin", "manual", "static"} else "auto",
+        relay=_flag(row.get("relay")),
+    )
+
+
+def map_config(raw: Any, wan_id: Optional[str] = None) -> Ipv6Config:
     root = dict(raw) if isinstance(raw, Mapping) else {}
-    wan = _first_mapping(root.get("wan6"))
+    rows = _wan_config_rows(root)
+    wan, selected_index = _select_wan(rows, wan_id)
     lan = _first_mapping(root.get("lan"))
     dhcpv6_type = _text(lan.get("dhcpv6Type"))
-    dns_type_raw = _text(wan.get("dnsType")).lower()
+    wans = [_map_wan_config(row, index) for index, row in enumerate(rows)]
     return Ipv6Config(
-        wan=WanIpv6Config(
-            proto=_text(wan.get("proto")) or "dhcpv6",
-            ifname=_text(wan.get("ifname")) or "@wan",
-            dns=split_dns(wan.get("dns")),
-            dns_type="manual" if dns_type_raw in {"admin", "manual", "static"} else "auto",
-            relay=_flag(wan.get("relay")),
-        ),
+        wan=_map_wan_config(wan, selected_index),
+        wans=wans,
         lan=LanIpv6Config(
             prefix_length=_integer(lan.get("ip6assign"), 64),
             dhcpv6_server=_text(lan.get("dhcpv6")).lower() == "server" or _flag(lan.get("dhcpv6")),
@@ -158,7 +212,7 @@ def _dhcpv6_type(server: bool, slaac: bool) -> str:
     return "disabled"
 
 
-def merge_config(current: Any, requested: Any) -> Dict[str, Any]:
+def merge_config(current: Any, requested: Any, wan_id: Optional[str] = None) -> Dict[str, Any]:
     if not isinstance(current, Mapping):
         raise Ipv6ValidationError("路由器未返回完整 network6 配置")
     if not isinstance(requested, Mapping):
@@ -167,7 +221,9 @@ def merge_config(current: Any, requested: Any) -> Dict[str, Any]:
     wan_request = _require_mapping(requested, "wan")
     lan_request = _require_mapping(requested, "lan")
     merged = copy.deepcopy(dict(current))
-    wan_current = _first_mapping(merged.get("wan6"))
+    wan_rows = _wan_config_rows(merged)
+    target_id = _text(wan_id or requested.get("wanId")).lower()
+    wan_current, wan_index = _select_wan(wan_rows, target_id)
     lan_current = _first_mapping(merged.get("lan"))
     if not wan_current or not lan_current:
         raise Ipv6ValidationError("路由器 network6 缺少 WAN 或 LAN 配置")
@@ -205,9 +261,11 @@ def merge_config(current: Any, requested: Any) -> Dict[str, Any]:
     lan_current["leasetime6"] = str(lease_minutes)
 
     if isinstance(merged.get("wan6"), list):
-        merged["wan6"][0] = wan_current
+        merged["wan6"][wan_index] = wan_current
     else:
-        merged["wan6"] = [wan_current]
+        rows = _wan_config_rows(merged)
+        rows[wan_index] = wan_current
+        merged["wan6"] = rows
     if isinstance(merged.get("lan"), list):
         merged["lan"][0] = lan_current
     else:

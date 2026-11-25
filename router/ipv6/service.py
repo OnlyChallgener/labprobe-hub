@@ -14,11 +14,11 @@ class Ipv6Service:
     def __init__(self, client: Any):
         self.client = client
 
-    def status(self) -> Ipv6Status:
-        return map_status(self.client.rpc("devSta.get", "ipinfo6"))
+    def status(self, wan_id: str = "") -> Ipv6Status:
+        return map_status(self.client.rpc("devSta.get", "ipinfo6"), wan_id)
 
-    def config(self) -> Ipv6Config:
-        return map_config(self._read_full_config())
+    def config(self, wan_id: str = "") -> Ipv6Config:
+        return map_config(self._read_full_config(), wan_id)
 
     def clients(self) -> List[Dhcpv6Client]:
         raw = self.client.rpc(
@@ -31,10 +31,11 @@ class Ipv6Service:
     def update_config(self, requested: Any) -> Dict[str, Any]:
         with self.client.write_lock:
             current = self._read_full_config()
-            payload = merge_config(current, requested)
+            wan_id = str(requested.get("wanId") or "") if isinstance(requested, dict) else ""
+            payload = merge_config(current, requested, wan_id)
             write_result = self.client.rpc("devConfig.set", "network6", payload)
             self._assert_write_success(write_result)
-            verified = map_config(self._read_full_config())
+            verified = map_config(self._read_full_config(), wan_id)
         return {"config": verified, "verifiedAt": int(time.time())}
 
     def _read_full_config(self) -> Dict[str, Any]:
