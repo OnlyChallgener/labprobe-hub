@@ -26,6 +26,7 @@ mod rdpi;
 mod speedtest;
 mod tcp_session_test;
 mod usage_stats;
+mod wan;
 mod wireguard;
 
 const VERSION: &str = env!("CARGO_PKG_VERSION");
