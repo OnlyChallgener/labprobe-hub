@@ -9,6 +9,7 @@ from __future__ import annotations
 import json
 import ipaddress
 import os
+import re
 import tempfile
 import threading
 import time
@@ -185,6 +186,13 @@ def _text(value: Any) -> str:
     return str(value or "").strip()
 
 
+def _normal_wan_id(value: Any) -> str:
+    text = _text(value).lower()
+    if text and not re.fullmatch(r"[a-z0-9_-]{1,64}", text):
+        raise ValueError("invalid wanId")
+    return text
+
+
 def _redact_error(value: Any, credentials: Mapping[str, Any]) -> str:
     """Keep adapter failures safe even if an adapter returns raw provider text."""
     text = _text(value)
@@ -282,7 +290,7 @@ def _bool(value: Any, default: bool = True) -> bool:
 
 
 def _empty_root() -> Dict[str, Any]:
-    return {"version": 1, "address": {}, "records": []}
+    return {"version": 1, "address": {}, "addresses": {}, "records": []}
 
 
 def _empty_tracker() -> Dict[str, Dict[str, Any]]:
@@ -352,6 +360,46 @@ def _normal_address(value: Any) -> Dict[str, Any]:
     }
 
 
+def _normal_addresses(value: Any) -> Dict[str, Dict[str, Any]]:
+    result: Dict[str, Dict[str, Any]] = {}
+    if not isinstance(value, dict):
+        return result
+    for raw_wan_id, raw_address in value.items():
+        try:
+            wan_id = _normal_wan_id(raw_wan_id)
+        except ValueError:
+            continue
+        if wan_id:
+            result[wan_id] = _normal_address(raw_address)
+    return result
+
+
+def _address_samples(value: Any) -> List[tuple[str, Dict[str, Any]]]:
+    """Normalize scalar, single-WAN and multi-WAN Relay payloads."""
+    if not isinstance(value, dict):
+        return []
+    if "wans" in value:
+        raw_wans = value.get("wans")
+        if not isinstance(raw_wans, list):
+            return []
+        samples: List[tuple[str, Dict[str, Any]]] = []
+        for raw_sample in raw_wans:
+            if not isinstance(raw_sample, dict):
+                continue
+            try:
+                wan_id = _normal_wan_id(raw_sample.get("wanId"))
+            except ValueError:
+                continue
+            if wan_id:
+                samples.append((wan_id, _normal_address(raw_sample)))
+        return samples
+    try:
+        wan_id = _normal_wan_id(value.get("wanId"))
+    except ValueError:
+        return []
+    return [(wan_id, _normal_address(value))]
+
+
 def _normal_record(value: Any) -> Optional[Dict[str, Any]]:
     if not isinstance(value, dict):
         return None
@@ -385,6 +433,7 @@ def _normal_record(value: Any) -> Optional[Dict[str, Any]]:
         "id": record_id,
         "provider": provider,
         "hostname": _text(value.get("hostname")),
+        "wanId": _normal_wan_id(value.get("wanId")),
         "recordTypes": list(dict.fromkeys(record_types)),
         "ttl": min(86400, max(60, _safe_int(value.get("ttl"), 600))),
         "enabled": enabled,
@@ -565,6 +614,7 @@ class LabDdnsStore:
                 raw = json.loads(self.path.read_text(encoding="utf-8"))
                 if isinstance(raw, dict):
                     self.root["address"] = _normal_address(raw.get("address"))
+                    self.root["addresses"] = _normal_addresses(raw.get("addresses"))
                     records = []
                     for item in raw.get("records", []):
                         record = _normal_record(item)
@@ -604,95 +654,162 @@ class LabDdnsStore:
             record["credentialsConfigured"] = self.secrets.configured(record.get("id", ""))
         return snapshot
 
+    def _apply_address_to_record(self, record: Dict[str, Any], address: Dict[str, Any], wan_id: str, sample_changed: bool) -> tuple[bool, bool]:
+        changed = False
+        values = {
+            "detectedIpv4": address["detectedIpv4"],
+            "detectedIpv6": address["detectedIpv6"],
+            "ipv4State": address["ipv4State"],
+            "ipv6State": address["ipv6State"],
+            "source": ",".join(filter(None, [address["ipv4Source"], address["ipv6Source"]])),
+            "lastDetectedAt": address["detectedAt"],
+        }
+        if wan_id:
+            # An unavailable family on a bound WAN must not erase the last
+            # usable observation.  Its state still blocks automatic updates.
+            active_sources = []
+            active_family = False
+            for state_key, detected_key, source_key in (
+                ("ipv4State", "detectedIpv4", "ipv4Source"),
+                ("ipv6State", "detectedIpv6", "ipv6Source"),
+            ):
+                if address[state_key] == "unavailable":
+                    values.pop(detected_key)
+                else:
+                    active_family = True
+                    if address[source_key]:
+                        active_sources.append(address[source_key])
+            if active_family:
+                values["source"] = ",".join(active_sources)
+            else:
+                values.pop("source")
+                values.pop("lastDetectedAt")
+        if any(record.get(key) != item for key, item in values.items() if key != "lastDetectedAt"):
+            changed = True
+        record.update(values)
+        auto_ready = False
+        for record_type, state_key, detected_key, published_key in (
+            ("A", "ipv4State", "detectedIpv4", "publishedIpv4"),
+            ("AAAA", "ipv6State", "detectedIpv6", "publishedIpv6"),
+        ):
+            tracker = record.setdefault("stability", _empty_tracker()).setdefault(record_type, _empty_tracker()[record_type])
+            detected = record.get(detected_key) or ""
+            published = record.get(published_key) or ""
+            if not sample_changed:
+                pass
+            elif wan_id and record.get(state_key) == "unavailable":
+                if tracker.get("candidate") or tracker.get("stableCount"):
+                    changed = True
+                tracker.update({"candidate": "", "stableCount": 0})
+                if detected == published:
+                    tracker.update({"retryAttempt": 0, "nextRetryAt": 0, "authError": False})
+            elif record_type not in record.get("recordTypes", RECORD_TYPES):
+                tracker.update({"candidate": "", "stableCount": 0})
+            elif record.get(state_key) == "public" and detected and detected != published:
+                if tracker.get("candidate") == detected:
+                    tracker["stableCount"] = min(2, _safe_int(tracker.get("stableCount")) + 1)
+                else:
+                    tracker.update({"candidate": detected, "stableCount": 1, "retryAttempt": 0, "nextRetryAt": 0, "authError": False})
+            else:
+                if tracker.get("candidate") or tracker.get("stableCount"):
+                    changed = True
+                tracker.update({"candidate": "", "stableCount": 0})
+                if detected == published:
+                    tracker.update({"retryAttempt": 0, "nextRetryAt": 0, "authError": False})
+            if (
+                record.get(state_key) == "public"
+                and detected
+                and detected != published
+                and _safe_int(tracker.get("stableCount")) >= 2
+                and (not wan_id or _address_is_fresh(record))
+            ):
+                auto_ready = True
+        pending = any(
+            record_type in record.get("recordTypes", RECORD_TYPES)
+            and record.get(state_key) == "public"
+            and record.get(detected_key)
+            and record.get(detected_key) != (record.get(published_key) or "")
+            for record_type, state_key, detected_key, published_key in (
+                ("A", "ipv4State", "detectedIpv4", "publishedIpv4"),
+                ("AAAA", "ipv6State", "detectedIpv6", "publishedIpv6"),
+            )
+        )
+        has_published = any(record.get(key) for key in ("publishedIpv4", "publishedIpv6")) or bool(record.get("publishedValues"))
+        has_direct_values = any(
+            record_type in record.get("recordTypes", RECORD_TYPES) and _text(record.get("recordValues", {}).get(record_type))
+            for record_type in ("CNAME", "TXT")
+        )
+        if not record.get("enabled", True):
+            new_status, new_error = "disabled", record.get("lastError")
+        elif record.get("status") in {"error", "updating"}:
+            new_status, new_error = record.get("status"), record.get("lastError")
+        elif pending:
+            new_status, new_error = "detected", None
+        elif has_published:
+            new_status, new_error = "published", None
+        elif has_direct_values:
+            new_status, new_error = "detected", None
+        else:
+            new_status, new_error = "waiting", None
+        if record.get("status") != new_status or record.get("lastError") != new_error:
+            changed = True
+            record["status"], record["lastError"] = new_status, new_error
+        return changed, auto_ready
+
     def accept_address(self, value: Any) -> bool:
-        address = _normal_address(value)
-        if not address:
+        samples = _address_samples(value)
+        if not samples:
             return False
         with self.lock:
-            if not address["detectedAt"]:
-                address["detectedAt"] = (
-                    _safe_int(self.root.get("address", {}).get("detectedAt")) or _now()
-                )
-            previous_address = self.root.get("address", {})
-            sample_changed = previous_address.get("detectedAt") != address.get("detectedAt")
-            semantic_keys = ("detectedIpv4", "detectedIpv6", "ipv4State", "ipv6State", "ipv4Source", "ipv6Source")
-            # detectedAt changes every sample.  It stays current in memory but is
-            # not, by itself, a reason to rewrite durable state every second.
-            changed = any(previous_address.get(key) != address.get(key) for key in semantic_keys)
-            self.root["address"] = address
+            changed = False
             auto_ready = False
-            for record in self.root["records"]:
-                source = ",".join(filter(None, [address["ipv4Source"], address["ipv6Source"]]))
-                values = {
-                    "detectedIpv4": address["detectedIpv4"],
-                    "detectedIpv6": address["detectedIpv6"],
-                    "ipv4State": address["ipv4State"],
-                    "ipv6State": address["ipv6State"],
-                    "source": source,
-                    "lastDetectedAt": address["detectedAt"],
-                }
-                if any(record.get(key) != item for key, item in values.items() if key != "lastDetectedAt"):
+            for wan_id, address in samples:
+                addresses = self.root.get("addresses", {})
+                previous_address = self.root.get("address", {}) if not wan_id else addresses.get(wan_id, {})
+                if not address["detectedAt"]:
+                    address["detectedAt"] = _safe_int(previous_address.get("detectedAt")) or _now()
+                sample_changed = previous_address.get("detectedAt") != address.get("detectedAt")
+                semantic_keys = ("detectedIpv4", "detectedIpv6", "ipv4State", "ipv6State", "ipv4Source", "ipv6Source")
+                # detectedAt changes every sample.  It stays current in memory but
+                # is not, by itself, a reason to rewrite durable state every second.
+                if any(previous_address.get(key) != address.get(key) for key in semantic_keys):
                     changed = True
-                record.update(values)
-                for record_type, state_key, detected_key, published_key in (
-                    ("A", "ipv4State", "detectedIpv4", "publishedIpv4"),
-                    ("AAAA", "ipv6State", "detectedIpv6", "publishedIpv6"),
-                ):
-                    tracker = record.setdefault("stability", _empty_tracker()).setdefault(record_type, _empty_tracker()[record_type])
-                    detected = address[detected_key]
-                    published = record.get(published_key) or ""
-                    if not sample_changed:
-                        pass
-                    elif record_type not in record.get("recordTypes", RECORD_TYPES):
-                        tracker.update({"candidate": "", "stableCount": 0})
-                    elif address[state_key] == "public" and detected and detected != published:
-                        if tracker.get("candidate") == detected:
-                            tracker["stableCount"] = min(2, _safe_int(tracker.get("stableCount")) + 1)
-                        else:
-                            tracker.update({"candidate": detected, "stableCount": 1, "retryAttempt": 0, "nextRetryAt": 0, "authError": False})
-                    else:
-                        if tracker.get("candidate") or tracker.get("stableCount"):
-                            changed = True
-                        tracker.update({"candidate": "", "stableCount": 0})
-                        if detected == published:
-                            tracker.update({"retryAttempt": 0, "nextRetryAt": 0, "authError": False})
-                    if _safe_int(tracker.get("stableCount")) >= 2 and detected and detected != published:
-                        auto_ready = True
-                pending = any(
-                    record_type in record.get("recordTypes", RECORD_TYPES)
-                    and address[state_key] == "public"
-                    and address[detected_key]
-                    and address[detected_key] != (record.get(published_key) or "")
-                    for record_type, state_key, detected_key, published_key in (
-                        ("A", "ipv4State", "detectedIpv4", "publishedIpv4"),
-                        ("AAAA", "ipv6State", "detectedIpv6", "publishedIpv6"),
-                    )
-                )
-                has_published = any(record.get(key) for key in ("publishedIpv4", "publishedIpv6")) or bool(record.get("publishedValues"))
-                has_direct_values = any(
-                    record_type in record.get("recordTypes", RECORD_TYPES) and _text(record.get("recordValues", {}).get(record_type))
-                    for record_type in ("CNAME", "TXT")
-                )
-                if not record.get("enabled", True):
-                    new_status, new_error = "disabled", record.get("lastError")
-                elif record.get("status") in {"error", "updating"}:
-                    new_status, new_error = record.get("status"), record.get("lastError")
-                elif pending:
-                    new_status, new_error = "detected", None
-                elif has_published:
-                    new_status, new_error = "published", None
-                elif has_direct_values:
-                    new_status, new_error = "detected", None
+                if wan_id:
+                    addresses[wan_id] = address
+                    self.root["addresses"] = addresses
                 else:
-                    new_status, new_error = "waiting", None
-                if record.get("status") != new_status or record.get("lastError") != new_error:
-                    changed = True
-                    record["status"], record["lastError"] = new_status, new_error
+                    self.root["address"] = address
+                for record in self.root["records"]:
+                    if record.get("wanId", "") != wan_id:
+                        continue
+                    record_changed, record_ready = self._apply_address_to_record(record, address, wan_id, sample_changed)
+                    changed = changed or record_changed
+                    auto_ready = auto_ready or record_ready
             if changed:
                 self._save_locked()
             if auto_ready:
                 self.auto_event.set()
         return True
+
+    def _selected_address(self, wan_id: str) -> Dict[str, Any]:
+        if wan_id:
+            return self.root.get("addresses", {}).get(wan_id, {})
+        return self.root.get("address", {})
+
+    def _reset_detection(self, record: Dict[str, Any], address: Dict[str, Any]) -> None:
+        record["detectedIpv4"] = address.get("detectedIpv4", "")
+        record["detectedIpv6"] = address.get("detectedIpv6", "")
+        record["ipv4State"] = address.get("ipv4State", "unavailable")
+        record["ipv6State"] = address.get("ipv6State", "unavailable")
+        record["lastDetectedAt"] = _safe_int(address.get("detectedAt"))
+        record["source"] = ",".join(filter(None, [address.get("ipv4Source", ""), address.get("ipv6Source", "")]))
+        stability = record.setdefault("stability", _empty_tracker())
+        for record_type in ("A", "AAAA"):
+            stability[record_type] = _empty_tracker()[record_type]
+        if not record.get("enabled", True):
+            record["status"] = "disabled"
+        else:
+            record["status"] = "detected" if record["detectedIpv4"] or record["detectedIpv6"] or record["recordValues"] else "waiting"
 
     def save_record(self, value: Mapping[str, Any], record_id: str = "") -> Dict[str, Any]:
         record = _normal_record(dict(value))
@@ -704,6 +821,9 @@ class LabDdnsStore:
                 for index, old in enumerate(self.root["records"]):
                     if old["id"] == record_id:
                         record["id"] = record_id
+                        if "wanId" not in value:
+                            record["wanId"] = old.get("wanId", "")
+                        wan_changed = old.get("wanId", "") != record.get("wanId", "")
                         types_changed = old.get("recordTypes") != record.get("recordTypes")
                         values_changed = old.get("recordValues", {}) != record.get("recordValues", {})
                         for key in ("detectedIpv4", "detectedIpv6", "ipv4State", "ipv6State", "publishedIpv4", "publishedIpv6", "publishedValues", "source", "status", "lastDetectedAt", "lastUpdatedAt", "lastError", "stability", "lastRecordResults"):
@@ -713,7 +833,9 @@ class LabDdnsStore:
                         record["publishedValues"] = {key: item for key, item in old.get("publishedValues", {}).items() if key in record["recordTypes"]}
                         record["ttl"] = record["ttl"] if "ttl" in value else old.get("ttl", record["ttl"])
                         record["enabled"] = _bool(value.get("enabled", old.get("enabled", True)))
-                        if not record["enabled"]:
+                        if wan_changed:
+                            self._reset_detection(record, self._selected_address(record["wanId"]))
+                        elif not record["enabled"]:
                             record["status"] = "disabled"
                         elif types_changed or values_changed or old.get("status") == "disabled":
                             record["status"] = "detected" if record["detectedIpv4"] or record["detectedIpv6"] or record["recordValues"] else "waiting"
@@ -722,7 +844,7 @@ class LabDdnsStore:
                         self.auto_event.set()
                         return dict(record)
                 raise KeyError(record_id)
-            address = self.root.get("address", {})
+            address = self._selected_address(record["wanId"])
             record["detectedIpv4"] = address.get("detectedIpv4", "")
             record["detectedIpv6"] = address.get("detectedIpv6", "")
             record["ipv4State"] = address.get("ipv4State", "unavailable")
