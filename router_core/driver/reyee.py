@@ -347,6 +347,46 @@ class ReyeeEWebDriver(RouterDriver):
 
     # --- Native Port Mapping ---
 
+    _PORT_MAPPING_WAN_SRC = {"all": "", "wan": "wan", "wan1": "wan1"}
+
+    @classmethod
+    def _port_mapping_payload(cls, rule: Dict[str, Any]) -> Dict[str, Any]:
+        payload = dict(rule)
+        wan_id = str(payload.get("wanId") or "").strip().lower()
+        if wan_id:
+            if wan_id not in cls._PORT_MAPPING_WAN_SRC:
+                raise RouterValidationError("不支持的端口映射线路", "PORT_MAPPING_WAN_UNSUPPORTED")
+            payload["src"] = cls._PORT_MAPPING_WAN_SRC[wan_id]
+        payload.pop("wanId", None)
+        return payload
+
+    @classmethod
+    def _port_mapping_wan_id(cls, row: Dict[str, Any]) -> str:
+        src = str(row.get("src") or "").strip().lower()
+        return next((wan_id for wan_id, value in cls._PORT_MAPPING_WAN_SRC.items() if value == src), "")
+
+    @classmethod
+    def _normalize_port_mapping_response(cls, raw: Any) -> Dict[str, Any]:
+        if isinstance(raw, list):
+            return {"portMapping": cls._normalize_port_mapping_response({"portMapping": raw})["portMapping"]}
+        if not isinstance(raw, dict):
+            raise RouterRpcExecutionError("端口映射响应结构异常", "PORT_MAPPING_INVALID_RESPONSE", 502)
+        result = dict(raw)
+        rows = result.get("portMapping") or result.get("list")
+        if isinstance(rows, list):
+            normalized = []
+            for row in rows:
+                if isinstance(row, dict):
+                    item = dict(row)
+                    item["wanId"] = cls._port_mapping_wan_id(item)
+                    normalized.append(item)
+                else:
+                    normalized.append(row)
+            result["portMapping"] = normalized
+            if "list" in result:
+                result["list"] = normalized
+        return result
+
     def _write_and_read(self, prefix: str, write: Callable[[], Any], read: Callable[[], Dict[str, Any]]) -> Dict[str, Any]:
         with self.write_lock:
             write()
@@ -356,12 +396,12 @@ class ReyeeEWebDriver(RouterDriver):
     def get_port_mappings(self, force: bool = False) -> Dict[str, Any]:
         try:
             if self._legacy_client and hasattr(self._legacy_client, "native_port_mapping"):
-                return self._legacy_client.native_port_mapping(force=force)
+                return self._normalize_port_mapping_response(self._legacy_client.native_port_mapping(force=force))
             if self._rpc_client:
                 return self._cached(
                     "native-portmap",
                     15.0,
-                    lambda: self.rpc("devConfig.get", "port_mapping"),
+                    lambda: self._normalize_port_mapping_response(self.rpc("devConfig.get", "port_mapping")),
                     force,
                 )
             raise NotImplementedError("native_port_mapping not available")
@@ -370,12 +410,13 @@ class ReyeeEWebDriver(RouterDriver):
 
     def add_port_mapping(self, rule: Dict[str, Any]) -> Dict[str, Any]:
         try:
+            payload = self._port_mapping_payload(rule)
             if self._legacy_client and hasattr(self._legacy_client, "add_native_port_mapping"):
-                return self._legacy_client.add_native_port_mapping(rule)
+                return self._normalize_port_mapping_response(self._legacy_client.add_native_port_mapping(payload))
             if self._rpc_client:
                 return self._write_and_read(
                     "native-portmap",
-                    lambda: self.rpc("devConfig.add", "port_mapping", {"list": [rule]}),
+                    lambda: self.rpc("devConfig.add", "port_mapping", {"list": [payload]}),
                     lambda: self.get_port_mappings(force=True),
                 )
             raise NotImplementedError("add_native_port_mapping not available")
@@ -384,8 +425,9 @@ class ReyeeEWebDriver(RouterDriver):
 
     def update_port_mapping(self, old_name: str, rule: Dict[str, Any]) -> Dict[str, Any]:
         try:
+            payload = self._port_mapping_payload(rule)
             if self._legacy_client and hasattr(self._legacy_client, "update_native_port_mapping"):
-                return self._legacy_client.update_native_port_mapping(old_name, rule)
+                return self._normalize_port_mapping_response(self._legacy_client.update_native_port_mapping(old_name, payload))
             if self._rpc_client:
                 latest = self.get_port_mappings(force=True)
                 rows = latest.get("portMapping") or latest.get("list") or []
@@ -397,7 +439,7 @@ class ReyeeEWebDriver(RouterDriver):
                     raise ValueError("Router native port mapping rule does not exist")
                 return self._write_and_read(
                     "native-portmap",
-                    lambda: self.rpc("devConfig.update", "port_mapping", {"old": old, "new": rule}),
+                    lambda: self.rpc("devConfig.update", "port_mapping", {"old": old, "new": payload}),
                     lambda: self.get_port_mappings(force=True),
                 )
             raise NotImplementedError("update_native_port_mapping not available")
