@@ -373,6 +373,31 @@ def test_reyee_driver_rpc_and_batch_delegation():
     mock_rpc_client.batch.assert_called_once_with(calls)
 
 
+def test_dashboard_batch_reads_flow_audit_without_extra_polling():
+    from router_core.driver.reyee import ReyeeEWebDriver
+
+    rpc = MagicMock(spec=ReyeeRpcClient)
+    rpc.rpc.side_effect = lambda method, module="", data=None, **kwargs: {}
+    flow = {"data": {"wan": {"up": "100", "down": "200", "total_up": "300", "total_down": "400"}}, "count": 1}
+
+    def batch(calls):
+        modules = [call.get("module") for call in calls]
+        if "ipinfo" in modules:
+            return [{}, {}, {}, flow]
+        if "ap_list" in modules:
+            return [{}, {}, {}, {}]
+        if "wireless" in modules:
+            return [{}, {}]
+        return []
+
+    rpc.batch.side_effect = batch
+    dashboard = ReyeeEWebDriver(rpc_client=rpc).get_dashboard(force=True)
+    assert dashboard["flowAudit"] == flow
+    wan_calls = [call for call in rpc.batch.call_args_list if any(item.get("module") == "ipinfo" for item in call.args[0])]
+    assert len(wan_calls) == 1
+    assert any(item.get("module") == "flow" and item.get("data") == {"func": "interface_info"} for item in wan_calls[0].args[0])
+
+
 def test_reyee_driver_ddns_get_update_delete():
     from router_core.driver.reyee import ReyeeEWebDriver
 

@@ -239,6 +239,7 @@ class ReyeeEWebDriver(RouterDriver):
                 {"method": "devSta.get", "module": "ipinfo", "noParse": True},
                 {"method": "devSta.get", "module": "networkConnect", "data": {"ifname": "list"}},
                 {"method": "devSta.get", "module": "ipinfo6", "noParse": True},
+                {"method": "devSta.get", "module": "flow", "data": {"func": "interface_info"}, "noParse": True},
             ]), [])
             wireless = optional(lambda: self.batch([
                 {"method": "acConfig.get", "module": "wireless"},
@@ -255,6 +256,7 @@ class ReyeeEWebDriver(RouterDriver):
                 "ipinfo": wan_values[0] if len(wan_values) > 0 else None,
                 "networkConnect": wan_values[1] if len(wan_values) > 1 else None,
                 "ipinfo6": wan_values[2] if len(wan_values) > 2 else None,
+                "flowAudit": wan_values[3] if len(wan_values) > 3 else None,
                 "wireless": wireless_values[0] if len(wireless_values) > 0 else None,
                 "rcgame": wireless_values[1] if len(wireless_values) > 1 else None,
                 "portStatus": optional(lambda: self.rpc("devSta.get", "port_status"), {}),
