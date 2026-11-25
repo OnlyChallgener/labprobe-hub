@@ -1665,26 +1665,74 @@ async fn collect_dashboard_payload(
     Ok(payload)
 }
 
-fn collect_router_credentials(config: &AgentConfig, refresh_nonce: u64) -> Result<Value> {
-    let network = command_json("dev_config", &["get", "-m", "network", "{}"]) ?;
-    let wan_scope = network.get("wan").unwrap_or(&network);
-    let lan_scope = network.get("lan").unwrap_or(&network);
-    let username = first_text_by_keys(
-        wan_scope,
-        &["username", "userName", "user_name", "account", "pppoeUser", "pppoe_username", "pppoe_account", "broadbandAccount", "user"],
-    );
-    let password = first_text_by_keys(
-        wan_scope,
-        &["password", "passwd", "pwd", "pppoePassword", "pppoe_password", "pppoe_passwd", "broadbandPassword"],
-    );
+fn router_credentials_from_network(network: &Value, refresh_nonce: u64) -> Value {
+    let lan_scope = network.get("lan").unwrap_or(network);
     let lan_mac = first_text_by_keys(lan_scope, &["mac", "macaddr", "macAddress", "hwaddr"]);
-    Ok(json!({
-        "router": config.router_name,
+    let mut wans = Vec::new();
+    if let Some(sections) = network.as_object() {
+        for (wan_id, scope) in sections {
+            let normalized = wan_id.trim().to_ascii_lowercase();
+            if normalized != "wan" && !normalized.starts_with("wan") {
+                continue;
+            }
+            let username = first_text_by_keys(
+                scope,
+                &[
+                    "username",
+                    "userName",
+                    "user_name",
+                    "account",
+                    "pppoeUser",
+                    "pppoe_username",
+                    "pppoe_account",
+                    "broadbandAccount",
+                    "user",
+                ],
+            );
+            let password = first_text_by_keys(
+                scope,
+                &[
+                    "password",
+                    "passwd",
+                    "pwd",
+                    "pppoePassword",
+                    "pppoe_password",
+                    "pppoe_passwd",
+                    "broadbandPassword",
+                ],
+            );
+            if username.is_empty() && password.is_empty() {
+                continue;
+            }
+            wans.push(json!({
+                "wanId": normalized,
+                "username": username,
+                "password": password,
+                "passwordConfigured": !password.is_empty(),
+            }));
+        }
+    }
+    let default = wans
+        .iter()
+        .find(|row| row.get("wanId").and_then(Value::as_str) == Some("wan"))
+        .cloned()
+        .unwrap_or_else(|| json!({}));
+    json!({
+        "router": "",
         "lanMac": lan_mac,
-        "username": username,
-        "password": password,
+        "username": default.get("username").cloned().unwrap_or(Value::String(String::new())),
+        "password": default.get("password").cloned().unwrap_or(Value::String(String::new())),
+        "passwordConfigured": default.get("passwordConfigured").cloned().unwrap_or(Value::Null),
+        "wans": wans,
         "refreshNonce": refresh_nonce,
-    }))
+    })
+}
+
+fn collect_router_credentials(config: &AgentConfig, refresh_nonce: u64) -> Result<Value> {
+    let network = command_json("dev_config", &["get", "-m", "network", "{}"])?;
+    let mut payload = router_credentials_from_network(&network, refresh_nonce);
+    payload["router"] = json!(config.router_name);
+    Ok(payload)
 }
 
 async fn sync_router_credentials(
@@ -2774,6 +2822,26 @@ pub fn print_status(args: &[String]) -> Result<()> {
 #[cfg(test)]
 mod local_telemetry_tests {
     use super::*;
+
+    #[test]
+    fn router_credentials_keep_each_wan_scoped() {
+        let payload = router_credentials_from_network(
+            &json!({
+                "wan": {"username": "wan-user", "password": "wan-secret"},
+                "wan1": {"username": "wan1-user", "password": "wan1-secret"},
+                "lan": {"mac": "00:11:22:33:44:55"}
+            }),
+            7,
+        );
+        assert_eq!(payload["username"], "wan-user");
+        assert_eq!(payload["password"], "wan-secret");
+        assert_eq!(payload["wans"][0]["wanId"], "wan");
+        assert_eq!(payload["wans"][1]["wanId"], "wan1");
+        assert_eq!(payload["wans"][1]["username"], "wan1-user");
+        assert_eq!(payload["wans"][1]["passwordConfigured"], true);
+        assert_eq!(payload["refreshNonce"], 7);
+    }
+
 
     #[test]
     fn fast_schema_accepts_real_zero_but_rejects_missing_metrics() {
