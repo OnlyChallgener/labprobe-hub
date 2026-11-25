@@ -293,18 +293,18 @@ async fn report_agent_status(
     state: &mut AgentState,
 ) -> Result<()> {
     let now = now_epoch();
-    if state.last_wan_capability_at == 0
-        || now.saturating_sub(state.last_wan_capability_at) >= 30
-    {
+    if state.last_wan_capability_at == 0 || now.saturating_sub(state.last_wan_capability_at) >= 30 {
         state.wan_capability = Some(agent_wan_capability(
             crate::wan::discover_snapshot_async().await,
         ));
         state.last_wan_capability_at = now;
     }
-    let capability = state.wan_capability.clone().unwrap_or_else(|| json!({
-        "capabilities": [],
-        "wanIds": [],
-    }));
+    let capability = state.wan_capability.clone().unwrap_or_else(|| {
+        json!({
+            "capabilities": [],
+            "wanIds": [],
+        })
+    });
     post_json(
         client,
         config,
@@ -3355,12 +3355,15 @@ mod local_telemetry_tests {
         .unwrap();
         let capability = agent_wan_capability(Ok(snapshot));
         assert_eq!(capability["wanIds"], json!(["wan"]));
-        assert_eq!(capability["capabilities"], json!([
-            "relay.multiWan",
-            "relay.wanTelemetry",
-            "relay.perWanTcpSession",
-            "relay.wanDdns"
-        ]));
+        assert_eq!(
+            capability["capabilities"],
+            json!([
+                "relay.multiWan",
+                "relay.wanTelemetry",
+                "relay.perWanTcpSession",
+                "relay.wanDdns"
+            ])
+        );
         assert_eq!(
             agent_wan_capability(Err(anyhow!("discovery unavailable"))),
             json!({"capabilities": [], "wanIds": []})

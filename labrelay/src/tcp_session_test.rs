@@ -867,7 +867,11 @@ impl TcpSessionTestManager {
             Some(wan::resolve_binding(
                 &snapshot,
                 &config.wan_id,
-                if ipv6 { wan::WanFamily::V6 } else { wan::WanFamily::V4 },
+                if ipv6 {
+                    wan::WanFamily::V6
+                } else {
+                    wan::WanFamily::V4
+                },
             )?)
         };
         if let Some(binding) = binding.as_mut() {
@@ -1953,7 +1957,10 @@ mod tests {
         };
         let value = serde_json::to_value(snapshot).unwrap();
         assert_eq!(value["wanId"], "wan1");
-        assert_eq!(serde_json::to_value(TcpSessionSnapshot::default()).unwrap()["wanId"], "");
+        assert_eq!(
+            serde_json::to_value(TcpSessionSnapshot::default()).unwrap()["wanId"],
+            ""
+        );
     }
 
     #[test]
