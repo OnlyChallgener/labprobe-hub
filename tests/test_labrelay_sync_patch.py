@@ -166,6 +166,32 @@ def test_old_agent_without_capabilities_remains_single_wan():
     assert body["agentWanIds"] == []
 
 
+def test_explicit_empty_capabilities_clear_old_values_and_version_change_does_not_inherit_them():
+    hub, _queued = _installed_hub(_rule("TCP"))
+    saved = {}
+    hub.save_json = lambda path, value: saved.update({path: value})
+
+    def post(body):
+        with hub.app.test_request_context("/api/router/agent/status", method="POST", json=body):
+            hub.app.view_functions["api_router_agent_status"]()
+        hub.load_json = lambda path, default=None: saved.get(path, default)
+
+    post({"router": "router", "version": "0.2.80", "protocolVersion": 2,
+          "capabilities": ["relay.multiWan"], "wanIds": ["wan", "wan1"]})
+    post({"router": "router", "version": "0.2.80", "protocolVersion": 2,
+          "capabilities": [], "wanIds": []})
+    assert saved[hub.AGENT_STATUS_FILE]["router"]["capabilities"] == []
+    assert saved[hub.AGENT_STATUS_FILE]["router"]["wanIds"] == []
+
+    post({"router": "router", "version": "0.2.81", "protocolVersion": 2,
+          "capabilities": ["relay.multiWan"], "wanIds": ["wan1"]})
+    post({"router": "router", "version": "0.2.82"})
+    heartbeat = saved[hub.AGENT_STATUS_FILE]["router"]
+    assert heartbeat["protocolVersion"] == 0
+    assert heartbeat["capabilities"] == []
+    assert heartbeat["wanIds"] == []
+
+
 def test_unavailable_rules_document_never_reconciles_runtime_as_empty():
     hub, queued = _installed_hub(_rule("TCP"), rules_loaded=False)
     local = _rule("TCP")

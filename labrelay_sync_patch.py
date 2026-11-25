@@ -404,13 +404,15 @@ def install_labrelay_sync_patch(hub: Any) -> None:
             data = statuses()
             old = data.get(router, {}) if isinstance(data.get(router), dict) else {}
             revision = max(number(old.get("revision")) + 1, now)
+            version = clean(payload.get("version")) or clean(old.get("version")) or "unknown"
+            same_version = version == clean(old.get("version"))
             data[router] = {
                 "router": router,
-                "version": clean(payload.get("version")) or clean(old.get("version")) or "unknown",
+                "version": version,
                 "architecture": clean(payload.get("architecture")) or clean(old.get("architecture")),
-                "protocolVersion": number(payload.get("protocolVersion")) or number(old.get("protocolVersion")),
-                "capabilities": _bounded_tokens(payload.get("capabilities")) or _bounded_tokens(old.get("capabilities")),
-                "wanIds": _bounded_tokens(payload.get("wanIds"), lower=True) or _bounded_tokens(old.get("wanIds"), lower=True),
+                "protocolVersion": number(payload.get("protocolVersion")) if "protocolVersion" in payload else number(old.get("protocolVersion")) if same_version else 0,
+                "capabilities": _bounded_tokens(payload.get("capabilities")) if "capabilities" in payload else _bounded_tokens(old.get("capabilities")) if same_version else [],
+                "wanIds": _bounded_tokens(payload.get("wanIds"), lower=True) if "wanIds" in payload else _bounded_tokens(old.get("wanIds"), lower=True) if same_version else [],
                 "updateState": clean(payload.get("updateState")) or "idle",
                 "message": clean(payload.get("message")),
                 "lastSeenAt": hub.now_str(),
