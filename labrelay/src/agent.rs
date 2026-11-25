@@ -88,6 +88,8 @@ struct AgentState {
     wireguard_endpoint_profiles: Vec<crate::wireguard::WireGuardEndpointProfile>,
     last_ddns_address_at: u64,
     ddns_address: Option<Value>,
+    last_wan_capability_at: u64,
+    wan_capability: Option<Value>,
 }
 
 #[derive(Clone, Copy)]
@@ -277,7 +279,24 @@ async fn get_json(client: &Client, config: &AgentConfig, path: &str) -> Result<V
     Ok(serde_json::from_str(&text)?)
 }
 
-async fn report_agent_status(client: &Client, config: &AgentConfig, state: &AgentState) -> Result<()> {
+async fn report_agent_status(
+    client: &Client,
+    config: &AgentConfig,
+    state: &mut AgentState,
+) -> Result<()> {
+    let now = now_epoch();
+    if state.last_wan_capability_at == 0
+        || now.saturating_sub(state.last_wan_capability_at) >= 30
+    {
+        state.wan_capability = Some(agent_wan_capability(
+            crate::wan::discover_snapshot_async().await,
+        ));
+        state.last_wan_capability_at = now;
+    }
+    let capability = state.wan_capability.clone().unwrap_or_else(|| json!({
+        "capabilities": [],
+        "wanIds": [],
+    }));
     post_json(
         client,
         config,
@@ -286,12 +305,38 @@ async fn report_agent_status(client: &Client, config: &AgentConfig, state: &Agen
             "router": config.router_name,
             "version": env!("CARGO_PKG_VERSION"),
             "architecture": std::env::consts::ARCH,
+            "capabilities": capability.get("capabilities").cloned().unwrap_or_else(|| json!([])),
+            "wanIds": capability.get("wanIds").cloned().unwrap_or_else(|| json!([])),
             "updateState": if state.update_state.is_empty() { "idle" } else { &state.update_state },
             "message": state.update_message,
         }),
     )
     .await?;
     Ok(())
+}
+
+fn agent_wan_capability(discovery: Result<crate::wan::WanSnapshot>) -> Value {
+    let snapshot = match discovery {
+        Ok(snapshot) => snapshot,
+        Err(_) => return json!({"capabilities": [], "wanIds": []}),
+    };
+    let wan_ids: Vec<String> = snapshot
+        .wans
+        .iter()
+        .filter(|wan| wan.up)
+        .map(|wan| wan.wan_id.clone())
+        .collect();
+    let capabilities = if wan_ids.is_empty() {
+        Vec::new()
+    } else {
+        vec![
+            "relay.multiWan",
+            "relay.wanTelemetry",
+            "relay.perWanTcpSession",
+            "relay.wanDdns",
+        ]
+    };
+    json!({"capabilities": capabilities, "wanIds": wan_ids})
 }
 
 async fn acknowledge_agent_command(
@@ -2668,7 +2713,7 @@ pub async fn run(args: &[String], once: bool) -> Result<()> {
                 Ok(_) => {}
                 Err(error) => log_limited(&config, &mut state, "WARN", "agent-command-check", &format!("agent command check skipped: {:#}", error)),
             }
-            if let Err(error) = report_agent_status(&client, &config, &state).await {
+            if let Err(error) = report_agent_status(&client, &config, &mut state).await {
                 let text = redact(&format!("agent status: {:#}", error), &config.hook_token);
                 log_limited(&config, &mut state, "WARN", "agent-status", &text);
                 errors.push(text);
@@ -2822,6 +2867,34 @@ pub fn print_status(args: &[String]) -> Result<()> {
 #[cfg(test)]
 mod local_telemetry_tests {
     use super::*;
+
+    #[test]
+    fn agent_wan_capability_advertises_real_lines_and_clears_failures() {
+        let snapshot = serde_json::from_value(json!({
+            "wans": [
+                {"wanId": "wan", "logicalInterface": "wan", "l3Device": "eth0", "kind": "ethernet", "devices": ["eth0"], "addresses": [], "gateways": [], "routeTables": [], "mwan3Member": null, "up": true, "defaultV4": true, "defaultV6": true},
+                {"wanId": "wan1", "logicalInterface": "wan1", "l3Device": "eth1", "kind": "ethernet", "devices": ["eth1"], "addresses": [], "gateways": [], "routeTables": [], "mwan3Member": null, "up": false, "defaultV4": false, "defaultV6": false}
+            ],
+            "defaultWanIdV4": "wan",
+            "defaultWanIdV6": "wan",
+            "observedAt": 1,
+            "source": "test"
+        }))
+        .unwrap();
+        let capability = agent_wan_capability(Ok(snapshot));
+        assert_eq!(capability["wanIds"], json!(["wan"]));
+        assert_eq!(capability["capabilities"], json!([
+            "relay.multiWan",
+            "relay.wanTelemetry",
+            "relay.perWanTcpSession",
+            "relay.wanDdns"
+        ]));
+        assert_eq!(
+            agent_wan_capability(Err(anyhow!("discovery unavailable"))),
+            json!({"capabilities": [], "wanIds": []})
+        );
+    }
+
 
     #[test]
     fn router_credentials_keep_each_wan_scoped() {
