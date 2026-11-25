@@ -15,6 +15,7 @@ import hashlib
 import ipaddress
 import json
 import os
+import re
 import threading
 import time
 import uuid
@@ -50,6 +51,7 @@ STUN_MAPPING_FRESH_SECONDS = 90
 # Presentation metadata such as name/updatedAt is intentionally excluded.
 STUN_RUNTIME_FIELDS = (
     "enabled",
+    "wanId",
     "kind",
     "mode",
     "listenPort",
@@ -67,6 +69,7 @@ STUN_RUNTIME_FIELDS = (
 
 STUN_NATIVE_MAPPING_FIELDS = (
     "enabled",
+    "wanId",
     "listenPort",
     "targetType",
     "targetIpv4",
@@ -78,6 +81,15 @@ STUN_NATIVE_MAPPING_FIELDS = (
 
 def _text(value: Any) -> str:
     return str(value or "").strip()
+
+
+def _wan_id(value: Any, default: str = "wan") -> str:
+    text = _text(value).lower()
+    if not text:
+        return default
+    if not re.fullmatch(r"[a-z0-9_-]{1,64}", text):
+        raise ValueError("WAN 线路标识无效")
+    return text
 
 
 def _int(value: Any, default: int = 0) -> int:
@@ -149,10 +161,17 @@ class StunService:
         raw = self.hub.load_json(self.rules_path, {"revision": 0, "rules": []})
         if not isinstance(raw, dict):
             raw = {}
+        rules = []
+        for row in raw.get("rules", []):
+            if not isinstance(row, dict):
+                continue
+            normalized = dict(row)
+            normalized["wanId"] = _wan_id(normalized.get("wanId"))
+            rules.append(normalized)
         return {
             "revision": _int(raw.get("revision")),
             "updatedAt": _text(raw.get("updatedAt")),
-            "rules": [dict(row) for row in raw.get("rules", []) if isinstance(row, dict)],
+            "rules": rules,
         }
 
     def rules_snapshot(self) -> Dict[str, Any]:
@@ -281,6 +300,7 @@ class StunService:
             "kind": "stun",
             "name": name,
             "enabled": _bool(payload.get("enabled"), _bool(old.get("enabled"), True)),
+            "wanId": _wan_id(payload.get("wanId"), _wan_id(old.get("wanId"))),
             "mode": "stun",
             "listenPort": listen,
             "targetType": target_type,
@@ -406,14 +426,24 @@ class StunService:
         raw = self.hub.load_json(self.history_path, {})
         return {str(key): list(value) for key, value in raw.items() if isinstance(value, list)} if isinstance(raw, dict) else {}
 
-    def _remember_endpoint(self, rule_id: str, runtime: Dict[str, Any]) -> None:
+    def _remember_endpoint(self, rule: Dict[str, Any] | str, runtime: Dict[str, Any]) -> None:
+        if isinstance(rule, str):
+            rule_id = _text(rule)
+            rule = next((item for item in self._document()["rules"] if item.get("id") == rule_id), {"id": rule_id})
+        else:
+            rule_id = _text(rule.get("id"))
         endpoint = _text(runtime.get("publicEndpoint"))
         if not endpoint:
             return
         history = self._history()
         rows = [row for row in history.get(rule_id, []) if isinstance(row, dict)]
-        if not rows or _text(rows[0].get("endpoint")) != endpoint:
-            rows.insert(0, {"endpoint": endpoint, "updatedAt": _int(runtime.get("mappingUpdatedAt")) or _now(), "protocol": _text(runtime.get("transportProtocol"))})
+        if not rows or _text(rows[0].get("endpoint")) != endpoint or _text(rows[0].get("wanId")) != _wan_id(rule.get("wanId")):
+            rows.insert(0, {
+                "endpoint": endpoint,
+                "updatedAt": _int(runtime.get("mappingUpdatedAt")) or _now(),
+                "protocol": _text(runtime.get("transportProtocol") or rule.get("transportProtocol")),
+                "wanId": _wan_id(rule.get("wanId")),
+            })
         history[rule_id] = rows[:3]
         self.hub.save_json(self.history_path, history)
 
@@ -449,7 +479,7 @@ class StunService:
     def _expected_native_mapping(self, rule: Dict[str, Any]) -> Dict[str, Any]:
         return {
             "ruleName": f"LabProbe STUN {rule['id']}",
-            "src": "wan",
+            "src": _wan_id(rule.get("wanId")),
             "srcIp": "",
             "srcPort": str(rule["listenPort"]),
             "destIp": _text(rule["targetIpv4"]),
@@ -609,7 +639,7 @@ class StunService:
             "ruleName": f"LabProbe STUN {rule['id']}", "direction": "inbound", "ipVersion": "ipv4",
             "proto": _text(rule["transportProtocol"]).lower(), "srcIP": "", "destIP": "", "srcPort": "",
             "destPort": str(rule["listenPort"]), "target": "ACCEPT", "enable": "1",
-            "ipv6SuffixSrc": "", "ipv6SuffixDest": "", "inIface": "wan", "outIface": "",
+            "ipv6SuffixSrc": "", "ipv6SuffixDest": "", "inIface": _wan_id(rule.get("wanId")), "outIface": "",
         }
 
     @staticmethod
@@ -844,8 +874,13 @@ class StunService:
                 # reported separately and still withheld from mutations.
                 firewall_state = "ready"
             actual = _text(current.get("state"))
+            reported_wan = _text(current.get("wanId"))
+            wan_mismatch = bool(reported_wan and reported_wan != _wan_id(rule.get("wanId")))
             if not _bool(rule.get("enabled")):
                 actual = "stopped"
+            elif wan_mismatch:
+                actual = "error"
+                current["lastError"] = "Relay 上报的 WAN 线路与规则不一致"
             elif current and (not local_rule or not _same_runtime(local_rule, rule)):
                 actual = "error" if actual == "error" or _text(current.get("lastError")) else "mapping"
             elif self._is_native_forward(rule) and actual == "mapped" and native_state != "ready":
@@ -1159,7 +1194,7 @@ def create_stun_blueprint(hub: Any, service: StunService) -> Blueprint:
                 service.queue("delete", {"id": rule_id}, record["router"], document["revision"])
             for rule in rules:
                 current = runtime.get(rule["id"], {})
-                service._remember_endpoint(rule["id"], current)
+                service._remember_endpoint(rule, current)
                 if _bool(rule.get("enabled")) and service._is_native_forward(rule):
                     try:
                         service.ensure_native_mapping(rule)

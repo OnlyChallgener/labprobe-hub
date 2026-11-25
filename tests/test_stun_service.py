@@ -91,6 +91,63 @@ def _running_rule(tmp_path, payload=None):
     return hub, client, service, rule, hub.app.test_client()
 
 
+def test_stun_rule_carries_wan_into_native_mapping_and_firewall(tmp_path):
+    service = StunService(_hub(tmp_path), _Client())
+    rule = service.clean_rule({
+        "serviceType": "SSH",
+        "targetIpv4": "192.168.5.46",
+        "targetPort": 22,
+        "wanId": "WAN1",
+    })
+
+    assert rule["wanId"] == "wan1"
+    assert service._expected_native_mapping(rule)["src"] == "wan1"
+    assert service._expected_firewall(rule)["inIface"] == "wan1"
+
+
+def test_legacy_stun_rule_defaults_to_wan_and_history_keeps_line(tmp_path):
+    service = StunService(_hub(tmp_path), _Client())
+    rule = service.clean_rule({"serviceType": "SSH", "targetIpv4": "192.168.5.46", "targetPort": 22})
+    rule["wanId"] = "wan1"
+    service._remember_endpoint(rule, {
+        "publicEndpoint": "203.0.113.9:12636",
+        "mappingUpdatedAt": 123,
+        "transportProtocol": "TCP",
+    })
+
+    assert service._document()["rules"] == []
+    assert service._history()[rule["id"]][0]["wanId"] == "wan1"
+    legacy = service.clean_rule({"serviceType": "SSH", "targetIpv4": "192.168.5.46", "targetPort": 22})
+    assert legacy["wanId"] == "wan"
+
+
+def test_reported_wan_mismatch_is_not_treated_as_mapped(tmp_path):
+    hub, client, service, rule, _ = _running_rule(tmp_path, {
+        "serviceType": "SSH", "targetIpv4": "192.168.5.46", "targetPort": 22, "wanId": "wan1",
+    })
+    now = int(time.time())
+    hub.save_json(service.status_path, {"status": {"rules": [{
+        "rule": {**rule, "wanId": "wan"},
+        "runtime": {"state": "mapped", "wanId": "wan", "publicEndpoint": "203.0.113.9:12636", "mappingUpdatedAt": now},
+    }]}})
+
+    row = service.rows()[0]
+    assert row["actualState"] == "error"
+    assert "WAN 线路" in row["runtime"]["lastError"]
+
+
+def test_wan_rebind_updates_existing_owned_native_mapping(tmp_path):
+    hub, client, service, rule, _ = _running_rule(tmp_path, {
+        "serviceType": "SSH", "targetIpv4": "192.168.5.46", "targetPort": 22, "wanId": "wan",
+    })
+    rebound = service.clean_rule({
+        "serviceType": "SSH", "targetIpv4": "192.168.5.46", "targetPort": 22, "wanId": "wan1",
+    }, rule)
+
+    assert service.ensure_native_mapping(rebound)["state"] == "ready"
+    assert client.native_rules[0]["src"] == "wan1"
+
+
 def test_service_templates_choose_protocol_and_skip_portmap_reservation(tmp_path):
     service = StunService(_hub(tmp_path), _Client())
     https = service.clean_rule({"serviceType": "HTTPS", "targetIpv4": "192.168.5.46", "targetPort": 443})
