@@ -462,27 +462,47 @@ class ReyeeEWebDriver(RouterDriver):
 
     # --- UPnP ---
 
+    _UPNP_WANS = {"auto", "wan", "wan1"}
+
+    @classmethod
+    def _upnp_wan(cls, value: Any, fallback: str = "AUTO") -> str:
+        wan = str(value or fallback).strip().lower()
+        if wan not in cls._UPNP_WANS:
+            raise RouterValidationError("不支持的 UPnP 线路", "UPNP_WAN_UNSUPPORTED")
+        return wan
+
+    @classmethod
+    def _normalize_upnp_response(cls, raw: Any) -> Dict[str, Any]:
+        if not isinstance(raw, dict):
+            raise RouterRpcExecutionError("UPnP 响应结构异常", "UPNP_INVALID_RESPONSE", 502)
+        result = dict(raw)
+        wan = cls._upnp_wan(result.get("wan"), "AUTO")
+        result["wan"] = wan.upper()
+        result["wanId"] = wan
+        return result
+
     def get_upnp(self, force: bool = False) -> Dict[str, Any]:
         try:
             if self._legacy_client and hasattr(self._legacy_client, "upnp"):
-                return self._legacy_client.upnp(force=force)
+                return self._normalize_upnp_response(self._legacy_client.upnp(force=force))
             if self._rpc_client:
-                return self._cached("upnp", 10.0, lambda: self.rpc("devSta.get", "upnp"), force)
+                return self._cached("upnp", 10.0, lambda: self._normalize_upnp_response(self.rpc("devSta.get", "upnp")), force)
             raise NotImplementedError("upnp not available")
         except Exception as exc:
             raise from_legacy_error(exc) from exc
 
     def set_upnp(self, enabled: bool, wan: str) -> Dict[str, Any]:
         try:
+            wan_value = self._upnp_wan(wan)
             if self._legacy_client and hasattr(self._legacy_client, "set_upnp"):
-                return self._legacy_client.set_upnp(enabled, wan)
+                return self._normalize_upnp_response(self._legacy_client.set_upnp(enabled, wan_value))
             if self._rpc_client:
                 latest = self.get_upnp(force=True)
                 payload = {
                     "enable_upnp": "true" if enabled else "false",
                     "upnpds": latest.get("upnpds") or [],
                     "upnp_line": str(latest.get("upnp_line") or "1"),
-                    "wan": str(wan or latest.get("wan") or "AUTO").upper(),
+                    "wan": wan_value,
                 }
                 return self._write_and_read(
                     "upnp",
