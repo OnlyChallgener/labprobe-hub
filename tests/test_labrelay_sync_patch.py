@@ -72,6 +72,7 @@ def _installed_hub(desired, *, rules_loaded=True):
         app=app,
         LOGGER=_Logger(),
         AGENT_STATUS_FILE="agent_status.json",
+        AGENT_UPDATE_COMMANDS_FILE="agent_update_commands.json",
         PORTMAP_RULES_FILE="portmap_rules.json",
         PORTMAP_ROUTER_STATUS_FILE="portmap_status.json",
         _load_portmap_rules_document=lambda: (
@@ -116,6 +117,53 @@ def test_production_reconcile_treats_missing_legacy_transport_as_tcp():
 
     assert response.status_code == 200
     assert queued == []
+
+
+def test_agent_status_preserves_bounded_multi_wan_capabilities():
+    hub, _queued = _installed_hub(_rule("TCP"))
+    saved = {}
+    hub.save_json = lambda path, value: saved.update({path: value})
+    with hub.app.test_request_context(
+        "/api/router/agent/status",
+        method="POST",
+        json={
+            "router": "router",
+            "version": "0.2.80",
+            "protocolVersion": 2,
+            "capabilities": ["relay.multiWan", "relay.wanTelemetry", "bad value", "relay.multiWan"],
+            "wanIds": ["WAN", "wan1", "WAN"],
+        },
+    ):
+        response = hub.app.view_functions["api_router_agent_status"]()
+
+    assert response.status_code == 200
+    heartbeat = saved[hub.AGENT_STATUS_FILE]["router"]
+    assert heartbeat["protocolVersion"] == 2
+    assert heartbeat["capabilities"] == ["relay.multiWan", "relay.wanTelemetry"]
+    assert heartbeat["wanIds"] == ["wan", "wan1"]
+
+    hub.load_json = lambda path, default=None: saved.get(path, default)
+    with hub.app.test_request_context("/api/portmaps", method="GET"):
+        body = hub.app.view_functions["api_portmaps"]().get_json()
+    assert body["agentProtocolVersion"] == 2
+    assert body["agentCapabilities"] == ["relay.multiWan", "relay.wanTelemetry"]
+    assert body["agentWanIds"] == ["wan", "wan1"]
+
+
+def test_old_agent_without_capabilities_remains_single_wan():
+    hub, _queued = _installed_hub(_rule("TCP"))
+    saved = {}
+    hub.save_json = lambda path, value: saved.update({path: value})
+    with hub.app.test_request_context("/api/router/agent/status", method="POST", json={
+        "router": "router", "version": "0.2.79",
+    }):
+        hub.app.view_functions["api_router_agent_status"]()
+    hub.load_json = lambda path, default=None: saved.get(path, default)
+    with hub.app.test_request_context("/api/portmaps", method="GET"):
+        body = hub.app.view_functions["api_portmaps"]().get_json()
+    assert body["agentProtocolVersion"] == 0
+    assert body["agentCapabilities"] == []
+    assert body["agentWanIds"] == []
 
 
 def test_unavailable_rules_document_never_reconciles_runtime_as_empty():

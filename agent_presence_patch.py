@@ -2,6 +2,7 @@
 from __future__ import annotations
 
 import os
+import re
 import time
 from datetime import datetime
 from typing import Any, Dict
@@ -28,6 +29,19 @@ def _epoch(value: Any) -> float:
         except ValueError:
             continue
     return 0.0
+
+
+def _tokens(value: Any, *, lower: bool = False) -> list[str]:
+    if not isinstance(value, list):
+        return []
+    result: list[str] = []
+    for item in value[:32]:
+        text = str(item or "").strip()
+        if lower:
+            text = text.lower()
+        if re.fullmatch(r"[A-Za-z0-9_.-]{1,64}", text) and text not in result:
+            result.append(text)
+    return result
 
 
 def _presence(hub: Any, router: str = "") -> Dict[str, Any]:
@@ -66,6 +80,9 @@ def _presence(hub: Any, router: str = "") -> Dict[str, Any]:
         "agentAgeSeconds": age,
         "agentVersion": hub.clean_saved_value(heartbeat.get("version")),
         "agentArchitecture": hub.clean_saved_value(heartbeat.get("architecture")),
+        "agentProtocolVersion": int(_epoch(heartbeat.get("protocolVersion"))),
+        "agentCapabilities": _tokens(heartbeat.get("capabilities")),
+        "agentWanIds": _tokens(heartbeat.get("wanIds"), lower=True),
     }
 
 

@@ -8,6 +8,7 @@ HTTP completion order.
 from __future__ import annotations
 
 import secrets
+import re
 import threading
 import time
 import types
@@ -19,6 +20,21 @@ PORTMAP_PORT_MIN = 1
 PORTMAP_PORT_MAX = 65535
 STUN_LOCAL_PORT_MIN = 30000
 STUN_LOCAL_PORT_MAX = 32767
+
+
+def _bounded_tokens(value: Any, *, lower: bool = False) -> List[str]:
+    if not isinstance(value, list):
+        return []
+    result: List[str] = []
+    for item in value[:32]:
+        text = str(item or "").strip()
+        if lower:
+            text = text.lower()
+        if not re.fullmatch(r"[A-Za-z0-9_.-]{1,64}", text):
+            continue
+        if text not in result:
+            result.append(text)
+    return result
 
 
 def install_labrelay_sync_patch(hub: Any) -> None:
@@ -251,6 +267,9 @@ def install_labrelay_sync_patch(hub: Any) -> None:
             "agentAgeSeconds": age,
             "agentVersion": clean(heartbeat.get("version")),
             "agentArchitecture": clean(heartbeat.get("architecture")),
+            "agentProtocolVersion": number(heartbeat.get("protocolVersion")),
+            "agentCapabilities": _bounded_tokens(heartbeat.get("capabilities")),
+            "agentWanIds": _bounded_tokens(heartbeat.get("wanIds"), lower=True),
             "agentRevision": max(number(heartbeat.get("revision")), number(runtime.get("presenceRevision")) if same_router else 0),
             "serverTime": now,
         }
@@ -389,6 +408,9 @@ def install_labrelay_sync_patch(hub: Any) -> None:
                 "router": router,
                 "version": clean(payload.get("version")) or clean(old.get("version")) or "unknown",
                 "architecture": clean(payload.get("architecture")) or clean(old.get("architecture")),
+                "protocolVersion": number(payload.get("protocolVersion")) or number(old.get("protocolVersion")),
+                "capabilities": _bounded_tokens(payload.get("capabilities")) or _bounded_tokens(old.get("capabilities")),
+                "wanIds": _bounded_tokens(payload.get("wanIds"), lower=True) or _bounded_tokens(old.get("wanIds"), lower=True),
                 "updateState": clean(payload.get("updateState")) or "idle",
                 "message": clean(payload.get("message")),
                 "lastSeenAt": hub.now_str(),
