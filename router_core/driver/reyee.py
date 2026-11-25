@@ -630,6 +630,23 @@ class ReyeeEWebDriver(RouterDriver):
     _DDNS_PROTOCOL_UNKNOWN = ""
     _DDNS_PROTOCOL_VIEW = "ddns_view"
     _DDNS_PROTOCOL_CFG = "ddnsCfg"
+    _DDNS_WANS = {"wan", "wan1"}
+
+    @classmethod
+    def _ddns_payload(cls, record: Dict[str, Any]) -> Dict[str, Any]:
+        payload = dict(record)
+        wan_id = str(payload.get("wanId") or "").strip().lower()
+        if wan_id:
+            if wan_id not in cls._DDNS_WANS:
+                raise RouterValidationError("不支持的 DDNS 线路", "DDNS_WAN_UNSUPPORTED")
+            payload["interface"] = wan_id
+        payload.pop("wanId", None)
+        return payload
+
+    @classmethod
+    def _ddns_wan_id(cls, row: Dict[str, Any]) -> str:
+        interface = str(row.get("interface") or row.get("iface") or "wan").strip().lower()
+        return interface if interface in cls._DDNS_WANS else ""
 
     @staticmethod
     def _validated_ddns_view(raw: Any) -> Tuple[List[Dict[str, Any]], Dict[str, Any]]:
@@ -753,6 +770,7 @@ class ReyeeEWebDriver(RouterDriver):
                         item["provider"] = service_name
                         item["domain"] = domain
                         item["nativeProtocol"] = protocol
+                        item["wanId"] = self._ddns_wan_id(item)
                         # ddns_view 里 enabled 是布尔，老 ddnsCfg 是 "0"/"1"。
                         # 老协议保持原字符串契约，避免破坏既有客户端与测试。
                         if protocol == self._DDNS_PROTOCOL_VIEW:
@@ -814,7 +832,7 @@ class ReyeeEWebDriver(RouterDriver):
         if password:
             entry["password"] = password
         # APP/HTTP 契约字段不能透传到固件 RPC；记录 ID 只允许来自原记录。
-        for key in ("enable", "serviceId", "service_id", "passwordConfigured", "nativeProtocol", "status", "ip", "id"):
+        for key in ("enable", "serviceId", "service_id", "passwordConfigured", "nativeProtocol", "status", "ip", "wanId", "id"):
             entry.pop(key, None)
         if old and old.get("id") is not None:
             entry["id"] = old["id"]
@@ -890,6 +908,7 @@ class ReyeeEWebDriver(RouterDriver):
 
     def add_ddns(self, record: Dict[str, Any], password: str) -> Dict[str, Any]:
         try:
+            record = self._ddns_payload(record)
             if self._legacy_client and hasattr(self._legacy_client, "add_ddns"):
                 return self._legacy_client.add_ddns(record, password)
             if self._rpc_client:
@@ -911,6 +930,7 @@ class ReyeeEWebDriver(RouterDriver):
 
     def update_ddns(self, service_id: str, record: Dict[str, Any], password: Optional[str]) -> Dict[str, Any]:
         try:
+            record = self._ddns_payload(record)
             if self._legacy_client and hasattr(self._legacy_client, "update_ddns"):
                 return self._legacy_client.update_ddns(service_id, record, password)
             if self._rpc_client:
@@ -966,6 +986,7 @@ class ReyeeEWebDriver(RouterDriver):
                     merged.pop("ip", None)
                     merged.pop("passwordConfigured", None)
                     merged.pop("serviceId", None)
+                    merged.pop("wanId", None)
 
                     def do_update():
                         self.rpc("devSta.update", "ddnsCfg", {"data": [merged]})
