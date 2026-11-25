@@ -14,8 +14,8 @@ def test_single_wan_keeps_supported_but_unconfigured_wan1():
         "network": {"wan": [{"proto": "pppoe", "ifname": "eth2.1", "ipv6": "1"}], "wanNum": "1"},
         "ipinfo": {
             "wan": {"ip": "36.157.252.37", "gateway": "36.157.252.1", "dnsList": "223.5.5.5"},
-            "wan_v6": {"ip": "2409:8a50:2e04::1", "gateway6": "2409:8a50:2e04::2"},
         },
+        "ipinfo6": {"wan_v6": {"ip": "2409:8a50:2e04::1", "gateway6": "2409:8a50:2e04::2"}},
         "networkConnect": {"wan": {"status": "online", "default": True, "uptime": 3600}},
         "portStatus": PORT_STATUS,
         "updatedAt": 1795259700,
@@ -28,6 +28,7 @@ def test_single_wan_keeps_supported_but_unconfigured_wan1():
     assert wan["configured"] and wan["online"] and wan["defaultEgress"]
     assert wan["ipv4"] == "36.157.252.37"
     assert wan["ipv6"] == "2409:8a50:2e04::1"
+    assert wan["families"] == ["ipv4", "ipv6"]
     assert wan["linkSpeedMbps"] == 2500
     assert wan["uptimeSeconds"] == 3600
     assert wan1["supported"] and not wan1["configured"] and not wan1["online"]

@@ -127,6 +127,7 @@ def build_wan_inventory(dashboard: Any) -> Dict[str, Any]:
     raw = dashboard if isinstance(dashboard, Mapping) else {}
     network = _network_wans(raw)
     ipinfo = _keyed_rows(raw.get("ipinfo"))
+    ipinfo6 = _keyed_rows(raw.get("ipinfo6"))
     connections = _keyed_rows(raw.get("networkConnect"))
     ports = _port_rows(raw.get("portStatus") or raw.get("port_status"))
 
@@ -149,7 +150,7 @@ def build_wan_inventory(dashboard: Any) -> Dict[str, Any]:
         config = network.get(wan_id, {})
         connection = connections.get(wan_id, {})
         info = ipinfo.get(wan_id, {})
-        info6 = ipinfo.get(f"{wan_id}_v6", {})
+        info6 = ipinfo.get(f"{wan_id}_v6") or ipinfo6.get(f"{wan_id}_v6", {})
         port = next(
             (
                 item for item in ports
@@ -180,7 +181,7 @@ def build_wan_inventory(dashboard: Any) -> Dict[str, Any]:
         families = []
         if configured and (ipv4 or proto.lower() in {"pppoe", "dhcp", "static", "none", ""}):
             families.append("ipv4")
-        if ipv6 or _text(config.get("ipv6")).lower() in {"1", "true", "on"} or f"{wan_id}_v6" in ipinfo:
+        if ipv6 or _text(config.get("ipv6")).lower() in {"1", "true", "on"} or f"{wan_id}_v6" in ipinfo or f"{wan_id}_v6" in ipinfo6:
             families.append("ipv6")
         supported = wan_id == "wan" or supported_wan1
         wans.append(
