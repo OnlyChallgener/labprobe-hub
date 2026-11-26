@@ -444,6 +444,8 @@ class ReyeeEWebDriver(RouterDriver):
                 )
                 if old is None:
                     raise ValueError("Router native port mapping rule does not exist")
+                old = dict(old)
+                old.pop("wanId", None)
                 return self._write_and_read(
                     "native-portmap",
                     lambda: self.rpc("devConfig.update", "port_mapping", {"old": old, "new": payload}),

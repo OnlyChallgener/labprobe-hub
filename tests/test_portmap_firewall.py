@@ -89,6 +89,13 @@ def test_portmap_firewall_is_owned_persistent_ipv6_input_only(tmp_path):
     assert service.cached("nas-https")["state"] == "missing"
 
 
+def test_portmap_firewall_uses_bound_wan_interface(tmp_path):
+    client = _Client()
+    service = PortMapFirewallService(_Hub(tmp_path, client), client)
+    assert service.ensure(_rule(wanId="WAN1"))["state"] == "ready"
+    assert client.rows[0]["inIface"] == "wan1"
+
+
 def test_portmap_firewall_never_adopts_or_deletes_unknown_same_name(tmp_path):
     client = _Client()
     manual = PortMapFirewallService.expected(_rule())

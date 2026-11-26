@@ -83,6 +83,7 @@ class HubSyncApiTests(unittest.TestCase):
     def test_portmap_service_type_is_preserved_by_the_hub_model(self):
         payload = {
             "id": "map-service-type",
+            "wanId": "WAN1",
             "name": "NAS HTTPS",
             "enabled": True,
             "mode": "6to4",
@@ -102,7 +103,17 @@ class HubSyncApiTests(unittest.TestCase):
         created = hub._clean_portmap_rule(payload)
         updated = hub._clean_portmap_rule({"name": "NAS Web"}, created)
         self.assertEqual(created["serviceType"], "HTTPS")
+        self.assertEqual(created["wanId"], "wan1")
         self.assertEqual(updated["serviceType"], "HTTPS")
+        self.assertEqual(updated["wanId"], "wan1")
+
+    def test_portmap_legacy_rule_defaults_to_wan(self):
+        cleaned = hub._clean_portmap_rule({
+            "id": "map-legacy", "name": "Legacy", "enabled": True, "mode": "6to4",
+            "listenPort": 20001, "targetMode": "ipv4", "targetIpv4": "192.168.5.46",
+            "targetPort": 443,
+        })
+        self.assertEqual(cleaned["wanId"], "wan")
 
     def test_portmap_listen_port_accepts_full_valid_range(self):
         from labrelay_sync_patch import PORTMAP_PORT_MAX, PORTMAP_PORT_MIN, STUN_LOCAL_PORT_MAX, STUN_LOCAL_PORT_MIN

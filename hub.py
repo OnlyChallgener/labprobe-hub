@@ -37,7 +37,7 @@ from child_guard_service import (
 )
 
 BEIJING_TZ = ZoneInfo("Asia/Shanghai")
-APP_VERSION = "0.14.7"
+APP_VERSION = "0.14.8"
 PORT = int(os.environ.get("PORT", "58443"))
 BASE_DIR = Path(os.environ.get("LABPROBE_BASE_DIR", ".")).resolve()
 CONFIG_DIR = Path(os.environ.get("CONFIG_DIR", str(BASE_DIR / "config"))).resolve()
@@ -5224,6 +5224,9 @@ def _clean_portmap_rule(payload: Dict[str, Any], existing: Optional[Dict[str, An
     mode = clean_saved_value(src.get("mode") or "6to4").lower()
     if mode not in ["6to4", "6to6"]:
         raise ValueError("映射类型只能是 6to4 或 6to6")
+    wan_id = clean_saved_value(src.get("wanId") or old.get("wanId") or "wan").lower()
+    if not re.fullmatch(r"[a-z0-9][a-z0-9_.-]{0,63}", wan_id):
+        raise ValueError("WAN ID 无效")
     listen_port = to_int(src.get("listenPort"), 0)
     target_port = to_int(src.get("targetPort"), 0)
     if not 1 <= listen_port <= 65535:
@@ -5305,6 +5308,7 @@ def _clean_portmap_rule(payload: Dict[str, Any], existing: Optional[Dict[str, An
     now = now_str()
     return {
         "id": rule_id,
+        "wanId": wan_id,
         "name": name,
         "enabled": bool(src.get("enabled", False)),
         "mode": mode,

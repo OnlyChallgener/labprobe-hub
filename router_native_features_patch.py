@@ -240,8 +240,9 @@ def _nat_result_with_request(
     result["requested_mode"] = requested_mode
     result["requestedInterface"] = requested_interface
     detected_interface = _nat_detected_interface(result)
-    result["wan_id"] = requested_interface
-    result["wanId"] = requested_interface
+    actual_interface = detected_interface or requested_interface
+    result["wan_id"] = actual_interface
+    result["wanId"] = actual_interface
     result.setdefault("mode", requested_mode)
 
     if detected_interface:
@@ -249,7 +250,15 @@ def _nat_result_with_request(
         result["detectedInterface"] = detected_interface
     # ``interface`` was historically ambiguous. Keep it usable for old history
     # readers, but never let firmware output replace the requested line.
-    result["interface"] = detected_interface or requested_interface
+    result["interface"] = actual_interface
+    status = str(result.get("status") or "").strip().lower()
+    if status in {"completed", "success", "failed", "error", "timeout", "cancelled", "canceled"} and (
+        (detected_interface and detected_interface != requested_interface)
+        or (not detected_interface and requested_interface != "wan")
+    ):
+        result["status"] = "failed"
+        result["error"] = "固件未确认请求线路的实际出口，结果不能归因到该 WAN"
+        result["errorCode"] = "wan_mismatch"
 
     source_ipv4 = _nat_source_ipv4(result)
     if source_ipv4:

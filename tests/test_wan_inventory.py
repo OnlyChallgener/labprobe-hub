@@ -77,6 +77,40 @@ def test_dual_wan_preserves_identity_addresses_and_default_route():
     assert all(wan1["capabilities"].values())
 
 
+def test_anonymous_reyee_config_array_binds_to_explicit_connection_slots():
+    raw = {
+        "network": {
+            "wan": [
+                {"proto": "pppoe", "mtu": "1460", "service": "CMCC"},
+                {"proto": "dhcp", "mtu": "1500", "metric": "5"},
+            ],
+            "wanNum": "2",
+        },
+        "networkConnect": {
+            "list": [
+                {"ifname": "wan", "connnected": "true"},
+                {"ifname": "wan1", "connnected": "false"},
+            ]
+        },
+        "ipinfo": {"wan": {"ip": "10.87.133.112", "gateway": "10.87.128.1"}},
+        "ipinfo6": {"wan_v6": {"ip6": "2001:db8::10/64", "gateway6": "2001:db8::1"}},
+        "flowAudit": {
+            "wan": {"up": 100, "down": 200, "total_up": 1000, "total_down": 2000},
+            "wan1": {"up": 0, "down": 0, "total_up": 0, "total_down": 0},
+        },
+    }
+    result = build_wan_inventory(raw)
+    assert result["configuredCount"] == 2
+    assert result["onlineCount"] == 1
+    wan, wan1 = result["wans"]
+    assert wan["configured"] and wan["online"] and wan["proto"] == "pppoe"
+    assert wan["uploadBps"] == 100 and wan["downloadBps"] == 200
+    assert wan["ipv6"] == "2001:db8::10"
+    assert wan1["configured"] and not wan1["online"] and wan1["proto"] == "dhcp"
+    assert wan1["ipv4"] == "" and wan1["gateway"] == ""
+    assert wan1["uploadBps"] == 0 and wan1["totalUploadBytes"] == 0
+
+
 def test_missing_optional_sources_do_not_fabricate_online_state():
     result = build_wan_inventory({"network": {"wan": [{"proto": "none"}]}})
     wan = result["wans"][0]

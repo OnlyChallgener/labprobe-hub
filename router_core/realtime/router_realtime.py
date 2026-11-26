@@ -353,6 +353,9 @@ class RouterRealtimeEngine:
 
         with self._lock:
             previous = dict((self._latest_router_frame or {}).get("data") or {})
+            previous_epoch_ms = _integer(previous.get("sampleEpochMs"), 0)
+            if epoch_ms and previous_epoch_ms and epoch_ms < previous_epoch_ms:
+                return
             merged = {
                 key: value
                 for key, value in previous.items()

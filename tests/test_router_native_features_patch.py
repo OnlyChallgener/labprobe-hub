@@ -51,6 +51,21 @@ def test_nat_result_keeps_requested_parameters_for_app_history():
     assert result["requested_interface"] == "wan1"
     assert result["requested_mode"] == "5780"
     assert result["nat_type"] == "port-restricted cone"
+    assert result["status"] == "failed"
+    assert result["wanId"] == "wan1"
+    assert result["errorCode"] == "wan_mismatch"
+
+
+def test_nat_result_rejects_firmware_output_from_another_wan():
+    result = _nat_result_with_request(
+        {"status": "completed", "nat_type": "Full Cone", "detected_interface": "wan"},
+        {"interface": "wan1"},
+    )
+    assert result["status"] == "failed"
+    assert result["requested_interface"] == "wan1"
+    assert result["detected_interface"] == "wan"
+    assert result["wanId"] == "wan"
+    assert result["errorCode"] == "wan_mismatch"
 
 
 def test_nat_result_correlates_request_and_firmware_metadata():
@@ -137,6 +152,7 @@ def test_native_nat_endpoint_rejects_concurrent_request_and_stale_result(monkeyp
             return {
                 "status": "completed",
                 "nat_type": "Current NAT",
+                "detected_interface": "wan1",
                 "timestamp": now,
                 "log": f"[2026-11-25 10:00:00] Interface: WAN1\nSource IP: 192.0.2.30\n",
             }

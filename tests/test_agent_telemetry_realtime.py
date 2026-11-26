@@ -133,7 +133,28 @@ def test_other_router_sources_keep_three_second_freshness(monkeypatch, firmware,
     accept({"cpuPercent": 7.0}, 997_000)
     assert engine.get_router_calibration_snapshot()["stale"] is False
     accept({"cpuPercent": 7.0}, 996_999)
-    assert engine.get_router_calibration_snapshot()["stale"] is True
+    snapshot = engine.get_router_calibration_snapshot()
+    assert snapshot["sampleEpochMs"] == 997_000
+    assert snapshot["stale"] is False
+
+
+def test_older_agent_epoch_cannot_overwrite_newer_wan_rows():
+    engine = RouterRealtimeEngine()
+    frames = _collect(engine)
+    engine.accept_agent_telemetry({
+        "cpuPercent": 10.0,
+        "wans": [{"wanId": "wan", "uploadBps": 10}, {"wanId": "wan1", "uploadBps": 20}],
+    }, 2_000_000)
+    frames.clear()
+    engine.accept_agent_telemetry({
+        "cpuPercent": 99.0,
+        "wans": [{"wanId": "wan", "uploadBps": 99}],
+    }, 1_000_000)
+    assert frames == []
+    snapshot = engine.get_router_calibration_snapshot()
+    assert snapshot["sampleEpochMs"] == 2_000_000
+    assert snapshot["cpuPercent"] == 10.0
+    assert len(snapshot["wans"]) == 2
 
 
 def test_agent_telemetry_flatten_preserves_per_wan_rows():

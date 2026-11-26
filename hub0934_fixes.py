@@ -23,6 +23,7 @@ PORTMAP_COMPARE_KEYS = (
     "targetMac",
     "targetPort",
     "transportProtocol",
+    "wanId",
     "expiresAt",
     "leaseSeconds",
     "maxConnections",
@@ -154,6 +155,8 @@ def _portmap_value(hub: Any, row: Dict[str, Any], key: str) -> Any:
         return hub._portmap_epoch(value)
     if key == "transportProtocol":
         return _clean(hub, value or "TCP").upper()
+    if key == "wanId":
+        return _clean(hub, value or "wan").lower()
     return _clean(hub, value)
 
 

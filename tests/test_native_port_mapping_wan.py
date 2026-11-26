@@ -23,7 +23,7 @@ class FakeRpc:
             return {"rcode": "0"}
         if method == "devConfig.update":
             old, new = data["old"], data["new"]
-            self.rows = [new if row == old else row for row in self.rows]
+            self.rows = [new if row.get("ruleName") == old.get("ruleName") else row for row in self.rows]
             return {"rcode": "0"}
         return {"rcode": "0"}
 
@@ -68,5 +68,6 @@ def test_port_mapping_update_keeps_global_name_and_old_new_contract():
     method, module, data = next(call for call in rpc.calls if call[0] == "devConfig.update")
     assert (method, module) == ("devConfig.update", "port_mapping")
     assert data["old"]["ruleName"] == "wan1"
+    assert "wanId" not in data["old"]
     assert data["new"]["src"] == "wan"
     assert "wanId" not in data["new"]

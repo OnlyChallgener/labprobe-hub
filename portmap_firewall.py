@@ -66,7 +66,7 @@ class PortMapFirewallService:
             "enable": "1",
             "ipv6SuffixSrc": "",
             "ipv6SuffixDest": "",
-            "inIface": "wan",
+            "inIface": _text(rule.get("wanId") or "wan").lower() or "wan",
             "outIface": "",
         }
 

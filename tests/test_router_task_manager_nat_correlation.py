@@ -107,7 +107,7 @@ def test_stale_firmware_results_cannot_replace_current_nat_result(nat_runtime):
         [
             {"status": "running", "timestamp": 200},
             {"status": "completed", "nat_type": "Regressed Old NAT", "timestamp": 199},
-            {"status": "completed", "nat_type": "Current NAT", "timestamp": 201},
+            {"status": "completed", "nat_type": "Current NAT", "detected_interface": "wan1", "timestamp": 201},
         ],
     )
     manager = make_manager(nat_runtime, client)
@@ -131,6 +131,7 @@ def test_wan1_result_retains_requested_and_detected_line_and_source_ipv4(nat_run
         {"code": 0, "message": "detection started"},
         [{
             "status": "completed",
+            "detected_interface": "wan1",
             "mode": "5780",
             "mapping_behavior": "Endpoint Independent",
             "filtering_behavior": "Address Dependent",

@@ -111,6 +111,17 @@ def _network_wans(raw: Any) -> Dict[str, Dict[str, Any]]:
     if not isinstance(raw, Mapping):
         return {}
     network = raw.get("network") if isinstance(raw.get("network"), Mapping) else raw
+    connection_value = raw.get("networkConnect")
+    if isinstance(connection_value, Mapping):
+        connection_value = connection_value.get("list") or connection_value.get("List")
+    connection_rows = connection_value if isinstance(connection_value, list) else []
+    connection_ids = [
+        _logical_id(row.get("ifname") or row.get("interface") or row.get("wanId") or row.get("name"))
+        for row in connection_rows
+        if isinstance(row, Mapping)
+    ]
+    connection_ids = [wan_id for wan_id in connection_ids if wan_id]
+    ordered_connections = len(connection_ids) == len(connection_rows) and len(set(connection_ids)) == len(connection_ids)
 
     def map_rows(value: Any) -> Dict[str, Dict[str, Any]]:
         result: Dict[str, Dict[str, Any]] = {}
@@ -118,8 +129,13 @@ def _network_wans(raw: Any) -> Dict[str, Dict[str, Any]]:
         usable = [dict(row) for row in rows if isinstance(row, Mapping)]
         for index, row in enumerate(usable):
             wan_id = _config_id(row)
-            # A single anonymous config is the legacy single-WAN shape. With
-            # multiple configs, position is not identity and must not be guessed.
+            # Reyee exposes network.wan as an ordered config array while
+            # networkConnect.list carries the explicit logical interface for
+            # the same slots. Bind only when both arrays have a one-to-one,
+            # uniquely named correspondence; otherwise keep the legacy single
+            # anonymous WAN shape and refuse to guess between multiple lines.
+            if not wan_id and len(usable) > 1 and ordered_connections and len(usable) == len(connection_ids):
+                wan_id = connection_ids[index]
             if not wan_id and len(usable) == 1 and index == 0:
                 wan_id = "wan"
             if wan_id:
@@ -199,7 +215,7 @@ def _first_optional_integer(*sources: Mapping[str, Any], keys: Iterable[str], po
 
 
 def _connection_state(row: Mapping[str, Any]) -> Optional[bool]:
-    for key in ("connected", "online", "connect_status", "status", "state"):
+    for key in ("connected", "connnected", "online", "connect_status", "status", "state"):
         if key in row:
             parsed = _flag(row.get(key))
             if parsed is not None:
@@ -354,7 +370,7 @@ def build_wan_inventory(dashboard: Any) -> Dict[str, Any]:
         proto = _text(config.get("proto") or connection.get("proto"))
         enabled = configured and proto.lower() not in {"none", "disabled", "off", ""}
         ipv4 = _first_text(info, connection, config, keys=("ip", "ipv4", "ipaddr"))
-        ipv6 = _first_text(info6, connection, config, keys=("ip", "ipv6", "ipaddr6"))
+        ipv6 = _first_text(info6, connection, config, keys=("ip", "ipv6", "ipaddr6", "ip6")).split("/", 1)[0]
         gateway = _first_text(info, connection, config, keys=("gateway", "gateway4"))
         gateway6 = _first_text(info6, connection, config, keys=("gateway", "gateway6"))
         dns = _dns(info.get("dnsList") or info.get("dns")) + _dns(info6.get("dnsList") or info6.get("dns6List") or info6.get("dns"))
