@@ -769,7 +769,16 @@ fn ensure_interface(ip_tool: &str, interface_name: &str) -> Result<()> {
 #[cfg(target_os = "linux")]
 pub fn apply_server(config: &WireGuardServerDesired) -> Result<WireGuardApplyResult> {
     validate_server_desired(config)?;
-    let _ = ensure_openwrt_wg_zone(config.listen_port, &config.wan_id);
+    let mut wan_zones = vec!["wan".to_string()];
+    for profile in &config.endpoint_profiles {
+        let zone = normalize_wg_wan_zone(&profile.wan_id);
+        if !wan_zones.contains(&zone) {
+            wan_zones.push(zone);
+        }
+    }
+    for zone in wan_zones {
+        let _ = ensure_openwrt_wg_zone(config.listen_port, &zone);
+    }
     let ip = find_tool("ip")
         .ok_or_else(|| anyhow::anyhow!("ip tool is required to create the WireGuard interface"))?;
     ensure_interface(&ip, &config.interface_name)?;
