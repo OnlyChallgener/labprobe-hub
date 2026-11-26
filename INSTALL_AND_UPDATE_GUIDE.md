@@ -1,6 +1,6 @@
 # LabProbe BE72 与 BE50 安装指南
 
-适用版本：Hub 0.14.6、LabRelay 0.2.79。本文供首次部署用户使用，按 Docker Hub、路由器 Relay、Android APP 的顺序操作。目前已验证的路由器为 BE72 Pro 和 BE50；其他型号需单独验证。N1 盒子可以承担 Docker Hub，但必须运行 64 位 Linux。
+适用版本：Hub 0.14.6、LabRelay 0.2.82。本文供首次部署用户使用，按 Docker Hub、路由器 Relay、Android APP 的顺序操作。目前已验证的路由器为 BE72 Pro 和 BE50；其他型号需单独验证。N1 盒子可以承担 Docker Hub，但必须运行 64 位 Linux。
 
 ## 1 安装前准备
 
@@ -72,7 +72,7 @@ mkdir -p data config backups logs update-repository/agent
 
 ```dotenv
 LABPROBE_IMAGE=onlychallgener/labprobe-hub:v0.14.6
-LABRELAY_RELEASE_VERSION=0.2.79
+LABRELAY_RELEASE_VERSION=0.2.82
 PORT=58443
 TZ=Asia/Shanghai
 HUB_NAME='LabProbe Hub'
@@ -199,7 +199,7 @@ services:
       BACKUPS_DIR: /app/backups
       LOGS_DIR: /app/logs
       UPDATE_REPOSITORY_DIR: /app/update-repository
-      LABRELAY_RELEASE_VERSION: ${LABRELAY_RELEASE_VERSION:-0.2.79}
+      LABRELAY_RELEASE_VERSION: ${LABRELAY_RELEASE_VERSION:-0.2.82}
       MQTT_PUBLIC_URL: ${MQTT_PUBLIC_URL:-}
       MQTT_INTERNAL_HOST: 127.0.0.1
       MQTT_INTERNAL_PORT: "1883"
@@ -271,7 +271,7 @@ DATA_DIR=/app/data
 BACKUPS_DIR=/app/backups
 LOGS_DIR=/app/logs
 UPDATE_REPOSITORY_DIR=/app/update-repository
-LABRELAY_RELEASE_VERSION=0.2.79
+LABRELAY_RELEASE_VERSION=0.2.82
 MQTT_USERNAME=labprobe
 MQTT_PASSWORD=
 MQTT_PUBLIC_URL=
@@ -400,7 +400,7 @@ labrelay test-hub
 labrelay doctor
 ```
 
-版本应为 `labrelay 0.2.79`。若路由器不能访问 GitHub，可先从 Release 下载对应架构二进制及 `checksums.txt`，放进 N1 的 `labprobe-hub/update-repository/agent/`，再在路由器运行 `export LABPROBE_UPDATE_ROOT="$HUB_URL"` 后重新执行安装脚本。Hub 将经 Docker 容器提供这些文件；请核对二进制与校验文件来自同一个 Release。
+版本应为 `labrelay 0.2.82`。若路由器不能访问 GitHub，可先从 Release 下载对应架构二进制及 `checksums.txt`，放进 N1 的 `labprobe-hub/update-repository/agent/`，再在路由器运行 `export LABPROBE_UPDATE_ROOT="$HUB_URL"` 后重新执行安装脚本。Hub 将经 Docker 容器提供这些文件；请核对二进制与校验文件来自同一个 Release。
 
 ## 4 安装 APP 并填写设置
 
@@ -411,6 +411,20 @@ labrelay doctor
 - **路由器配置**：名称填写 BE72 或 BE50；管理地址使用 Hub 能访问的路由器地址；账号一般为 `admin`，密码填写 EWEB 管理密码。Hub 路由标识可留空。
 
 点击 APP 的“保存设置”，再点击“校准数据”，然后查看首页与终端列表。Hub 收到 Relay 上报后，状态、温度与终端信息才会逐步显示。安卓 APP 与修改版“星耀家 Hub”测试 APK 是不同客户端；首次给其他用户部署使用 LabProbeApp 正式 Release。
+
+### 4.1 可选 HTTPS 与证书
+
+HTTPS 默认关闭，不改变现有 HTTP `58443`，也不需要 Lucky、域名或证书才能使用官方账号和普通 Hub 功能。
+
+1. 如需在 APP 中直接上传私钥，先使用已有的 HTTPS 反向代理，或完成下面的首次本地配置并把 APP Hub 地址切换为 `https://域名:58445`。普通内网 HTTP 禁止上传私钥。
+2. 首次配置时，将完整证书链和私钥放到 NAS 的 `labprobe-hub/data/https/import/`（或在 `.env` 设置 `HTTPS_LOCAL_CERT_ROOT` 并挂载对应目录）。建议文件名为 `fullchain.pem`、`privkey.pem`，私钥权限仅 root/容器可读。
+3. 在 APP“设置 → HTTPS 与证书”填写端口（默认 `58445`）和访问域名，选择“NAS 本地证书文件”，填写相对路径后导入并启用。
+4. 已通过 HTTPS 连接时，可在同一页面用通用文件选择器导入或更新证书。Hub 会校验域名、有效期、证书链和私钥匹配，再热加载；失败时旧证书继续生效。
+5. 删除证书会关闭 HTTPS 并删除 Hub 保存的证书副本，但不会删除 NAS 原文件，也不影响 HTTP `58443`。
+
+Bridge 部署需保留 `docker-compose.bridge.yml` 中的 HTTPS 端口映射；Host 部署无需额外映射。内置 HTTPS 同时提供 Hub API、`/api/realtime/ws` WSS 和 `/mqtt` MQTT WSS。已有外部反向代理时无需重复启用。
+
+证书信息会自动进入原证书到期页面，按 7 天、3 天、当天各提醒一次，并同步到“记录—事件”。更新证书会更新原记录，关闭服务保留记录，删除证书移除自动记录，Hub 离线时保留最近有效记录。
 
 ## 5 更新和排查
 
@@ -462,4 +476,4 @@ curl -fsS http://127.0.0.1:58443/health
 
 Compose 用户也可在 `~/labprobe-hub` 执行 `sudo docker compose ps`。端口若改过，健康检查和 APP 地址也要使用新端口。Relay 失败时先核对 Hub 地址和 HOOK_TOKEN，再运行 `labrelay test-hub`。APP 登录失败时核对 Hub 地址、端口和 APP_TOKEN。请隐藏真实令牌与密码后再分享日志。
 
-版本发布页：[Hub 源码与 Release](https://github.com/OnlyChallgener/labprobe-hub/releases/tag/v0.14.6)、[Relay 下载](https://github.com/OnlyChallgener/labprobe-hub/releases/tag/labrelay-v0.2.79)。
+版本发布页：[Hub 源码与 Release](https://github.com/OnlyChallgener/labprobe-hub/releases/tag/v0.14.6)、[Relay 下载](https://github.com/OnlyChallgener/labprobe-hub/releases/tag/labrelay-v0.2.82)。

@@ -16,7 +16,7 @@ ENV PYTHONDONTWRITEBYTECODE=1 \
 WORKDIR /app
 
 RUN apt-get update \
-    && apt-get install -y --no-install-recommends curl ca-certificates iproute2 nginx \
+    && apt-get install -y --no-install-recommends curl ca-certificates iproute2 nginx openssl \
     && rm -rf /var/lib/apt/lists/*
 
 COPY requirements.txt /app/requirements.txt
@@ -50,7 +50,7 @@ RUN python -m compileall -q /app \
 # the server, so they are covered by the compileall pass above and by the
 # preflight check below.  child_guard_service is listed explicitly because its
 # absence from this list is exactly what let the missing COPY ship.
-RUN python -c "import child_guard_service, rdpi_signature_service, labprobe_storage, hub0934_fixes, hub0935_sync_fix, followup_stability_patch, final_stability_patch, labrelay_sync_patch, lab_ddns, lab_ddns_providers, agent_presence_patch, device_history_patch, portmap_persistence_patch, portmap_firewall, stun_port_config_patch, tcp_session_service, usage_aggregate, router_lite_realtime_patch, router_device_live_sync_patch, router_fast_watchdog_patch, router_build024_fix, router_slow_cache_patch, router_control_scheduler_patch, router_control_actor_patch, router_task_manager_patch, router_config_sync_patch, ipv6_neighbor_archive_patch, router.ipv6, hub_realtime_ws, assistant, router_core, router_core.driver.reyee_session, router_core.driver.reyee_rpc, router_core.driver.reyee, router_core.cache.router_cache, router_core.realtime.router_realtime, router_core.service.router_service, router_core.service.blueprint" \
+RUN python -c "import child_guard_service, rdpi_signature_service, labprobe_storage, hub0934_fixes, hub0935_sync_fix, followup_stability_patch, final_stability_patch, labrelay_sync_patch, lab_ddns, lab_ddns_providers, agent_presence_patch, device_history_patch, portmap_persistence_patch, portmap_firewall, stun_port_config_patch, tcp_session_service, usage_aggregate, router_lite_realtime_patch, router_device_live_sync_patch, router_fast_watchdog_patch, router_build024_fix, router_slow_cache_patch, router_control_scheduler_patch, router_control_actor_patch, router_task_manager_patch, router_config_sync_patch, ipv6_neighbor_archive_patch, https_core, https_service, router.ipv6, hub_realtime_ws, assistant, router_core, router_core.driver.reyee_session, router_core.driver.reyee_rpc, router_core.driver.reyee, router_core.cache.router_cache, router_core.realtime.router_realtime, router_core.service.router_service, router_core.service.blueprint" \
     && mkdir -p /app/data /app/config /app/backups /app/logs /app/scripts /app/update-repository/agent \
     && chmod 755 /app/scripts/repair_storage.py /app/agent/install.sh
 
@@ -59,7 +59,7 @@ RUN python -c "import child_guard_service, rdpi_signature_service, labprobe_stor
 # the check that would have failed the build for the crash-looping image.
 RUN python /app/scripts/docker_preflight.py /app
 
-EXPOSE 58443
+EXPOSE 58443 58445
 
 HEALTHCHECK --interval=30s --timeout=5s --start-period=40s --retries=3 \
     CMD curl -fsS "http://127.0.0.1:${PORT}/health" >/dev/null || exit 1

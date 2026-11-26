@@ -1,7 +1,7 @@
 {
   "version": "1.0.0",
-  "extractedAt": "2026-08-24T16:33:00Z",
-  "totalRestEndpoints": 76,
+  "extractedAt": "2026-11-26T00:00:00Z",
+  "totalRestEndpoints": 93,
   "totalWebSocketTypes": 8,
   "rest": [
     {
@@ -98,13 +98,14 @@
         "data": {
           "rules": [
             {
-              "name": "String",
-              "interface": "String",
-              "proto": "String",
-              "extPort": "Int",
-              "intIp": "String",
-              "intPort": "Int",
-              "enabled": "Boolean"
+              "ruleName": "String",
+              "wanId": "String (wan/wan1/all; display alias for src)",
+              "src": "String (firmware egress interface; empty means all WAN)",
+              "srcIp": "String (external server IP mode; mutually exclusive with src)",
+              "srcPort": "String",
+              "destIp": "String",
+              "destPort": "String",
+              "proto": "String (tcp/udp/tcp+udp)"
             }
           ]
         }
@@ -117,18 +118,28 @@
       "function": "addNativePortMapping(rule)",
       "queryParams": [],
       "requestBody": {
-        "name": "String",
-        "interface": "String (e.g. 'WAN')",
-        "proto": "String (e.g. 'tcp')",
-        "extPort": "Int",
-        "intIp": "String",
-        "intPort": "Int",
-        "enabled": "Boolean"
+        "ruleName": "String",
+        "wanId": "String (wan/wan1/all; display alias for src)",
+        "src": "String (firmware egress interface; empty means all WAN)",
+        "srcIp": "String (external server IP mode; mutually exclusive with src)",
+        "srcPort": "String",
+        "destIp": "String",
+        "destPort": "String",
+        "proto": "String (tcp/udp/tcp+udp)"
       },
       "responseFields": {
         "data": {
           "rules": [
-            "NativePortMapRule"
+            {
+              "ruleName": "String",
+              "wanId": "String (wan/wan1/all; display alias for src)",
+              "src": "String (firmware egress interface; empty means all WAN)",
+              "srcIp": "String (external server IP mode; mutually exclusive with src)",
+              "srcPort": "String",
+              "destIp": "String",
+              "destPort": "String",
+              "proto": "String (tcp/udp/tcp+udp)"
+            }
           ]
         }
       }
@@ -140,18 +151,28 @@
       "function": "updateNativePortMapping(oldName, rule)",
       "queryParams": [],
       "requestBody": {
-        "name": "String",
-        "interface": "String",
-        "proto": "String",
-        "extPort": "Int",
-        "intIp": "String",
-        "intPort": "Int",
-        "enabled": "Boolean"
+        "ruleName": "String",
+        "wanId": "String (wan/wan1/all; display alias for src)",
+        "src": "String (firmware egress interface; empty means all WAN)",
+        "srcIp": "String (external server IP mode; mutually exclusive with src)",
+        "srcPort": "String",
+        "destIp": "String",
+        "destPort": "String",
+        "proto": "String (tcp/udp/tcp+udp)"
       },
       "responseFields": {
         "data": {
           "rules": [
-            "NativePortMapRule"
+            {
+              "ruleName": "String",
+              "wanId": "String (wan/wan1/all; display alias for src)",
+              "src": "String (firmware egress interface; empty means all WAN)",
+              "srcIp": "String (external server IP mode; mutually exclusive with src)",
+              "srcPort": "String",
+              "destIp": "String",
+              "destPort": "String",
+              "proto": "String (tcp/udp/tcp+udp)"
+            }
           ]
         }
       }
@@ -166,7 +187,16 @@
       "responseFields": {
         "data": {
           "rules": [
-            "NativePortMapRule"
+            {
+              "ruleName": "String",
+              "wanId": "String (wan/wan1/all; display alias for src)",
+              "src": "String (firmware egress interface; empty means all WAN)",
+              "srcIp": "String (external server IP mode; mutually exclusive with src)",
+              "srcPort": "String",
+              "destIp": "String",
+              "destPort": "String",
+              "proto": "String (tcp/udp/tcp+udp)"
+            }
           ]
         }
       }
@@ -243,8 +273,13 @@
               "destPort": "String",
               "direction": "String",
               "time": "String",
-              "editable": "Boolean"
+              "editable": "Boolean",
+              "inIface": "String",
+              "outIface": "String"
             }
+          ],
+          "interfaces": [
+            "String (firmware-native names, including WAN, LAN and VLAN interfaces)"
           ]
         }
       }
@@ -381,7 +416,9 @@
               "enabled": "Boolean",
               "status": "String",
               "lastUpdate": "String",
-              "ip": "String"
+              "ip": "String",
+              "interfaceName": "String (firmware egress interface)",
+              "useIpv6": "Boolean"
             }
           ]
         }
@@ -399,7 +436,9 @@
         "domain": "String",
         "username": "String",
         "password": "String",
-        "enabled": "Boolean"
+        "enabled": "Boolean",
+        "interfaceName": "String (firmware egress interface; default wan)",
+        "useIpv6": "Boolean"
       },
       "responseFields": {
         "data": {
@@ -421,7 +460,9 @@
         "domain": "String",
         "username": "String",
         "password": "String (optional)",
-        "enabled": "Boolean"
+        "enabled": "Boolean",
+        "interfaceName": "String (firmware egress interface; default wan)",
+        "useIpv6": "Boolean"
       },
       "responseFields": {
         "data": {
@@ -763,7 +804,8 @@
               "expiresAt": "Long?",
               "lastResolvedAt": "Long?",
               "lastError": "String"
-            }
+            },
+            "wanId": "String (Relay-owned line binding; wan/wan1)"
           }
         ],
         "portRange": {
@@ -814,7 +856,8 @@
         "expiresAt": "Long? / null",
         "leaseSeconds": "Long",
         "maxConnections": "Int",
-        "idleTimeoutSec": "Int"
+        "idleTimeoutSec": "Int",
+        "wanId": "String (optional; defaults to wan)"
       },
       "responseFields": {
         "rule": "PortMapRule",
@@ -846,7 +889,8 @@
         "expiresAt": "Long? / null",
         "leaseSeconds": "Long",
         "maxConnections": "Int",
-        "idleTimeoutSec": "Int"
+        "idleTimeoutSec": "Int",
+        "wanId": "String (optional; defaults to wan)"
       },
       "responseFields": {
         "rule": "PortMapRule",
@@ -932,7 +976,9 @@
               "totalUploadBytes": "Long",
               "totalDownloadBytes": "Long",
               "lastError": "String"
-            }
+            },
+            "wanId": "String (LabProbe-owned line binding)",
+            "targetType": "String (manual/router_self)"
           }
         ],
         "agentOnline": "Boolean",
@@ -952,7 +998,10 @@
         "targetIpv4": "String",
         "targetPort": "Int",
         "name": "String (optional)",
-        "enabled": "Boolean (true)"
+        "enabled": "Boolean (true)",
+        "wanId": "String (optional; defaults to wan)",
+        "targetType": "String (optional)",
+        "forwardMode": "String (router_native/relay_proxy)"
       },
       "responseFields": {
         "rule": "StunRule"
@@ -971,7 +1020,10 @@
         "targetIpv4": "String",
         "targetPort": "Int",
         "name": "String (optional)",
-        "enabled": "Boolean (true)"
+        "enabled": "Boolean (true)",
+        "wanId": "String (optional; defaults to wan)",
+        "targetType": "String (optional)",
+        "forwardMode": "String (router_native/relay_proxy)"
       },
       "responseFields": {
         "rule": "StunRule"
@@ -1044,7 +1096,12 @@
             "txBytes": "Long"
           }
         ],
-        "revision": "Long"
+        "revision": "Long",
+        "endpointProfiles": [
+          "WireGuardEndpointProfile"
+        ],
+        "endpointRevision": "Long",
+        "lanForwarding": "Boolean"
       }
     },
     {
@@ -1066,6 +1123,9 @@
             ],
             "persistentKeepalive": "Int"
           }
+        ],
+        "endpointProfiles": [
+          "WireGuardEndpointProfile"
         ]
       },
       "responseFields": {
@@ -1081,7 +1141,9 @@
       "queryParams": [],
       "requestBody": {
         "endpoint": "String",
-        "endpointRevision": "Long"
+        "endpointRevision": "Long",
+        "expectedEndpointRevision": "Long (required)",
+        "wanId": "String (must match profile binding)"
       },
       "responseFields": {
         "success": "Boolean",
@@ -1535,6 +1597,28 @@
       ]
     },
     {
+      "endpoint": "/api/events",
+      "method": "POST",
+      "caller": "CertificateExpiry.kt",
+      "function": "CertificateReminderCenter.syncEvent()",
+      "queryParams": [],
+      "requestBody": {
+        "type": "String",
+        "eventKey": "String",
+        "title": "String",
+        "name": "String",
+        "newValue": "String",
+        "domain": "String",
+        "expiresOn": "String",
+        "daysRemaining": "Int"
+      },
+      "responseFields": {
+        "ok": "Boolean",
+        "duplicate": "Boolean",
+        "event": "JSONObject"
+      }
+    },
+    {
       "endpoint": "/api/events/{id}",
       "method": "DELETE",
       "caller": "MainActivity.kt",
@@ -1636,6 +1720,379 @@
         "city": "String",
         "isp": "String",
         "flag": "String"
+      }
+    },
+    {
+      "endpoint": "/api/router/speedtest/ports",
+      "method": "GET",
+      "caller": "RouterSpeedTest.kt",
+      "function": "ports()",
+      "queryParams": [],
+      "requestBody": null,
+      "responseFields": {
+        "data": {
+          "ports": [
+            {
+              "portId": "String",
+              "name": "String",
+              "panelName": "String",
+              "up": "Boolean",
+              "speedMbps": "Int",
+              "wan": "Boolean",
+              "testable": "Boolean"
+            }
+          ],
+          "testable": [
+            "String"
+          ],
+          "total": "Int"
+        }
+      }
+    },
+    {
+      "endpoint": "/api/router/speedtest/servers",
+      "method": "GET",
+      "caller": "RouterSpeedTest.kt",
+      "function": "nodes()",
+      "queryParams": [],
+      "requestBody": null,
+      "responseFields": {
+        "data": {
+          "servers": [
+            {
+              "id": "String",
+              "name": "String"
+            }
+          ],
+          "total": "Int",
+          "errorCode": "String"
+        }
+      }
+    },
+    {
+      "endpoint": "/api/router/speedtest/capability",
+      "method": "GET",
+      "caller": "RouterSpeedTest.kt",
+      "function": "capability()",
+      "queryParams": [],
+      "requestBody": null,
+      "responseFields": {
+        "data": {
+          "supported": "Boolean",
+          "ready": "Boolean",
+          "engine": "String",
+          "nodeSource": "String",
+          "testableIntfs": [
+            "String"
+          ],
+          "reason": "String?"
+        }
+      }
+    },
+    {
+      "endpoint": "/api/router/speedtest/state",
+      "method": "GET",
+      "caller": "RouterSpeedTest.kt",
+      "function": "running()",
+      "queryParams": [],
+      "requestBody": null,
+      "responseFields": {
+        "data": {
+          "procState": "String",
+          "running": "Boolean"
+        }
+      }
+    },
+    {
+      "endpoint": "/api/router/speedtest/progress",
+      "method": "GET",
+      "caller": "RouterSpeedTest.kt",
+      "function": "progress()",
+      "queryParams": [],
+      "requestBody": null,
+      "responseFields": {
+        "data": {
+          "stat": "String",
+          "finished": "Boolean",
+          "running": "Boolean",
+          "mode": "String (unite/max)",
+          "interfaces": [
+            "SpeedSampleSet"
+          ],
+          "primary": "SpeedSampleSet",
+          "aggregate": "SpeedSampleSet? (firmware max result)",
+          "updatedAt": "Long"
+        }
+      }
+    },
+    {
+      "endpoint": "/api/router/speedtest/history",
+      "method": "GET",
+      "caller": "RouterSpeedTest.kt",
+      "function": "history()",
+      "queryParams": [],
+      "requestBody": null,
+      "responseFields": {
+        "data": {
+          "records": [
+            {
+              "timestamp": "String",
+              "epoch": "Long",
+              "mode": "String (unite/max)",
+              "interfaces": [
+                "SpeedHistoryInterface"
+              ],
+              "primary": "SpeedHistoryInterface",
+              "aggregate": "SpeedHistoryInterface?"
+            }
+          ],
+          "total": "Int"
+        }
+      }
+    },
+    {
+      "endpoint": "/api/router/speedtest/start",
+      "method": "POST",
+      "caller": "RouterSpeedTest.kt",
+      "function": "start(interfaces,node)",
+      "queryParams": [],
+      "requestBody": {
+        "intf": [
+          "String (wan/wan1)"
+        ],
+        "nodes": {
+          "<interface>": [
+            "String (server id; 0=auto)"
+          ]
+        }
+      },
+      "responseFields": {
+        "data": {
+          "intf": [
+            "String"
+          ],
+          "nodes": {
+            "<interface>": [
+              "String"
+            ]
+          },
+          "alreadyRunning": "Boolean",
+          "startedAt": "Long",
+          "errorCode": "String"
+        }
+      }
+    },
+    {
+      "endpoint": "/api/https/status",
+      "method": "GET",
+      "caller": "HubHttpsCertificate.kt",
+      "function": "getHttpsStatus()",
+      "queryParams": [],
+      "requestBody": null,
+      "responseFields": {
+        "ok": "Boolean",
+        "enabled": "Boolean",
+        "running": "Boolean",
+        "supported": "Boolean",
+        "port": "Int",
+        "domain": "String",
+        "source": "String (manual/local)",
+        "certificate": "HttpsCertificateInfo?",
+        "publicUrl": "String",
+        "realtimeUrl": "String",
+        "mqttUrl": "String",
+        "adminTokenRequired": "Boolean",
+        "lastError": "String"
+      }
+    },
+    {
+      "endpoint": "/api/https/config",
+      "method": "POST",
+      "caller": "HubHttpsCertificate.kt",
+      "function": "saveHttpsConfig(body)",
+      "queryParams": [],
+      "requestBody": {
+        "port": "Int (default 58445)",
+        "domain": "String",
+        "source": "String (manual/local)",
+        "localCertPath": "String",
+        "localKeyPath": "String"
+      },
+      "responseFields": {
+        "ok": "Boolean",
+        "enabled": "Boolean",
+        "running": "Boolean",
+        "port": "Int",
+        "domain": "String",
+        "source": "String",
+        "certificate": "HttpsCertificateInfo?"
+      }
+    },
+    {
+      "endpoint": "/api/https/enable",
+      "method": "POST",
+      "caller": "HubHttpsCertificate.kt",
+      "function": "setHttpsEnabled(enabled)",
+      "queryParams": [],
+      "requestBody": {
+        "enabled": "Boolean"
+      },
+      "responseFields": {
+        "ok": "Boolean",
+        "enabled": "Boolean",
+        "running": "Boolean",
+        "publicUrl": "String"
+      }
+    },
+    {
+      "endpoint": "/api/https/import/manual",
+      "method": "POST",
+      "caller": "HubHttpsCertificate.kt",
+      "function": "importHttpsManual(body)",
+      "queryParams": [],
+      "requestBody": {
+        "certificateBase64": "String (PEM chain; HTTPS only)",
+        "keyBase64": "String (PEM private key; HTTPS only)",
+        "issuerCertificateBase64": "String (optional)",
+        "domain": "String"
+      },
+      "responseFields": {
+        "ok": "Boolean",
+        "certificate": "HttpsCertificateInfo",
+        "source": "String (manual)"
+      }
+    },
+    {
+      "endpoint": "/api/https/import/local",
+      "method": "POST",
+      "caller": "HubHttpsCertificate.kt",
+      "function": "importHttpsLocal(certPath,keyPath,domain)",
+      "queryParams": [],
+      "requestBody": {
+        "certPath": "String (relative to HTTPS_LOCAL_CERT_ROOT)",
+        "keyPath": "String (relative to HTTPS_LOCAL_CERT_ROOT)",
+        "domain": "String"
+      },
+      "responseFields": {
+        "ok": "Boolean",
+        "certificate": "HttpsCertificateInfo",
+        "source": "String (local)"
+      }
+    },
+    {
+      "endpoint": "/api/https/certificate",
+      "method": "DELETE",
+      "caller": "HubHttpsCertificate.kt",
+      "function": "deleteHttpsCertificate()",
+      "queryParams": [],
+      "requestBody": null,
+      "responseFields": {
+        "ok": "Boolean",
+        "enabled": "Boolean (false)",
+        "certificate": "Object (empty)"
+      }
+    },
+    {
+      "endpoint": "/api/official-account",
+      "method": "GET",
+      "caller": "OfficialAccountRepository.kt",
+      "function": "status()",
+      "queryParams": [
+        "verify (optional '0'/'1'; compatibility only, never triggers Hub cloud access)"
+      ],
+      "requestBody": null,
+      "responseFields": {
+        "ok": "Boolean",
+        "account": "String (masked)",
+        "accountFingerprint": "String (SHA-256)",
+        "authorized": "Boolean",
+        "state": "String ('authorized'|'partial'|'conflict'|'checking'|'unauthorized')",
+        "projectCount": "Int",
+        "matchedRouterCount": "Int",
+        "hubAuthorization": "String",
+        "expireTime": "Long (epoch ms)",
+        "routers": [
+          {
+            "routerId": "String",
+            "serialNumber": "String",
+            "online": "Boolean",
+            "authorized": "Boolean",
+            "matched": "Boolean",
+            "projectId": "String",
+            "projectName": "String",
+            "createTime": "String",
+            "meshSerials": [
+              "String"
+            ],
+            "bindingVersion": "Int",
+            "accountFingerprint": "String",
+            "syncState": "String",
+            "errorCode": "String (optional)",
+            "error": "String (optional)"
+          }
+        ]
+      }
+    },
+    {
+      "endpoint": "/api/official-account",
+      "method": "POST",
+      "caller": "OfficialAccountRepository.kt",
+      "function": "login()/refresh()/syncBindings()",
+      "queryParams": [],
+      "requestBody": {
+        "action": "String (required: 'bind')",
+        "account": "String (required metadata)",
+        "accountFingerprint": "String (required SHA-256)",
+        "expireTime": "Long (required future epoch ms)",
+        "verifiedAt": "Double (epoch seconds)",
+        "binding": "Object (single-router Hub)",
+        "bindings": [
+          {
+            "serial": "String (required, must match Hub identity)",
+            "projectId": "String (required metadata, never authorization)",
+            "projectName": "String",
+            "createTime": "String",
+            "meshSerials": [
+              "String"
+            ],
+            "account": "String",
+            "accountFingerprint": "String",
+            "expireTime": "Long",
+            "verifiedAt": "Double",
+            "bindingVersion": "Int (required positive integer)"
+          }
+        ],
+        "forbidden": [
+          "password",
+          "token",
+          "refreshToken",
+          "Authorization"
+        ]
+      },
+      "responseFields": {
+        "ok": "Boolean",
+        "authorized": "Boolean",
+        "state": "String",
+        "routers": [
+          "Object (same shape as GET)"
+        ]
+      }
+    },
+    {
+      "endpoint": "/api/official-account",
+      "method": "DELETE",
+      "caller": "OfficialAccountRepository.kt",
+      "function": "logout()",
+      "queryParams": [],
+      "requestBody": null,
+      "responseFields": {
+        "ok": "Boolean",
+        "authorized": "Boolean (false)",
+        "state": "String ('unauthorized')",
+        "localCleared": "Boolean",
+        "remoteRevocation": "String ('app-managed/confirmed-by-app')",
+        "operationState": "String",
+        "retrySafe": "Boolean"
       }
     }
   ],

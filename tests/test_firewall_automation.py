@@ -59,7 +59,7 @@ def _save_json(path, data):
     value.write_text(json.dumps(data, ensure_ascii=False), encoding="utf-8")
 
 
-def _relay_mapping(mapping_id="mapping-1", address="192.168.5.46", mode="6to4", port=9443):
+def _relay_mapping(mapping_id="mapping-1", address="192.168.5.46", mode="6to4", port=9443, wan_id="wan"):
     return {
         "id": mapping_id,
         "name": "NAS 映射",
@@ -71,6 +71,7 @@ def _relay_mapping(mapping_id="mapping-1", address="192.168.5.46", mode="6to4", 
         "targetIpv6Snapshot": address if mode != "6to4" else "",
         "transportProtocol": "TCP",
         "targetPort": port,
+        "wanId": wan_id,
     }
 
 
@@ -201,6 +202,41 @@ def test_native_mapping_uses_existing_router_config_snapshot(tmp_path):
     service.reconcile(client.firewall(True), blocking=True)
 
     assert client.rules[0]["destIP"] == "192.168.5.46"
+
+
+def test_wan1_mapping_requires_matching_firewall_ingress(tmp_path):
+    native = {"portMapping": [{"ruleName": "WAN1", "destIp": "192.168.5.46", "destPort": "1661", "srcPort": "58822", "proto": "tcp", "src": "wan1"}]}
+    rule = _rule("uuid-wan1", "192.168.5.20", port="1661,9443")
+    rule["inIface"] = "wan1"
+    client = _Client([rule], native=native)
+    service = FirewallAutomationService(_hub(tmp_path, native=native), client)
+
+    service.upsert("uuid-wan1", _binding("uuid-wan1", kind="native", mapping_id="WAN1"))
+    service.reconcile(client.firewall(True), blocking=True)
+
+    assert client.rules[0]["destIP"] == "192.168.5.46"
+    assert client.rules[0]["inIface"] == "wan1"
+
+
+def test_mapping_interface_mismatch_is_rejected(tmp_path):
+    native = {"portMapping": [{"ruleName": "WAN1", "destIp": "192.168.5.46", "destPort": "1661", "srcPort": "58822", "proto": "tcp", "src": "wan1"}]}
+    client = _Client([_rule("uuid-mismatch", "192.168.5.20", port="1661")], native=native)
+    service = FirewallAutomationService(_hub(tmp_path, native=native), client)
+
+    with pytest.raises(FirewallAutomationError, match="入接口"):
+        service.upsert("uuid-mismatch", _binding("uuid-mismatch", kind="native", mapping_id="WAN1"))
+
+
+def test_relay_wan1_mapping_accepts_wan1_firewall_rule(tmp_path):
+    rule = _rule("uuid-relay-wan1", "192.168.5.20", port="9443")
+    rule["inIface"] = "wan1"
+    client = _Client([rule])
+    service = FirewallAutomationService(_hub(tmp_path, [_relay_mapping(wan_id="wan1")]), client)
+
+    service.upsert("uuid-relay-wan1", _binding("uuid-relay-wan1"))
+    service.reconcile(client.firewall(True), blocking=True)
+
+    assert client.rules[0]["inIface"] == "wan1"
 
 
 def test_ipv6_suffix_mapping_preserves_multi_port_shape(tmp_path):

@@ -14,6 +14,7 @@ from hub0935_sync_fix import (
     install_hub0935_device_sync_fix,
 )
 from hub_realtime_ws import install_hub_realtime_ws
+from https_service import register_https_service
 from ipv6_neighbor_archive_patch import install_ipv6_neighbor_archive_patch
 from labrelay_sync_patch import install_labrelay_sync_patch
 from lab_ddns import install_lab_ddns
@@ -52,7 +53,7 @@ from router_core.service.router_service import RouterService
 from router_core.service.blueprint import create_router_blueprint_v1
 
 PREVIOUS_HUB_VERSION = "0.13.1"
-HUB_VERSION = "0.14.8"
+HUB_VERSION = "0.14.9"
 hub.APP_VERSION = HUB_VERSION
 install_ipv6_neighbor_archive_patch(hub)
 
@@ -279,6 +280,12 @@ install_followup_stability_patch(hub, None)
 install_final_stability_patch(hub)
 install_labrelay_sync_patch(hub)
 install_hub0934_fixes(hub)
+
+try:
+    hub.HTTPS_SERVICE = register_https_service(hub, hub.DATA_DIR / "https")
+except Exception as error:
+    hub.HTTPS_SERVICE = None
+    hub.LOGGER.warning("HTTPS 可选模块初始化失败，核心服务继续启动：%s", type(error).__name__)
 
 if __name__ == "__main__":
     raise SystemExit(hub.command_line())

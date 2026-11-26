@@ -61,6 +61,34 @@ class HubSyncApiTests(unittest.TestCase):
         self.assertTrue(any(x["entity"] == "online_device" and x["operation"] == "delete" for x in changes))
         self.assertTrue(any(x["entity"] == "device" and x["operation"] == "upsert" for x in changes))
 
+    def test_certificate_expiry_event_is_synced_once_and_visible_in_events(self):
+        previous_events = hub.load_json(hub.EVENTS_FILE, [])
+        self.addCleanup(lambda: hub.save_json(hub.EVENTS_FILE, previous_events))
+        hub.save_json(hub.EVENTS_FILE, [])
+        payload = {
+            "type": "certificate_expiry",
+            "eventKey": "cert-1:2026-12-01:7",
+            "title": "证书将在 7 天后到期",
+            "name": "Hub HTTPS · hub.example.com",
+            "newValue": "hub.example.com · 到期 2026-12-01",
+            "domain": "hub.example.com",
+            "expiresOn": "2026-12-01",
+            "daysRemaining": 7,
+        }
+
+        created = self.client.post("/api/events", headers=self.headers, json=payload)
+        duplicate = self.client.post("/api/events", headers=self.headers, json=payload)
+        listed = self.client.get("/api/events", headers=self.headers)
+
+        self.assertEqual(created.status_code, 201)
+        self.assertFalse(created.get_json()["duplicate"])
+        self.assertEqual(duplicate.status_code, 200)
+        self.assertTrue(duplicate.get_json()["duplicate"])
+        self.assertEqual(1, len(listed.get_json()["events"]))
+        self.assertEqual("certificate_expiry", listed.get_json()["events"][0]["type"])
+        self.assertEqual(self.client.post("/api/events", headers=self.headers, json={"type": "other"}).status_code, 400)
+        self.assertEqual(self.client.post("/api/events", json=payload).status_code, 401)
+
     def test_portmap_list_exposes_document_revision_and_command_sync_state(self):
         rule = {"id": "map-1", "name": "Web", "enabled": True, "listenPort": 20000}
         hub.save_json(hub.PORTMAP_RULES_FILE, {"version": 1, "revision": 7, "updatedAt": "2026-08-10 10:00:00", "rules": [rule]})

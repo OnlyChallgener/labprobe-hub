@@ -1,4 +1,4 @@
-# LabProbe Hub 0.14.8（测试版）
+# LabProbe Hub 0.14.9（测试版）
 
 LabProbe Hub 可部署在任意 Linux AMD64/ARM64 宿主机，包括服务器、小主机、NAS 和软路由。Hub 使用 SQLite 保存数据；已适配锐捷路由器上的 Rust Agent 继续以 `dev_sta/user_list` 为核心数据源。
 
@@ -72,6 +72,23 @@ docker compose -f docker-compose.bridge.yml up -d --build
 ```
 
 CI 使用 Buildx 同时构建 `linux/amd64` 和 `linux/arm64`，容器内置 `/health` HEALTHCHECK。
+
+## 官方账号与内网 Hub
+
+APP 直接通过固定 HTTPS 官方云接口完成登录、Token 刷新、退出和儿童守护名单回读；官方账号密码与云 Token 不会发送到内网 Hub。Hub 只用自身 APP_TOKEN 鉴权，接收项目、SN、有效期等绑定元数据，项目 ID 本身不构成授权。HTTP `58443`、内网 MQTT WS 和原生儿童守护链保持可用；旧 Hub 不支持绑定时，APP 保留本地功能且不会回退为向 Hub 发送密码。
+
+## 可选 HTTPS 与证书
+
+Hub 内置 HTTPS 默认关闭，HTTP `58443`、MQTT 和 Relay 保持原有行为。APP 在“设置 → HTTPS 与证书”中管理服务，默认端口为 `58445`，支持 Hub API、Hub WSS 和 `/mqtt` MQTT WSS；Lucky 不是依赖。
+
+- `HTTPS_PORT`：监听端口，默认 `58445`。
+- `HTTPS_ADMIN_TOKEN`：可选的更强管理授权；未设置时 APP 管理请求仍需显式确认。
+- `HTTPS_LOCAL_CERT_ROOT`：NAS 本地证书目录，留空为 `./data/https/import`。APP 只能发送该目录内的相对路径。
+- Bridge 部署需保留 Compose 中的 `${HTTPS_PORT}:${HTTPS_PORT}` 映射；Host 部署直接监听宿主端口。
+
+首次配置尚未启用 HTTPS 时，可把完整证书链和私钥放入 NAS 本地证书目录，再通过 APP 导入并启用。APP 直接上传私钥仅在当前 Hub 地址为 HTTPS 时允许，普通内网 HTTP 会被拒绝。证书更新采用校验后热加载，失败保留旧证书；删除证书只删除 Hub 保存的副本，不删除 NAS 原文件。
+
+证书域名、签发机构、签发时间、到期时间和状态均来自实际证书解析，并自动加入 APP 原证书到期页面。到期前 7 天、3 天、当天各提醒一次，同时写入“记录—事件”；关闭 HTTPS 保留记录，删除证书同步移除自动记录。已有外部反向代理时无需启用内置 HTTPS。
 
 
 ## JSON 到 SQLite

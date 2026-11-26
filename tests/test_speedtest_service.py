@@ -102,6 +102,42 @@ def test_progress_keeps_sample_arrays_and_reads_last_value():
     assert primary["currentUp"] == 83.66
 
 
+def test_progress_preserves_per_wan_and_native_aggregate_results():
+    payload = {
+        "intf": ["wan1"], "stat": "running", "error_code": "0",
+        "tmp_rst": {
+            "wan": {"downspeed": ["500"], "upspeed": ["50"]},
+            "wan1": {"downspeed": ["600"], "upspeed": ["60"]},
+            "max": {"downspeed": ["1100"], "upspeed": ["110"], "latency": "1.5", "jitter": "0.2", "loss": "0"},
+        },
+    }
+
+    data = st.normalize_progress(payload)
+
+    assert data["mode"] == "max"
+    assert [item["intf"] for item in data["interfaces"]] == ["wan1", "wan", "max"]
+    assert data["primary"]["intf"] == "wan1"
+    assert data["aggregate"]["currentDown"] == 1100.0
+    assert data["aggregate"]["currentUp"] == 110.0
+
+
+def test_history_preserves_native_aggregate_without_summing():
+    payload = {"his_rst": [{
+        "timestamp": "1789637285", "intf": ["wan", "wan1"],
+        "tmp_rst": {
+            "wan": {"downspeed": "500", "upspeed": "50"},
+            "wan1": {"downspeed": "600", "upspeed": "60"},
+            "max": {"downspeed": "1100", "upspeed": "110"},
+        },
+    }]}
+
+    record = st.normalize_history(payload)["records"][0]
+
+    assert record["mode"] == "max"
+    assert record["aggregate"]["currentDown"] == 1100.0
+    assert [item["intf"] for item in record["interfaces"]] == ["wan", "wan1", "max"]
+
+
 def test_progress_end_state_is_recognized():
     payload = dict(CUR_INTF_RST)
     payload["stat"] = "end"
@@ -254,6 +290,19 @@ def test_start_route_builds_firmware_set_nodes_shape():
     sent = driver.calls[-1]["data"]
     assert sent == {"type": "start_test", "sdk": "globalspeed", "intf": ["wan"],
                     "set_nodes": {"wan": ["308000101"]}}
+
+
+def test_start_route_uses_native_multi_wan_shape_for_aggregate():
+    client, driver = build_client({})
+    response = client.post("/api/router/speedtest/start", json={
+        "intf": ["wan", "wan1"], "nodes": {"wan": "308000101", "wan1": "301000101"},
+    })
+
+    assert response.status_code == 202
+    assert driver.calls[-1]["data"] == {
+        "type": "start_test", "sdk": "globalspeed", "intf": ["wan", "wan1"],
+        "set_nodes": {"wan": ["308000101"], "wan1": ["301000101"]},
+    }
 
 
 def test_start_route_defaults_to_auto_node():

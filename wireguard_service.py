@@ -686,10 +686,10 @@ class WireGuardService:
         router = router or self._router_name() or "router"
         with self.lock:
             rows = self.commands()
-            if action == "apply":
+            if action in {"apply", "endpoint"}:
                 active = next((row for row in reversed(rows) if (
                     row.get("router") == router
-                    and row.get("action") == "apply"
+                    and row.get("action") == action
                     and _int(row.get("revision")) == revision
                     and _text(row.get("revisionScope")) in {"", revision_scope}
                     and row.get("status") in {"pending", "delivered"}
@@ -698,7 +698,7 @@ class WireGuardService:
                     return active
                 failed = next((row for row in reversed(rows) if (
                     row.get("router") == router
-                    and row.get("action") == "apply"
+                    and row.get("action") == action
                     and _int(row.get("revision")) == revision
                     and _text(row.get("revisionScope")) in {"", revision_scope}
                     and row.get("status") == "failed"
@@ -1066,7 +1066,7 @@ def create_wireguard_blueprint(hub: Any, service: WireGuardService) -> Blueprint
                     })
                     if ok:
                         row.pop("retryAfterEpoch", None)
-                    elif row.get("action") == "apply":
+                    elif row.get("action") in {"apply", "endpoint"}:
                         attempts = max(1, _int(row.get("attempts")))
                         row["retryAfterEpoch"] = finished_epoch + _apply_retry_delay(attempts)
                     changed += 1
@@ -1094,6 +1094,60 @@ def create_wireguard_blueprint(hub: Any, service: WireGuardService) -> Blueprint
                     service.queue("apply", document["revision"], {"server": document["server"]}, router)
                 elif document.get("tombstone"):
                     service.queue("delete", document["revision"], {**document["tombstone"], "tombstone": True}, router)
+            server = document.get("server") or {}
+            agent_profiles = {
+                _text(row.get("id")): row
+                for row in payload.get("endpointProfiles", [])
+                if isinstance(row, dict)
+            } if isinstance(payload.get("endpointProfiles"), list) else {}
+            if isinstance(payload.get("endpointProfiles"), list):
+                for profile in server.get("endpointProfiles", []):
+                    if not isinstance(profile, dict):
+                        continue
+                    profile_id = _text(profile.get("id"))
+                    if not profile_id:
+                        continue
+                    observed = agent_profiles.get(profile_id)
+                    desired_endpoint = _text(profile.get("resolvedEndpoint"))
+                    desired_revision = _int(profile.get("endpointRevision"))
+                    if observed is None:
+                        if agent_revision >= document["revision"]:
+                            service.queue("apply", document["revision"], {"server": server}, router)
+                        continue
+                    if (_text(observed.get("resolvedEndpoint")) == desired_endpoint
+                            and _int(observed.get("endpointRevision")) >= desired_revision):
+                        rows = service.commands()
+                        changed = False
+                        for command in rows:
+                            if (command.get("router") == router
+                                    and command.get("action") == "endpoint"
+                                    and _text(command.get("revisionScope")) == f"endpoint:{profile_id}"
+                                    and command.get("status") in {"pending", "delivered"}):
+                                command.update({
+                                    "status": "done",
+                                    "result": {"ok": True, "alreadyApplied": True},
+                                    "finishedAt": _now_text(),
+                                    "finishedEpoch": _now(),
+                                })
+                                changed = True
+                        if changed:
+                            service._save_commands(rows)
+                        continue
+                    service.queue(
+                        "endpoint",
+                        desired_revision,
+                        {
+                            "profileId": profile_id,
+                            "endpointSource": _text(profile.get("endpointSource")),
+                            "owner": _text(profile.get("owner")),
+                            "wanId": _text(profile.get("wanId")),
+                            "endpoint": desired_endpoint,
+                            "expectedEndpointRevision": _int(observed.get("endpointRevision")),
+                            "endpointRevision": desired_revision,
+                        },
+                        router,
+                        revision_scope=f"endpoint:{profile_id}",
+                    )
         return jsonify({"ok": True, "receivedAt": record["receivedAt"], "desiredRevision": document["revision"]})
 
     return bp

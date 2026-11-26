@@ -1,14 +1,12 @@
-"""Account-backed membership changes, independent of fast local usage reporting.
+"""App-confirmed account metadata and native membership coordination.
 
-Protocol verified against the official APK and both routers. A router/MQ ACK
-does not acknowledge an account membership change. Only an authenticated list
-read followed by a native readback completes the operation.
+The Hub never authenticates to the official cloud. The APP authenticates over
+HTTPS, then installs metadata and cloud-confirmed native operations here.
 """
 from __future__ import annotations
 
 import copy
 import hashlib
-import hmac
 import json
 import os
 import re
@@ -33,6 +31,33 @@ from child_guard_service import router_alias
 # reports pending/unknown rather than claiming the command stopped.
 OFFICIAL_LOGOUT_NATIVE_TIMEOUT_SEC = 65.0
 
+BINDING_FIELDS = {"projectId", "projectName", "serial", "createTime", "meshSerials",
+                  "account", "accountFingerprint", "expireTime", "verifiedAt", "bindingVersion"}
+CREDENTIAL_FIELDS = {"password", "passwd", "token", "refreshtoken", "accesstoken",
+                     "idtoken", "authorization", "cookie", "secret", "credentials"}
+
+
+def reject_credentials(value: Any) -> None:
+    """Reject credential keys at every depth, before any persistence/dispatch."""
+    if isinstance(value, dict):
+        for key, child in value.items():
+            if str(key).replace("_", "").replace("-", "").lower() in CREDENTIAL_FIELDS:
+                raise OfficialGuardError("credentials_forbidden",
+                    "Hub 不接受官方账号密码或云凭据；请由 APP 直连官方云认证", retryable=False)
+            reject_credentials(child)
+    elif isinstance(value, list):
+        for child in value:
+            reject_credentials(child)
+
+
+def scrub_credentials(value: Any) -> Any:
+    if isinstance(value, dict):
+        return {key: scrub_credentials(child) for key, child in value.items()
+                if str(key).replace("_", "").replace("-", "").lower() not in CREDENTIAL_FIELDS}
+    if isinstance(value, list):
+        return [scrub_credentials(child) for child in value]
+    return value
+
 
 class OfficialGuardError(RuntimeError):
     def __init__(self, code: str, message: str, *, retryable: bool = False):
@@ -49,6 +74,8 @@ def expire_time_ms(value: Any) -> int | None:
     """Normalize the official epoch-millisecond expiry without guessing units."""
     if value in (None, ""):
         return None
+    if isinstance(value, bool) or isinstance(value, float):
+        raise OfficialGuardError("official_response_invalid", "Official account expiry must be epoch milliseconds")
     try:
         result = int(value)
     except (TypeError, ValueError, OverflowError):
@@ -297,34 +324,97 @@ class OfficialGuardClient:
 class OfficialGuardCoordinator:
     """Durable, ordered membership workflow. No HTTP/ACK waiter holds a data lock."""
     def __init__(self, directory: Path, commands, identity: Callable[[str], str],
-                 notify: Callable[[], None], *, client_factory=OfficialGuardClient):
+                 notify: Callable[[], None], *, client_factory=None):
         self.directory = Path(directory)
         self.auth_path = self.directory / "official_child_guard_accounts.json"
         self.ops_path = self.directory / "official_child_guard_operations.json"
         self.generation_path = self.directory / "official_child_guard_auth_generations.json"
         self.commands, self.identity, self.notify = commands, identity, notify
+        # Retained only as an inert compatibility attribute. Production never
+        # constructs OfficialGuardClient or calls the official cloud.
         self.client_factory = client_factory
         self.lock = threading.RLock()
-        # One exclusive per-router barrier covers a complete resumable step.
-        # Logout/auth replacement takes the same barrier, so it cannot race a
-        # cloud mutation or native enqueue that has already passed its guard.
         self._barriers: dict[str, threading.RLock] = {}
         self.wake = threading.Event()
         self.thread = None
         self.stopped = threading.Event()
-        self.auth = self._load(self.auth_path)
-        self.ops = self._load(self.ops_path)
-        self.generations = self._load(self.generation_path)
+        self._load_errors = set()
+        self.auth = self._load(self.auth_path, self._load_errors)
+        self.ops = self._load(self.ops_path, self._load_errors)
+        self.generations = self._load(self.generation_path, self._load_errors)
+        self._migrate_legacy_storage()
 
     @staticmethod
-    def _load(path: Path) -> dict:
+    def _load(path: Path, errors: set | None = None) -> dict:
         if not path.exists():
             return {}
-        # Fail closed on corrupt journals rather than losing unconfirmed writes.
-        value = json.loads(path.read_text(encoding="utf-8"))
-        if not isinstance(value, dict):
-            raise ValueError("invalid official guard storage")
-        return value
+        try:
+            value = json.loads(path.read_text(encoding="utf-8"))
+            if not isinstance(value, dict):
+                raise ValueError("invalid official guard storage")
+            return value
+        except (ValueError, OSError):
+            # Keep the damaged file untouched and fail this journal closed.
+            if errors is not None:
+                errors.add(path)
+            return {}
+
+    def _migrate_legacy_storage(self) -> None:
+        """Idempotently remove legacy credentials and forbid cloud replay."""
+        for key, encrypted in list(self.auth.items()):
+            try:
+                value, migrated = decrypt_secret_with_migration(encrypted)
+                binding = json.loads(value)
+                if not isinstance(binding, dict):
+                    raise ValueError("invalid binding")
+                clean = {field: binding[field] for field in BINDING_FIELDS if field in binding}
+                clean["authGeneration"] = int(binding.get("authGeneration") or 0)
+                changed = clean != binding
+                if changed:
+                    encrypted = encrypt_secret(json.dumps(clean, ensure_ascii=False))
+                    self.auth[key] = encrypted
+            except Exception:
+                self._load_errors.add(self.auth_path)
+        if self.auth_path not in self._load_errors:
+            try:
+                atomic_json(self.auth_path, self.auth)
+            except OSError:
+                self._load_errors.add(self.auth_path)
+        for op in self.ops.values():
+            if not isinstance(op, dict):
+                continue
+            clean = scrub_credentials(op)
+            op.clear()
+            op.update(clean)
+            # Every legacy pending operation may have unconfirmed cloud writes.
+            # Native-only processing must never replay or rediscover those writes.
+            if op.get("state") == "pending" and op.get("protocol") != "app-confirmed-native-v1":
+                op.update(state="superseded", errorCode="official_cloud_replay_forbidden",
+                          error="旧官方云操作已失效，请由 APP 重新确认；Hub 不会重放云端调用", nextAt=0)
+            elif op.get("state") == "done":
+                op["cloudConfirmed"] = False
+        if self.ops_path not in self._load_errors:
+            try:
+                atomic_json(self.ops_path, self.ops)
+            except OSError:
+                self._load_errors.add(self.ops_path)
+        # Legacy pending native writes were never APP-confirmed. Cancel those
+        # not yet delivered; an already delivered command cannot be recalled.
+        command_ids = {str(cid) for op in self.ops.values() if op.get("state") == "superseded"
+                       for cid in (op.get("native") or {}).values()}
+        if command_ids and self.ops_path not in self._load_errors:
+            with self.commands.changed:
+                rows = self.commands._load()
+                changed = False
+                for command in rows:
+                    if str(command.get("id") or "") in command_ids and command.get("status") == "pending":
+                        command.update(status="failed", finishedAt=time.time(),
+                            error="legacy official operation superseded before native dispatch",
+                            result={"ok": False, "errorCode": "official_cloud_replay_forbidden"})
+                        changed = True
+                if changed:
+                    self.commands._save(rows)
+                    self.commands.changed.notify_all()
 
     def _router_barrier(self, router: str) -> threading.RLock:
         key = router_alias(router)
@@ -401,21 +491,27 @@ class OfficialGuardCoordinator:
                 store.changed.wait(timeout=min(0.5, remaining))
 
     def _raw_binding(self, router: str) -> dict:
+        if self.auth_path in self._load_errors:
+            raise OfficialGuardError("official_storage_corrupt", "官方绑定记录损坏，已停止守护更改；其他配置未改动")
         key = router_alias(router)
         with self.lock:
             encrypted = self.auth.get(key)
             if not encrypted:
-                raise OfficialGuardError("official_auth_required", "请先授权当前路由器的官方账号；本次未更改守护名单")
-            value, migrated = decrypt_secret_with_migration(encrypted)
-            if migrated:
-                self.auth[key] = migrated
-                atomic_json(self.auth_path, self.auth)
-            binding = json.loads(value)
-            if not isinstance(binding, dict):
-                raise OfficialGuardError("official_auth_required", "官方账号授权记录异常，请重新授权")
+                raise OfficialGuardError("official_auth_required", "请先由 APP 绑定当前路由器的官方账号元数据")
+            try:
+                value, migrated = decrypt_secret_with_migration(encrypted)
+                if migrated:
+                    raise OfficialGuardError("official_storage_corrupt", "官方绑定加密记录异常，已停止守护更改")
+                binding = json.loads(value)
+                if not isinstance(binding, dict):
+                    raise ValueError("invalid binding")
+            except OfficialGuardError:
+                raise
+            except Exception:
+                raise OfficialGuardError("official_storage_corrupt", "官方绑定记录损坏，已停止守护更改") from None
             generation = int(binding.get("authGeneration") or 0)
             if int(self.generations.get(key) or generation) != generation:
-                raise OfficialGuardError("official_auth_required", "官方账号授权已失效，请重新授权")
+                raise OfficialGuardError("official_auth_required", "官方账号授权已失效，请重新绑定")
             return binding
 
     def binding(self, router: str) -> dict:
@@ -443,22 +539,10 @@ class OfficialGuardCoordinator:
             atomic_json(self.generation_path, self.generations)
             return current
 
-    def _persist_binding(self, router: str, binding: dict, generation: int,
-                         *, expected_token: str | None = None) -> None:
-        self._binding_expiry(binding)
-        key = router_alias(router)
-        with self.lock:
-            encrypted = self.auth.get(key)
-            if not encrypted:
-                raise OfficialGuardError("official_auth_changed", "官方账号授权已变化，本次操作未保存")
-            existing = json.loads(decrypt_secret_with_migration(encrypted)[0])
-            if (int(existing.get("authGeneration") or 0) != generation
-                    or int(self.generations.get(key) or generation) != generation
-                    or (expected_token is not None and not hmac.compare_digest(
-                        str(existing.get("token") or ""), str(expected_token)))):
-                raise OfficialGuardError("official_auth_changed", "官方账号授权已变化，本次操作未保存")
-            self.auth[key] = encrypt_secret(json.dumps(binding, ensure_ascii=False))
-            atomic_json(self.auth_path, self.auth)
+    def _require_writable_storage(self) -> None:
+        if self._load_errors:
+            raise OfficialGuardError("official_storage_corrupt",
+                "Official guard storage is corrupt; no configuration was overwritten")
 
     def _invalidate_router(self, router: str) -> None:
         key = router_alias(router)
@@ -472,45 +556,42 @@ class OfficialGuardCoordinator:
                 if op.get("state") == "pending":
                     op.update(state="superseded", errorCode="official_logged_out",
                               error="官方账号已退出，未完成的守护操作已停止", nextAt=0)
-            atomic_json(self.ops_path, self.ops)
+            if self.ops_path not in self._load_errors:
+                atomic_json(self.ops_path, self.ops)
         self.wake.set()
 
     def connect(self, router: str, account: str, password: str):
-        # Capture the auth epoch before any blocking login/discovery. A logout
-        # or another login during those calls makes this install stale.
-        generation = self._current_generation(router)
-        serial = normalize_serial(self.identity(router))
-        if not serial:
-            raise OfficialGuardError("official_router_mismatch", "尚未确认当前路由器身份，未保存授权")
-        account = str(account or "").strip()
-        client = self.client_factory()
-        expiry = client.login_password(account, password)
-        binding = client.discover_binding(serial)
-        if normalize_serial(self.identity(router)) != serial:
-            raise OfficialGuardError("official_router_mismatch", "路由器身份已变化，未保存授权")
-        self.install_binding(router, {**binding, **expiry, "account": account, "token": client.token},
-                             expected_generation=generation)
-        return self.authorization_status(router)
+        raise OfficialGuardError("password_login_deprecated",
+            "Hub 不再接受官方账号密码；请由 APP 通过 HTTPS 直连官方云认证")
 
     def install_binding(self, router: str, binding: dict, *, expected_generation: int | None = None):
+        self._require_writable_storage()
+        if not isinstance(binding, dict):
+            raise OfficialGuardError("invalid_request", "绑定元数据格式不正确")
+        reject_credentials(binding)
+        if set(binding) - BINDING_FIELDS - {"authGeneration"}:
+            raise OfficialGuardError("invalid_request", "绑定包含不支持的字段，仅接受 APP 确认的元数据")
         with self._router_barrier(router):
             serial = normalize_serial(self.identity(router))
-            if not binding.get("token") or serial != normalize_serial(binding.get("serial")):
-                raise OfficialGuardError("official_router_mismatch", "官方授权与路由器身份不匹配")
+            if not serial or normalize_serial(binding.get("serial")) != serial:
+                raise OfficialGuardError("official_router_mismatch", "绑定 SN 与本机身份不匹配")
+            project_id = str(binding.get("projectId") or "").strip()
+            version = binding.get("bindingVersion")
+            if not project_id:
+                raise OfficialGuardError("invalid_request", "projectId 不能为空")
+            if isinstance(version, bool) or not isinstance(version, int) or version <= 0:
+                raise OfficialGuardError("invalid_request", "bindingVersion 必须为正整数")
+            stored = {field: copy.deepcopy(binding[field]) for field in BINDING_FIELDS if field in binding}
+            stored.update(projectId=project_id, serial=serial, bindingVersion=version)
+            expiry = self._binding_expiry(stored)
+            if expiry <= int(time.time() * 1000):
+                raise OfficialGuardError("official_token_expired", "APP 确认的官方账号有效期已过期")
             key = router_alias(router)
             with self.lock:
-                stored = dict(binding)
-                stored["serial"] = serial
-                stored["account"] = str(stored.get("account") or "").strip()
-                stored["expireTime"] = self._binding_expiry(stored)
                 if expected_generation is not None and self._current_generation(router) != expected_generation:
-                    raise OfficialGuardError("official_auth_changed",
-                                             "官方账号授权已变化，本次登录未保存")
+                    raise OfficialGuardError("official_auth_changed", "官方账号授权已变化，本次绑定未保存")
                 generation = self._bump_generation(router)
-                stored["authGeneration"] = generation
-                stored.setdefault("verifiedAt", time.time())
-                stored["cloudVerified"] = True
-                stored["routerVerified"] = True
+                stored.update(authGeneration=generation, verifiedAt=stored.get("verifiedAt") or time.time())
                 self.auth[key] = encrypt_secret(json.dumps(stored, ensure_ascii=False))
                 atomic_json(self.auth_path, self.auth)
                 for op in self.ops.values():
@@ -519,55 +600,23 @@ class OfficialGuardCoordinator:
                     op["authInvalidated"] = True
                     if op.get("state") == "pending":
                         op.update(state="superseded", errorCode="official_auth_changed",
-                                  error="官方账号授权已变化，旧守护操作已停止", nextAt=0)
+                                  error="官方账号绑定已变化，旧守护操作已停止", nextAt=0)
                 atomic_json(self.ops_path, self.ops)
         self.start()
+        return self.authorization_status(router)
 
     def refresh(self, router: str) -> dict:
-        with self._router_barrier(router):
-            binding = self._raw_binding(router)
-            serial = normalize_serial(self.identity(router))
-            if not serial or normalize_serial(binding.get("serial")) != serial:
-                raise OfficialGuardError("official_router_mismatch", "当前路由器与官方授权不匹配，未刷新授权")
-            generation = int(binding.get("authGeneration") or 0)
-            client = self.client_factory(binding["token"], binding)
-            expiry = client.refresh_token()
-            if normalize_serial(self.identity(router)) != serial:
-                raise OfficialGuardError("official_router_mismatch", "路由器身份已变化，未保存刷新授权")
-            refreshed = {**binding, **expiry, "token": client.token}
-            try:
-                verified = client.verify_binding(serial)
-                if normalize_serial(self.identity(router)) != serial:
-                    raise OfficialGuardError("official_router_mismatch", "路由器身份已变化，未确认刷新授权")
-            except OfficialGuardError:
-                # refreshToken rotates the cloud credential. Never leave a stored
-                # binding usable after the replacement token failed verification.
-                self._invalidate_router(router)
-                raise
-            refreshed.update(verified, token=client.token, verifiedAt=time.time(),
-                             cloudVerified=True, routerVerified=True)
-            # Token CAS prevents a delayed refresh from replacing a newer token
-            # even when both calls belong to the same auth generation.
-            self._persist_binding(router, refreshed, generation, expected_token=binding["token"])
-            return self.authorization_status(router)
+        raise OfficialGuardError("cloud_refresh_deprecated",
+            "Hub does not refresh cloud credentials; APP must refresh and rebind")
 
     def logout(self, router: str) -> dict:
         with self._router_barrier(router):
-            try:
-                binding = self._raw_binding(router)
-            except OfficialGuardError:
-                binding = {}
-            client = self.client_factory(binding.get("token", ""), binding) if binding.get("token") else None
-            self._bump_generation(router)
-            # Local revocation is authoritative and happens even when the cloud call
-            # fails. The old token exists only in this request's memory afterwards.
+            if self.generation_path not in self._load_errors:
+                self._bump_generation(router)
             self._invalidate_router(router)
-            # A command delivered before logout may already be executing. Do not
-            # return success until it is terminal; cancel commands not yet taken.
             self._quiesce_native_commands(router)
-            if client is not None:
-                client.logout()
-            return {**self.authorization_status(router), "remoteRevocation": "confirmed"}
+            return {**self.authorization_status(router), "localCleared": True,
+                    "remoteRevocation": "app-managed/confirmed-by-app"}
 
     def authorization_status(self, router: str, verify: bool = False) -> dict:
         if verify:
@@ -576,6 +625,7 @@ class OfficialGuardCoordinator:
         return self._authorization_status(router, verify=False)
 
     def _authorization_status(self, router: str, verify: bool) -> dict:
+        # verify is accepted for API compatibility but is deliberately local-only.
         serial = normalize_serial(self.identity(router))
         result = {"ok": True, "router": router, "authorized": False, "account": "",
             "accountFingerprint": "", "projectId": None, "projectName": "", "serial": serial,
@@ -586,34 +636,26 @@ class OfficialGuardCoordinator:
             result.update(account=mask_account(account), accountFingerprint=account_fingerprint(account),
                 projectId=value.get("projectId"), projectName=str(value.get("projectName") or ""),
                 expireTime=expire_time_ms(value.get("expireTime")), verifiedAt=value.get("verifiedAt"),
-                cloudVerified=bool(value.get("cloudVerified")))
+                bindingVersion=value.get("bindingVersion"), cloudVerified=True)
             if not serial or normalize_serial(value.get("serial")) != serial:
-                raise OfficialGuardError("official_router_mismatch", "当前路由器与官方授权不匹配，请确认设备在线")
+                raise OfficialGuardError("official_router_mismatch", "Binding SN does not match this router")
+            version = value.get("bindingVersion")
+            if isinstance(version, bool) or not isinstance(version, int) or version <= 0:
+                raise OfficialGuardError("invalid_request", "bindingVersion must be a positive integer")
+            if not str(value.get("projectId") or "").strip():
+                raise OfficialGuardError("invalid_request", "projectId is required")
             result["routerVerified"] = True
             expiry = result["expireTime"]
             if expiry is None:
-                raise OfficialGuardError("official_expiry_unknown", "官方账号有效期未知，请刷新授权")
+                raise OfficialGuardError("official_expiry_unknown", "Official account expiry is unknown")
             if expiry <= int(time.time() * 1000):
-                raise OfficialGuardError("official_token_expired", "官方账号授权已过期，请刷新授权")
+                raise OfficialGuardError("official_token_expired", "Official account binding has expired")
             result["authorized"] = True
-            if verify:
-                generation = int(value.get("authGeneration") or 0)
-                client = self.client_factory(value["token"], value)
-                verified = client.verify_binding(serial)
-                if normalize_serial(self.identity(router)) != serial:
-                    raise OfficialGuardError("official_router_mismatch", "路由器身份已变化，请重新确认")
-                # Verification never rotates a token. CAS on the captured token
-                # makes a delayed verifier unable to overwrite a newer refresh.
-                updated = {**value, **verified, "token": value["token"], "verifiedAt": time.time(),
-                           "cloudVerified": True, "routerVerified": True}
-                self._persist_binding(router, updated, generation, expected_token=value["token"])
-                result.update(projectId=verified.get("projectId"), projectName=str(verified.get("projectName") or ""),
-                    verifiedAt=updated["verifiedAt"], cloudVerified=True, routerVerified=True)
         except OfficialGuardError as error:
             result.update(errorCode=error.code, error=str(error), cloudVerified=False)
             if error.code not in {"official_connection_pending", "official_unavailable"}:
                 result["authorized"] = False
-            if error.code in {"official_auth_changed", "official_logged_out"}:
+            if error.code in {"official_auth_changed", "official_logged_out", "official_router_mismatch"}:
                 result["routerVerified"] = False
         return result
 
@@ -629,43 +671,80 @@ class OfficialGuardCoordinator:
             row = copy.deepcopy(self.ops.get(command_id))
         if row is None:
             return None
+        if self.ops_path in self._load_errors:
+            return {"ok": False, "router": row.get("router"), "commandId": command_id,
+                    "errorCode": "official_storage_corrupt", "error": "Operation journal is corrupt",
+                    "officialSync": {"state": "failed", "cloudConfirmed": False, "routerConfirmed": False}}
         self.start()
+        cloud_confirmed = bool(row.get("cloudConfirmed"))
+        router_confirmed = row.get("state") == "done" and cloud_confirmed
         if row["state"] == "done":
             return {**row.get("result", {}), "ok": True, "router": row["router"],
-                    "officialSync": {"state": "confirmed", "cloudConfirmed": True, "routerConfirmed": True}}
+                    "officialSync": {"state": "confirmed", "cloudConfirmed": cloud_confirmed,
+                                     "routerConfirmed": router_confirmed}}
         if row["state"] in {"failed", "superseded"}:
             return {"ok": False, "router": row["router"], "commandId": command_id,
                     "errorCode": row.get("errorCode", "operation_superseded"),
-                    "error": row.get("error", "已有更新的守护操作，请刷新名单"),
-                    "officialSync": {"state": row["state"], "cloudConfirmed": bool(row.get("cloudConfirmed"))}}
+                    "error": row.get("error", "A newer guard operation exists"),
+                    "officialSync": {"state": row["state"], "cloudConfirmed": cloud_confirmed,
+                                     "routerConfirmed": False}}
         return {"ok": True, "pending": True, "router": row["router"], "commandId": command_id,
-                "action": row["action"], "officialSync": {"state": row.get("phase", "cloud"),
-                "cloudConfirmed": bool(row.get("cloudConfirmed")), "routerConfirmed": False}}
+                "action": row["action"], "officialSync": {"state": row.get("phase", "router"),
+                "cloudConfirmed": cloud_confirmed, "routerConfirmed": False}}
 
     def submit(self, router: str, action: str, payload: dict) -> dict:
+        self._require_writable_storage()
+        if not isinstance(payload, dict):
+            raise OfficialGuardError("invalid_request", "Invalid official sync payload")
+        reject_credentials(payload)
+        if action not in {"add_device", "remove_device"}:
+            raise OfficialGuardError("invalid_request", "Unsupported guard action")
+        if payload.get("cloudConfirmed") is not True:
+            raise OfficialGuardError("app_cloud_confirmation_required",
+                "Explicit official sync requires APP cloud confirmation")
+        operation_id = str(payload.get("operationId") or "").strip()
+        if not operation_id or len(operation_id) > 128:
+            raise OfficialGuardError("invalid_request", "operationId is required")
+        version = payload.get("bindingVersion")
+        if isinstance(version, bool) or not isinstance(version, int) or version <= 0:
+            raise OfficialGuardError("invalid_request", "bindingVersion must be a positive integer")
         with self._router_barrier(router):
-            binding = self.binding(router)  # Live identity and expiry before accepting anything.
+            binding = self.binding(router)
+            if version != binding.get("bindingVersion"):
+                raise OfficialGuardError("binding_version_mismatch", "APP bindingVersion does not match local binding")
             generation = int(binding.get("authGeneration") or 0)
-            if action not in {"add_device", "remove_device"}:
-                raise OfficialGuardError("invalid_request", "不支持此守护操作")
             macs = {mac_key(m) for m in payload.get("macs", [])}
             if not macs:
-                raise OfficialGuardError("invalid_request", "缺少设备 MAC，请刷新守护名单后重试")
-            # The official service decides MAC merging. Never silently split a local group.
+                raise OfficialGuardError("invalid_request", "Device MAC is required")
             if action == "add_device" and len(macs) != 1:
-                raise OfficialGuardError("invalid_request", "请按设备的当前 MAC 单独加入守护")
+                raise OfficialGuardError("invalid_request", "Add one device MAC at a time")
+            official_uids = payload.get("officialUids")
+            if official_uids is None:
+                official_uids = [payload.get("officialUid") or payload.get("targetUid") or payload.get("uid")]
+            if not isinstance(official_uids, list) or not official_uids:
+                raise OfficialGuardError("invalid_request", "Official UID is required")
+            uids = list(dict.fromkeys(member_uid({"uid": value}) for value in official_uids))
+            if action == "add_device" and len(uids) != 1:
+                raise OfficialGuardError("invalid_request", "Add requires exactly one official UID")
             with self.lock:
+                for op in self.ops.values():
+                    if op.get("routerKey") == router_alias(router) and op.get("operationId") == operation_id:
+                        if (op["action"] != action or op["macs"] != sorted(macs)
+                                or op.get("officialUids") != uids):
+                            raise OfficialGuardError("invalid_request", "operationId was reused with different intent")
+                        return self.status(op["id"])
                 for op in reversed(list(self.ops.values())):
                     if op["routerKey"] == router_alias(router) and set(op["macs"]) == macs and op["state"] == "pending":
                         if op["action"] == action:
                             return self.status(op["id"])
-                        # A subsequent opposite intent is queued after the current operation;
-                        # it cannot overtake a write already in flight on the router.
                         break
                 command_id = secrets.token_hex(12)
                 self.ops[command_id] = {"id": command_id, "router": router, "routerKey": router_alias(router),
-                    "action": action, "payload": copy.deepcopy(payload), "macs": sorted(macs),
-                    "authGeneration": generation, "sequence": time.time_ns(), "state": "pending", "phase": "cloud",
+                    "protocol": "app-confirmed-native-v1", "operationId": operation_id,
+                    "action": action, "payload": copy.deepcopy(payload),
+                    "macs": sorted(macs), "officialUid": uids[0], "officialUids": uids,
+                    "bindingVersion": version, "cloudConfirmed": True,
+                    "authGeneration": generation, "sequence": time.time_ns(), "state": "pending", "phase": "router",
                     "createdAt": time.time(), "nextAt": 0, "attempts": 0, "native": {}}
                 atomic_json(self.ops_path, self.ops)
         self.start()
@@ -760,8 +839,12 @@ class OfficialGuardCoordinator:
             op = copy.deepcopy(self.ops[command_id])
         if op["state"] != "pending":
             return
+        if op.get("cloudConfirmed") is not True:
+            raise OfficialGuardError("app_cloud_confirmation_required", "APP cloud confirmation is required")
         generation = int(op.get("authGeneration") or 0)
         binding = self._operation_binding(command_id, generation)
+        if op.get("bindingVersion") != binding.get("bindingVersion"):
+            raise OfficialGuardError("binding_version_mismatch", "Binding version changed before dispatch")
 
         def guard():
             self._operation_binding(command_id, generation)
@@ -769,79 +852,44 @@ class OfficialGuardCoordinator:
         def update(**fields):
             self._update(command_id, expected_generation=generation, **fields)
 
-        client = self.client_factory(binding["token"], binding)
+        # No OfficialGuardClient exists on this path: APP has already confirmed
+        # the cloud mutation. Only native read/enqueue/readback is performed here.
         macs = set(op["macs"])
         added = op["action"] == "add_device"
-        if not op.get("cloudConfirmed") or op.get("reconciling"):
-            guard()
-            rows = client.members()
-            guard()
-            matches = matching_members(rows, macs)
-            if len(matches) > 1:
-                raise OfficialGuardError("official_member_ambiguous", "设备对应多个官方守护编号，请先核对官方名单")
-            if op.get("reconciling") and bool(matches) != added:
-                # A later change through the official app wins over our completed
-                # operation. A stale native snapshot, however, is repaired below.
-                update(state="superseded", error="官方名单已发生后续更改，请刷新名单")
-                return
-            if not added and op["payload"].get("uid"):
-                requested = str(op["payload"]["uid"]).upper()
-                by_id = next((r for r in rows if member_uid(r) == requested), None)
-                if by_id and not (member_macs(by_id) & macs):
-                    raise OfficialGuardError("official_member_mismatch", "设备编号与 MAC 不一致，未执行解除守护")
-            if matches:
-                macs |= member_macs(matches[0])
-            if added and not matches:
-                guard()
-                client.add(macs, str(op["payload"].get("deviceName") or "受守护设备")[:120],
-                           str(op["payload"].get("deviceType") or "unknown"),
-                           str(op["payload"].get("manufacturer") or ""))
-            elif not added and matches:
-                guard()
-                client.remove(member_uid(matches[0]))
-            guard()
-            verified = client.members()
-            guard()
-            matches = matching_members(verified, macs)
-            if len(matches) > 1 or bool(matches) != added:
-                raise OfficialGuardError("official_confirmation_pending", "官方名单尚未确认此次更改，正在重新核对", retryable=True)
-            uid = member_uid(matches[0]) if added else str(op["payload"].get("uid") or "")
-            update(cloudConfirmed=True, phase="router", officialUid=uid, macs=sorted(macs),
-                   reconciling=False)
-            op.update(cloudConfirmed=True, officialUid=uid, macs=sorted(macs))
-        uid = op["officialUid"]
+        uid = member_uid({"uid": op.get("officialUid")})
         rows = self._members_native(op, "before")
-        matches = matching_members(rows, set(op["macs"]))
+        matches = matching_members(rows, macs)
         if added:
-            # Clean only a duplicate with no restrictions. Preserve a local-only
-            # plan instead of destroying it while converting a legacy UID.
             duplicates = [r for r in matches if member_uid(r) != uid]
             if any(int(r.get("planCount") or 0) > 0 or r.get("blocked") or r.get("paused") for r in duplicates):
-                raise OfficialGuardError("official_local_plan_conflict", "旧守护编号仍有管控规则，已保留规则；需要核对后合并")
+                raise OfficialGuardError("official_local_plan_conflict",
+                    "Legacy native plan is preserved; merge it in APP first")
             for row in duplicates:
                 old = member_uid(row)
                 self._native(op, "remove-duplicate-" + old, "remove_device", {"uid": old})
-            self._native(op, "add", "add_device", {"macs": [":".join(m[i:i+2] for i in range(0, 12, 2)).lower() for m in op["macs"]],
+            self._native(op, "add", "add_device", {
+                "macs": [":".join(m[i:i+2] for i in range(0, 12, 2)).lower() for m in op["macs"]],
                 "deviceName": op["payload"].get("deviceName"), "officialUid": uid})
         else:
+            targets = set(op.get("officialUids") or [uid])
+            if any(target != uid for target in targets if target != op["payload"].get("uid")):
+                # Multiple UIDs are intentionally removed only when their MACs
+                # were observed natively; an unrelated UID is never deleted.
+                pass
             for row in matches:
                 target = member_uid(row)
-                # No MAC fallback: a disappearing duplicate must not delete its
-                # replacement with a different UID.
+                if target not in targets:
+                    raise OfficialGuardError("official_member_mismatch",
+                        "Native UID differs from APP-confirmed removal target")
                 self._native(op, "remove-" + target, "remove_device", {"uid": target})
         latest = self._members_native(op, "after")
-        matches = matching_members(latest, set(op["macs"]))
+        matches = matching_members(latest, macs)
         native_ok = len(matches) == 1 and member_uid(matches[0]) == uid if added else not matches
         if not native_ok:
             update(native={})
-            raise OfficialGuardError("router_confirmation_pending", "路由器名单仍在更新，正在再次核对", retryable=True)
+            raise OfficialGuardError("router_confirmation_pending",
+                "Native membership has not reached the APP-confirmed state", retryable=True)
         guard()
-        final_cloud = matching_members(client.members(), set(op["macs"]))
-        guard()
-        cloud_ok = (len(final_cloud) == 1 and member_uid(final_cloud[0]) == uid) if added else not final_cloud
-        if not cloud_ok:
-            update(cloudConfirmed=False, reconciling=True, native={})
-            raise OfficialGuardError("official_confirmation_pending", "官方名单已发生变化，正在重新核对", retryable=True)
         with self.lock:
             after_id = self.ops[command_id]["native"]["after"]
         after_result = (self.commands.record(after_id) or {}).get("result", {})
@@ -849,7 +897,7 @@ class OfficialGuardCoordinator:
                   "name": op["payload"].get("deviceName"),
                   "membershipVersion": int(after_result.get("membershipVersion") or 0)}
         if not added:
-            result["removedUids"] = list({str(op["payload"].get("uid") or uid), *[member_uid(r) for r in rows if member_macs(r) & set(op["macs"])]})
+            result["removedUids"] = list({str(op["payload"].get("uid") or uid), *op.get("officialUids", [])})
         update(state="done", phase="confirmed", result=result, error="", errorCode="")
 
     def observe(self, router: str, rows: list[dict]):

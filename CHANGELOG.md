@@ -1,5 +1,19 @@
 # LabProbe 变更记录
 
+## 0.14.9 / LabRelay 0.2.82（多 WAN 修正测试版）
+
+- 修复 BE72 Pro 双 WAN 的桥接口径与 PPPoE 地址解析：WAN1 使用 `br-wan1`，`pppoe-wan` 无前缀地址按 `/32` 解析，避免 Relay 误报无可用源地址。
+- STUN 路由器原生映射只迁移已知旧算法指纹：指纹忽略 Hub 侧 `wanId` 元数据，只有真实 `src`、源端口、目标地址、目标端口或协议变化才进入人工修改；已有状态不会被指纹单方面清除。
+- APP 首页 VPN/STUN 只展示 Webhook 状态中的地址，不再混入 STUN 管理 API、Lucky 回退或合成地址；普通进入复用缓存，只有旧失败或过期缓存才强制刷新。
+- APP 双 WAN 展示收敛到在线线路：网络详情、NAT/UPnP/STUN/TCP 选择器仅在有两条在线线路时出现 WAN1，设置与物理端口页继续显示真实配置状态。
+- 首页速率与连接数卡片压缩排版，设置入口图标固定为 38dp 方形；NAT 检测在单线在线时仍显示当前 WAN 类型。
+- 新增 APP“HTTPS 与证书”独立页面、Hub 可选 nginx 服务、证书校验/热加载/回滚、本地与 HTTPS 手动导入，以及 7/3/当天到期提醒和事件同步；默认关闭，不依赖 Lucky。
+- 端口映射区分原生出接口 `src` 与外部服务器 IP `srcIp`；DDNS、UPnP、防火墙保留固件接口语义，防火墙接口列表覆盖 WAN、LAN 与 VLAN。
+- 固件测速支持 WAN、WAN1 独立及原生 `max` 叠加结果；APP 直接展示固件综合值，不在客户端相加。
+- 修复 STUN 原生映射回写混入 `wanId`、WireGuard 端点失败不重试、旧 Relay 空线路不兼容、握手状态过早报错及英文错误透出。
+- 官方账号改为 APP 通过固定 HTTPS 直连锐捷云完成登录、刷新、退出与名单回读；Hub 仅接收 APP_TOKEN 鉴权后的项目绑定元数据，不再保存云 Token 或接收密码，旧绑定迁移后停止云端重放。
+- 自动化覆盖 Hub、APP 与 Relay WAN 回归；双 WAN、HTTPS 与 WireGuard 真机场景仍需按清单验证。
+
 ## 0.14.8 / LabRelay 0.2.81（多 WAN 测试版）
 
 - 修复真实固件匿名 `network.wan` 配置数组与 `networkConnect.list` 的一对一线路关联，正确识别 WAN1 离线、IPv6 与逐线路流量。

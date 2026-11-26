@@ -65,6 +65,9 @@ services:
         condition: service_healthy
     environment: &labprobe_environment
       PORT: ${PORT:-58443}
+      HTTPS_PORT: ${HTTPS_PORT:-58445}
+      HTTPS_ADMIN_TOKEN: ${HTTPS_ADMIN_TOKEN:-}
+      HTTPS_LOCAL_CERT_ROOT: ${HTTPS_LOCAL_CERT_ROOT:-}
       TZ: ${TZ:-Asia/Shanghai}
       CONFIG_PATH: ./config/config.yaml
       CONFIG_DIR: ./config
@@ -72,7 +75,7 @@ services:
       BACKUPS_DIR: ./backups
       LOGS_DIR: ./logs
       UPDATE_REPOSITORY_DIR: /app/update-repository
-      LABRELAY_RELEASE_VERSION: ${LABRELAY_RELEASE_VERSION:-0.2.79}
+      LABRELAY_RELEASE_VERSION: ${LABRELAY_RELEASE_VERSION:-0.2.82}
       LOG_LEVEL: ${LOG_LEVEL:-INFO}
       LOG_RETENTION_DAYS: ${LOG_RETENTION_DAYS:-14}
       REVISION_MAX_ROWS: ${REVISION_MAX_ROWS:-5000}

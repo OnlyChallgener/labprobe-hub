@@ -18,6 +18,7 @@ from datetime import datetime, date
 from zoneinfo import ZoneInfo
 from pathlib import Path
 from typing import Any, Callable, Dict, List, Optional, Tuple
+from urllib.parse import urlsplit
 
 import yaml
 import requests
@@ -37,7 +38,7 @@ from child_guard_service import (
 )
 
 BEIJING_TZ = ZoneInfo("Asia/Shanghai")
-APP_VERSION = "0.14.8"
+APP_VERSION = "0.14.9"
 PORT = int(os.environ.get("PORT", "58443"))
 BASE_DIR = Path(os.environ.get("LABPROBE_BASE_DIR", ".")).resolve()
 CONFIG_DIR = Path(os.environ.get("CONFIG_DIR", str(BASE_DIR / "config"))).resolve()
@@ -567,7 +568,39 @@ def host_mac() -> str:
 
 
 def advertise_url() -> str:
-    return env_compat("HUB_ADVERTISE_URL", default=f"http://127.0.0.1:{PORT}").rstrip("/")
+    explicit = env_compat("HUB_ADVERTISE_URL")
+    if explicit:
+        return explicit.rstrip("/")
+    service = globals().get("HTTPS_SERVICE")
+    if service is not None:
+        try:
+            public = service.public_url()
+            if public:
+                return public.rstrip("/")
+        except Exception:
+            pass
+    return f"http://127.0.0.1:{PORT}"
+
+
+def _is_private_hub_url(raw: str) -> bool:
+    try:
+        parsed = urlsplit(raw)
+    except Exception:
+        return False
+    host = (parsed.hostname or "").strip().lower()
+    if not host:
+        return False
+    if host == "localhost":
+        return False
+    if host.endswith((".local", ".lan", ".home")):
+        return True
+    try:
+        address = ipaddress.ip_address(host)
+    except ValueError:
+        return False
+    if address.is_loopback or address.is_unspecified:
+        return False
+    return bool(address.is_private or address.is_link_local)
 
 
 def parse_default_gateway_ipv4(route_text: str) -> str:
@@ -630,7 +663,7 @@ def hub_reachability() -> Dict[str, Any]:
     lan_ip = hub_lan_ipv4()
     lan = ""
     source = ""
-    if advertised and "://127." not in advertised and "://localhost" not in advertised:
+    if advertised and _is_private_hub_url(advertised):
         lan, source = advertised, "advertise"
     elif lan_ip:
         lan, source = f"http://{lan_ip}:{PORT}", "detected"
@@ -3624,7 +3657,7 @@ def _official_account_global_response(router: str, details: Dict[str, Any]) -> D
     matched = bool(authorized and details.get("cloudVerified") and details.get("routerVerified")
                    and details.get("projectId"))
     code = str(details.get("errorCode") or "")
-    if details.get("remoteRevocation") == "confirmed" and details.get("localCleared") is True:
+    if details.get("remoteRevocation") == "app-managed/confirmed-by-app" and details.get("localCleared") is True:
         sync_state = "unauthorized"
     elif authorized and matched:
         sync_state = "synced"
@@ -3639,6 +3672,10 @@ def _official_account_global_response(router: str, details: Dict[str, Any]) -> D
         "serialNumber": serial, "online": bool(serial), "authorized": authorized, "matched": matched,
         "projectId": str(details.get("projectId") or ""),
         "projectName": str(details.get("projectName") or ""), "syncState": sync_state,
+        "createTime": str(details.get("createTime") or ""),
+        "meshSerials": list(details.get("meshSerials") or []),
+        "bindingVersion": details.get("bindingVersion") or 0,
+        "accountFingerprint": str(details.get("accountFingerprint") or ""),
     }
     if code:
         row["errorCode"] = code
@@ -3662,7 +3699,8 @@ def _official_account_global_response(router: str, details: Dict[str, Any]) -> D
     if isinstance(expiry, int) and expiry > 0:
         result["expireTime"] = expiry
     for key in ("localCleared", "remoteRevocation", "operationState", "retrySafe", "errorCode", "error",
-                "cloudVerified", "routerVerified", "serial", "projectId", "projectName", "verifiedAt"):
+                "cloudVerified", "routerVerified", "serial", "projectId", "projectName", "verifiedAt",
+                "createTime", "meshSerials", "bindingVersion", "accountFingerprint"):
         if key in details:
             result[key] = details[key]
     return result
@@ -3671,38 +3709,42 @@ def _official_account_global_response(router: str, details: Dict[str, Any]) -> D
 @app.route("/api/router/child-guard/official/auth", methods=["GET", "POST", "DELETE"])
 @app.route("/api/official-account", methods=["GET", "POST", "DELETE"])
 def api_child_guard_official_auth():
-    if not (check_read_token() if request.method == "GET" else _official_account_management_auth()):
+    if not _official_account_management_auth():
         return jsonify({"ok": False, "error": "unauthorized"}), 401
     body = request.get_json(silent=True) or {} if request.method == "POST" else {}
+    if not isinstance(body, dict):
+        return jsonify({"ok": False, "errorCode": "invalid_request", "error": "invalid JSON object"}), 400
     router = clean_saved_value(body.get("router") or request.args.get("router") or primary_router_name())
     try:
         if request.method == "GET":
+            # verify remains a compatibility parameter, never a cloud trigger.
             return jsonify(_official_account_global_response(router, OFFICIAL_CHILD_GUARD.authorization_status(
                 router, verify=request.args.get("verify") == "1")))
         if request.method == "DELETE":
             details = {**OFFICIAL_CHILD_GUARD.logout(router), "localCleared": True,
                        "operationState": "complete", "retrySafe": True}
             return jsonify(_official_account_global_response(router, details))
-        if body.get("action") == "refresh":
-            return jsonify(_official_account_global_response(router, OFFICIAL_CHILD_GUARD.refresh(router)))
-        account, password = str(body.get("account") or ""), str(body.get("password") or "")
-        if not account.strip() or not password or len(account) > 128 or len(password) > 256:
-            return jsonify({"ok": False, "errorCode": "invalid_request", "error": "请填写官方账号和密码"}), 400
-        return jsonify(_official_account_global_response(router, OFFICIAL_CHILD_GUARD.connect(router, account, password)))
+        from official_child_guard import reject_credentials
+        reject_credentials(body)
+        if body.get("action") in {"refresh", "login"}:
+            raise OfficialGuardError("password_login_deprecated" if body.get("action") == "login" else "cloud_refresh_deprecated",
+                "APP must authenticate with the official cloud over HTTPS and rebind metadata")
+        if body.get("action") not in (None, "", "bind", "binding", "login") and "binding" not in body:
+            raise OfficialGuardError("invalid_request", "Only bind is accepted; Hub no longer logs in to the cloud")
+        binding = body.get("binding") if isinstance(body.get("binding"), dict) else body
+        binding = {key: value for key, value in binding.items() if key not in {"action", "router", "bindings"}}
+        details = OFFICIAL_CHILD_GUARD.install_binding(router, binding)
+        return jsonify(_official_account_global_response(router, details))
     except OfficialGuardError as error:
-        code = error.code
+        if error.code in {"password_login_deprecated", "cloud_refresh_deprecated", "credentials_forbidden"}:
+            return jsonify({"ok": False, "errorCode": error.code,
+                            "error": str(error), "cloudDirectRequired": True}), 410
         try:
             details = OFFICIAL_CHILD_GUARD.authorization_status(router)
         except Exception:
             details = {}
-        if request.method == "DELETE":
-            pending = error.code in {"official_logout_pending", "official_connection_pending", "official_unavailable"}
-            code = "official_logout_pending" if pending else "official_logout_failed"
-            details.update(ok=False, authorized=False, localCleared=True,
-                remoteRevocation="unknown" if pending else "failed",
-                operationState="pending_unknown" if pending else "failed", retrySafe=False)
         response = _official_account_global_response(router, details)
-        response.update(ok=False, authorized=False, errorCode=code, error=str(error))
+        response.update(ok=False, authorized=False, errorCode=error.code, error=str(error))
         return jsonify(response), 400 if error.code == "invalid_request" else 409
 
 
@@ -4085,6 +4127,9 @@ def api_child_guard_devices_collection():
     # LabProbeApp manages the router's native child_guard membership. Official
     # cloud synchronization is an explicit opt-in for clients that need it.
     if request.args.get("sync") == "official":
+        for key in ("cloudConfirmed", "officialUid", "officialUids", "targetUid", "operationId", "bindingVersion"):
+            if key in body:
+                operation[key] = body[key]
         return _child_guard_official_membership("add_device", operation)
     return _child_guard_execute("add_device", operation)
 
@@ -4110,6 +4155,9 @@ def api_child_guard_device_delete(uid: str):
         macs = cached.get("macs", []) if cached else []
     operation = {"uid": normalized_uid, "macs": macs, "router": body.get("router")}
     if request.args.get("sync") == "official":
+        for key in ("cloudConfirmed", "officialUid", "officialUids", "targetUid", "operationId", "bindingVersion"):
+            if key in body:
+                operation[key] = body[key]
         return _child_guard_official_membership("remove_device", operation)
     return _child_guard_execute("remove_device", operation)
 
@@ -6094,10 +6142,43 @@ def api_ipv6_neighbors():
     return jsonify({"ok": True, "count": len(rows), "neighbors": rows})
 
 
-@app.route("/api/events", methods=["GET"])
+@app.route("/api/events", methods=["GET", "POST"])
 def api_events():
     if not check_read_token():
         return jsonify({"ok": False, "error": "unauthorized"}), 401
+    if request.method == "POST":
+        body = request.get_json(silent=True) or {}
+        if not isinstance(body, dict) or body.get("type") != "certificate_expiry":
+            return jsonify({"ok": False, "error": "仅支持证书到期事件", "errorCode": "invalid_event"}), 400
+        event_key = str(body.get("eventKey") or "").strip()[:200]
+        title = str(body.get("title") or "").strip()[:120]
+        name = str(body.get("name") or "").strip()[:120]
+        detail = str(body.get("newValue") or "").strip()[:500]
+        domain = str(body.get("domain") or "").strip()[:253]
+        expires_on = str(body.get("expiresOn") or "").strip()[:10]
+        if not event_key or not title or not domain or not expires_on:
+            return jsonify({"ok": False, "error": "证书到期事件缺少必要字段", "errorCode": "invalid_event"}), 400
+        try:
+            days_remaining = int(body.get("daysRemaining", -1))
+        except (TypeError, ValueError):
+            days_remaining = -1
+        with DATA_LOCK:
+            events = load_json(EVENTS_FILE, [])
+            existing = next((event for event in events if str(event.get("eventKey") or "") == event_key), None)
+            if existing is not None:
+                return jsonify({"ok": True, "duplicate": True, "event": existing})
+            event = add_event({
+                "type": "certificate_expiry",
+                "eventKey": event_key,
+                "title": title,
+                "name": name,
+                "newValue": detail,
+                "domain": domain,
+                "expiresOn": expires_on,
+                "daysRemaining": days_remaining,
+                "level": "warning",
+            })
+        return jsonify({"ok": True, "duplicate": False, "event": event}), 201
     after = int(request.args.get("after", "0"))
     events = load_json(EVENTS_FILE, [])
     return jsonify({"ok": True, "events": [e for e in events if int(e.get("id", 0)) > after and not e.get("deleted")]})
@@ -6452,6 +6533,10 @@ def command_line() -> int:
         LOGGER.warning("configuration: %s", warning)
     for error in report["errors"]:
         LOGGER.error("configuration: %s", error)
+    https_service = globals().get("HTTPS_SERVICE")
+    if https_service is not None:
+        https_service.start_if_enabled()
+        LOGGER.info("https enabled=%s public=%s", bool(https_service.config.get("enabled")), https_service.public_url())
     # Flask 3 enables threaded serving by default. Keep it explicit because
     # notification SSE and slow router diagnostics require concurrent requests.
     app.run(host=bind_host, port=PORT, threaded=True)

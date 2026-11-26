@@ -12,6 +12,7 @@ from __future__ import annotations
 import ipaddress
 import hashlib
 import json
+import re
 import threading
 import time
 from pathlib import Path
@@ -31,6 +32,14 @@ class FirewallAutomationError(ValueError):
 
 def _text(value: Any) -> str:
     return str(value or "").strip()
+
+
+def _mapping_interface_matches(mapping: Dict[str, Any], interface: str) -> bool:
+    actual = _text(interface).lower()
+    expected = _text(mapping.get("src") or mapping.get("wanId")).lower()
+    if expected in {"", "all", "auto"}:
+        return re.fullmatch(r"wan[0-9]{0,2}", actual) is not None
+    return actual == expected
 
 
 def _enabled(value: Any, default: bool = True) -> bool:
@@ -222,9 +231,6 @@ class FirewallAutomationService:
             raise FirewallAutomationError("丢弃规则不参与映射自动化")
         if _text(rule.get("direction")).lower() != "forward":
             raise FirewallAutomationError("映射只能关联 WAN 到 LAN 的转发规则")
-        if _text(rule.get("inIface")).lower() != "wan" or _text(rule.get("outIface")).lower() != "lan":
-            raise FirewallAutomationError("映射防火墙规则必须使用 WAN 入接口和 LAN 出接口")
-
         provisional = {
             "mappingKind": mapping_kind,
             "mappingId": mapping_id,
@@ -233,6 +239,8 @@ class FirewallAutomationService:
         mapping = self._mapping_spec(provisional, fresh=True)
         if mapping is None:
             raise FirewallAutomationError("关联的映射规则不存在或暂不可读取", "MAPPING_NOT_FOUND", 404)
+        if not _mapping_interface_matches(mapping, rule.get("inIface")) or _text(rule.get("outIface")).lower() != "lan":
+            raise FirewallAutomationError("映射防火墙规则入接口必须与映射线路一致，出接口必须为 LAN")
         if _text(mapping.get("addressFamily")) != family:
             raise FirewallAutomationError("防火墙规则与映射的 IP 版本不一致")
         if not _protocol_matches(rule.get("proto"), mapping.get("protocol")):
@@ -310,6 +318,7 @@ class FirewallAutomationService:
             "address": _ip(candidate, family),
             "protocol": _text(rule.get("transportProtocol") or "TCP").lower(),
             "targetPort": rule.get("targetPort"),
+            "wanId": _text(rule.get("wanId") or "wan"),
         }
 
     @staticmethod
@@ -339,6 +348,7 @@ class FirewallAutomationService:
             "address": _ip(rule.get("destIp"), "ipv4"),
             "protocol": _text(rule.get("proto") or "tcp").lower(),
             "targetPort": rule.get("destPort"),
+            "src": _text(rule.get("src")),
         }
 
     def _mapping_spec(self, binding: Dict[str, Any], fresh: bool = False) -> Optional[Dict[str, Any]]:
@@ -378,7 +388,7 @@ class FirewallAutomationService:
             and bool(_field_value(field, rule.get(field), family))
             and _text(rule.get("target")).upper() == "ACCEPT"
             and _text(rule.get("direction")).lower() == "forward"
-            and _text(rule.get("inIface")).lower() == "wan"
+            and _mapping_interface_matches(mapping, rule.get("inIface"))
             and _text(rule.get("outIface")).lower() == "lan"
             and _text(mapping.get("addressFamily")) == family
             and _protocol_matches(rule.get("proto"), mapping.get("protocol"))

@@ -6,6 +6,7 @@ Supports dual modes:
 """
 
 import json
+import re
 import threading
 import time
 from typing import Any, Callable, Dict, List, Optional, Tuple
@@ -476,7 +477,7 @@ class ReyeeEWebDriver(RouterDriver):
     @classmethod
     def _upnp_wan(cls, value: Any, fallback: str = "AUTO") -> str:
         wan = str(value or fallback).strip().lower()
-        if wan not in cls._UPNP_WANS:
+        if wan not in cls._UPNP_WANS and not re.fullmatch(r"[a-z0-9_.:-]{1,64}", wan):
             raise RouterValidationError("不支持的 UPnP 线路", "UPNP_WAN_UNSUPPORTED")
         return wan
 
@@ -524,6 +525,23 @@ class ReyeeEWebDriver(RouterDriver):
 
     # --- Firewall ---
 
+    @staticmethod
+    def _firewall_interfaces(network: Dict[str, Any]) -> List[str]:
+        names: List[str] = []
+        wans = network.get("wan") if isinstance(network, dict) else []
+        if isinstance(wans, list):
+            for index, _row in enumerate(wans):
+                names.append("wan" if index == 0 else f"wan{index}")
+        lans = network.get("lan") if isinstance(network, dict) else []
+        if isinstance(lans, list):
+            for index, row in enumerate(lans):
+                if index == 0:
+                    names.append("lan")
+                else:
+                    vlan = str(row.get("vlanid") or "").strip() if isinstance(row, dict) else ""
+                    names.append(f"lan_{vlan}" if vlan.isdigit() else f"lan_{index}")
+        return list(dict.fromkeys(names))
+
     def get_firewall(self, force: bool = False) -> Dict[str, Any]:
         try:
             if self._legacy_client and hasattr(self._legacy_client, "firewall"):
@@ -536,6 +554,10 @@ class ReyeeEWebDriver(RouterDriver):
                     ])
                     config = data[0] if isinstance(data, list) and len(data) > 0 and isinstance(data[0], dict) else {}
                     stats = data[1] if isinstance(data, list) and len(data) > 1 and isinstance(data[1], dict) else {}
+                    try:
+                        network = self.rpc("devConfig.get", "network")
+                    except Exception:
+                        network = {}
                     stat_map = {
                         str(row.get("uuid")): row
                         for row in stats.get("list", [])
@@ -546,7 +568,7 @@ class ReyeeEWebDriver(RouterDriver):
                         for rule in config.get("list", [])
                         if isinstance(rule, dict)
                     ]
-                    return {**config, "list": rules, "updatedAt": int(time.time())}
+                    return {**config, "list": rules, "interfaces": self._firewall_interfaces(network), "updatedAt": int(time.time())}
                 return self._cached("firewall", 5.0, load, force)
             raise NotImplementedError("firewall not available")
         except Exception as exc:

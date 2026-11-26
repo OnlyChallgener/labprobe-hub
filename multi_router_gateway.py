@@ -538,7 +538,7 @@ def _worker_official_call(router: dict, method: str, body: dict | None = None) -
     """Call one loopback worker; return reachability and a non-secret payload."""
     url = f"http://127.0.0.1:{router['workerPort']}{OFFICIAL_ACCOUNT_PATH}"
     if method == "GET":
-        url += "?verify=1"
+        url += ""
     data = None if body is None else json.dumps(body, ensure_ascii=False).encode("utf-8")
     headers = {"Authorization": f"Bearer {router['appToken']}", "Accept": "application/json"}
     if data is not None:
@@ -554,7 +554,7 @@ def _worker_official_call(router: dict, method: str, body: dict | None = None) -
             value = {}
         return True, value if isinstance(value, dict) else {"ok": False, "errorCode": "official_request_rejected"}
     except (TimeoutError, socket.timeout):
-        # A timed-out DELETE may still be revoking cloud auth or waiting for an
+        # A timed-out DELETE may still be clearing local state or waiting for an
         # already-delivered native command. Never describe it as stopped.
         return True, {"ok": False, "errorCode": "worker_timeout",
                       "operationState": "pending_unknown", "retrySafe": False}
@@ -572,15 +572,58 @@ def _worker_official_call(router: dict, method: str, body: dict | None = None) -
     return True, value if isinstance(value, dict) else {"ok": False, "errorCode": "official_response_invalid"}
 
 
-def aggregate_official_account(config: dict, method: str, body: dict | None = None) -> dict:
-    """Fan out concurrently and expose only the stable global status contract."""
-    body = body or None
-    with ThreadPoolExecutor(max_workers=max(1, len(config["routers"])),
-                            thread_name_prefix="official-account") as pool:
-        replies = list(pool.map(lambda router: _worker_official_call(router, method, body), config["routers"]))
+def _reject_gateway_credentials(value):
+    forbidden = {"password", "passwd", "token", "refreshtoken", "accesstoken", "idtoken", "authorization", "cookie", "secret", "credentials"}
+    if isinstance(value, dict):
+        for key, child in value.items():
+            if str(key).replace("_", "").replace("-", "").lower() in forbidden:
+                raise ValueError("credentials_forbidden")
+            _reject_gateway_credentials(child)
+    elif isinstance(value, list):
+        for child in value:
+            _reject_gateway_credentials(child)
 
-    rows = []
-    accounts = []
+
+def _binding_for_serial(body: dict, serial: str) -> dict | None:
+    bindings = body.get("bindings", [body.get("binding") or body])
+    if not isinstance(bindings, list) or not bindings or any(not isinstance(row, dict) for row in bindings):
+        raise ValueError("invalid bindings")
+    for binding in bindings:
+        if str(binding.get("serial") or "").strip().upper() == serial.strip().upper():
+            return {key: value for key, value in binding.items() if key not in {"router", "bindings"}}
+    return None
+
+
+def aggregate_official_account(config: dict, method: str, body: dict | None = None) -> dict:
+    body = body or None
+    if method == "POST":
+        if not isinstance(body, dict) or body.get("action") not in (None, "", "bind", "binding"):
+            raise ValueError("unsupported action")
+        if "bindings" not in body and "binding" not in body and "serial" not in body:
+            raise ValueError("password login is no longer supported")
+        _reject_gateway_credentials(body)
+        candidates = body.get("bindings", [body.get("binding") or body])
+        if not isinstance(candidates, list) or not candidates:
+            raise ValueError("invalid bindings")
+        for binding in candidates:
+            if not isinstance(binding, dict):
+                raise ValueError("invalid binding")
+        with ThreadPoolExecutor(max_workers=max(1, len(config["routers"])), thread_name_prefix="official-account") as pool:
+            replies = list(pool.map(lambda router: _worker_official_call(router, "GET"), config["routers"]))
+        jobs = []
+        for index, (router, (online, value)) in enumerate(zip(config["routers"], replies)):
+            binding = _binding_for_serial(body, str(value.get("serial") or "")) if online and value.get("serial") else None
+            if binding is not None:
+                jobs.append((index, router, binding))
+        with ThreadPoolExecutor(max_workers=max(1, len(jobs)), thread_name_prefix="official-account") as pool:
+            posted = list(pool.map(lambda job: (job[0], _worker_official_call(job[1], "POST", {"action": "bind", "binding": job[2]})), jobs))
+        for index, reply in posted:
+            replies[index] = reply
+    else:
+        with ThreadPoolExecutor(max_workers=max(1, len(config["routers"])), thread_name_prefix="official-account") as pool:
+            replies = list(pool.map(lambda router: _worker_official_call(router, method, body), config["routers"]))
+
+    rows, accounts = [], []
     fingerprints = set()
     for router, (online, value) in zip(config["routers"], replies):
         serial = str(value.get("serial") or "").strip().upper()
@@ -591,134 +634,51 @@ def aggregate_official_account(config: dict, method: str, body: dict | None = No
         if fingerprint:
             fingerprints.add(fingerprint)
         authorized = bool(online and value.get("authorized") and serial)
-        matched = bool(authorized and value.get("cloudVerified") and value.get("routerVerified")
-                       and value.get("projectId"))
+        matched = bool(authorized and value.get("cloudVerified") and value.get("routerVerified") and value.get("projectId"))
         code = str(value.get("errorCode") or "")
-        logout_fields = {}
+        extra = {}
         if method == "DELETE":
-            local_cleared = (bool(value.get("localCleared"))
-                             if online and "localCleared" in value else
-                             not bool(value.get("authorized"))
-                             if online and value.get("ok") is True and "authorized" in value else None)
-            if not online:
-                remote, operation = "unknown", "pending_unknown" if code == "worker_timeout" else "unknown"
-                sync_state, error_code = ("failed" if code == "worker_timeout" else "offline"), code or "worker_offline"
-            elif value.get("ok") is False:
-                pending = code in {"worker_timeout", "official_logout_pending",
-                                   "official_connection_pending", "official_unavailable"}
-                remote, operation = ("unknown" if pending else "failed"), ("pending_unknown" if pending else "failed")
-                sync_state, error_code = ("checking" if pending else "failed"), code or "official_logout_failed"
-            elif local_cleared is False:
-                remote, operation = "failed", "failed"
-                sync_state, error_code = "failed", code or "official_logout_failed"
-            elif code:
-                pending = code in {"worker_timeout", "official_logout_pending",
-                                   "official_connection_pending", "official_unavailable"}
-                remote, operation = ("unknown" if pending else "failed"), ("pending_unknown" if pending else "failed")
-                sync_state, error_code = ("checking" if pending else "failed"), code
-            elif local_cleared is True:
-                remote, operation = "confirmed", "complete"
-                sync_state, error_code = "unauthorized", ""
-            else:
-                remote, operation = "unknown", "unknown"
-                sync_state, error_code = "failed", "official_logout_failed"
-            logout_fields = {"localCleared": local_cleared, "remoteRevocation": remote,
-                             "operationState": operation, "retrySafe": remote == "confirmed"}
+            local = bool(value.get("localCleared")) if online and "localCleared" in value else None
+            sync_state = "unauthorized" if local else "offline" if not online else "failed"
+            remote = "app-managed/confirmed-by-app" if local else "unknown" if not online else "app-managed/not-confirmed"
+            extra = {"localCleared": local, "remoteRevocation": remote,
+                     "operationState": "complete" if local else "pending_unknown" if not online or value.get("errorCode") == "worker_timeout" else "failed",
+                     "retrySafe": local is True}
+            if not local:
+                code = code or ("worker_offline" if not online else "official_logout_failed")
         elif not online:
-            sync_state, error_code = "offline", "worker_offline"
+            sync_state, code = "offline", "worker_offline"
         elif not serial:
-            sync_state, error_code = "offline", "router_serial_unknown"
+            sync_state, code = "offline", "router_serial_unknown"
         elif value.get("ok") is False or not authorized:
-            if code in {"official_auth_required", "official_token_expired"}:
-                sync_state = "unauthorized"
-            elif code in {"official_connection_pending", "official_unavailable"}:
-                sync_state = "checking"
-            else:
-                sync_state = "failed"
-            error_code = code or "official_sync_failed"
-        elif not value.get("cloudVerified"):
-            sync_state, error_code = "checking", code or "official_connection_pending"
-        elif not value.get("routerVerified") or not value.get("projectId"):
-            sync_state, error_code = "failed", code or "official_router_mismatch"
+            sync_state, code = ("unauthorized" if code in {"official_auth_required", "official_token_expired"} else "failed"), code or "official_sync_failed"
+        elif not matched:
+            sync_state, code = "failed", code or "official_router_mismatch"
         else:
-            sync_state, error_code = "synced", ""
-        row = {"routerId": router["routerId"], "name": router["name"], "site": router["site"],
-               "model": router["model"], "serialNumber": serial, "online": bool(online and serial),
-               "authorized": authorized, "matched": matched,
-               "projectId": str(value.get("projectId") or ""),
-               "projectName": str(value.get("projectName") or ""), "syncState": sync_state,
-               **logout_fields}
-        if error_code:
-            row["errorCode"] = error_code
-            row["error"] = _official_error_text(error_code)
+            sync_state, code = "synced", ""
+        row = {"routerId": router["routerId"], "name": router["name"], "site": router["site"], "model": router["model"], "serialNumber": serial, "online": bool(online and serial), "authorized": authorized, "matched": matched, "projectId": str(value.get("projectId") or ""), "projectName": str(value.get("projectName") or ""), "syncState": sync_state,
+               "createTime": str(value.get("createTime") or ""),
+               "meshSerials": list(value.get("meshSerials") or []),
+               "bindingVersion": value.get("bindingVersion") or 0,
+               "accountFingerprint": str(value.get("accountFingerprint") or ""), **extra}
+        if code:
+            row.update(errorCode=code, error=_official_error_text(code))
         rows.append(row)
 
-    project_ids = {row["projectId"] for row in rows if row["matched"] and row["projectId"]}
+    projects = {row["projectId"] for row in rows if row["matched"] and row["projectId"]}
     serials = {row["serialNumber"] for row in rows if row["matched"] and row["serialNumber"]}
-    expiries = []
-    for row, (_, value) in zip(rows, replies):
-        if row["matched"] and isinstance(value.get("expireTime"), int):
-            expiries.append(value["expireTime"])
+    expiries = [value["expireTime"] for row, (_, value) in zip(rows, replies) if row["matched"] and isinstance(value.get("expireTime"), int)]
     all_synced = bool(rows) and all(row["syncState"] == "synced" for row in rows)
     conflict = len(fingerprints) > 1
-    if conflict:
-        state = "conflict"
-    elif serials:
-        state = "authorized" if all_synced else "partial"
-    elif any(row["syncState"] in {"offline", "checking", "failed"} for row in rows):
-        state = "checking"
-    else:
-        state = "unauthorized"
-
-    if conflict:
-        hub_authorization = "partial"
-    elif all_synced:
-        hub_authorization = "synced"
-    elif serials:
-        hub_authorization = "partial"
-    elif any(row["syncState"] == "offline" for row in rows):
-        hub_authorization = "offline"
-    elif any(row["syncState"] in {"failed", "checking"} for row in rows):
-        hub_authorization = "failed"
-    else:
-        hub_authorization = "unauthorized"
-
+    state = "conflict" if conflict else "authorized" if serials and all_synced else "partial" if serials else "checking" if any(row["syncState"] in {"offline", "failed"} for row in rows) else "unauthorized"
+    hub = "partial" if conflict else "synced" if all_synced else "partial" if serials else "offline" if any(row["syncState"] == "offline" for row in rows) else "failed" if any(row["syncState"] in {"failed", "checking"} for row in rows) else "unauthorized"
     if method == "DELETE":
-        confirmed = sum(row["remoteRevocation"] == "confirmed" for row in rows)
-        unknown = any(row["remoteRevocation"] == "unknown" for row in rows)
-        failed = any(row["remoteRevocation"] == "failed" for row in rows)
+        confirmed = sum(row["localCleared"] is True for row in rows)
         all_confirmed = bool(rows) and confirmed == len(rows)
-        local_values = [row["localCleared"] for row in rows]
-        local_cleared = (False if any(value is False for value in local_values)
-                         else True if all(value is True for value in local_values) else None)
-        if all_confirmed:
-            logout_state, operation_state, hub_authorization = "unauthorized", "complete", "unauthorized"
-        elif unknown:
-            logout_state = "partial" if confirmed else "pending_unknown"
-            operation_state, hub_authorization = "pending_unknown", "partial" if confirmed else "failed"
-        elif confirmed:
-            logout_state, operation_state, hub_authorization = "partial", "partial_failure", "partial"
-        else:
-            logout_state, operation_state, hub_authorization = "failed", "failed", "failed"
-        remote = ("confirmed" if all_confirmed else "unknown" if unknown
-                  else "partial" if confirmed and failed else "failed")
-        return {"ok": all_confirmed,
-                "account": accounts[0] if accounts else "",
-                "authorized": (True if any(value is False for value in local_values)
-                               else False if local_cleared is True else None),
-                "localCleared": local_cleared, "remoteRevocation": remote,
-                "operationState": operation_state, "retrySafe": all_confirmed,
-                "state": logout_state, "projectCount": 0, "matchedRouterCount": 0,
-                "hubAuthorization": hub_authorization, "routers": rows,
-                "errors": [{"routerId": row["routerId"], "errorCode": row.get("errorCode", "official_logout_failed"),
-                            "error": row.get("error", _official_error_text("official_logout_failed")),
-                            "operationState": row["operationState"], "retrySafe": row["retrySafe"]}
-                           for row in rows if row.get("errorCode")]}
-
-    result = {"ok": True, "account": accounts[0] if accounts else _mask_official_account((body or {}).get("account")),
-              "authorized": bool(serials), "state": state, "projectCount": len(project_ids),
-              "matchedRouterCount": len(serials), "hubAuthorization": hub_authorization,
-              "routers": rows}
+        values = [row["localCleared"] for row in rows]
+        local = False if any(value is False for value in values) else True if all(value is True for value in values) else None
+        return {"ok": all_confirmed, "account": accounts[0] if accounts else "", "authorized": False if local else None, "localCleared": local, "remoteRevocation": "app-managed/confirmed-by-app" if all_confirmed else "app-managed/partially-confirmed-by-app" if confirmed else "unknown", "operationState": "complete" if all_confirmed else "partial" if confirmed else "failed", "retrySafe": all_confirmed, "state": "unauthorized" if all_confirmed else "partial", "projectCount": 0, "matchedRouterCount": 0, "hubAuthorization": "unauthorized" if all_confirmed else "partial", "routers": rows, "errors": [{"routerId": row["routerId"], "errorCode": row.get("errorCode", "official_logout_failed"), "error": row.get("error", _official_error_text("official_logout_failed")), "operationState": row["operationState"], "retrySafe": row["retrySafe"]} for row in rows if row.get("errorCode")]}
+    result = {"ok": True, "account": accounts[0] if accounts else "", "authorized": bool(serials), "state": state, "projectCount": len(projects), "matchedRouterCount": len(serials), "hubAuthorization": hub, "routers": rows}
     if expiries:
         result["expireTime"] = min(expiries)
     return result
@@ -855,27 +815,34 @@ def make_registry_handler(config: dict, controller: DefaultRouterController | No
                     return
                 try:
                     size = int(self.headers.get("Content-Length", "0"))
-                    if not 0 < size <= 4096:
+                    if not 0 < size <= 65536:
                         raise ValueError("invalid request size")
                     body = json.loads(self.rfile.read(size))
                     if not isinstance(body, dict):
                         raise ValueError("invalid request body")
-                    action = body.get("action")
-                    if action == "refresh":
-                        worker_body = {"action": "refresh"}
-                    elif action in (None, "", "login"):
-                        account = str(body.get("account") or "")
-                        password = str(body.get("password") or "")
-                        if not account.strip() or not password or len(account) > 128 or len(password) > 256:
-                            raise ValueError("account and password are required")
-                        worker_body = {"account": account, "password": password}
-                    else:
+                    try:
+                        _reject_gateway_credentials(body)
+                    except ValueError:
+                        self.respond({"ok": False, "errorCode": "credentials_forbidden",
+                                      "error": "APP must authenticate directly with the official cloud"}, 410)
+                        return
+                    if body.get("action") == "refresh":
+                        self.respond({"ok": False, "errorCode": "cloud_refresh_deprecated",
+                                      "error": "APP must refresh directly with the official cloud"}, 410)
+                        return
+                    if body.get("action") not in (None, "", "bind", "binding"):
                         raise ValueError("unsupported action")
                 except (ValueError, TypeError, json.JSONDecodeError):
                     self.respond({"ok": False, "errorCode": "invalid_request", "error": "invalid request"}, 400)
                     return
-                self.respond(aggregate_official_account(config, "POST", worker_body))
-                return
+                try:
+                    result = aggregate_official_account(config, "POST", body)
+                except ValueError as error:
+                    deprecated = str(error) == "credentials_forbidden" or "password login" in str(error)
+                    self.respond({"ok": False, "errorCode": str(error),
+                                  "error": "APP must authenticate directly with the official cloud"}, 410 if deprecated else 400)
+                    return
+                self.respond(result)
             if self.path != "/api/routers/default":
                 self.send_error(404)
                 return

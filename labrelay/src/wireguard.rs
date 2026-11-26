@@ -95,8 +95,12 @@ pub fn apply_endpoint_update(
     if profile.owner.is_empty() || profile.owner != update.owner {
         bail!("endpoint updater owner does not match profile");
     }
-    let profile_wan = profile.wan_id.trim().to_ascii_lowercase();
+    let mut profile_wan = profile.wan_id.trim().to_ascii_lowercase();
     let update_wan = update.wan_id.trim().to_ascii_lowercase();
+    if profile_wan.is_empty() && profile.endpoint_source != "manual" && update_wan == "wan" {
+        profile.wan_id = "wan".into();
+        profile_wan = "wan".into();
+    }
     if profile_wan != update_wan {
         bail!("endpoint updater wanId does not match profile");
     }
@@ -1432,6 +1436,32 @@ mod tests {
         assert!(apply_endpoint_update(&mut profiles, &wrong_wan).is_err());
         assert_eq!(profiles[0].resolved_endpoint, "wg.example.test:51820");
         assert_eq!(profiles[0].endpoint_revision, 1);
+    }
+
+    #[test]
+    fn legacy_empty_wan_accepts_primary_wan_endpoint_update() {
+        let mut profiles = vec![WireGuardEndpointProfile {
+            id: "wg-ddns".into(),
+            endpoint_source: "ddns".into(),
+            owner: "ddns:wg-ddns".into(),
+            hostname: "wg.example.test".into(),
+            binding_mode: "fixed-port".into(),
+            port: 51820,
+            ..WireGuardEndpointProfile::default()
+        }];
+        let update = WireGuardEndpointUpdate {
+            profile_id: "wg-ddns".into(),
+            endpoint_source: "ddns".into(),
+            owner: "ddns:wg-ddns".into(),
+            endpoint: "wg.example.test:51820".into(),
+            expected_endpoint_revision: 0,
+            endpoint_revision: 1,
+            wan_id: "wan".into(),
+        };
+
+        let applied = apply_endpoint_update(&mut profiles, &update).unwrap();
+        assert_eq!(applied.wan_id, "wan");
+        assert_eq!(applied.endpoint_revision, 1);
     }
 
     #[test]

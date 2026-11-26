@@ -215,24 +215,28 @@ def _normalize_interface(key: str, raw: Any, *, scalars: bool) -> Dict[str, Any]
     }
 
 
+def _interface_keys(raw_intfs: Any, tmp: Dict[str, Any]) -> List[str]:
+    current = [str(item) for item in raw_intfs] if isinstance(raw_intfs, list) else []
+    return list(dict.fromkeys(current + [str(key) for key in tmp]))
+
+
 def normalize_progress(payload: Dict[str, Any]) -> Dict[str, Any]:
     stat = _text(payload.get("stat"), 16).lower()
     if stat not in {"start", "running", "end"}:
         stat = "idle"
-    raw_intfs = payload.get("intf")
-    intf_keys = [str(item) for item in raw_intfs] if isinstance(raw_intfs, list) else []
     tmp = payload.get("tmp_rst") if isinstance(payload.get("tmp_rst"), dict) else {}
-    if not intf_keys:
-        intf_keys = [key for key in tmp.keys()]
-    interfaces = [_normalize_interface(key, tmp.get(key), scalars=False) for key in intf_keys]
-    primary = interfaces[0] if interfaces else None
+    interfaces = [_normalize_interface(key, tmp.get(key), scalars=False) for key in _interface_keys(payload.get("intf"), tmp)]
+    primary = next((item for item in interfaces if item["intf"] != "max"), interfaces[0] if interfaces else None)
+    aggregate = next((item for item in interfaces if item["intf"] == "max"), None)
     return {
         "stat": stat,
         "finished": stat == "end",
         "running": stat in {"start", "running"},
         "errorCode": _text(payload.get("error_code"), 8) or "0",
+        "mode": "max" if aggregate is not None or sum(item["intf"] != "max" for item in interfaces) > 1 else "unite",
         "interfaces": interfaces,
         "primary": primary,
+        "aggregate": aggregate,
         "updatedAt": int(time.time()),
     }
 
@@ -245,18 +249,17 @@ def normalize_history(payload: Dict[str, Any]) -> Dict[str, Any]:
     for row in rows:
         if not isinstance(row, dict):
             continue
-        raw_intfs = row.get("intf")
-        intf_keys = [str(item) for item in raw_intfs] if isinstance(raw_intfs, list) else []
         tmp = row.get("tmp_rst") if isinstance(row.get("tmp_rst"), dict) else {}
-        if not intf_keys:
-            intf_keys = [key for key in tmp.keys()]
-        interfaces = [_normalize_interface(key, tmp.get(key), scalars=True) for key in intf_keys]
-        primary = interfaces[0] if interfaces else None
+        interfaces = [_normalize_interface(key, tmp.get(key), scalars=True) for key in _interface_keys(row.get("intf"), tmp)]
+        primary = next((item for item in interfaces if item["intf"] != "max"), interfaces[0] if interfaces else None)
+        aggregate = next((item for item in interfaces if item["intf"] == "max"), None)
         records.append({
             "timestamp": _text(row.get("timestamp"), 24),
             "epoch": _as_epoch(row.get("timestamp")),
+            "mode": "max" if aggregate is not None or sum(item["intf"] != "max" for item in interfaces) > 1 else "unite",
             "interfaces": interfaces,
             "primary": primary,
+            "aggregate": aggregate,
         })
     records.sort(key=lambda item: item.get("epoch") or 0, reverse=True)
     return {"records": records[:MAX_HISTORY], "total": len(records)}

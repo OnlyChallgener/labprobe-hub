@@ -131,6 +131,15 @@ def _stun_server(protocol: str) -> str:
 
 
 def _rule_fingerprint(row: Dict[str, Any]) -> str:
+    data = {
+        str(key): value
+        for key, value in row.items()
+        if str(key) not in {"stats", "uuid", "wanId"}
+    }
+    return hashlib.sha256(json.dumps(data, ensure_ascii=False, sort_keys=True, separators=(",", ":"), default=str).encode()).hexdigest()
+
+
+def _rule_fingerprint_legacy(row: Dict[str, Any]) -> str:
     data = {str(key): value for key, value in row.items() if str(key) not in {"stats", "uuid"}}
     return hashlib.sha256(json.dumps(data, ensure_ascii=False, sort_keys=True, separators=(",", ":"), default=str).encode()).hexdigest()
 
@@ -170,6 +179,7 @@ class StunService:
         self.history_path = Path(hub.DATA_DIR) / "stun_address_history.json"
         self.firewall_path = Path(hub.DATA_DIR) / "stun_firewall.json"
         self.native_mapping_path = Path(hub.DATA_DIR) / "stun_native_portmap.json"
+        self._native_fingerprints_reconciled = False
         self._migrate_legacy_tcp_server()
 
     def _document(self) -> Dict[str, Any]:
@@ -499,10 +509,45 @@ class StunService:
     def _save_native_mapping_bindings(self, rows: Dict[str, Dict[str, Any]]) -> None:
         self.hub.save_json(self.native_mapping_path, {"updatedAt": _now_text(), "rules": rows})
 
+    def _reconcile_native_mapping_fingerprints(self) -> None:
+        """Refresh legacy fingerprints only when every forwarding field still matches."""
+        if self._native_fingerprints_reconciled:
+            return
+        bindings = self._native_mapping_bindings()
+        rules = [rule for rule in self._document()["rules"] if self._is_native_forward(rule)]
+        if not bindings or not rules:
+            self._native_fingerprints_reconciled = True
+            return
+        try:
+            current = self.client.native_port_mapping(True)
+        except Exception:
+            return
+        changed = False
+        for rule in rules:
+            binding = bindings.get(rule["id"], {})
+            fingerprint = _text(binding.get("fingerprint"))
+            expected = self._expected_native_mapping(rule)
+            existing = self._find_native_mapping(current, expected["ruleName"])
+            if existing is None or not self._native_mapping_matches(existing, expected):
+                continue
+            current_fingerprint = _rule_fingerprint(existing)
+            legacy_fingerprint = _rule_fingerprint_legacy(existing)
+            if fingerprint == current_fingerprint or fingerprint != legacy_fingerprint:
+                continue
+            bindings[rule["id"]] = {**binding, "state": "ready", "ruleName": expected["ruleName"], "fingerprint": current_fingerprint, "message": ""}
+            changed = True
+        if changed:
+            self._save_native_mapping_bindings(bindings)
+        self._native_fingerprints_reconciled = True
+
     @staticmethod
     def _native_mapping_rows(snapshot: Dict[str, Any]) -> List[Dict[str, Any]]:
         rows = snapshot.get("portMapping") or snapshot.get("list") or []
         return [dict(row) for row in rows if isinstance(row, dict)] if isinstance(rows, list) else []
+
+    @staticmethod
+    def _native_mapping_payload(row: Dict[str, Any]) -> Dict[str, Any]:
+        return {key: value for key, value in row.items() if key != "wanId"}
 
     @staticmethod
     def _find_native_mapping(snapshot: Dict[str, Any], rule_name: str) -> Optional[Dict[str, Any]]:
@@ -555,7 +600,7 @@ class StunService:
         elif old_row is not None and existing is None:
             verified = self.controller.write_and_verify(
                 "native-portmap",
-                lambda: self.client.rpc("devConfig.add", "port_mapping", {"list": [old_row]}),
+                lambda: self.client.rpc("devConfig.add", "port_mapping", {"list": [self._native_mapping_payload(old_row)]}),
                 lambda: self.client.native_port_mapping(True),
             )
             restored = self._find_native_mapping(verified.get("data", {}), rule_name)
@@ -564,7 +609,10 @@ class StunService:
         elif old_row is not None and existing is not None and _rule_fingerprint(existing) != _rule_fingerprint(old_row):
             verified = self.controller.write_and_verify(
                 "native-portmap",
-                lambda: self.client.rpc("devConfig.update", "port_mapping", {"old": existing, "new": old_row}),
+                lambda: self.client.rpc("devConfig.update", "port_mapping", {
+                    "old": self._native_mapping_payload(existing),
+                    "new": self._native_mapping_payload(old_row),
+                }),
                 lambda: self.client.native_port_mapping(True),
             )
             restored = self._find_native_mapping(verified.get("data", {}), rule_name)
@@ -589,6 +637,12 @@ class StunService:
         if existing:
             current_fingerprint = _rule_fingerprint(existing)
             if binding.get("fingerprint") and binding["fingerprint"] != current_fingerprint:
+                legacy_fingerprint = _rule_fingerprint_legacy(existing)
+                if binding["fingerprint"] == legacy_fingerprint and self._native_mapping_matches(existing, expected):
+                    result = {"state": "ready", "ruleName": expected["ruleName"], "fingerprint": current_fingerprint}
+                    bindings[rule["id"]] = result
+                    self._save_native_mapping_bindings(bindings)
+                    return result
                 result = {"state": "manual_change", "message": "已检测到路由器端口映射被手动修改"}
                 bindings[rule["id"]] = {**binding, **result}
                 self._save_native_mapping_bindings(bindings)
@@ -596,7 +650,10 @@ class StunService:
             if not self._native_mapping_matches(existing, expected):
                 verified = self.controller.write_and_verify(
                     "native-portmap",
-                    lambda: self.client.rpc("devConfig.update", "port_mapping", {"old": existing, "new": expected}),
+                    lambda: self.client.rpc("devConfig.update", "port_mapping", {
+                        "old": self._native_mapping_payload(existing),
+                        "new": expected,
+                    }),
                     lambda: self.client.native_port_mapping(True),
                 )
                 existing = self._find_native_mapping(verified.get("data", {}), expected["ruleName"])
@@ -863,9 +920,10 @@ class StunService:
 
     def rows(self) -> List[Dict[str, Any]]:
         reported = self._reported_rules()
+        document = self._document()
+        self._reconcile_native_mapping_fingerprints()
         firewall_bindings = self._firewall_bindings()
         native_bindings = self._native_mapping_bindings()
-        document = self._document()
         desired = {rule["id"]: rule for rule in document["rules"]}
         sync_errors = self._command_sync_errors(desired)
         # Older router-self rules can retain a working firewall entry after

@@ -41,12 +41,28 @@ def test_upnp_wan1_write_uses_firmware_external_interface_contract():
     assert result["wanId"] == "wan1"
 
 
-def test_upnp_rejects_unknown_line_before_write():
+def test_upnp_rejects_unsafe_interface_before_write():
     rpc = FakeRpc()
     with pytest.raises(RouterValidationError) as raised:
-        driver(rpc).set_upnp(True, "WAN2")
+        driver(rpc).set_upnp(True, "../bad")
     assert raised.value.code == "UPNP_WAN_UNSUPPORTED"
     assert not rpc.calls
+
+
+def test_upnp_preserves_existing_native_interface_name():
+    rpc = FakeRpc()
+    rpc.state["wan"] = "br-wan"
+    result = driver(rpc).get_upnp(force=True)
+    assert result["wan"] == "BR-WAN"
+    assert result["wanId"] == "br-wan"
+
+
+def test_firewall_interfaces_come_from_native_network_config():
+    network = {
+        "wan": [{"proto": "dhcp"}, {"proto": "pppoe"}],
+        "lan": [{"vlanid": "233"}, {"vlanid": "234"}, {"vlanid": "235"}],
+    }
+    assert ReyeeEWebDriver._firewall_interfaces(network) == ["wan", "wan1", "lan", "lan_234", "lan_235"]
 
 
 @pytest.mark.parametrize("ui_wan", ["AUTO", "WAN", "WAN1"])

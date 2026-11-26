@@ -910,6 +910,47 @@ def test_failed_apply_command_reuses_one_id_with_bounded_backoff(tmp_path, monke
     assert terminal[0]["attempts"] == 5
 
 
+def test_failed_endpoint_command_is_retried_from_agent_status(tmp_path, monkeypatch):
+    clock = {"now": 1_000}
+    monkeypatch.setattr(wireguard_module, "_now", lambda: clock["now"])
+    hub = _hub(tmp_path)
+    service = install_wireguard_service(hub)
+    client = hub.app.test_client()
+    service.put(_server(), 0)
+    service.update_endpoint(
+        "ddns-primary", "ddns", "ddns:ddns-primary", "wg.example.test", 0, "wan2"
+    )
+    command = next(row for row in service.commands() if row["action"] == "endpoint")
+    command_id = command["id"]
+    client.post(
+        "/api/router/wireguard/ack?router=Router",
+        json={"acks": [{"id": command_id, "ok": False, "result": {"ok": False}}]},
+    )
+    failed = next(row for row in service.commands() if row["id"] == command_id)
+    assert failed["status"] == "failed"
+    assert failed["retryAfterEpoch"] == clock["now"] + 15
+    stale_status = {
+        "revision": 1,
+        "endpointProfiles": [
+            {"id": "ddns-primary", "endpointRevision": 0, "resolvedEndpoint": ""},
+            {"id": "stun-fallback", "endpointRevision": 0, "resolvedEndpoint": ""},
+        ],
+    }
+
+    client.post("/api/router/wireguard/status?router=Router", json=stale_status)
+    assert next(row for row in service.commands() if row["id"] == command_id)["status"] == "failed"
+    clock["now"] = failed["retryAfterEpoch"]
+    client.post("/api/router/wireguard/status?router=Router", json=stale_status)
+    assert next(row for row in service.commands() if row["id"] == command_id)["status"] == "pending"
+
+    matching_status = copy.deepcopy(stale_status)
+    matching_status["endpointProfiles"][0] = {
+        "id": "ddns-primary", "endpointRevision": 1, "resolvedEndpoint": "wg.example.test:51820",
+    }
+    client.post("/api/router/wireguard/status?router=Router", json=matching_status)
+    assert not any(row["action"] == "endpoint" and row["status"] == "pending" for row in service.commands())
+
+
 def test_successful_apply_command_flow_remains_terminal(tmp_path):
     hub = _hub(tmp_path)
     service = install_wireguard_service(hub)

@@ -1,6 +1,8 @@
 from pathlib import Path
 from types import SimpleNamespace
 import copy
+import hashlib
+import json
 import threading
 import time
 
@@ -427,6 +429,98 @@ def test_tcp_stun_uses_one_router_native_map_while_public_endpoint_changes(tmp_p
         service._remember_endpoint(rule["id"], {"publicEndpoint": endpoint})
         assert service.ensure_native_mapping(rule)["state"] == "ready"
         assert client.native_rules == [created]
+
+
+def test_legacy_native_fingerprint_is_migrated_when_forwarding_fields_match(tmp_path):
+    hub = _hub(tmp_path)
+    client = _Client()
+    service = StunService(hub, client)
+    rule = service.clean_rule({"serviceType": "HTTPS", "targetIpv4": "192.168.5.46", "targetPort": 443})
+    assert service.ensure_native_mapping(rule)["state"] == "ready"
+    service._save_rules([rule])
+    client.native_rules[0]["wanId"] = "wan"
+    legacy = hashlib.sha256(json.dumps(client.native_rules[0], sort_keys=True, separators=(",", ":"), default=str).encode()).hexdigest()
+    service._save_native_mapping_bindings({rule["id"]: {
+        "state": "ready", "ruleName": f"LabProbe STUN {rule['id']}", "fingerprint": legacy,
+    }})
+
+    restarted = StunService(hub, client)
+    row = restarted.rows()[0]
+
+    assert row["nativeMappingState"] == "ready"
+    assert restarted._native_mapping_bindings()[rule["id"]]["fingerprint"] != legacy
+
+
+def test_unknown_native_fingerprint_is_not_reclaimed_even_when_rule_matches(tmp_path):
+    hub = _hub(tmp_path)
+    client = _Client()
+    service = StunService(hub, client)
+    rule = service.clean_rule({"serviceType": "HTTPS", "targetIpv4": "192.168.5.46", "targetPort": 443})
+    assert service.ensure_native_mapping(rule)["state"] == "ready"
+    service._save_rules([rule])
+    service._save_native_mapping_bindings({rule["id"]: {
+        "state": "manual_change", "ruleName": f"LabProbe STUN {rule['id']}", "fingerprint": "unknown-fingerprint",
+    }})
+
+    row = StunService(hub, client).rows()[0]
+
+    assert row["nativeMappingState"] == "manual_change"
+
+
+def test_manual_change_state_is_not_cleared_by_fingerprint_alone(tmp_path):
+    hub = _hub(tmp_path)
+    client = _Client()
+    service = StunService(hub, client)
+    rule = service.clean_rule({"serviceType": "HTTPS", "targetIpv4": "192.168.5.46", "targetPort": 443})
+    assert service.ensure_native_mapping(rule)["state"] == "ready"
+    service._save_rules([rule])
+    binding = service._native_mapping_bindings()[rule["id"]]
+    service._save_native_mapping_bindings({rule["id"]: {**binding, "state": "manual_change"}})
+
+    row = StunService(hub, client).rows()[0]
+
+    assert row["nativeMappingState"] == "manual_change"
+
+
+def test_native_mapping_metadata_change_refreshes_fingerprint_without_manual_change(tmp_path):
+    client = _Client()
+    service = StunService(_hub(tmp_path), client)
+    rule = service.clean_rule({"serviceType": "HTTPS", "targetIpv4": "192.168.5.46", "targetPort": 443})
+    assert service.ensure_native_mapping(rule)["state"] == "ready"
+    client.rpc_calls.clear()
+    client.native_rules[0]["wanId"] = "wan"
+
+    assert service.ensure_native_mapping(rule)["state"] == "ready"
+    assert client.rpc_calls == []
+
+
+def test_native_mapping_write_strips_read_only_wan_metadata(tmp_path):
+    client = _Client()
+    service = StunService(_hub(tmp_path), client)
+    old = service.clean_rule({"serviceType": "HTTPS", "targetIpv4": "192.168.5.46", "targetPort": 443})
+    assert service.ensure_native_mapping(old)["state"] == "ready"
+    client.native_rules[0]["wanId"] = "wan"
+    updated = service.clean_rule({"targetIpv4": "192.168.5.47", "targetPort": 8443}, old)
+    client.rpc_calls.clear()
+
+    assert service.ensure_native_mapping(updated)["state"] == "ready"
+    payload = client.rpc_calls[-1][2]
+    assert "wanId" not in payload["old"]
+    assert "wanId" not in payload["new"]
+    assert payload["old"]["src"] == "wan"
+    assert payload["new"]["src"] == "wan"
+
+
+def test_native_mapping_forwarding_change_still_requires_manual_review(tmp_path):
+    client = _Client()
+    service = StunService(_hub(tmp_path), client)
+    rule = service.clean_rule({"serviceType": "HTTPS", "targetIpv4": "192.168.5.46", "targetPort": 443})
+    assert service.ensure_native_mapping(rule)["state"] == "ready"
+    client.rpc_calls.clear()
+    client.native_rules[0]["destPort"] = "8443"
+
+    assert service.ensure_native_mapping(rule)["state"] == "manual_change"
+    assert client.rpc_calls == []
 
 
 def test_tcp_native_map_updates_only_when_the_selected_target_changes(tmp_path):

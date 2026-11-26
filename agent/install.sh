@@ -40,6 +40,13 @@ HUB_URL="${1:-${HUB_URL:-$SAVED_HUB}}"
 HOOK_TOKEN="${2:-${HOOK_TOKEN:-$SAVED_TOKEN}}"
 ROUTER_NAME="${3:-${ROUTER_NAME:-$SAVED_NAME}}"
 [ -n "$ROUTER_NAME" ] || ROUTER_NAME="$(hostname 2>/dev/null || echo router)"
+
+# APP-driven upgrades pass no identity arguments and must keep the existing
+# binding. A deliberate migration remains possible, but only through an explicit
+# opt-in so a stale installer cannot silently move an Agent to another Hub.
+if [ -n "$SAVED_HUB" ] && { [ "$HUB_URL" != "$SAVED_HUB" ] || [ "$HOOK_TOKEN" != "$SAVED_TOKEN" ] || [ "$ROUTER_NAME" != "$SAVED_NAME" ]; }; then
+  [ "${LABRELAY_ALLOW_IDENTITY_CHANGE:-0}" = "1" ] || fail 'existing Agent identity differs; set LABRELAY_ALLOW_IDENTITY_CHANGE=1 only for a deliberate migration'
+fi
 LOCAL_BINARY="${4:-${LABRELAY_BINARY:-}}"
 REPOSITORY_ROOT="${5:-${LABRELAY_REPOSITORY_ROOT:-${LABPROBE_UPDATE_ROOT:-${HUB_URL:-https://lab.net86.dynv6.net:27772}}}}"
 REPOSITORY_ROOT="${REPOSITORY_ROOT%/}"

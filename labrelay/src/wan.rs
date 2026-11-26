@@ -160,6 +160,7 @@ impl WanBinding {
 struct LogicalWan {
     section: String,
     proto: String,
+    kind: String,
     device: String,
     ifnames: Vec<String>,
 }
@@ -1035,6 +1036,7 @@ fn parse_network_uci(output: &str) -> Result<BTreeMap<String, LogicalWan>> {
                     LogicalWan {
                         section: (*rest).to_string(),
                         proto: String::new(),
+                        kind: String::new(),
                         device: String::new(),
                         ifnames: Vec::new(),
                     },
@@ -1055,6 +1057,7 @@ fn parse_network_uci(output: &str) -> Result<BTreeMap<String, LogicalWan>> {
         let value = unquote_uci(value);
         match option {
             "proto" => wan.proto = value,
+            "type" => wan.kind = value,
             "device" => wan.device = value,
             "ifname" => wan.ifnames = value.split_whitespace().map(str::to_string).collect(),
             _ => {}
@@ -1197,13 +1200,14 @@ fn parse_addresses(output: &str, family: WanFamily) -> Vec<WanAddress> {
         let Some(cidr) = fields.get(marker_index + 1) else {
             continue;
         };
-        let Some((address, prefix_len)) = cidr.split_once('/') else {
-            continue;
+        let (address, prefix_len) = match cidr.split_once('/') {
+            Some((address, prefix_len)) => match prefix_len.parse::<u8>() {
+                Ok(prefix_len) => (address, prefix_len),
+                Err(_) => continue,
+            },
+            None => (*cidr, if family == WanFamily::V4 { 32 } else { 128 }),
         };
         let Ok(address) = IpAddr::from_str(address) else {
-            continue;
-        };
-        let Ok(prefix_len) = prefix_len.parse::<u8>() else {
             continue;
         };
         let maximum = if address.is_ipv4() { 32 } else { 128 };
@@ -1489,6 +1493,12 @@ fn resolve_l3_device(
 ) -> String {
     if logical.proto.eq_ignore_ascii_case("pppoe") {
         return format!("pppoe-{}", logical.section);
+    }
+    if logical.kind.eq_ignore_ascii_case("bridge") {
+        let bridge = format!("br-{}", logical.section);
+        if links.contains_key(bridge.as_str()) {
+            return bridge;
+        }
     }
     for candidate in [logical.section.as_str(), wan_id] {
         if links.contains_key(candidate) {
@@ -1863,6 +1873,66 @@ fn now_epoch() -> u64 {
 mod tests {
     use super::*;
     use serde_json::json;
+
+    #[test]
+    fn reyee_bridge_wan1_uses_br_wan1_and_pppoe_wan_resolves_source() {
+        let outputs = DiscoveryOutputs {
+            network_uci: r#"network.wan=interface
+network.wan.type='bridge'
+network.wan.ifname='eth2.1'
+network.wan.proto='pppoe'
+network.wan.ipv6='1'
+network.wan1=interface
+network.wan1.type='bridge'
+network.wan1.ifname='eth2.4094'
+network.wan1.proto='dhcp'
+network.wan1.ipv6='1'
+"#
+            .into(),
+            links: r#"39: labwg0: <POINTOPOINT,NOARP,UP,LOWER_UP> mtu 1384 state UNKNOWN
+40: br-wan1: <BROADCAST,MULTICAST,UP,LOWER_UP> mtu 1500 state UP
+41: eth2.4094@eth2: <BROADCAST,MULTICAST,UP,LOWER_UP> mtu 1500 master br-wan1 state UP
+42: pppoe-wan: <POINTOPOINT,MULTICAST,NOARP,UP,LOWER_UP> mtu 1460 state UNKNOWN
+"#
+            .into(),
+            addresses_v4:
+                r#"40: br-wan1    inet 192.168.2.2/24 brd 192.168.2.255 scope global br-wan1
+42: pppoe-wan    inet 10.87.133.112 peer 10.87.128.1/32 scope global pppoe-wan
+"#
+                .into(),
+            addresses_v6: String::new(),
+            routes_v4: r#"default via 10.87.128.1 dev pppoe-wan table 1
+10.87.128.1 dev pppoe-wan proto kernel scope link src 10.87.133.112
+192.168.2.0/24 dev br-wan1 proto kernel scope link src 192.168.2.2
+"#
+            .into(),
+            routes_v6: String::new(),
+            rules_v4: String::new(),
+            rules_v6: String::new(),
+            mwan3_uci: String::new(),
+            mwan3_file: String::new(),
+        };
+        let snapshot = build_snapshot(outputs, 1, "test".into()).unwrap();
+        let wan = snapshot
+            .wans
+            .iter()
+            .find(|row| row.wan_id == "wan")
+            .unwrap();
+        let wan1 = snapshot
+            .wans
+            .iter()
+            .find(|row| row.wan_id == "wan1")
+            .unwrap();
+        assert_eq!(wan.l3_device, "pppoe-wan");
+        assert_eq!(wan1.l3_device, "br-wan1");
+        assert!(wan1
+            .addresses
+            .iter()
+            .any(|address| address.address.to_string() == "192.168.2.2"));
+        let binding = resolve_binding(&snapshot, "wan", WanFamily::V4).unwrap();
+        assert_eq!(binding.source_address, "10.87.133.112");
+        assert_eq!(binding.device.as_deref(), Some("pppoe-wan"));
+    }
 
     #[test]
     fn no_carrier_link_is_not_online_even_when_bridge_is_up() {
@@ -2316,6 +2386,7 @@ default via fe80::2 dev pppoe-wan1 proto static table 101 metric 20 pref medium
         let logical = LogicalWan {
             section: "wan1".into(),
             proto: "pppoe".into(),
+            kind: String::new(),
             device: "eth1".into(),
             ifnames: vec!["eth1".into()],
         };
@@ -2342,6 +2413,7 @@ default via fe80::2 dev pppoe-wan1 proto static table 101 metric 20 pref medium
                 &LogicalWan {
                     section: "wan".into(),
                     proto: "dhcp".into(),
+                    kind: String::new(),
                     device: "eth0".into(),
                     ifnames: vec![],
                 },

@@ -1,6 +1,6 @@
 # 多 WAN 测试包真机验证清单
 
-适用测试包：LabProbe App `0.14.13 build357`、Hub `0.14.8`、LabRelay `0.2.81`。
+适用测试包：LabProbe App `0.14.14 build358`、Hub `0.14.9`、LabRelay `0.2.82`。
 
 ## 验证边界
 
@@ -15,7 +15,7 @@
 - [ ] 备份 Hub 数据与路由器现有配置。
 - [ ] 记录两条线路的 WAN ID、物理端口、连接方式、IPv4/IPv6、网关和 DNS。
 - [ ] 记录现有规则及其 `wanId`；旧规则没有 `wanId` 时按 WAN 处理。
-- [ ] 确认 APP、Hub、Relay 的版本分别为 `0.14.13 build357`、`0.14.8`、`0.2.81`。
+- [ ] 确认 APP、Hub、Relay 的版本分别为 `0.14.14 build358`、`0.14.9`、`0.2.82`。
 - [ ] 确认 Test Bundle 的 APK 签名校验、Hub 镜像架构和 Relay ARM64/ARMv7 校验文件均通过。
 - [ ] 记录验证前的默认路由、主 WAN 和路由器总上/下行计数。
 

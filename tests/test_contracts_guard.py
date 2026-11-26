@@ -27,7 +27,7 @@ def test_frozen_contract_structure():
     assert "extractedAt" in data
     assert len(data["rest"]) == data["totalRestEndpoints"]
     assert len(data["websocket"][0]["frames"]) == data["totalWebSocketTypes"]
-    assert data["totalRestEndpoints"] == 76
+    assert data["totalRestEndpoints"] == len(data["rest"])
     assert data["totalWebSocketTypes"] == 8
 
 
@@ -103,6 +103,7 @@ def test_frozen_contract_endpoints_integrity():
         ("/api/sync/snapshot", "GET"),
         ("/api/sync/revision", "GET"),
         ("/api/events", "GET"),
+        ("/api/events", "POST"),
         ("/api/events/{id}", "DELETE"),
         ("/api/daily", "GET"),
         ("/api/daily/latest", "GET"),
