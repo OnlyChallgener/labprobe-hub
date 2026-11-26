@@ -10,7 +10,7 @@
 - 新增 APP“HTTPS 与证书”独立页面、Hub 可选 nginx 服务、证书校验/热加载/回滚、本地与 HTTPS 手动导入，以及 7/3/当天到期提醒和事件同步；默认关闭，不依赖 Lucky。
 - 端口映射区分原生出接口 `src` 与外部服务器 IP `srcIp`；DDNS、UPnP、防火墙保留固件接口语义，防火墙接口列表覆盖 WAN、LAN 与 VLAN。
 - 固件测速支持 WAN、WAN1 独立及原生 `max` 叠加结果；APP 直接展示固件综合值，不在客户端相加。
-- 修复 STUN 原生映射回写混入 `wanId`、WireGuard 端点失败不重试、旧 Relay 空线路不兼容、握手状态过早报错及英文错误透出。
+- 修复 STUN 原生映射回写混入 `wanId`、WireGuard 端点失败不重试、旧 Relay 空线路不兼容、握手状态过早报错及英文错误透出；OpenWrt WireGuard 防火墙入站与转发规则跟随 profile 的 `wanId`，不再写死 WAN。
 - 官方账号改为 APP 通过固定 HTTPS 直连锐捷云完成登录、刷新、退出与名单回读；Hub 仅接收 APP_TOKEN 鉴权后的项目绑定元数据，不再保存云 Token 或接收密码，旧绑定迁移后停止云端重放。
 - 自动化覆盖 Hub、APP 与 Relay WAN 回归；双 WAN、HTTPS 与 WireGuard 真机场景仍需按清单验证。
 

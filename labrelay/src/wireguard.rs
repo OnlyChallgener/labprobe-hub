@@ -769,7 +769,7 @@ fn ensure_interface(ip_tool: &str, interface_name: &str) -> Result<()> {
 #[cfg(target_os = "linux")]
 pub fn apply_server(config: &WireGuardServerDesired) -> Result<WireGuardApplyResult> {
     validate_server_desired(config)?;
-    let _ = ensure_openwrt_wg_zone(config.listen_port);
+    let _ = ensure_openwrt_wg_zone(config.listen_port, &config.wan_id);
     let ip = find_tool("ip")
         .ok_or_else(|| anyhow::anyhow!("ip tool is required to create the WireGuard interface"))?;
     ensure_interface(&ip, &config.interface_name)?;
@@ -970,8 +970,8 @@ pub fn parse_uci_firewall_has_wg_forwarding(raw: &str) -> bool {
 }
 
 /// Parse `uci show firewall` or `/etc/config/firewall` output to check if a
-/// forwarding rule from `wg` to `wan` is already configured.
-pub fn parse_uci_firewall_has_wg_wan_forwarding(raw: &str) -> bool {
+/// forwarding rule from `wg` to the selected WAN zone is already configured.
+pub fn parse_uci_firewall_has_wg_wan_forwarding(raw: &str, wan_zone: &str) -> bool {
     let lower = raw.to_ascii_lowercase();
     let has_src_wg = lower.contains("src='wg'")
         || lower.contains("src=\"wg\"")
@@ -981,16 +981,16 @@ pub fn parse_uci_firewall_has_wg_wan_forwarding(raw: &str) -> bool {
         || lower.contains("src=\"labprobe_wg\"")
         || lower.contains("src 'labprobe_wg'")
         || lower.contains("src \"labprobe_wg\"");
-    let has_dest_wan = lower.contains("dest='wan'")
-        || lower.contains("dest=\"wan\"")
-        || lower.contains("dest 'wan'")
-        || lower.contains("dest \"wan\"");
+    let zone = normalize_wg_wan_zone(wan_zone);
+    let has_dest_wan = ["'", "\"", " ", ""]
+        .iter()
+        .any(|quote| lower.contains(&format!("dest={quote}{zone}{quote}")));
     has_src_wg && has_dest_wan
 }
 
 /// Parse `uci show firewall` or `/etc/config/firewall` output to check if an
-/// inbound rule for the WireGuard UDP listening port is already configured on the WAN zone.
-pub fn parse_uci_firewall_has_wg_inbound_rule(raw: &str, port: u16) -> bool {
+/// inbound rule for the WireGuard UDP listening port is already configured on the selected WAN zone.
+pub fn parse_uci_firewall_has_wg_inbound_rule(raw: &str, port: u16, wan_zone: &str) -> bool {
     let lower = raw.to_ascii_lowercase();
     let port_str = port.to_string();
     let has_port = lower.contains(&format!("dest_port='{port_str}'"))
@@ -998,11 +998,10 @@ pub fn parse_uci_firewall_has_wg_inbound_rule(raw: &str, port: u16) -> bool {
         || lower.contains(&format!("dest_port '{port_str}'"))
         || lower.contains(&format!("dest_port \"{port_str}\""))
         || lower.contains(&format!("dest_port={port_str}"));
-    let has_src_wan = lower.contains("src='wan'")
-        || lower.contains("src=\"wan\"")
-        || lower.contains("src 'wan'")
-        || lower.contains("src \"wan\"")
-        || lower.contains("src=wan");
+    let zone = normalize_wg_wan_zone(wan_zone);
+    let has_src_wan = ["'", "\"", " ", ""]
+        .iter()
+        .any(|quote| lower.contains(&format!("src={quote}{zone}{quote}")));
     let has_proto_udp = lower.contains("proto='udp'")
         || lower.contains("proto=\"udp\"")
         || lower.contains("proto 'udp'")
@@ -1011,18 +1010,33 @@ pub fn parse_uci_firewall_has_wg_inbound_rule(raw: &str, port: u16) -> bool {
     has_port && has_src_wan && has_proto_udp
 }
 
-/// Non-blocking, idempotent setup of OpenWrt firewall `wg` zone, `wg -> lan` / `wg -> wan`
-/// forwarding rules, and WAN UDP port inbound allowance rule using `uci`. Safe on non-OpenWrt systems.
-pub fn ensure_openwrt_wg_zone(listen_port: u16) -> Result<()> {
+fn normalize_wg_wan_zone(value: &str) -> String {
+    let zone = value.trim().to_ascii_lowercase();
+    if !zone.is_empty()
+        && zone.len() <= 32
+        && zone
+            .bytes()
+            .all(|byte| byte.is_ascii_lowercase() || byte.is_ascii_digit() || byte == b'_')
+    {
+        zone
+    } else {
+        "wan".to_string()
+    }
+}
+
+/// Non-blocking, idempotent setup of OpenWrt firewall `wg` zone, `wg -> lan` / selected WAN
+/// forwarding rules, and the selected WAN UDP inbound allowance rule using `uci`. Safe on non-OpenWrt systems.
+pub fn ensure_openwrt_wg_zone(listen_port: u16, wan_zone: &str) -> Result<()> {
     let Some(uci) = find_tool("uci") else {
         return Ok(());
     };
     let port = if listen_port > 0 { listen_port } else { 51820 };
+    let wan_zone = normalize_wg_wan_zone(wan_zone);
     let firewall_text = run_capture(&uci, &["show", "firewall"]).unwrap_or_default();
     let has_zone = parse_uci_firewall_has_wg_zone(&firewall_text);
     let has_forwarding = parse_uci_firewall_has_wg_forwarding(&firewall_text);
-    let has_wan_forwarding = parse_uci_firewall_has_wg_wan_forwarding(&firewall_text);
-    let has_inbound = parse_uci_firewall_has_wg_inbound_rule(&firewall_text, port);
+    let has_wan_forwarding = parse_uci_firewall_has_wg_wan_forwarding(&firewall_text, &wan_zone);
+    let has_inbound = parse_uci_firewall_has_wg_inbound_rule(&firewall_text, port, &wan_zone);
 
     if has_zone && has_forwarding && has_wan_forwarding && has_inbound {
         return Ok(());
@@ -1051,7 +1065,10 @@ pub fn ensure_openwrt_wg_zone(listen_port: u16) -> Result<()> {
     if !has_wan_forwarding {
         let _ = run_capture(&uci, &["add", "firewall", "forwarding"]);
         let _ = run_capture(&uci, &["set", "firewall.@forwarding[-1].src=wg"]);
-        let _ = run_capture(&uci, &["set", "firewall.@forwarding[-1].dest=wan"]);
+        let _ = run_capture(
+            &uci,
+            &["set", &format!("firewall.@forwarding[-1].dest={wan_zone}")],
+        );
         changed = true;
     }
 
@@ -1059,9 +1076,15 @@ pub fn ensure_openwrt_wg_zone(listen_port: u16) -> Result<()> {
         let _ = run_capture(&uci, &["add", "firewall", "rule"]);
         let _ = run_capture(
             &uci,
-            &["set", "firewall.@rule[-1].name=Allow-WireGuard-Inbound"],
+            &[
+                "set",
+                &format!("firewall.@rule[-1].name=Allow-WireGuard-Inbound-{wan_zone}"),
+            ],
         );
-        let _ = run_capture(&uci, &["set", "firewall.@rule[-1].src=wan"]);
+        let _ = run_capture(
+            &uci,
+            &["set", &format!("firewall.@rule[-1].src={wan_zone}")],
+        );
         let _ = run_capture(&uci, &["set", "firewall.@rule[-1].proto=udp"]);
         let _ = run_capture(
             &uci,
@@ -1830,8 +1853,34 @@ firewall.cfg02.proto='udp'
 firewall.cfg02.dest_port='51820'
 firewall.cfg02.target='ACCEPT'
 ";
-        assert!(parse_uci_firewall_has_wg_wan_forwarding(raw));
-        assert!(parse_uci_firewall_has_wg_inbound_rule(raw, 51820));
-        assert!(!parse_uci_firewall_has_wg_inbound_rule(raw, 40000));
+        assert!(parse_uci_firewall_has_wg_wan_forwarding(raw, "wan"));
+        assert!(parse_uci_firewall_has_wg_inbound_rule(raw, 51820, "wan"));
+        assert!(!parse_uci_firewall_has_wg_inbound_rule(raw, 40000, "wan"));
+        assert!(!parse_uci_firewall_has_wg_wan_forwarding(raw, "wan1"));
+        assert!(!parse_uci_firewall_has_wg_inbound_rule(raw, 51820, "wan1"));
+    }
+
+    #[test]
+    fn uci_firewall_wg_wan1_rules_are_not_mistaken_for_wan() {
+        let raw = "\
+firewall.cfg01=forwarding
+firewall.cfg01.src='wg'
+firewall.cfg01.dest='wan1'
+firewall.cfg02=rule
+firewall.cfg02.name='Allow-WireGuard-Inbound-wan1'
+firewall.cfg02.src='wan1'
+firewall.cfg02.proto='udp'
+firewall.cfg02.dest_port='51821'
+firewall.cfg02.target='ACCEPT'
+";
+        assert!(parse_uci_firewall_has_wg_wan_forwarding(raw, "wan1"));
+        assert!(parse_uci_firewall_has_wg_inbound_rule(raw, 51821, "wan1"));
+        assert!(!parse_uci_firewall_has_wg_wan_forwarding(raw, "wan"));
+        assert!(!parse_uci_firewall_has_wg_inbound_rule(raw, 51821, "wan"));
+        assert!(parse_uci_firewall_has_wg_wan_forwarding(raw, "WAN1"));
+        assert!(!parse_uci_firewall_has_wg_wan_forwarding(
+            raw,
+            "invalid zone"
+        ));
     }
 }

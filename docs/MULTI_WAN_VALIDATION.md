@@ -73,6 +73,7 @@
 - [ ] 自动端点的来源线路、`ddnsRecordId`、名称、启用状态和更新时间在 Hub/Relay 往返后保留。
 - [ ] WAN1 端点更新不会把既有 WAN 端点或手动 profile 改成自动 profile。
 - [ ] WAN1 离线时保留上一条可用端点，不自动改成 WAN。
+- [ ] WAN1 profile 的 OpenWrt 防火墙 `wg -> wan1` 转发和 WireGuard UDP 入站规则使用 `wan1`，不写成 `wan`。
 
 ## 五、断线与恢复
 
