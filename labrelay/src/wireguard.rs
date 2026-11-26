@@ -25,6 +25,10 @@ const DEFAULT_PRIVATE_KEY_PATH: &str = "/etc/labprobe/wireguard/private.key";
 #[serde(rename_all = "camelCase")]
 pub struct WireGuardEndpointProfile {
     pub id: String,
+    #[serde(default)]
+    pub name: String,
+    #[serde(default = "default_true")]
+    pub enabled: bool,
     pub endpoint_source: String,
     /// Stable updater identity (`ddns:<profile-id>` or `stun:<rule-id>`).
     /// Manual profiles have no owner and reject automatic updates.
@@ -39,6 +43,8 @@ pub struct WireGuardEndpointProfile {
     #[serde(default)]
     pub stun_rule_id: String,
     #[serde(default)]
+    pub ddns_record_id: String,
+    #[serde(default)]
     pub binding_mode: String,
     #[serde(default)]
     pub forward_mode: String,
@@ -50,6 +56,8 @@ pub struct WireGuardEndpointProfile {
     pub port: u16,
     #[serde(default)]
     pub endpoint_revision: u64,
+    #[serde(default)]
+    pub endpoint_updated_at: String,
     #[serde(default)]
     pub wan_id: String,
 }
@@ -1361,6 +1369,29 @@ mod tests {
             }],
         };
         assert!(validate_server_desired(&desired).is_err());
+    }
+
+    #[test]
+    fn endpoint_profile_preserves_hub_metadata() {
+        let profile: WireGuardEndpointProfile = serde_json::from_value(serde_json::json!({
+            "id": "wg-ddns",
+            "name": "DDNS 直连",
+            "enabled": true,
+            "endpointSource": "ddns",
+            "owner": "ddns:wg-ddns",
+            "hostname": "wg.example.com",
+            "ddnsRecordId": "record-1",
+            "endpointRevision": 3,
+            "endpointUpdatedAt": "2026-11-26T10:00:00Z",
+            "wanId": "wan1"
+        }))
+        .unwrap();
+        assert_eq!(profile.name, "DDNS 直连");
+        assert_eq!(profile.ddns_record_id, "record-1");
+        assert_eq!(profile.endpoint_updated_at, "2026-11-26T10:00:00Z");
+        let value = serde_json::to_value(profile).unwrap();
+        assert_eq!(value["ddnsRecordId"], "record-1");
+        assert_eq!(value["endpointUpdatedAt"], "2026-11-26T10:00:00Z");
     }
 
     #[test]

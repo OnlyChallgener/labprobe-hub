@@ -246,7 +246,9 @@ impl InterfaceTopology {
 }
 
 pub async fn detect() -> DdnsAddressReport {
-    let discovered = wan::discover_snapshot_cached_async(Duration::from_secs(120)).await.ok();
+    let discovered = wan::discover_snapshot_cached_async(Duration::from_secs(120))
+        .await
+        .ok();
     let wan_supported = discovered.is_some();
     let detected_at = now_epoch();
     let detections = match discovered.as_ref() {
@@ -371,7 +373,11 @@ async fn query_external_bound(
             continue;
         };
         if let Some(ip) = parse_public_address(text.trim(), family) {
-            return (Some((ip, format!("egress-http:{name}"))), verification);
+            let verified_after = wan::verify_route_get(&mut binding, target).await;
+            if verified_after == WanVerification::Verified {
+                return (Some((ip, format!("egress-http:{name}"))), verified_after);
+            }
+            strongest = strongest_verification(strongest, verified_after);
         }
     }
     (None, strongest)

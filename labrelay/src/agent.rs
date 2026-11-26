@@ -293,7 +293,8 @@ async fn report_agent_status(
     state: &mut AgentState,
 ) -> Result<()> {
     let now = now_epoch();
-    if state.last_wan_capability_at == 0 || now.saturating_sub(state.last_wan_capability_at) >= 120 {
+    if state.last_wan_capability_at == 0 || now.saturating_sub(state.last_wan_capability_at) >= 120
+    {
         state.wan_capability = Some(agent_wan_capability(
             crate::wan::discover_snapshot_cached_async(Duration::from_secs(120)).await,
         ));
@@ -779,11 +780,14 @@ fn fast_telemetry_with_local_fallback(
 ) -> Value {
     let mut telemetry =
         telemetry_from_fast(fast, metadata.online_devices, metadata.storage_percent);
-    let wan = object_path(fast, &["wan_stat", "wans"])
-        .or_else(|| object_path(fast, &["wan_stat", "wan"]))
+    let wan = object_path(fast, &["wan_stat", "wan"])
+        .or_else(|| object_path(fast, &["wan_stat", "wans"]))
         .unwrap_or(&Value::Null);
-    let missing_upload = !has_numeric_metric(wan, &["tx_rate_bps", "tx_rate", "up"]);
-    let missing_download = !has_numeric_metric(wan, &["rx_rate_bps", "rx_rate", "down"]);
+    let has_per_wan = !fast_wan_rows(fast).is_empty();
+    let missing_upload =
+        !has_per_wan && !has_numeric_metric(wan, &["tx_rate_bps", "tx_rate", "up"]);
+    let missing_download =
+        !has_per_wan && !has_numeric_metric(wan, &["rx_rate_bps", "rx_rate", "down"]);
     let missing_ipv4 = !has_numeric_metric(
         wan,
         &[
@@ -1345,38 +1349,129 @@ fn local_telemetry_payload(config: &AgentConfig, state: &mut AgentState) -> Valu
     })
 }
 
+fn fast_wan_rate(row: &Value, upload: bool) -> f64 {
+    let keys: &[&str] = if upload {
+        &["tx_rate_bps", "tx_rate", "up", "uploadBps"]
+    } else {
+        &["rx_rate_bps", "rx_rate", "down", "downloadBps"]
+    };
+    keys.iter()
+        .map(|key| number(row.get(*key)))
+        .fold(0.0, f64::max)
+}
+
+fn fast_wan_total(row: &Value, upload: bool) -> f64 {
+    let keys: &[&str] = if upload {
+        &[
+            "total_up",
+            "total_upload",
+            "totalTxBytes",
+            "totalUploadBytes",
+        ]
+    } else {
+        &[
+            "total_down",
+            "total_download",
+            "totalRxBytes",
+            "totalDownloadBytes",
+        ]
+    };
+    keys.iter()
+        .map(|key| number(row.get(*key)))
+        .fold(0.0, f64::max)
+}
+
+fn fast_wan_rows(fast: &Value) -> Vec<Value> {
+    let Some(raw) = object_path(fast, &["wan_stat", "wans"]) else {
+        return Vec::new();
+    };
+    let mut rows = Vec::new();
+    let mut push = |wan_id: &str, row: &Value| {
+        if !row.is_object() || wan_id.is_empty() {
+            return;
+        }
+        rows.push(json!({
+            "wanId": wan_id,
+            "uploadBps": fast_wan_rate(row, true) as u64,
+            "downloadBps": fast_wan_rate(row, false) as u64,
+            "totalUploadBytes": fast_wan_total(row, true) as u64,
+            "totalDownloadBytes": fast_wan_total(row, false) as u64,
+            "trafficSource": "fast_wan_stat",
+        }));
+    };
+    match raw {
+        Value::Object(values) => {
+            for (wan_id, row) in values {
+                if row.is_object()
+                    && (wan_id == "wan" || wan_id == "wan1" || row.get("wanId").is_some())
+                {
+                    push(wan_id, row);
+                }
+            }
+        }
+        Value::Array(values) => {
+            for row in values {
+                let Some(wan_id) = row
+                    .get("wanId")
+                    .or_else(|| row.get("id"))
+                    .and_then(Value::as_str)
+                else {
+                    continue;
+                };
+                push(wan_id, row);
+            }
+        }
+        _ => {}
+    }
+    rows
+}
+
+fn fast_wan_metrics(fast: &Value) -> (f64, f64, f64, f64) {
+    let primary = object_path(fast, &["wan_stat", "wan"]).unwrap_or(&Value::Null);
+    let aggregate = object_path(fast, &["wan_stat", "wans"]).unwrap_or(&Value::Null);
+    let mut upload = fast_wan_rate(primary, true);
+    let mut download = fast_wan_rate(primary, false);
+    let mut total_upload = fast_wan_total(primary, true);
+    let mut total_download = fast_wan_total(primary, false);
+    if aggregate.is_object() {
+        upload = upload.max(fast_wan_rate(aggregate, true));
+        download = download.max(fast_wan_rate(aggregate, false));
+        total_upload = total_upload.max(fast_wan_total(aggregate, true));
+        total_download = total_download.max(fast_wan_total(aggregate, false));
+    }
+    if upload == 0.0 || download == 0.0 || total_upload == 0.0 || total_download == 0.0 {
+        let rows = fast_wan_rows(fast);
+        let row_upload: f64 = rows.iter().map(|row| fast_wan_rate(row, true)).sum();
+        let row_download: f64 = rows.iter().map(|row| fast_wan_rate(row, false)).sum();
+        let row_total_upload: f64 = rows.iter().map(|row| fast_wan_total(row, true)).sum();
+        let row_total_download: f64 = rows.iter().map(|row| fast_wan_total(row, false)).sum();
+        if upload == 0.0 {
+            upload = row_upload;
+        }
+        if download == 0.0 {
+            download = row_download;
+        }
+        if total_upload == 0.0 {
+            total_upload = row_total_upload;
+        }
+        if total_download == 0.0 {
+            total_download = row_total_download;
+        }
+    }
+    (upload, download, total_upload, total_download)
+}
+
 fn telemetry_from_fast(
     fast: &Value,
     online_devices: usize,
     cached_storage_percent: Option<f64>,
 ) -> Value {
-    let wan_primary = object_path(fast, &["wan_stat", "wan"]).unwrap_or(&Value::Null);
-    let wan = object_path(fast, &["wan_stat", "wans"])
-        .or_else(|| object_path(fast, &["wan_stat", "wan"]))
+    let (upload_raw, download_raw, total_upload, total_download) = fast_wan_metrics(fast);
+    let wan = object_path(fast, &["wan_stat", "wan"])
+        .or_else(|| object_path(fast, &["wan_stat", "wans"]))
         .unwrap_or(&Value::Null);
-    let upload_raw = number(wan.get("tx_rate_bps"))
-        .max(number(wan.get("tx_rate")))
-        .max(number(wan.get("up")));
-    let download_raw = number(wan.get("rx_rate_bps"))
-        .max(number(wan.get("rx_rate")))
-        .max(number(wan.get("down")));
-    let total_upload_primary =
-        first_number_by_keys(wan_primary, &["total_up", "total_upload", "totalTxBytes"]);
-    let total_download_primary = first_number_by_keys(
-        wan_primary,
-        &["total_down", "total_download", "totalRxBytes"],
-    );
-    let total_upload = if total_upload_primary > 0.0 {
-        total_upload_primary
-    } else {
-        first_number_by_keys(wan, &["total_up", "total_upload", "totalTxBytes"])
-    };
-    let total_download = if total_download_primary > 0.0 {
-        total_download_primary
-    } else {
-        first_number_by_keys(wan, &["total_down", "total_download", "totalRxBytes"])
-    };
-    json!({
+    let wans = fast_wan_rows(fast);
+    let mut telemetry = json!({
         "cpuPercent": number(fast.get("cpu_usage")).max(number(fast.get("cpuutil"))),
         "memoryPercent": number(fast.get("memutil")),
         "storagePercent": cached_storage_percent.unwrap_or_else(|| storage_percent_from_fast(fast)),
@@ -1427,7 +1522,11 @@ fn telemetry_from_fast(
             "flow": first_number_by_keys(wan, &["flow_cnt", "flow_count", "flows"]) as u64,
             "cps": first_number_by_keys(wan, &["cps", "connections_per_second"]) as u64
         }
-    })
+    });
+    if !wans.is_empty() {
+        telemetry["wans"] = Value::Array(wans);
+    }
+    telemetry
 }
 
 fn csv_values(value: Option<&Value>) -> Value {
@@ -2865,6 +2964,7 @@ async fn sync_wireguard(
             "interfaceName": state.wireguard_interface,
             "applyResult": state.wireguard_apply_result,
             "capability": capability,
+            "endpointProfiles": state.wireguard_endpoint_profiles,
         }),
     )
     .await?;
@@ -3484,6 +3584,42 @@ mod local_telemetry_tests {
         // 同一帧经 HUB eWeb WS 通道 normalize_fast_message 得到同样的 bit/s，
         // 两条通道不再差 8 倍。
         assert_eq!(telemetry["wan"]["uploadBps"].as_u64().unwrap(), 24372);
+    }
+
+    #[test]
+    fn fast_wan_aggregate_is_not_replaced_by_first_per_wan_row() {
+        let fast = json!({
+            "wan_stat": {
+                "wan": {"up": 100, "down": 200, "total_up": 1000, "total_down": 2000},
+                "wans": {
+                    "wan": {"up": 60, "down": 120, "total_up": 600, "total_down": 1200},
+                    "wan1": {"up": 40, "down": 80, "total_up": 400, "total_down": 800}
+                }
+            }
+        });
+        let telemetry = telemetry_from_fast(&fast, 0, None);
+        assert_eq!(telemetry["wan"]["uploadBps"], 100);
+        assert_eq!(telemetry["wan"]["downloadBps"], 200);
+        assert_eq!(telemetry["wan"]["totalUploadBytes"], 1000);
+        assert_eq!(telemetry["wans"][0]["wanId"], "wan");
+        assert_eq!(telemetry["wans"][1]["wanId"], "wan1");
+    }
+
+    #[test]
+    fn fast_wan_metrics_sum_per_wan_rows_without_an_aggregate() {
+        let fast = json!({
+            "wan_stat": {
+                "wans": {
+                    "wan": {"up": 60, "down": 120, "total_up": 600, "total_down": 1200},
+                    "wan1": {"up": 40, "down": 80, "total_up": 400, "total_down": 800}
+                }
+            }
+        });
+        let telemetry = telemetry_from_fast(&fast, 0, None);
+        assert_eq!(telemetry["wan"]["uploadBps"], 100);
+        assert_eq!(telemetry["wan"]["downloadBps"], 200);
+        assert_eq!(telemetry["wan"]["totalUploadBytes"], 1000);
+        assert_eq!(telemetry["wan"]["totalDownloadBytes"], 2000);
     }
 
     #[test]

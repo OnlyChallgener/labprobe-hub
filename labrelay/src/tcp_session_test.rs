@@ -1526,6 +1526,10 @@ fn cpu_rate_scale(cpu_percent: f64) -> f64 {
     }
 }
 
+fn connected_source_matches(local: SocketAddr, source: &str) -> bool {
+    local.ip().to_string().eq_ignore_ascii_case(source.trim())
+}
+
 async fn connect_once(
     address: SocketAddr,
     connect_timeout: Duration,
@@ -1567,6 +1571,15 @@ async fn connect_once(
     match timeout(connect_timeout, socket.connect(address)).await {
         Ok(Ok(stream)) => match stream.into_std() {
             Ok(stream) => {
+                if let Some(binding) = binding {
+                    let matches_source = stream
+                        .local_addr()
+                        .map(|local| connected_source_matches(local, &binding.source_address))
+                        .unwrap_or(false);
+                    if !matches_source {
+                        return ConnectResult::Failed(FailureKind::Other);
+                    }
+                }
                 let _ = SockRef::from(&stream).set_linger(Some(Duration::ZERO));
                 ConnectResult::Connected(stream)
             }
@@ -1939,6 +1952,14 @@ fn now_epoch() -> u64 {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn connected_tcp_source_must_match_selected_wan() {
+        let local = "192.0.2.10:45678".parse().unwrap();
+        assert!(connected_source_matches(local, " 192.0.2.10 "));
+        assert!(!connected_source_matches(local, "192.0.2.11"));
+        assert!(!connected_source_matches(local, ""));
+    }
 
     #[test]
     fn tcp_session_config_and_status_preserve_wan_identity() {

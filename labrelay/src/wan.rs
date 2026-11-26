@@ -176,7 +176,9 @@ struct LinkInfo {
 
 impl LinkInfo {
     fn is_up(&self) -> bool {
-        self.flags.contains("UP") || self.state.eq_ignore_ascii_case("UP")
+        self.flags.contains("UP")
+            && !self.flags.contains("NO-CARRIER")
+            && (self.flags.contains("LOWER_UP") || self.state.eq_ignore_ascii_case("UP"))
     }
 }
 
@@ -331,12 +333,13 @@ static WAN_DISCOVERY_CACHE: tokio::sync::Mutex<Option<(Instant, Result<WanSnapsh
 pub async fn discover_snapshot_cached_async(max_age: Duration) -> Result<WanSnapshot> {
     let mut cache = WAN_DISCOVERY_CACHE.lock().await;
     if let Some((observed, value)) = cache.as_ref() {
-        let ttl = if value.is_ok() { max_age } else { max_age.min(Duration::from_secs(15)) };
-        if observed.elapsed() < ttl {
+        if observed.elapsed() < max_age {
             return value.clone().map_err(anyhow::Error::msg);
         }
     }
-    let result = discover_snapshot_async().await.map_err(|error| format!("{error:#}"));
+    let result = discover_snapshot_async()
+        .await
+        .map_err(|error| format!("{error:#}"));
     *cache = Some((Instant::now(), result.clone()));
     result.map_err(anyhow::Error::msg)
 }
@@ -1860,6 +1863,30 @@ fn now_epoch() -> u64 {
 mod tests {
     use super::*;
     use serde_json::json;
+
+    #[test]
+    fn no_carrier_link_is_not_online_even_when_bridge_is_up() {
+        let online = LinkInfo {
+            index: 1,
+            name: "wan".into(),
+            parent: None,
+            master: None,
+            flags: ["BROADCAST", "UP", "LOWER_UP"]
+                .into_iter()
+                .map(str::to_string)
+                .collect(),
+            state: "UP".into(),
+        };
+        let offline = LinkInfo {
+            flags: ["BROADCAST", "UP", "NO-CARRIER"]
+                .into_iter()
+                .map(str::to_string)
+                .collect(),
+            ..online.clone()
+        };
+        assert!(online.is_up());
+        assert!(!offline.is_up());
+    }
 
     const NETWORK: &str = r#"
 network.wan=interface
